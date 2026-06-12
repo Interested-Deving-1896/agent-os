@@ -10,10 +10,25 @@
 //   2. A `agent-os-sidecar` binary placed next to this package (dev builds).
 //   3. The platform-specific `@rivet-dev/agent-os-sidecar-<platform>` package.
 
-const { existsSync } = require("node:fs");
+const { existsSync, chmodSync, statSync } = require("node:fs");
 const { join, dirname } = require("node:path");
 
 const BINARY_NAME = "agent-os-sidecar";
+
+// npm normalizes published non-`bin` file modes to 0644, stripping the
+// executable bit from the platform binary. Restore it (best effort) so the
+// resolved path is directly spawnable.
+function ensureExecutable(binaryPath) {
+	try {
+		const mode = statSync(binaryPath).mode;
+		if ((mode & 0o111) === 0) {
+			chmodSync(binaryPath, mode | 0o755);
+		}
+	} catch {
+		// Best effort: a read-only install or unsupported platform should not
+		// break resolution. The spawn will surface a clear error if needed.
+	}
+}
 
 function getPlatformPackageName() {
 	const { platform, arch } = process;
@@ -41,6 +56,7 @@ function getSidecarPath() {
 
 	const localBinary = join(__dirname, BINARY_NAME);
 	if (existsSync(localBinary)) {
+		ensureExecutable(localBinary);
 		return localBinary;
 	}
 
@@ -65,7 +81,9 @@ function getSidecarPath() {
 		);
 	}
 
-	return join(dirname(pkgJsonPath), BINARY_NAME);
+	const binaryPath = join(dirname(pkgJsonPath), BINARY_NAME);
+	ensureExecutable(binaryPath);
+	return binaryPath;
 }
 
 module.exports = { getSidecarPath };
