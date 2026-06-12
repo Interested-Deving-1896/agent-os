@@ -1,6 +1,6 @@
 {
 	"name": "@rivet-dev/agent-os-sidecar-linux-x64-gnu",
-	"version": "0.2.0-rc.2",
+	"version": "0.2.0-rc.3",
 	"description": "Agent OS native sidecar binary for Linux x64 (glibc)",
 	"license": "Apache-2.0",
 	"repository": {
