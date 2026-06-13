@@ -1533,8 +1533,19 @@ impl AgentOs {
     ) -> Result<String> {
         let mut parts: Vec<String> = Vec::new();
         if !skip_base {
-            let data = self.read_file("/etc/agentos/instructions.md").await?;
-            parts.push(String::from_utf8_lossy(&data).into_owned());
+            // OS instructions are best-effort: a VM whose base layer predates the
+            // baked `/etc/agentos/instructions.md` (older sidecar) must not crash
+            // session creation. Treat a missing file as "no base instructions",
+            // matching the non-destructive, skip-able prompt-injection contract.
+            match self.read_file("/etc/agentos/instructions.md").await {
+                Ok(data) => parts.push(String::from_utf8_lossy(&data).into_owned()),
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "skipping OS instructions: /etc/agentos/instructions.md not readable"
+                    );
+                }
+            }
         }
         if let Some(additional) = additional {
             if !additional.is_empty() {

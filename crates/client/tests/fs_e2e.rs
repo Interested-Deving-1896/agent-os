@@ -11,6 +11,29 @@ use agent_os_client::fs::{BatchWriteEntry, DeleteOptions, FileContent, MkdirOpti
 use agent_os_client::ClientError;
 
 #[tokio::test]
+async fn base_layer_exposes_agentos_instructions() {
+    if !common::sidecar_available() {
+        eprintln!("skipping base_layer_exposes_agentos_instructions: sidecar binary not built");
+        return;
+    }
+    let os = common::new_vm().await;
+
+    // A known base-layer file reads (sanity that the bundled base is applied).
+    let hostname = os.read_file("/etc/hostname").await.expect("read /etc/hostname");
+    assert!(!hostname.is_empty());
+
+    // The baked OS instructions must be present so createSession can read them.
+    let instructions = os
+        .read_file("/etc/agentos/instructions.md")
+        .await
+        .expect("read /etc/agentos/instructions.md");
+    assert!(
+        String::from_utf8_lossy(&instructions).contains("agentOS"),
+        "instructions content should be the baked system prompt"
+    );
+}
+
+#[tokio::test]
 async fn filesystem_surface_round_trips() {
     if !common::sidecar_available() {
         eprintln!("skipping filesystem_surface_round_trips: sidecar binary not built");
