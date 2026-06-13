@@ -4037,57 +4037,123 @@ pub(crate) fn vfs_error(error: VfsError) -> SidecarError {
     SidecarError::Kernel(error.to_string())
 }
 
-/// Actionable guidance shown when an agent adapter fails because its packages live
-/// in a symlinked (non-hoisted) `node_modules` whose pnpm store is not visible in
-/// the VM. Mounting host `node_modules` is a bind mount, so a symlinked layout
-/// (pnpm default, yarn-berry) does not resolve inside the VM: Node canonicalizes a
-/// module to its store realpath (`node_modules/.pnpm/...`) which the guest `fs`
-/// cannot read. A flat (hoisted) layout is required.
-const HOISTED_NODE_MODULES_GUIDANCE: &str = "Agent OS can't load this agent: its node_modules uses a symlinked layout (pnpm / yarn-berry) whose package store isn't visible inside the VM. A flat (hoisted) node_modules is required.\n  - pnpm        -> add `node-linker=hoisted` to .npmrc, then reinstall\n  - yarn berry  -> set `nodeLinker: node-modules` in .yarnrc.yml (not PnP)\n  - npm / yarn classic / bun -> already flat, no change needed";
+/// Actionable guidance shown when an agent adapter fails because its packages
+/// live in a non-flat `node_modules` whose package store is not visible in the
+/// VM. Mounting host `node_modules` is a bind mount, so symlinked/store layouts
+/// do not resolve inside the VM: Node canonicalizes a module to its store
+/// realpath (e.g. `node_modules/.pnpm/...`, `.bun/...`, `.store/...`) which lives
+/// above the mounted directory and the guest `fs` cannot read. Plug'n'Play
+/// (yarn-berry default) has no `node_modules` at all. A flat (hoisted) layout is
+/// required. The empirically-supported package managers are captured in
+/// `crates/sidecar/tests/module_layout_e2e.rs`.
+const HOISTED_NODE_MODULES_GUIDANCE: &str = "Agent OS can't load this agent: its node_modules uses a non-flat layout (pnpm / bun / yarn workspaces store, or yarn Plug'n'Play) whose package store isn't visible inside the VM. A flat (hoisted) node_modules is required.\n  - pnpm        -> add `node-linker=hoisted` to .npmrc, then reinstall\n  - yarn berry  -> set `nodeLinker: node-modules` in .yarnrc.yml (not pnp/pnpm)\n  - bun         -> install the agent outside a workspace (workspaces use a .bun store)\n  - npm / yarn classic -> already flat, no change needed";
 
-/// Detect, from an adapter's captured stderr, the symlinked-`node_modules`
-/// failure signature: a missing-file error on a path inside a pnpm `.pnpm` store
-/// (which escapes the VM module-access mount). Returns the actionable guidance to
-/// fold into the surfaced error, or `None` when the failure is unrelated.
+/// Detect, from an adapter's captured stderr, a non-flat-`node_modules` failure
+/// signature. Returns the actionable guidance to fold into the surfaced error,
+/// or `None` when the failure is unrelated.
 ///
-/// Kept deliberately specific (an ENOENT-class error AND a `node_modules/.pnpm`
-/// path) so it never fires on unrelated adapter crashes.
+/// Two signatures, both kept specific so they never fire on unrelated crashes:
+/// - a missing-file / cannot-resolve error referencing a package STORE path that
+///   lives above the mounted project (`.pnpm`, `.bun`, `.store`, PnP `__virtual__`),
+/// - a yarn Plug'n'Play fingerprint (`.pnp.cjs`, the zip cache, or PnP's
+///   "isn't declared in your dependencies" resolver error).
 fn symlinked_node_modules_hint(stderr: &str) -> Option<&'static str> {
-    let mentions_store = stderr.contains("node_modules/.pnpm")
-        || stderr.contains("node_modules\\.pnpm");
-    if !mentions_store {
-        return None;
+    // Package stores that only appear in a path when a non-flat layout is used.
+    // pnpm (isolated), bun (workspace), yarn-berry (nodeLinker: pnpm), and PnP
+    // virtual instances all keep real package files under these store dirs, which
+    // sit above the mounted project node_modules and so are not guest-visible.
+    const STORE_MARKERS: &[&str] = &[
+        "node_modules/.pnpm/",
+        "node_modules/.bun/",
+        "node_modules/.store/",
+        "/__virtual__/",
+    ];
+    // Yarn Plug'n'Play has no node_modules at all; resolution fails against the
+    // .pnp runtime / zip cache. "isn't declared in your dependencies" is PnP's
+    // distinctive resolver error and is specific enough to fire on its own.
+    const PNP_STRICT_MARKERS: &[&str] = &["isn't declared in your dependencies"];
+    const PNP_PATH_MARKERS: &[&str] = &[".pnp.cjs", ".pnp.loader.mjs", "/.yarn/cache/"];
+
+    if PNP_STRICT_MARKERS.iter().any(|m| stderr.contains(m)) {
+        return Some(HOISTED_NODE_MODULES_GUIDANCE);
     }
-    let missing_file = stderr.contains("ENOENT")
+
+    let missing = stderr.contains("ENOENT")
         || stderr.contains("no such file or directory")
-        || stderr.contains("Cannot find module");
-    if !missing_file {
+        || stderr.contains("Cannot find module")
+        || stderr.contains("MODULE_NOT_FOUND");
+    if !missing {
         return None;
     }
-    Some(HOISTED_NODE_MODULES_GUIDANCE)
+    if STORE_MARKERS.iter().any(|m| stderr.contains(m))
+        || PNP_PATH_MARKERS.iter().any(|m| stderr.contains(m))
+    {
+        return Some(HOISTED_NODE_MODULES_GUIDANCE);
+    }
+    None
 }
 
 #[cfg(test)]
 mod symlinked_node_modules_hint_tests {
     use super::symlinked_node_modules_hint;
 
+    // Positive cases: each non-flat package manager's store/PnP signature.
     #[test]
     fn matches_pnpm_store_enoent() {
-        // The real pi-coding-agent failure: getPackageDir() falls back to a
+        // Real pi-coding-agent failure: getPackageDir() falls back to a
         // dist/package.json inside the unreachable .pnpm store.
         let stderr = "Error: ENOENT: no such file or directory, open '/root/node_modules/.pnpm/@mariozechner+pi-coding-agent@0.60.0_x/node_modules/@mariozechner/pi-coding-agent/dist/package.json'";
         assert!(symlinked_node_modules_hint(stderr).is_some());
     }
 
     #[test]
-    fn ignores_enoent_outside_pnpm_store() {
+    fn matches_bun_store_enoent() {
+        let stderr = "Error: ENOENT: no such file or directory, open '/root/node_modules/.bun/is-odd@3.0.1/node_modules/is-odd/package.json'";
+        assert!(symlinked_node_modules_hint(stderr).is_some());
+    }
+
+    #[test]
+    fn matches_yarn_pnpm_store_enoent() {
+        let stderr = "Error: ENOENT: no such file or directory, open '/root/node_modules/.store/is-odd-npm-3.0.1-93c3c3f41b/package/package.json'";
+        assert!(symlinked_node_modules_hint(stderr).is_some());
+    }
+
+    #[test]
+    fn matches_pnp_declared_error() {
+        // Yarn PnP's distinctive resolver error (no node_modules at all).
+        let stderr = "Error: Your application tried to access is-number, but it isn't declared in your dependencies; this makes the require call ambiguous and unsound.";
+        assert!(symlinked_node_modules_hint(stderr).is_some());
+    }
+
+    #[test]
+    fn matches_pnp_cjs_module_not_found() {
+        let stderr = "Error: Cannot find module 'is-odd'\n    at /root/.pnp.cjs:12345:18\n    code: 'MODULE_NOT_FOUND'";
+        assert!(symlinked_node_modules_hint(stderr).is_some());
+    }
+
+    #[test]
+    fn matches_virtual_instance() {
+        let stderr = "Error: ENOENT: no such file or directory, open '/root/.yarn/__virtual__/is-odd-abc/1/node_modules/is-odd/package.json'";
+        assert!(symlinked_node_modules_hint(stderr).is_some());
+    }
+
+    // Negative cases: must not fire.
+    #[test]
+    fn ignores_enoent_outside_a_store() {
         let stderr = "Error: ENOENT: no such file or directory, open '/tmp/scratch/config.json'";
         assert!(symlinked_node_modules_hint(stderr).is_none());
     }
 
     #[test]
-    fn ignores_pnpm_path_without_missing_file() {
+    fn ignores_store_path_without_missing_file() {
         let stderr = "loaded /root/node_modules/.pnpm/some-pkg@1.0.0/node_modules/some-pkg/index.js";
+        assert!(symlinked_node_modules_hint(stderr).is_none());
+    }
+
+    #[test]
+    fn ignores_flat_node_modules_enoent() {
+        // npm / yarn-nm / pnpm-hoisted: flat, no store dir in the path.
+        let stderr = "Error: ENOENT: no such file or directory, open '/root/node_modules/is-odd/missing-asset.json'";
         assert!(symlinked_node_modules_hint(stderr).is_none());
     }
 
