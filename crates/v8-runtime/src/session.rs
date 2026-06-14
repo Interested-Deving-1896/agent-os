@@ -33,14 +33,30 @@ type SharedIsolateHandle = Arc<Mutex<Option<v8::IsolateHandle>>>;
 type SharedIsolateHandle = Arc<Mutex<Option<()>>>;
 
 /// Sender for typed runtime events produced by session threads.
-pub type RuntimeEventSender = crossbeam_channel::Sender<RuntimeEvent>;
+pub type RuntimeEventSender = crossbeam_channel::Sender<RuntimeEventEnvelope>;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeEventEnvelope {
+    pub output_generation: Option<u64>,
+    pub event: RuntimeEvent,
+}
 
 const LATE_TERMINATE_EXECUTION_ERROR_CODE: &str = "ERR_LATE_TERMINATE_EXECUTION";
 const LATE_STREAM_EVENT_ERROR_CODE: &str = "ERR_LATE_STREAM_EVENT";
 const LATE_BRIDGE_RESPONSE_ERROR_CODE: &str = "ERR_LATE_BRIDGE_RESPONSE";
+const DEFERRED_COMMAND_LIMIT_ERROR_CODE: &str = "ERR_SESSION_DEFERRED_COMMAND_LIMIT";
+const SESSION_COMMAND_CHANNEL_CAPACITY: usize = 256;
+const MAX_DEFERRED_SESSION_COMMANDS: usize = SESSION_COMMAND_CHANNEL_CAPACITY;
+const MAX_DEFERRED_SYNC_MESSAGES: usize = SESSION_COMMAND_CHANNEL_CAPACITY;
+
+fn normalize_cpu_time_limit_ms(cpu_time_limit_ms: Option<u32>) -> Option<u32> {
+    cpu_time_limit_ms.filter(|timeout_ms| *timeout_ms > 0)
+}
 
 /// Internal entry for a running session
 struct SessionEntry {
+    /// Output receiver generation current when this session was created.
+    output_generation: Option<u64>,
     /// Channel to send commands to the session thread
     tx: Sender<SessionCommand>,
     /// Thread join handle
@@ -50,6 +66,30 @@ struct SessionEntry {
     isolate_handle: SharedIsolateHandle,
     /// Current execution abort handle used to wake sync bridge waits.
     execution_abort: SharedExecutionAbort,
+}
+
+/// Deferred shutdown work for a session that has already been removed from
+/// the manager. `finish()` joins the session thread and clears any call
+/// routes the thread registered while shutting down. Callers must release
+/// the SessionManager lock before calling `finish()`. Joining under the lock
+/// deadlocks: the dispatch thread needs the lock to drain the event channel,
+/// and the joined thread can be parked on a full event channel send.
+pub struct SessionShutdown {
+    session_id: String,
+    join_handle: Option<thread::JoinHandle<()>>,
+    call_id_router: CallIdRouter,
+}
+
+impl SessionShutdown {
+    pub fn finish(mut self) {
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+        self.call_id_router
+            .lock()
+            .expect("call_id router lock poisoned")
+            .retain(|_, routed_session_id| routed_session_id != &self.session_id);
+    }
 }
 
 /// Concurrency slot tracker shared across session threads
@@ -62,6 +102,7 @@ pub(crate) type DeferredQueue = Arc<Mutex<VecDeque<SessionMessage>>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecutionAbortReason {
     Terminated,
+    #[cfg_attr(test, allow(dead_code))]
     TimedOut,
 }
 
@@ -181,11 +222,27 @@ impl SessionManager {
         heap_limit_mb: Option<u32>,
         cpu_time_limit_ms: Option<u32>,
     ) -> Result<(), String> {
+        self.create_session_with_output_generation(
+            session_id,
+            heap_limit_mb,
+            cpu_time_limit_ms,
+            None,
+        )
+    }
+
+    pub fn create_session_with_output_generation(
+        &mut self,
+        session_id: String,
+        heap_limit_mb: Option<u32>,
+        cpu_time_limit_ms: Option<u32>,
+        output_generation: Option<u64>,
+    ) -> Result<(), String> {
         if self.sessions.contains_key(&session_id) {
             return Err(format!("session {} already exists", session_id));
         }
 
-        let (tx, rx) = crossbeam_channel::bounded(256);
+        let cpu_time_limit_ms = normalize_cpu_time_limit_ms(cpu_time_limit_ms);
+        let (tx, rx) = crossbeam_channel::bounded(SESSION_COMMAND_CHANNEL_CAPACITY);
         let slot_control = Arc::clone(&self.slot_control);
         let max = self.max_concurrency;
         let event_tx = self.event_tx.clone();
@@ -219,6 +276,7 @@ impl SessionManager {
                     isolate_handle_for_thread,
                     execution_abort_for_thread,
                     session_id_for_thread,
+                    output_generation,
                 );
             })
             .map_err(|e| format!("failed to spawn session thread: {}", e))?;
@@ -226,6 +284,7 @@ impl SessionManager {
         self.sessions.insert(
             session_id,
             SessionEntry {
+                output_generation,
                 tx,
                 join_handle: Some(join_handle),
                 isolate_handle,
@@ -236,15 +295,59 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Destroy a session. Sends shutdown to the session thread and joins it.
-    pub fn destroy_session(&mut self, session_id: &str) -> Result<(), String> {
+    pub fn destroy_session_if_output_generation(
+        &mut self,
+        session_id: &str,
+        output_generation: u64,
+    ) -> Result<bool, String> {
+        match self.begin_destroy_session_if_output_generation(session_id, output_generation)? {
+            Some(shutdown) => {
+                shutdown.finish();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    pub fn begin_destroy_session_if_output_generation(
+        &mut self,
+        session_id: &str,
+        output_generation: u64,
+    ) -> Result<Option<SessionShutdown>, String> {
+        if !self
+            .sessions
+            .get(session_id)
+            .is_some_and(|entry| entry.output_generation == Some(output_generation))
+        {
+            return Ok(None);
+        }
+
+        self.begin_destroy_session(session_id).map(Some)
+    }
+
+    pub fn detach_session_if_output_generation(
+        &mut self,
+        session_id: &str,
+        output_generation: u64,
+    ) -> Result<bool, String> {
+        if !self
+            .sessions
+            .get(session_id)
+            .is_some_and(|entry| entry.output_generation == Some(output_generation))
+        {
+            return Ok(false);
+        }
+
+        self.detach_session(session_id)?;
+        Ok(true)
+    }
+
+    fn detach_session(&mut self, session_id: &str) -> Result<(), String> {
         let entry = self
             .sessions
             .get(session_id)
             .ok_or_else(|| format!("session {} does not exist", session_id))?;
 
-        // Send shutdown, drop the sender so the session thread's rx.recv()
-        // returns Err if Shutdown was consumed by an inner loop, then join.
         #[cfg(not(test))]
         if let Some(handle) = entry
             .isolate_handle
@@ -255,25 +358,116 @@ impl SessionManager {
             handle.terminate_execution();
         }
         signal_execution_abort(&entry.execution_abort, ExecutionAbortReason::Terminated);
-        let _ = entry.tx.send(SessionCommand::Shutdown);
+        self.clear_call_routes_for_session(session_id);
         let mut entry = self.sessions.remove(session_id).unwrap();
+        let _ = entry.tx.try_send(SessionCommand::Shutdown);
         drop(entry.tx);
-        if let Some(handle) = entry.join_handle.take() {
-            let _ = handle.join();
-        }
-
+        let _ = entry.join_handle.take();
         Ok(())
     }
 
-    /// Send a message to a session.
-    pub fn send_to_session(&self, session_id: &str, msg: SessionMessage) -> Result<(), String> {
+    /// Destroy a session inline. Joins the session thread before returning, so
+    /// this must not be called while a shared lock on the manager is held. Lock
+    /// holders use `begin_destroy_session` and call `finish()` after unlocking.
+    pub fn destroy_session(&mut self, session_id: &str) -> Result<(), String> {
+        self.begin_destroy_session(session_id)?.finish();
+        Ok(())
+    }
+
+    /// First phase of destroying a session: terminate execution, signal abort,
+    /// send shutdown, clear call routes, and remove the entry. The returned
+    /// shutdown joins the session thread and must be finished after the
+    /// SessionManager lock is released.
+    pub fn begin_destroy_session(&mut self, session_id: &str) -> Result<SessionShutdown, String> {
+        if !self.sessions.contains_key(session_id) {
+            return Err(format!("session {} does not exist", session_id));
+        }
+
+        self.clear_call_routes_for_session(session_id);
+        let mut entry = self
+            .sessions
+            .remove(session_id)
+            .expect("checked session exists");
+
+        #[cfg(not(test))]
+        if let Some(handle) = entry
+            .isolate_handle
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+        {
+            handle.terminate_execution();
+        }
+        signal_execution_abort(&entry.execution_abort, ExecutionAbortReason::Terminated);
+        // Send shutdown, then drop the entry (and with it the sender) so the
+        // session thread's rx.recv() returns Err if Shutdown was consumed by
+        // an inner loop.
+        let _ = entry.tx.try_send(SessionCommand::Shutdown);
+        let join_handle = entry.join_handle.take();
+        drop(entry);
+        Ok(SessionShutdown {
+            session_id: session_id.to_owned(),
+            join_handle,
+            call_id_router: Arc::clone(&self.call_id_router),
+        })
+    }
+
+    pub(crate) fn take_session_shutdown_handles(&mut self) -> Vec<thread::JoinHandle<()>> {
+        self.call_id_router
+            .lock()
+            .expect("call_id router lock poisoned")
+            .clear();
+
+        self.sessions
+            .drain()
+            .filter_map(|(_, mut entry)| {
+                #[cfg(not(test))]
+                if let Some(handle) = entry
+                    .isolate_handle
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().cloned())
+                {
+                    handle.terminate_execution();
+                }
+                signal_execution_abort(&entry.execution_abort, ExecutionAbortReason::Terminated);
+                let _ = entry.tx.try_send(SessionCommand::Shutdown);
+                drop(entry.tx);
+                entry.join_handle.take()
+            })
+            .collect()
+    }
+
+    pub(crate) fn clear_call_route(&self, call_id: u64) {
+        self.call_id_router
+            .lock()
+            .expect("call_id router lock poisoned")
+            .remove(&call_id);
+    }
+
+    fn clear_call_routes_for_session(&self, session_id: &str) {
+        self.call_id_router
+            .lock()
+            .expect("call_id router lock poisoned")
+            .retain(|_, routed_session_id| routed_session_id != session_id);
+    }
+
+    /// Resolve a session's command sender and apply message side effects that
+    /// must happen under the manager lock (isolate termination, abort signal).
+    /// The caller sends on the returned channel after releasing the lock so a
+    /// full command channel cannot block the manager mutex.
+    pub fn session_command_sender(
+        &self,
+        session_id: &str,
+        msg: &SessionMessage,
+    ) -> Result<Sender<SessionCommand>, String> {
         let entry = self
             .sessions
             .get(session_id)
             .ok_or_else(|| format!("session {} does not exist", session_id))?;
 
         #[cfg(not(test))]
-        if matches!(&msg, SessionMessage::TerminateExecution) {
+        if matches!(msg, SessionMessage::TerminateExecution) {
             if let Some(handle) = entry
                 .isolate_handle
                 .lock()
@@ -283,24 +477,44 @@ impl SessionManager {
                 handle.terminate_execution();
             }
         }
-        if matches!(&msg, SessionMessage::TerminateExecution) {
+        if matches!(msg, SessionMessage::TerminateExecution) {
             signal_execution_abort(&entry.execution_abort, ExecutionAbortReason::Terminated);
         }
 
-        entry
-            .tx
+        Ok(entry.tx.clone())
+    }
+
+    /// Send a message to a session. Blocks on the session command channel, so
+    /// this must not be called while a shared lock on the manager is held.
+    pub fn send_to_session(&self, session_id: &str, msg: SessionMessage) -> Result<(), String> {
+        let sender = self.session_command_sender(session_id, &msg)?;
+        sender
             .send(SessionCommand::Message(msg))
             .map_err(|e| format!("session thread disconnected: {}", e))
     }
 
-    /// Destroy a set of sessions, ignoring sessions that were already removed.
+    /// Destroy a set of sessions inline, ignoring sessions that were already
+    /// removed. Joins session threads, so this must not be called while a
+    /// shared lock on the manager is held.
     pub fn destroy_sessions<I>(&mut self, session_ids: I)
     where
         I: IntoIterator<Item = String>,
     {
-        for sid in session_ids {
-            let _ = self.destroy_session(&sid);
+        for shutdown in self.begin_destroy_sessions(session_ids) {
+            shutdown.finish();
         }
+    }
+
+    /// Begin destroying a set of sessions, ignoring sessions that were already
+    /// removed. Finish each returned shutdown after releasing the manager lock.
+    pub fn begin_destroy_sessions<I>(&mut self, session_ids: I) -> Vec<SessionShutdown>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        session_ids
+            .into_iter()
+            .filter_map(|sid| self.begin_destroy_session(&sid).ok())
+            .collect()
     }
 
     /// Number of registered sessions (including those waiting for a slot).
@@ -330,8 +544,15 @@ impl SessionManager {
 
 /// Send a typed runtime event without re-serializing it on the session thread.
 #[cfg(not(test))]
-fn send_event(event_tx: &RuntimeEventSender, event: RuntimeEvent) {
-    if let Err(error) = event_tx.send(event) {
+fn send_event_with_generation(
+    event_tx: &RuntimeEventSender,
+    output_generation: Option<u64>,
+    event: RuntimeEvent,
+) {
+    if let Err(error) = event_tx.send(RuntimeEventEnvelope {
+        output_generation,
+        event,
+    }) {
         eprintln!("failed to send runtime event: {error}");
     }
 }
@@ -339,6 +560,7 @@ fn send_event(event_tx: &RuntimeEventSender, event: RuntimeEvent) {
 fn send_late_message_warning(
     event_tx: &RuntimeEventSender,
     session_id: &str,
+    output_generation: Option<u64>,
     error_code: &str,
     detail: String,
 ) {
@@ -347,7 +569,10 @@ fn send_late_message_warning(
         channel: 1,
         message: format!("[{error_code}] {detail}"),
     };
-    if let Err(error) = event_tx.send(warning) {
+    if let Err(error) = event_tx.send(RuntimeEventEnvelope {
+        output_generation,
+        event: warning,
+    }) {
         eprintln!("failed to send late-session warning: {error}");
     }
 }
@@ -355,6 +580,7 @@ fn send_late_message_warning(
 fn handle_late_session_message(
     event_tx: &RuntimeEventSender,
     session_id: &str,
+    output_generation: Option<u64>,
     message: SessionMessage,
 ) {
     match message {
@@ -365,19 +591,24 @@ fn handle_late_session_message(
         }) => send_late_message_warning(
             event_tx,
             session_id,
+            output_generation,
             LATE_BRIDGE_RESPONSE_ERROR_CODE,
             format!(
                 "dropping BridgeResponse after execution completed (call_id={call_id}, status={status}, payload_len={})",
                 payload.len()
             ),
         ),
-        SessionMessage::StreamEvent(StreamEvent { event_type, payload }) => {
+        SessionMessage::StreamEvent(StreamEvent {
+            event_type,
+            payload,
+        }) => {
             if event_type == "timer" {
                 return;
             }
             send_late_message_warning(
                 event_tx,
                 session_id,
+                output_generation,
                 LATE_STREAM_EVENT_ERROR_CODE,
                 format!(
                     "dropping StreamEvent after execution completed (event_type={event_type}, payload_len={})",
@@ -388,11 +619,36 @@ fn handle_late_session_message(
         SessionMessage::TerminateExecution => send_late_message_warning(
             event_tx,
             session_id,
+            output_generation,
             LATE_TERMINATE_EXECUTION_ERROR_CODE,
             String::from("dropping TerminateExecution after execution completed"),
         ),
         SessionMessage::InjectGlobals { .. } | SessionMessage::Execute { .. } => {}
     }
+}
+
+fn defer_session_command_before_slot(
+    deferred_commands: &mut VecDeque<SessionCommand>,
+    event_tx: &RuntimeEventSender,
+    session_id: &str,
+    output_generation: Option<u64>,
+    command: SessionCommand,
+) -> bool {
+    if deferred_commands.len() < MAX_DEFERRED_SESSION_COMMANDS {
+        deferred_commands.push_back(command);
+        return true;
+    }
+
+    send_late_message_warning(
+        event_tx,
+        session_id,
+        output_generation,
+        DEFERRED_COMMAND_LIMIT_ERROR_CODE,
+        format!(
+            "dropping queued session before slot acquisition because deferred command queue exceeded limit of {MAX_DEFERRED_SESSION_COMMANDS}"
+        ),
+    );
+    false
 }
 
 /// Session thread: acquires a concurrency slot, defers V8 isolate creation
@@ -412,6 +668,7 @@ fn session_thread(
     #[cfg_attr(test, allow(unused_variables))] isolate_handle: SharedIsolateHandle,
     #[cfg_attr(test, allow(unused_variables))] execution_abort: SharedExecutionAbort,
     #[cfg_attr(test, allow(unused_variables))] session_id: String,
+    #[cfg_attr(test, allow(unused_variables))] output_generation: Option<u64>,
 ) {
     // Acquire concurrency slot, but keep polling the session channel so a queued
     // session can still shut down cleanly before it ever gets a slot.
@@ -435,7 +692,17 @@ fn session_thread(
                 | Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     break false;
                 }
-                Ok(command) => deferred_commands.push_back(command),
+                Ok(command) => {
+                    if !defer_session_command_before_slot(
+                        &mut deferred_commands,
+                        &event_tx,
+                        &session_id,
+                        output_generation,
+                        command,
+                    ) {
+                        break false;
+                    }
+                }
                 Err(crossbeam_channel::TryRecvError::Empty) => {}
             }
         }
@@ -520,12 +787,34 @@ fn session_thread(
                     {
                         let session_id = session_id.clone();
                         // Use cached bridge code when host sends empty (0-length = use cached)
+                        let should_update_cached_bridge_code = !bridge_code.is_empty();
                         let effective_bridge_code = if bridge_code.is_empty() {
                             last_bridge_code.as_deref().unwrap_or("").to_string()
                         } else {
-                            last_bridge_code = Some(bridge_code.clone());
                             bridge_code
                         };
+
+                        if let Err(message) =
+                            snapshot::validate_bridge_code_size(&effective_bridge_code)
+                        {
+                            let result_frame = RuntimeEvent::ExecutionResult {
+                                session_id,
+                                exit_code: 1,
+                                exports: None,
+                                error: Some(ExecutionErrorBin {
+                                    error_type: "Error".into(),
+                                    message,
+                                    stack: String::new(),
+                                    code: snapshot::V8_BRIDGE_CODE_LIMIT_ERROR_CODE.into(),
+                                }),
+                            };
+                            send_event_with_generation(&event_tx, output_generation, result_frame);
+                            continue;
+                        }
+
+                        if should_update_cached_bridge_code {
+                            last_bridge_code = Some(effective_bridge_code.clone());
+                        }
 
                         if v8_isolate.is_some()
                             && isolate_bridge_code.as_deref()
@@ -553,7 +842,10 @@ fn session_thread(
                                         )
                                     }
                                     Err(e) => {
-                                        eprintln!("snapshot creation failed, falling back to fresh isolate: {}", e);
+                                        eprintln!(
+                                            "snapshot creation failed, falling back to fresh isolate: {}",
+                                            e
+                                        );
                                         from_snapshot = false;
                                         isolate::create_isolate(heap_limit_mb)
                                     }
@@ -591,7 +883,27 @@ fn session_thread(
                             let scope = &mut v8::HandleScope::new(iso);
                             let ctx = v8::Local::new(scope, &exec_context);
                             let scope = &mut v8::ContextScope::new(scope, ctx);
-                            execution::inject_globals_from_payload(scope, payload);
+                            if let Err(error) =
+                                execution::inject_globals_from_payload(scope, payload)
+                            {
+                                let result_frame = RuntimeEvent::ExecutionResult {
+                                    session_id,
+                                    exit_code: 1,
+                                    exports: None,
+                                    error: Some(ExecutionErrorBin {
+                                        error_type: error.error_type,
+                                        message: error.message,
+                                        stack: error.stack,
+                                        code: error.code.unwrap_or_default(),
+                                    }),
+                                };
+                                send_event_with_generation(
+                                    &event_tx,
+                                    output_generation,
+                                    result_frame,
+                                );
+                                continue;
+                            }
                         }
 
                         // Arm a per-execution abort channel so timeouts and external
@@ -609,7 +921,10 @@ fn session_thread(
                             Arc::clone(&deferred_queue),
                         );
                         let bridge_ctx = BridgeCallContext::with_receiver(
-                            Box::new(ChannelRuntimeEventSender::new(event_tx.clone())),
+                            Box::new(ChannelRuntimeEventSender::new(
+                                event_tx.clone(),
+                                output_generation,
+                            )),
                             Box::new(channel_rx),
                             session_id.clone(),
                             Arc::clone(&call_id_router),
@@ -657,7 +972,11 @@ fn session_thread(
                                         code: e.code.unwrap_or_default(),
                                     }),
                                 };
-                                send_event(&event_tx, result_frame);
+                                send_event_with_generation(
+                                    &event_tx,
+                                    output_generation,
+                                    result_frame,
+                                );
                                 continue;
                             }
                         }
@@ -666,11 +985,34 @@ fn session_thread(
                         let mut timeout_guard = match cpu_time_limit_ms {
                             Some(ms) => {
                                 let handle = iso.thread_safe_handle();
-                                Some(crate::timeout::TimeoutGuard::with_execution_abort(
+                                match crate::timeout::TimeoutGuard::with_execution_abort(
                                     ms,
                                     handle,
                                     execution_abort.clone(),
-                                ))
+                                ) {
+                                    Ok(guard) => Some(guard),
+                                    Err(message) => {
+                                        let result_frame = RuntimeEvent::ExecutionResult {
+                                            session_id,
+                                            exit_code: 1,
+                                            exports: None,
+                                            error: Some(ExecutionErrorBin {
+                                                error_type: "Error".into(),
+                                                message,
+                                                stack: String::new(),
+                                                code:
+                                                    crate::timeout::TIMEOUT_GUARD_START_ERROR_CODE
+                                                        .into(),
+                                            }),
+                                        };
+                                        send_event_with_generation(
+                                            &event_tx,
+                                            output_generation,
+                                            result_frame,
+                                        );
+                                        continue;
+                                    }
+                                }
                             }
                             _ => None,
                         };
@@ -737,7 +1079,7 @@ fn session_thread(
                         // are visible yet — the module body may have registered
                         // timers, stdin listeners, or child_process handles that
                         // need event loop pumping to deliver their callbacks.
-                        let should_enter_event_loop = pending.len() > 0
+                        let should_enter_event_loop = !pending.is_empty()
                             || execution::has_pending_module_evaluation()
                             || execution::has_pending_script_evaluation()
                             || !deferred_queue.lock().unwrap().is_empty();
@@ -812,7 +1154,7 @@ fn session_thread(
                             }
 
                             // Phase 2: pump event loop for active handles
-                            if pending.len() > 0
+                            if !pending.is_empty()
                                 || execution::has_pending_script_evaluation()
                                 || !deferred_queue.lock().unwrap().is_empty()
                             {
@@ -912,7 +1254,7 @@ fn session_thread(
                         execution::clear_pending_script_evaluation();
                         execution::clear_module_state();
 
-                        send_event(&event_tx, result_frame);
+                        send_event_with_generation(&event_tx, output_generation, result_frame);
                     }
                     #[cfg(test)]
                     {
@@ -922,7 +1264,7 @@ fn session_thread(
                 SessionMessage::BridgeResponse(_)
                 | SessionMessage::StreamEvent(_)
                 | SessionMessage::TerminateExecution => {
-                    handle_late_session_message(&event_tx, &session_id, msg);
+                    handle_late_session_message(&event_tx, &session_id, output_generation, msg);
                 }
             },
         }
@@ -966,6 +1308,7 @@ pub(crate) const SYNC_BRIDGE_FNS: &[&str] = &[
     // Sync module loading (bypass _loadPolyfill dispatch, used by CJS require)
     "_resolveModuleSync",
     "_loadFileSync",
+    "_moduleFormat",
     "_batchResolveModules",
     // Crypto
     "_cryptoRandomFill",
@@ -1056,6 +1399,7 @@ pub(crate) const SYNC_BRIDGE_FNS: &[&str] = &[
     "_upgradeSocketWriteRaw",
     "_upgradeSocketEndRaw",
     "_upgradeSocketDestroyRaw",
+    "_networkDnsLookupSyncRaw",
     "_netSocketConnectRaw",
     "_netSocketPollRaw",
     "_netSocketReadRaw",
@@ -1068,6 +1412,8 @@ pub(crate) const SYNC_BRIDGE_FNS: &[&str] = &[
     "_netSocketGetTlsClientHelloRaw",
     "_netSocketTlsQueryRaw",
     "_tlsGetCiphersRaw",
+    "_netReserveTcpPortRaw",
+    "_netReleaseTcpPortRaw",
     "_netServerListenRaw",
     "_netServerAcceptRaw",
     "_dgramSocketCreateRaw",
@@ -1163,7 +1509,7 @@ pub fn run_event_loop(
     abort_rx: Option<&crossbeam_channel::Receiver<()>>,
     deferred: Option<&DeferredQueue>,
 ) -> EventLoopStatus {
-    while pending.len() > 0
+    while !pending.is_empty()
         || execution::pending_module_evaluation_needs_wait(scope)
         || execution::pending_script_evaluation_needs_wait(scope)
         || pending_guest_timer_count(scope) > 0
@@ -1182,7 +1528,7 @@ pub fn run_event_loop(
                     return status;
                 }
             }
-            if pending.len() == 0
+            if pending.is_empty()
                 && !execution::pending_module_evaluation_needs_wait(scope)
                 && !execution::pending_script_evaluation_needs_wait(scope)
                 && pending_guest_timer_count(scope) == 0
@@ -1207,7 +1553,7 @@ pub fn run_event_loop(
 
         // Re-check exit conditions after microtask flush — the microtask may
         // have resolved all pending promises or registered new handles.
-        if pending.len() == 0
+        if pending.is_empty()
             && !execution::pending_module_evaluation_needs_wait(scope)
             && !execution::pending_script_evaluation_needs_wait(scope)
             && pending_guest_timer_count(scope) == 0
@@ -1253,7 +1599,7 @@ pub fn run_event_loop(
                 }
             }
             // Check if we should exit
-            if pending.len() == 0
+            if pending.is_empty()
                 && !execution::pending_module_evaluation_needs_wait(scope)
                 && !execution::pending_script_evaluation_needs_wait(scope)
                 && pending_guest_timer_count(scope) == 0
@@ -1435,11 +1781,11 @@ impl crate::host_call::BridgeResponseReceiver for ChannelResponseReceiver {
                         if call_id == expected_call_id {
                             return Ok(response.clone());
                         }
-                        self.deferred.lock().unwrap().push_back(frame);
+                        push_deferred_sync_message(&self.deferred, frame)?;
                         continue;
                     }
                     // Queue non-BridgeResponse for later event loop processing
-                    self.deferred.lock().unwrap().push_back(frame);
+                    push_deferred_sync_message(&self.deferred, frame)?;
                 }
                 SessionCommand::Shutdown => return Err("session shutdown".into()),
             }
@@ -1447,10 +1793,24 @@ impl crate::host_call::BridgeResponseReceiver for ChannelResponseReceiver {
     }
 }
 
+fn push_deferred_sync_message(
+    deferred: &DeferredQueue,
+    frame: SessionMessage,
+) -> Result<(), String> {
+    let mut queue = deferred.lock().unwrap();
+    if queue.len() >= MAX_DEFERRED_SYNC_MESSAGES {
+        return Err(format!(
+            "sync bridge deferred message queue exceeded limit of {MAX_DEFERRED_SYNC_MESSAGES}"
+        ));
+    }
+    queue.push_back(frame);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_os_bridge::{bridge_contract, BridgeCallConvention};
+    use agent_os_bridge::{BridgeCallConvention, bridge_contract};
     use std::collections::{HashMap, HashSet};
 
     /// Helper to create a SessionManager for tests
@@ -1458,7 +1818,7 @@ mod tests {
         test_manager_with_events(max).0
     }
 
-    fn test_manager_with_events(max: usize) -> (SessionManager, Receiver<RuntimeEvent>) {
+    fn test_manager_with_events(max: usize) -> (SessionManager, Receiver<RuntimeEventEnvelope>) {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let router: CallIdRouter = Arc::new(Mutex::new(HashMap::new()));
         let snap_cache = Arc::new(SnapshotCache::new(4));
@@ -1466,8 +1826,15 @@ mod tests {
         (manager, _rx)
     }
 
+    #[test]
+    fn zero_cpu_time_limit_is_normalized_to_no_timeout() {
+        assert_eq!(normalize_cpu_time_limit_ms(None), None);
+        assert_eq!(normalize_cpu_time_limit_ms(Some(0)), None);
+        assert_eq!(normalize_cpu_time_limit_ms(Some(1)), Some(1));
+    }
+
     fn expect_late_message_warning(
-        rx: &Receiver<RuntimeEvent>,
+        rx: &Receiver<RuntimeEventEnvelope>,
         session_id: &str,
         error_code: &str,
         detail_fragment: &str,
@@ -1475,7 +1842,7 @@ mod tests {
         let event = rx
             .recv_timeout(std::time::Duration::from_millis(200))
             .expect("late-message warning");
-        match event {
+        match event.event {
             RuntimeEvent::Log {
                 session_id: observed_session_id,
                 channel,
@@ -1617,6 +1984,86 @@ mod tests {
     }
 
     #[test]
+    fn detach_session_clears_call_id_routes_for_session() {
+        let mut mgr = test_manager(1);
+        mgr.create_session_with_output_generation("session-route".into(), None, None, Some(7))
+            .expect("create session");
+        mgr.call_id_router()
+            .lock()
+            .expect("call_id router")
+            .insert(42, "session-route".into());
+
+        assert!(
+            mgr.detach_session_if_output_generation("session-route", 7)
+                .expect("detach session"),
+            "matching output generation should detach session"
+        );
+        assert!(
+            mgr.call_id_router()
+                .lock()
+                .expect("call_id router")
+                .get(&42)
+                .is_none(),
+            "detach should clear stale bridge call routes for the session"
+        );
+    }
+
+    #[test]
+    fn begin_destroy_session_removes_entry_before_finish() {
+        let mut mgr = test_manager(1);
+        mgr.create_session("two-phase".into(), None, None)
+            .expect("create session");
+
+        let first_shutdown = mgr
+            .begin_destroy_session("two-phase")
+            .expect("begin destroy session");
+        assert_eq!(
+            mgr.session_count(),
+            0,
+            "entry should be removed before the shutdown is finished"
+        );
+
+        // A same-id create during the unfinished shutdown window must succeed
+        // because the entry was removed up front.
+        mgr.create_session("two-phase".into(), None, None)
+            .expect("re-create session while first shutdown is unfinished");
+
+        let second_shutdown = mgr
+            .begin_destroy_session("two-phase")
+            .expect("begin destroy re-created session");
+        first_shutdown.finish();
+        second_shutdown.finish();
+        assert_eq!(mgr.session_count(), 0);
+    }
+
+    #[test]
+    fn session_shutdown_finish_clears_late_call_routes() {
+        let mut mgr = test_manager(1);
+        mgr.create_session("late-route".into(), None, None)
+            .expect("create session");
+
+        let shutdown = mgr
+            .begin_destroy_session("late-route")
+            .expect("begin destroy session");
+        // Simulate a route the session thread registered between the pre-join
+        // route clear and thread exit.
+        mgr.call_id_router()
+            .lock()
+            .expect("call_id router")
+            .insert(42, "late-route".into());
+
+        shutdown.finish();
+        assert!(
+            mgr.call_id_router()
+                .lock()
+                .expect("call_id router")
+                .get(&42)
+                .is_none(),
+            "finish should clear call routes registered during shutdown"
+        );
+    }
+
+    #[test]
     fn channel_response_receiver_filters_bridge_response() {
         use crate::host_call::BridgeResponseReceiver;
 
@@ -1663,6 +2110,71 @@ mod tests {
             matches!(&dq[1], SessionMessage::TerminateExecution),
             "second deferred should be TerminateExecution"
         );
+    }
+
+    #[test]
+    fn channel_response_receiver_rejects_deferred_queue_overflow() {
+        use crate::host_call::BridgeResponseReceiver;
+
+        let (tx, rx) = crossbeam_channel::bounded(MAX_DEFERRED_SYNC_MESSAGES + 1);
+        let deferred = new_deferred_queue();
+        let receiver = ChannelResponseReceiver::new(rx, Arc::clone(&deferred));
+
+        for index in 0..=MAX_DEFERRED_SYNC_MESSAGES {
+            tx.send(SessionCommand::Message(SessionMessage::StreamEvent(
+                StreamEvent {
+                    event_type: format!("child_stdout_{index}"),
+                    payload: Vec::new(),
+                },
+            )))
+            .unwrap();
+        }
+
+        let error = receiver
+            .recv_response(1)
+            .expect_err("deferred queue overflow should reject sync bridge wait");
+        assert!(error.contains("deferred message queue exceeded limit"));
+        assert_eq!(deferred.lock().unwrap().len(), MAX_DEFERRED_SYNC_MESSAGES);
+    }
+
+    #[test]
+    fn pre_slot_deferred_command_overflow_is_bounded_and_logged() {
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let mut deferred_commands = VecDeque::new();
+
+        for _ in 0..MAX_DEFERRED_SESSION_COMMANDS {
+            assert!(defer_session_command_before_slot(
+                &mut deferred_commands,
+                &event_tx,
+                "queued-session",
+                Some(3),
+                SessionCommand::Message(SessionMessage::TerminateExecution),
+            ));
+        }
+
+        assert!(!defer_session_command_before_slot(
+            &mut deferred_commands,
+            &event_tx,
+            "queued-session",
+            Some(3),
+            SessionCommand::Message(SessionMessage::TerminateExecution),
+        ));
+        assert_eq!(deferred_commands.len(), MAX_DEFERRED_SESSION_COMMANDS);
+
+        let warning = event_rx.recv().expect("overflow warning");
+        assert_eq!(warning.output_generation, Some(3));
+        match warning.event {
+            RuntimeEvent::Log {
+                session_id,
+                channel,
+                message,
+            } => {
+                assert_eq!(session_id, "queued-session");
+                assert_eq!(channel, 1);
+                assert!(message.contains(DEFERRED_COMMAND_LIMIT_ERROR_CODE));
+            }
+            other => panic!("expected overflow warning log, got {other:?}"),
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@ export type {
 	AgentCapabilities,
 	AgentInfo,
 	AgentOsCreateSidecarOptions,
+	AgentOsLimits,
 	AgentOsOptions,
 	AgentOsSharedSidecarOptions,
 	AgentOsSidecarConfig,
@@ -41,11 +42,7 @@ export type {
 	SessionModeState,
 	SpawnedProcessInfo,
 } from "./agent-os.js";
-export type {
-	AgentConfig,
-	AgentType,
-	PrepareInstructionsOptions,
-} from "./agents.js";
+export type { AgentConfig, AgentType } from "./agents.js";
 export type {
 	CronAction,
 	CronEvent,

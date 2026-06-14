@@ -9,6 +9,7 @@ import {
 	type AuthenticatedSession,
 	type CreatedVm,
 	type LocalCompatMount,
+	NATIVE_SIDECAR_FRAME_TIMEOUT_MS,
 	NativeSidecarKernelProxy,
 	NativeSidecarProcessClient,
 	type RootFilesystemEntry,
@@ -1526,8 +1527,6 @@ export const WASMVM_COMMANDS = Object.freeze([
 	"stty",
 	"codex",
 	"codex-exec",
-	"spawn-test-host",
-	"http-test",
 ]) as readonly string[];
 
 export type PermissionTier = "full" | "read-write" | "read-only" | "isolated";
@@ -1546,8 +1545,6 @@ export const DEFAULT_FIRST_PARTY_TIERS: Readonly<
 	make: "full",
 	codex: "full",
 	"codex-exec": "full",
-	"spawn-test-host": "full",
-	"http-test": "full",
 	git: "full",
 	"git-remote-http": "full",
 	"git-remote-https": "full",
@@ -2049,7 +2046,7 @@ function planNodeFilesystemPassthroughMounts(
 		mounts.push({
 			path: guestPath,
 			fs: new NodeFileSystem({ root: hostPath }),
-			readOnly: false,
+			readOnly: true,
 		});
 	}
 
@@ -2198,13 +2195,131 @@ const VIRTUAL_FILESYSTEM_METHOD_NAMES = [
 type VirtualFileSystemMethodName =
 	(typeof VIRTUAL_FILESYSTEM_METHOD_NAMES)[number];
 
+type BoundVirtualFileSystemMethods = Partial<
+	Record<VirtualFileSystemMethodName, (...args: unknown[]) => unknown>
+>;
+
+interface LiveFilesystemBinding {
+	syncFromLive(paths: readonly string[]): Promise<void>;
+	restore(): void;
+}
+
+const LIVE_FILESYSTEM_SYNC_CHUNK_SIZE = 512 * 1024;
+
+function topLevelSyncRoot(targetPath: string): string {
+	const normalized = normalizePath(targetPath);
+	const [first] = normalized.split("/").filter(Boolean);
+	return first ? `/${first}` : "/";
+}
+
+function collectLiveFilesystemSyncRoots(
+	entries: readonly RootFilesystemEntry[],
+): string[] {
+	const roots = new Set<string>();
+	for (const entry of entries) {
+		if (entry.path === "/") {
+			continue;
+		}
+		roots.add(topLevelSyncRoot(entry.path));
+	}
+	return [...roots].sort((left, right) => left.localeCompare(right));
+}
+
+async function callBoundFilesystemMethod<T>(
+	methods: BoundVirtualFileSystemMethods,
+	method: VirtualFileSystemMethodName,
+	...args: unknown[]
+): Promise<T> {
+	const delegate = methods[method];
+	if (!delegate) {
+		throw new Error(`filesystem method ${method} is unavailable`);
+	}
+	return (await delegate(...args)) as T;
+}
+
+async function ensureBoundParentDirectory(
+	methods: BoundVirtualFileSystemMethods,
+	targetPath: string,
+): Promise<void> {
+	const parent = dirnameVirtual(targetPath);
+	if (parent === targetPath) {
+		return;
+	}
+	await callBoundFilesystemMethod(methods, "mkdir", parent, { recursive: true });
+}
+
+async function syncLiveFilesystemToBoundMethods(
+	live: VirtualFileSystem,
+	methods: BoundVirtualFileSystemMethods,
+	paths: readonly string[],
+): Promise<void> {
+	for (const targetPath of [...new Set(paths.map(normalizePath))].sort((left, right) =>
+		left.localeCompare(right),
+	)) {
+		if (!(await live.exists(targetPath).catch(() => false))) {
+			continue;
+		}
+		await syncLiveFilesystemPathToBoundMethods(live, methods, targetPath);
+	}
+}
+
+async function syncLiveFilesystemPathToBoundMethods(
+	live: VirtualFileSystem,
+	methods: BoundVirtualFileSystemMethods,
+	targetPath: string,
+): Promise<void> {
+	const stat = targetPath === "/" ? await live.stat(targetPath) : await live.lstat(targetPath);
+	if (stat.isSymbolicLink) {
+		await ensureBoundParentDirectory(methods, targetPath);
+		await callBoundFilesystemMethod(methods, "removeFile", targetPath).catch(
+			() => {},
+		);
+		await callBoundFilesystemMethod(
+			methods,
+			"symlink",
+			await live.readlink(targetPath),
+			targetPath,
+		);
+		return;
+	}
+	if (stat.isDirectory) {
+		await callBoundFilesystemMethod(methods, "mkdir", targetPath, {
+			recursive: true,
+		});
+		const children = (await live.readDirWithTypes(targetPath))
+			.map((entry) => entry.name)
+			.filter((name) => name !== "." && name !== "..")
+			.sort((left, right) => left.localeCompare(right));
+		for (const child of children) {
+			await syncLiveFilesystemPathToBoundMethods(
+				live,
+				methods,
+				targetPath === "/" ? posixPath.join("/", child) : posixPath.join(targetPath, child),
+			);
+		}
+		return;
+	}
+
+	await ensureBoundParentDirectory(methods, targetPath);
+	await callBoundFilesystemMethod(methods, "writeFile", targetPath, new Uint8Array(0));
+	for (let offset = 0; offset < stat.size; offset += LIVE_FILESYSTEM_SYNC_CHUNK_SIZE) {
+		const chunk = await live.pread(
+			targetPath,
+			offset,
+			Math.min(LIVE_FILESYSTEM_SYNC_CHUNK_SIZE, stat.size - offset),
+		);
+		if (chunk.length === 0) {
+			break;
+		}
+		await callBoundFilesystemMethod(methods, "pwrite", targetPath, offset, chunk);
+	}
+}
+
 function bindLiveFilesystem(
 	target: VirtualFileSystem,
 	getFilesystem: () => VirtualFileSystem | null,
-): void {
-	const fallback: Partial<
-		Record<VirtualFileSystemMethodName, (...args: unknown[]) => unknown>
-	> = {};
+): LiveFilesystemBinding {
+	const fallback: BoundVirtualFileSystemMethods = {};
 	for (const method of VIRTUAL_FILESYSTEM_METHOD_NAMES) {
 		const candidate = (target as unknown as Record<string, unknown>)[method];
 		if (typeof candidate === "function") {
@@ -2230,6 +2345,21 @@ function bindLiveFilesystem(
 			return delegate(...args);
 		};
 	}
+
+	return {
+		async syncFromLive(paths: readonly string[]): Promise<void> {
+			const filesystem = getFilesystem();
+			if (!filesystem) {
+				return;
+			}
+			await syncLiveFilesystemToBoundMethods(filesystem, fallback, paths);
+		},
+		restore(): void {
+			for (const [method, delegate] of Object.entries(fallback)) {
+				(target as unknown as Record<string, unknown>)[method] = delegate;
+			}
+		},
+	};
 }
 
 class NativeKernel implements Kernel {
@@ -2248,6 +2378,8 @@ class NativeKernel implements Kernel {
 	private proxy: NativeSidecarKernelProxy | null = null;
 	private rootFilesystem: VirtualFileSystem | null = null;
 	private readyPromise: Promise<void> | null = null;
+	private readonly liveFilesystemBinding: LiveFilesystemBinding;
+	private liveFilesystemSyncRoots: string[] = [];
 	private readonly pendingLocalMounts: LocalCompatMount[] = [];
 	private mountedCommandDirs: string[] = [];
 	private readonly mountedRuntimeDrivers: KernelRuntimeDriver[] = [];
@@ -2270,6 +2402,7 @@ class NativeKernel implements Kernel {
 				fs: VirtualFileSystem;
 				readOnly?: boolean;
 			}>;
+			syncFilesystemOnDispose?: boolean;
 		},
 	) {
 		this.env = { ...(options.env ?? {}) };
@@ -2299,7 +2432,10 @@ class NativeKernel implements Kernel {
 			});
 		}
 		this.vfs = new DeferredFileSystem(() => this.rootFilesystem);
-		bindLiveFilesystem(this.options.filesystem, () => this.rootFilesystem);
+		this.liveFilesystemBinding = bindLiveFilesystem(
+			this.options.filesystem,
+			() => this.rootFilesystem,
+		);
 	}
 
 	get zombieTimerCount(): number {
@@ -2384,12 +2520,33 @@ class NativeKernel implements Kernel {
 
 	async dispose(): Promise<void> {
 		await this.readyPromise?.catch(() => {});
-		await this.proxy?.dispose().catch(() => {});
-		this.proxy = null;
-		this.rootFilesystem = null;
-		this.client = null;
-		this.session = null;
-		this.vm = null;
+		let syncError: unknown;
+		if (
+			this.options.syncFilesystemOnDispose !== false &&
+			this.rootFilesystem &&
+			!(this.options.filesystem instanceof NodeFileSystem)
+		) {
+			try {
+				await this.liveFilesystemBinding.syncFromLive(
+					this.liveFilesystemSyncRoots,
+				);
+			} catch (error) {
+				syncError = error;
+			}
+		}
+		try {
+			await this.proxy?.dispose().catch(() => {});
+		} finally {
+			this.proxy = null;
+			this.rootFilesystem = null;
+			this.client = null;
+			this.session = null;
+			this.vm = null;
+			this.liveFilesystemBinding.restore();
+		}
+		if (syncError) {
+			throw syncError;
+		}
 	}
 
 	async exec(
@@ -2593,6 +2750,8 @@ class NativeKernel implements Kernel {
 					rootPassthroughPlan.passthroughDirectories,
 			},
 		);
+		this.liveFilesystemSyncRoots =
+			collectLiveFilesystemSyncRoots(snapshotEntries);
 		const rootFilesystem = {
 			disableDefaultBaseLayer: true,
 			lowers: [
@@ -2610,7 +2769,7 @@ class NativeKernel implements Kernel {
 			cwd: REPO_ROOT,
 			command: ensureNativeSidecarBinary(),
 			args: [],
-			frameTimeoutMs: 60_000,
+			frameTimeoutMs: NATIVE_SIDECAR_FRAME_TIMEOUT_MS,
 		});
 		const session = await client.authenticateAndOpenSession();
 		const vm = await client.createVm(session, {
@@ -2712,6 +2871,7 @@ export function createKernel(options: {
 	loopbackExemptPorts?: number[];
 	logger?: unknown;
 	mounts?: Array<{ path: string; fs: VirtualFileSystem; readOnly?: boolean }>;
+	syncFilesystemOnDispose?: boolean;
 }): Kernel {
 	return new NativeKernel(options);
 }

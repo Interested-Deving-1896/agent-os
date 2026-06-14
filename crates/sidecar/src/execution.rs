@@ -5,28 +5,31 @@ use crate::filesystem::{
     service_javascript_fs_sync_rpc,
 };
 use crate::protocol::{
-    BoundUdpSnapshotResponse, CloseStdinRequest, EventFrame, EventPayload, ExecuteRequest,
-    FindBoundUdpRequest, FindListenerRequest, GetProcessSnapshotRequest, GetSignalStateRequest,
-    GetZombieTimerCountRequest, GuestRuntimeKind, JavascriptChildProcessSpawnOptions,
-    JavascriptChildProcessSpawnRequest, JavascriptDgramBindRequest,
-    JavascriptDgramCreateSocketRequest, JavascriptDgramSendRequest, JavascriptDnsLookupRequest,
-    JavascriptDnsResolveRequest, JavascriptNetConnectRequest, JavascriptNetListenRequest,
-    KillProcessRequest, ListenerSnapshotResponse, OwnershipScope, ProcessExitedEvent,
-    ProcessKilledResponse, ProcessOutputEvent, ProcessSnapshotEntry, ProcessSnapshotResponse,
-    ProcessSnapshotStatus, ProcessStartedResponse, RequestFrame, ResponsePayload,
-    SidecarRequestPayload, SignalDispositionAction, SignalHandlerRegistration, SignalStateResponse,
-    SocketStateEntry, StdinClosedResponse, StdinWrittenResponse, StreamChannel, VmFetchRequest,
-    VmFetchResponse, WasmPermissionTier, WriteStdinRequest, ZombieTimerCountResponse,
+    BoundUdpSnapshotResponse, CloseStdinRequest, DEFAULT_MAX_FRAME_BYTES, EventFrame, EventPayload,
+    ExecuteRequest, FindBoundUdpRequest, FindListenerRequest, GetProcessSnapshotRequest,
+    GetSignalStateRequest, GetZombieTimerCountRequest, GuestRuntimeKind,
+    JavascriptChildProcessSpawnOptions, JavascriptChildProcessSpawnRequest,
+    JavascriptDgramBindRequest, JavascriptDgramCreateSocketRequest, JavascriptDgramSendRequest,
+    JavascriptDnsLookupRequest, JavascriptDnsResolveRequest, JavascriptNetConnectRequest,
+    JavascriptNetListenRequest, JavascriptNetReserveTcpPortRequest, KillProcessRequest,
+    ListenerSnapshotResponse, NativeFrameCodec, NativePayloadCodec, OwnershipScope,
+    ProcessExitedEvent, ProcessKilledResponse, ProcessOutputEvent, ProcessSnapshotEntry,
+    ProcessSnapshotResponse, ProcessSnapshotStatus, ProcessStartedResponse, ProtocolFrame,
+    RequestFrame, ResponseFrame, ResponsePayload, SidecarRequestPayload, SignalDispositionAction,
+    SignalHandlerRegistration, SignalStateResponse, SocketStateEntry, StdinClosedResponse,
+    StdinWrittenResponse, StreamChannel, VmFetchRequest, VmFetchResponse, WasmPermissionTier,
+    WriteStdinRequest, ZombieTimerCountResponse,
 };
 use crate::service::{
     audit_fields, dirname, emit_security_audit_event, emit_structured_event, javascript_error,
     kernel_error, log_stale_process_event, normalize_host_path, normalize_path,
-    parse_javascript_child_process_spawn_request, path_is_within_root, python_error, wasm_error,
+    parse_javascript_child_process_spawn_request, path_is_within_root,
+    process_event_queue_overflow_error, python_error, wasm_error, MAX_PROCESS_EVENT_QUEUE,
 };
 use crate::state::{
-    ActiveChildProcessRedirect, ActiveCipherSession, ActiveDhSession, ActiveDiffieHellmanSession,
-    ActiveEcdhSession, ActiveExecution, ActiveExecutionEvent, ActiveHttp2Server,
-    ActiveHttp2Session, ActiveHttp2Stream, ActiveHttpServer, ActiveMappedHostFd, ActiveProcess,
+    ActiveCipherSession, ActiveDhSession, ActiveDiffieHellmanSession, ActiveEcdhSession,
+    ActiveExecution, ActiveExecutionEvent, ActiveHttp2Server, ActiveHttp2Session,
+    ActiveHttp2Stream, ActiveHttpServer, ActiveMappedHostFd, ActiveProcess,
     ActiveSqliteDatabase, ActiveSqliteStatement, ActiveTcpListener, ActiveTcpSocket,
     ActiveTlsState, ActiveTlsStream, ActiveUdpSocket, ActiveUnixListener, ActiveUnixSocket,
     BridgeError, ExitedProcessSnapshot, Http2BridgeEvent, Http2RuntimeSnapshot,
@@ -148,6 +151,8 @@ const PYTHON_PYODIDE_CACHE_GUEST_ROOT: &str = "/__agent_os_pyodide_cache";
 const TCP_SOCKET_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_LOOPBACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const MAX_PER_PROCESS_STATE_HANDLES: usize = 1024;
+const VM_FETCH_BUFFER_LIMIT_BYTES: usize = DEFAULT_MAX_FRAME_BYTES;
 const DEFAULT_SCRYPT_COST: u64 = 16_384;
 const DEFAULT_SCRYPT_BLOCK_SIZE: u32 = 8;
 const DEFAULT_SCRYPT_PARALLELIZATION: u32 = 1;
@@ -320,7 +325,6 @@ impl ActiveProcess {
             runtime,
             detached: false,
             execution,
-            child_process_redirect: None,
             guest_cwd: String::from("/"),
             env: BTreeMap::new(),
             host_cwd: PathBuf::from("/"),
@@ -337,6 +341,8 @@ impl ActiveProcess {
             next_tcp_listener_id: 0,
             tcp_sockets: BTreeMap::new(),
             next_tcp_socket_id: 0,
+            tcp_port_reservations: BTreeMap::new(),
+            next_tcp_port_reservation_id: 0,
             unix_listeners: BTreeMap::new(),
             next_unix_listener_id: 0,
             unix_sockets: BTreeMap::new(),
@@ -352,6 +358,17 @@ impl ActiveProcess {
             sqlite_statements: BTreeMap::new(),
             next_sqlite_statement_id: 0,
         }
+    }
+
+    pub(crate) fn queue_pending_execution_event(
+        &mut self,
+        event: ActiveExecutionEvent,
+    ) -> Result<(), SidecarError> {
+        if self.pending_execution_events.len() >= MAX_PROCESS_EVENT_QUEUE {
+            return Err(process_event_queue_overflow_error());
+        }
+        self.pending_execution_events.push_back(event);
+        Ok(())
     }
 
     pub(crate) fn with_host_cwd(mut self, host_cwd: PathBuf) -> Self {
@@ -376,14 +393,6 @@ impl ActiveProcess {
 
     pub(crate) fn with_detached(mut self, detached: bool) -> Self {
         self.detached = detached;
-        self
-    }
-
-    pub(crate) fn with_child_process_redirect(
-        mut self,
-        redirect: Option<ActiveChildProcessRedirect>,
-    ) -> Self {
-        self.child_process_redirect = redirect;
         self
     }
 
@@ -422,6 +431,11 @@ impl ActiveProcess {
     fn allocate_tcp_socket_id(&mut self) -> String {
         self.next_tcp_socket_id += 1;
         format!("socket-{}", self.next_tcp_socket_id)
+    }
+
+    fn allocate_tcp_port_reservation_id(&mut self) -> String {
+        self.next_tcp_port_reservation_id += 1;
+        format!("tcp-port-reservation-{}", self.next_tcp_port_reservation_id)
     }
 
     fn allocate_unix_listener_id(&mut self) -> String {
@@ -503,6 +517,36 @@ impl ActiveProcess {
 
         counts
     }
+}
+
+fn poll_tool_process_event(
+    execution: &ToolExecution,
+) -> Result<Option<ActiveExecutionEvent>, SidecarError> {
+    let event = execution
+        .pending_events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pop_front();
+    if event.is_some() {
+        return Ok(event);
+    }
+    if execution.events_overflowed.load(Ordering::Relaxed) {
+        return Err(process_event_queue_overflow_error());
+    }
+    Ok(None)
+}
+
+fn descendant_pending_execution_event_capacity(
+    root: &ActiveProcess,
+    child_path: &[&str],
+) -> Option<usize> {
+    let mut child = root;
+    for child_process_id in child_path {
+        child = child.child_processes.get(*child_process_id)?;
+    }
+    Some(MAX_PROCESS_EVENT_QUEUE.saturating_sub(
+        child.pending_execution_events.len(),
+    ))
 }
 
 fn poll_child_execution_after_exit(
@@ -818,33 +862,158 @@ impl Write for crate::state::LoopbackTlsEndpoint {
 
 // TCP types moved to crate::state
 
+struct ActiveTcpConnectRequest<'a, B> {
+    bridge: &'a SharedBridge<B>,
+    kernel: &'a mut SidecarKernel,
+    kernel_pid: u32,
+    vm_id: &'a str,
+    dns: &'a VmDnsConfig,
+    host: &'a str,
+    port: u16,
+    local_address: Option<&'a str>,
+    local_port: Option<u16>,
+    local_reservation: Option<(JavascriptSocketFamily, u16)>,
+    context: &'a JavascriptSocketPathContext,
+}
+
+struct ActiveUdpSendToRequest<'a, B> {
+    bridge: &'a SharedBridge<B>,
+    kernel: &'a mut SidecarKernel,
+    kernel_pid: u32,
+    vm_id: &'a str,
+    dns: &'a VmDnsConfig,
+    host: &'a str,
+    port: u16,
+    context: &'a JavascriptSocketPathContext,
+    contents: &'a [u8],
+}
+
+struct UdpRemoteAddrRequest<'a, B> {
+    bridge: &'a SharedBridge<B>,
+    kernel: &'a SidecarKernel,
+    vm_id: &'a str,
+    dns: &'a VmDnsConfig,
+    host: &'a str,
+    port: u16,
+    family: JavascriptUdpFamily,
+    context: &'a JavascriptSocketPathContext,
+}
+
+pub(crate) struct JavascriptSyncRpcServiceRequest<'a, B> {
+    pub(crate) bridge: &'a SharedBridge<B>,
+    pub(crate) vm_id: &'a str,
+    pub(crate) dns: &'a VmDnsConfig,
+    pub(crate) socket_paths: &'a JavascriptSocketPathContext,
+    pub(crate) kernel: &'a mut SidecarKernel,
+    pub(crate) process: &'a mut ActiveProcess,
+    pub(crate) sync_request: &'a JavascriptSyncRpcRequest,
+    pub(crate) resource_limits: &'a ResourceLimits,
+    pub(crate) network_counts: NetworkResourceCounts,
+}
+
+pub(crate) struct JavascriptNetSyncRpcServiceRequest<'a, B> {
+    pub(crate) bridge: &'a SharedBridge<B>,
+    pub(crate) vm_id: &'a str,
+    pub(crate) dns: &'a VmDnsConfig,
+    pub(crate) socket_paths: &'a JavascriptSocketPathContext,
+    pub(crate) kernel: &'a mut SidecarKernel,
+    pub(crate) process: &'a mut ActiveProcess,
+    pub(crate) sync_request: &'a JavascriptSyncRpcRequest,
+    pub(crate) resource_limits: &'a ResourceLimits,
+    pub(crate) network_counts: NetworkResourceCounts,
+}
+
+struct LoopbackHttpResponseWaitRequest<'a, B> {
+    bridge: &'a SharedBridge<B>,
+    vm_id: &'a str,
+    dns: &'a VmDnsConfig,
+    socket_paths: &'a JavascriptSocketPathContext,
+    kernel: &'a mut SidecarKernel,
+    process: &'a mut ActiveProcess,
+    resource_limits: &'a ResourceLimits,
+    request_key: (u64, u64),
+}
+
+struct JavascriptDgramSyncRpcServiceRequest<'a, B> {
+    bridge: &'a SharedBridge<B>,
+    kernel: &'a mut SidecarKernel,
+    vm_id: &'a str,
+    dns: &'a VmDnsConfig,
+    socket_paths: &'a JavascriptSocketPathContext,
+    process: &'a mut ActiveProcess,
+    sync_request: &'a JavascriptSyncRpcRequest,
+    resource_limits: &'a ResourceLimits,
+    network_counts: NetworkResourceCounts,
+}
+
+struct JavascriptHttp2SyncRpcServiceRequest<'a, B> {
+    bridge: &'a SharedBridge<B>,
+    kernel: &'a mut SidecarKernel,
+    vm_id: &'a str,
+    dns: &'a VmDnsConfig,
+    socket_paths: &'a JavascriptSocketPathContext,
+    process: &'a mut ActiveProcess,
+    sync_request: &'a JavascriptSyncRpcRequest,
+    resource_limits: &'a ResourceLimits,
+    network_counts: NetworkResourceCounts,
+}
+
 impl ActiveTcpSocket {
-    fn connect<B>(
-        bridge: &SharedBridge<B>,
-        kernel: &mut SidecarKernel,
-        kernel_pid: u32,
-        vm_id: &str,
-        dns: &VmDnsConfig,
-        host: &str,
-        port: u16,
-        context: &JavascriptSocketPathContext,
-    ) -> Result<Self, SidecarError>
+    fn connect<B>(request: ActiveTcpConnectRequest<'_, B>) -> Result<Self, SidecarError>
     where
         B: NativeSidecarBridge + Send + 'static,
         BridgeError<B>: fmt::Debug + Send + Sync + 'static,
     {
+        let ActiveTcpConnectRequest {
+            bridge,
+            kernel,
+            kernel_pid,
+            vm_id,
+            dns,
+            host,
+            port,
+            local_address,
+            local_port,
+            local_reservation,
+            context,
+        } = request;
         let resolved = resolve_tcp_connect_addr(bridge, kernel, vm_id, dns, host, port, context)?;
         if resolved.use_kernel_loopback {
             let family = JavascriptSocketFamily::from_ip(resolved.guest_remote_addr.ip());
-            let local_port = allocate_guest_listen_port(
-                0,
-                family,
-                &context.used_tcp_guest_ports,
-                context.listen_policy,
-            )?;
-            let local_ip = match family {
-                JavascriptSocketFamily::Ipv4 => IpAddr::V4(Ipv4Addr::LOCALHOST),
-                JavascriptSocketFamily::Ipv6 => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            let requested_local_port = local_port.unwrap_or(0);
+            let local_port = if requested_local_port != 0
+                && local_reservation == Some((family, requested_local_port))
+            {
+                requested_local_port
+            } else {
+                allocate_guest_listen_port(
+                    requested_local_port,
+                    family,
+                    &context.used_tcp_guest_ports,
+                    context.listen_policy,
+                )?
+            };
+            let local_ip = match (family, local_address) {
+                (JavascriptSocketFamily::Ipv4, Some("0.0.0.0")) => {
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                }
+                (JavascriptSocketFamily::Ipv4, Some("127.0.0.1") | Some("localhost") | None) => {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                }
+                (JavascriptSocketFamily::Ipv6, Some("::")) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                (JavascriptSocketFamily::Ipv6, Some("::1") | Some("localhost") | None) => {
+                    IpAddr::V6(Ipv6Addr::LOCALHOST)
+                }
+                (JavascriptSocketFamily::Ipv4, Some(other)) => {
+                    return Err(SidecarError::Execution(format!(
+                        "EACCES: TCP sockets must bind to loopback or unspecified addresses, got {other}"
+                    )));
+                }
+                (JavascriptSocketFamily::Ipv6, Some(other)) => {
+                    return Err(SidecarError::Execution(format!(
+                        "EACCES: TCP sockets must bind to loopback or unspecified addresses, got {other}"
+                    )));
+                }
             };
             let local_addr = SocketAddr::new(local_ip, local_port);
             let spec = match family {
@@ -2071,22 +2240,33 @@ impl ActiveUdpSocket {
 
     fn send_to<B>(
         &mut self,
-        bridge: &SharedBridge<B>,
-        kernel: &mut SidecarKernel,
-        kernel_pid: u32,
-        vm_id: &str,
-        dns: &VmDnsConfig,
-        host: &str,
-        port: u16,
-        context: &JavascriptSocketPathContext,
-        contents: &[u8],
+        request: ActiveUdpSendToRequest<'_, B>,
     ) -> Result<(usize, SocketAddr), SidecarError>
     where
         B: NativeSidecarBridge + Send + 'static,
         BridgeError<B>: fmt::Debug + Send + Sync + 'static,
     {
-        let remote_addr =
-            resolve_udp_addr(bridge, kernel, vm_id, dns, host, port, self.family, context)?;
+        let ActiveUdpSendToRequest {
+            bridge,
+            kernel,
+            kernel_pid,
+            vm_id,
+            dns,
+            host,
+            port,
+            context,
+            contents,
+        } = request;
+        let remote_addr = resolve_udp_addr(UdpRemoteAddrRequest {
+            bridge,
+            kernel,
+            vm_id,
+            dns,
+            host,
+            port,
+            family: self.family,
+            context,
+        })?;
         let local_addr = self.ensure_bound_for_send(kernel, kernel_pid, context)?;
         let written = if let Some(socket_id) = self.kernel_socket_id {
             if is_loopback_ip(remote_addr.ip()) && remote_addr.port() == port {
@@ -2492,9 +2672,9 @@ impl ActiveExecution {
                     })
                 })
                 .map_err(|error| SidecarError::Execution(error.to_string())),
-            Self::Tool(_) => {
+            Self::Tool(execution) => {
                 let _ = timeout;
-                Ok(None)
+                poll_tool_process_event(execution)
             }
         }
     }
@@ -2566,24 +2746,52 @@ impl ActiveExecution {
                     })
                 })
                 .map_err(|error| SidecarError::Execution(error.to_string())),
-            Self::Tool(_) => {
+            Self::Tool(execution) => {
                 let _ = timeout;
-                Ok(None)
+                poll_tool_process_event(execution)
             }
         }
     }
 }
 
-fn spawn_tool_process_events(
-    sender: tokio::sync::mpsc::UnboundedSender<ProcessEventEnvelope>,
+struct ToolProcessEventRequest {
     sidecar_requests: SharedSidecarRequestClient,
     connection_id: String,
     session_id: String,
     vm_id: String,
-    process_id: String,
     tool_resolution: ToolCommandResolution,
     cancelled: Arc<AtomicBool>,
-) {
+    pending_events: Arc<Mutex<VecDeque<ActiveExecutionEvent>>>,
+    events_overflowed: Arc<AtomicBool>,
+}
+
+pub(crate) fn send_tool_process_event(
+    pending_events: &Arc<Mutex<VecDeque<ActiveExecutionEvent>>>,
+    events_overflowed: &AtomicBool,
+    event: ActiveExecutionEvent,
+) -> bool {
+    let mut pending_events = pending_events
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if pending_events.len() >= MAX_PROCESS_EVENT_QUEUE {
+        events_overflowed.store(true, Ordering::Relaxed);
+        return false;
+    }
+    pending_events.push_back(event);
+    true
+}
+
+fn spawn_tool_process_events(request: ToolProcessEventRequest) {
+    let ToolProcessEventRequest {
+        sidecar_requests,
+        connection_id,
+        session_id,
+        vm_id,
+        tool_resolution,
+        cancelled,
+        pending_events,
+        events_overflowed,
+    } = request;
     std::thread::spawn(move || match tool_resolution {
         ToolCommandResolution::Immediate {
             stdout,
@@ -2594,30 +2802,28 @@ fn spawn_tool_process_events(
                 return;
             }
             if !stdout.is_empty() {
-                let _ = sender.send(ProcessEventEnvelope {
-                    connection_id: connection_id.clone(),
-                    session_id: session_id.clone(),
-                    vm_id: vm_id.clone(),
-                    process_id: process_id.clone(),
-                    event: ActiveExecutionEvent::Stdout(stdout),
-                });
+                if !send_tool_process_event(
+                    &pending_events,
+                    &events_overflowed,
+                    ActiveExecutionEvent::Stdout(stdout),
+                ) {
+                    return;
+                }
             }
             if !stderr.is_empty() {
-                let _ = sender.send(ProcessEventEnvelope {
-                    connection_id: connection_id.clone(),
-                    session_id: session_id.clone(),
-                    vm_id: vm_id.clone(),
-                    process_id: process_id.clone(),
-                    event: ActiveExecutionEvent::Stderr(stderr),
-                });
+                if !send_tool_process_event(
+                    &pending_events,
+                    &events_overflowed,
+                    ActiveExecutionEvent::Stderr(stderr),
+                ) {
+                    return;
+                }
             }
-            let _ = sender.send(ProcessEventEnvelope {
-                connection_id,
-                session_id,
-                vm_id,
-                process_id,
-                event: ActiveExecutionEvent::Exited(exit_code),
-            });
+            let _ = send_tool_process_event(
+                &pending_events,
+                &events_overflowed,
+                ActiveExecutionEvent::Exited(exit_code),
+            );
         }
         ToolCommandResolution::Invoke { request, timeout } => {
             let response = sidecar_requests.invoke(
@@ -2641,77 +2847,67 @@ fn spawn_tool_process_events(
                                 "failed to serialize tool result: {error}"
                             ))
                         });
-                        let _ = sender.send(ProcessEventEnvelope {
-                            connection_id: connection_id.clone(),
-                            session_id: session_id.clone(),
-                            vm_id: vm_id.clone(),
-                            process_id: process_id.clone(),
-                            event: ActiveExecutionEvent::Stdout(stdout),
-                        });
-                        let _ = sender.send(ProcessEventEnvelope {
-                            connection_id,
-                            session_id,
-                            vm_id,
-                            process_id: process_id.clone(),
-                            event: ActiveExecutionEvent::Exited(0),
-                        });
+                        if !send_tool_process_event(
+                            &pending_events,
+                            &events_overflowed,
+                            ActiveExecutionEvent::Stdout(stdout),
+                        ) {
+                            return;
+                        }
+                        let _ = send_tool_process_event(
+                            &pending_events,
+                            &events_overflowed,
+                            ActiveExecutionEvent::Exited(0),
+                        );
                     } else {
                         let message = result
                             .error
                             .unwrap_or_else(|| String::from("tool invocation returned no result"));
-                        let _ = sender.send(ProcessEventEnvelope {
-                            connection_id: connection_id.clone(),
-                            session_id: session_id.clone(),
-                            vm_id: vm_id.clone(),
-                            process_id: process_id.clone(),
-                            event: ActiveExecutionEvent::Stderr(format_tool_failure_output(
-                                &message,
-                            )),
-                        });
-                        let _ = sender.send(ProcessEventEnvelope {
-                            connection_id,
-                            session_id,
-                            vm_id,
-                            process_id: process_id.clone(),
-                            event: ActiveExecutionEvent::Exited(1),
-                        });
+                        if !send_tool_process_event(
+                            &pending_events,
+                            &events_overflowed,
+                            ActiveExecutionEvent::Stderr(format_tool_failure_output(&message)),
+                        ) {
+                            return;
+                        }
+                        let _ = send_tool_process_event(
+                            &pending_events,
+                            &events_overflowed,
+                            ActiveExecutionEvent::Exited(1),
+                        );
                     }
                 }
                 Ok(_) => {
-                    let _ = sender.send(ProcessEventEnvelope {
-                        connection_id: connection_id.clone(),
-                        session_id: session_id.clone(),
-                        vm_id: vm_id.clone(),
-                        process_id: process_id.clone(),
-                        event: ActiveExecutionEvent::Stderr(format_tool_failure_output(
+                    if !send_tool_process_event(
+                        &pending_events,
+                        &events_overflowed,
+                        ActiveExecutionEvent::Stderr(format_tool_failure_output(
                             "unexpected sidecar tool response",
                         )),
-                    });
-                    let _ = sender.send(ProcessEventEnvelope {
-                        connection_id,
-                        session_id,
-                        vm_id,
-                        process_id,
-                        event: ActiveExecutionEvent::Exited(1),
-                    });
+                    ) {
+                        return;
+                    }
+                    let _ = send_tool_process_event(
+                        &pending_events,
+                        &events_overflowed,
+                        ActiveExecutionEvent::Exited(1),
+                    );
                 }
                 Err(error) => {
-                    let _ = sender.send(ProcessEventEnvelope {
-                        connection_id: connection_id.clone(),
-                        session_id: session_id.clone(),
-                        vm_id: vm_id.clone(),
-                        process_id: process_id.clone(),
-                        event: ActiveExecutionEvent::Stderr(format_tool_failure_output(
+                    if !send_tool_process_event(
+                        &pending_events,
+                        &events_overflowed,
+                        ActiveExecutionEvent::Stderr(format_tool_failure_output(
                             &error.to_string(),
                         )),
-                    });
-                    let _ = sender.send(ProcessEventEnvelope {
-                        connection_id,
-                        session_id,
-                        vm_id,
-                        process_id,
-                        event: ActiveExecutionEvent::Exited(1),
-                    });
+                    ) {
+                        return;
+                    }
+                    let _ = send_tool_process_event(
+                        &pending_events,
+                        &events_overflowed,
+                        ActiveExecutionEvent::Exited(1),
+                    );
                 }
             }
         }
@@ -2770,6 +2966,8 @@ where
                 let kernel_pid = kernel_handle.pid();
                 let tool_execution = ToolExecution::default();
                 let cancelled = tool_execution.cancelled.clone();
+                let pending_events = tool_execution.pending_events.clone();
+                let events_overflowed = tool_execution.events_overflowed.clone();
                 vm.active_processes.insert(
                     payload.process_id.clone(),
                     ActiveProcess::new(
@@ -2782,16 +2980,16 @@ where
                     .with_host_cwd(resolve_vm_guest_path_to_host(vm, &guest_cwd)),
                 );
                 self.bridge.emit_lifecycle(&vm_id, LifecycleState::Busy)?;
-                spawn_tool_process_events(
-                    self.process_event_sender.clone(),
-                    self.sidecar_requests.clone(),
-                    connection_id.clone(),
-                    session_id.clone(),
-                    vm_id.clone(),
-                    payload.process_id.clone(),
+                spawn_tool_process_events(ToolProcessEventRequest {
+                    sidecar_requests: self.sidecar_requests.clone(),
+                    connection_id: connection_id.clone(),
+                    session_id: session_id.clone(),
+                    vm_id: vm_id.clone(),
                     tool_resolution,
                     cancelled,
-                );
+                    pending_events,
+                    events_overflowed,
+                });
 
                 return Ok(DispatchResult {
                     response: self.respond(
@@ -2833,6 +3031,7 @@ where
                 },
             )
             .map_err(kernel_error)?;
+        let kernel_pid = kernel_handle.pid();
 
         let (execution, process_env) = match resolved.runtime {
             GuestRuntimeKind::JavaScript => {
@@ -2925,6 +3124,14 @@ where
                 (ActiveExecution::Python(execution), env.clone())
             }
             GuestRuntimeKind::WebAssembly => {
+                env.insert(
+                    String::from("AGENT_OS_VIRTUAL_PROCESS_PID"),
+                    kernel_pid.to_string(),
+                );
+                env.insert(
+                    String::from("AGENT_OS_VIRTUAL_PROCESS_PPID"),
+                    String::from("0"),
+                );
                 apply_wasm_limit_env(&mut env, vm.kernel.resource_limits());
                 let wasm_permission_tier = resolved.wasm_permission_tier.unwrap_or_else(|| {
                     resolve_wasm_permission_tier(
@@ -2953,7 +3160,6 @@ where
             }
         };
         let child_pid = execution.child_pid();
-        let kernel_pid = kernel_handle.pid();
         let kernel_stdin_writer_fd = install_kernel_stdin_pipe(&mut vm.kernel, kernel_pid)?;
         vm.active_processes.insert(
             payload.process_id.clone(),
@@ -3250,22 +3456,25 @@ where
                 "request": request_json,
             }),
         )?;
-        let response_json = wait_for_loopback_http_response(
-            &self.bridge,
-            &vm_id,
-            &vm.dns,
-            &socket_paths,
-            &mut vm.kernel,
+        let response_json = wait_for_loopback_http_response(LoopbackHttpResponseWaitRequest {
+            bridge: &self.bridge,
+            vm_id: &vm_id,
+            dns: &vm.dns,
+            socket_paths: &socket_paths,
+            kernel: &mut vm.kernel,
             process,
-            &resource_limits,
-            (server_id, request_id),
-        )?;
+            resource_limits: &resource_limits,
+            request_key: (server_id, request_id),
+        })?;
+
+        let response = self.respond(
+            request,
+            ResponsePayload::VmFetchResult(VmFetchResponse { response_json }),
+        );
+        ensure_vm_fetch_response_frame_within_limit(&response, self.config.max_frame_bytes)?;
 
         Ok(DispatchResult {
-            response: self.respond(
-                request,
-                ResponsePayload::VmFetchResult(VmFetchResponse { response_json }),
-            ),
+            response,
             events: Vec::new(),
         })
     }
@@ -3403,13 +3612,9 @@ where
                 };
                 if signal != 0 {
                     execution.cancelled.store(true, Ordering::Relaxed);
-                    let _ = self.process_event_sender.send(ProcessEventEnvelope {
-                        connection_id: vm.connection_id.clone(),
-                        session_id: vm.session_id.clone(),
-                        vm_id: vm_id.to_owned(),
-                        process_id: process_id.to_owned(),
-                        event: ActiveExecutionEvent::Exited(128 + signal),
-                    });
+                    process.queue_pending_execution_event(ActiveExecutionEvent::Exited(
+                        128 + signal,
+                    ))?;
                 }
             }
             KillBehavior::SharedV8StateOnly => {
@@ -3433,16 +3638,14 @@ where
                 }
                 process.execution.terminate()?;
                 if signal != 0 && matches!(process.execution, ActiveExecution::Wasm(_)) {
-                    process
-                        .pending_execution_events
-                        .push_back(ActiveExecutionEvent::Exited(128 + signal));
+                    process.queue_pending_execution_event(ActiveExecutionEvent::Exited(
+                        128 + signal,
+                    ))?;
                 }
             }
             KillBehavior::SharedV8DispatchOrTerminate => {
-                if signal != 0 {
-                    if !dispatch_v8_process_signal(process, signal)? {
-                        process.execution.terminate()?;
-                    }
+                if signal != 0 && !dispatch_v8_process_signal(process, signal)? {
+                    process.execution.terminate()?;
                 }
             }
             KillBehavior::Noop => {}
@@ -3478,20 +3681,31 @@ where
     ) -> Result<bool, SidecarError> {
         let mut emitted_any = false;
 
+        let mut queued_envelopes = Vec::new();
         {
+            let pending_capacity = self.pending_process_event_capacity();
             let receiver = self.process_event_receiver.as_mut().ok_or_else(|| {
                 SidecarError::InvalidState(String::from("process event receiver unavailable"))
             })?;
             loop {
+                if queued_envelopes.len() >= pending_capacity {
+                    if receiver.is_empty() {
+                        break;
+                    }
+                    return Err(process_event_queue_overflow_error());
+                }
                 match receiver.try_recv() {
                     Ok(envelope) => {
-                        self.pending_process_events.push_back(envelope);
+                        queued_envelopes.push(envelope);
                         emitted_any = true;
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                 }
             }
+        }
+        for envelope in queued_envelopes {
+            self.queue_pending_process_event(envelope)?;
         }
 
         let vm_ids = self.vm_ids_for_scope(ownership)?;
@@ -3524,7 +3738,7 @@ where
                         continue;
                     }
                     enum ProcessPollResult {
-                        Event(Option<ActiveExecutionEvent>),
+                        Event(Box<Option<ActiveExecutionEvent>>),
                         RecoverClosedChannel,
                     }
                     let poll_result = {
@@ -3535,10 +3749,10 @@ where
                             continue;
                         };
                         if let Some(event) = process.pending_execution_events.pop_front() {
-                            ProcessPollResult::Event(Some(event))
+                            ProcessPollResult::Event(Box::new(Some(event)))
                         } else {
                             match process.execution.poll_event(Duration::ZERO).await {
-                                Ok(event) => ProcessPollResult::Event(event),
+                                Ok(event) => ProcessPollResult::Event(Box::new(event)),
                                 Err(SidecarError::Execution(message))
                                     if (process.runtime == GuestRuntimeKind::JavaScript
                                         && closed_javascript_event_channel(&message))
@@ -3554,7 +3768,7 @@ where
                         }
                     };
                     let event = match poll_result {
-                        ProcessPollResult::Event(event) => event,
+                        ProcessPollResult::Event(event) => *event,
                         ProcessPollResult::RecoverClosedChannel => {
                             self.recover_closed_root_runtime_process_event(&vm_id, &process_id)?
                         }
@@ -3564,13 +3778,13 @@ where
                         continue;
                     };
 
-                    let _ = self.process_event_sender.send(ProcessEventEnvelope {
+                    self.queue_pending_process_event(ProcessEventEnvelope {
                         connection_id: connection_id.clone(),
                         session_id: session_id.clone(),
                         vm_id: vm_id.clone(),
                         process_id: process_id.clone(),
                         event,
-                    });
+                    })?;
                     emitted_any = true;
                     emitted_this_pass = true;
                 }
@@ -3641,6 +3855,36 @@ where
             current = current.child_processes.get_mut(*child_id)?;
         }
         Some(current)
+    }
+
+    fn active_process_by_owned_path_mut<'a>(
+        process: &'a mut ActiveProcess,
+        child_path: &[String],
+    ) -> Option<&'a mut ActiveProcess> {
+        let mut current = process;
+        for child_id in child_path {
+            current = current.child_processes.get_mut(child_id)?;
+        }
+        Some(current)
+    }
+
+    fn active_process_path_by_kernel_pid(
+        process: &ActiveProcess,
+        kernel_pid: u32,
+    ) -> Option<Vec<String>> {
+        if process.kernel_pid == kernel_pid {
+            return Some(Vec::new());
+        }
+
+        for (child_id, child) in &process.child_processes {
+            let Some(mut path) = Self::active_process_path_by_kernel_pid(child, kernel_pid) else {
+                continue;
+            };
+            path.insert(0, child_id.clone());
+            return Some(path);
+        }
+
+        None
     }
 
     fn descendant_parent_process<'a>(
@@ -3757,7 +4001,7 @@ where
             if child_path.is_empty() {
                 loop {
                     enum ProcessPollResult {
-                        Event(Option<ActiveExecutionEvent>),
+                        Event(Box<Option<ActiveExecutionEvent>>),
                         RecoverClosedChannel,
                     }
                     let poll_result = {
@@ -3768,10 +4012,10 @@ where
                             break;
                         };
                         if let Some(event) = process.pending_execution_events.pop_front() {
-                            ProcessPollResult::Event(Some(event))
+                            ProcessPollResult::Event(Box::new(Some(event)))
                         } else {
                             match process.execution.poll_event_blocking(Duration::ZERO) {
-                                Ok(event) => ProcessPollResult::Event(event),
+                                Ok(event) => ProcessPollResult::Event(Box::new(event)),
                                 Err(SidecarError::Execution(message))
                                     if (process.runtime == GuestRuntimeKind::JavaScript
                                         && closed_javascript_event_channel(&message))
@@ -3787,7 +4031,7 @@ where
                         }
                     };
                     let event = match poll_result {
-                        ProcessPollResult::Event(event) => event,
+                        ProcessPollResult::Event(event) => *event,
                         ProcessPollResult::RecoverClosedChannel => {
                             self.recover_closed_root_runtime_process_event(vm_id, &root_process_id)?
                         }
@@ -3804,36 +4048,36 @@ where
                     };
                     match event {
                         ActiveExecutionEvent::Stdout(chunk) => {
-                            self.pending_process_events.push_back(ProcessEventEnvelope {
+                            self.queue_pending_process_event(ProcessEventEnvelope {
                                 connection_id,
                                 session_id,
                                 vm_id: vm_id.to_owned(),
                                 process_id: detached_process_id.clone(),
                                 event: ActiveExecutionEvent::Stdout(chunk),
-                            });
+                            })?;
                             emitted_any = true;
                         }
                         ActiveExecutionEvent::Stderr(chunk) => {
-                            self.pending_process_events.push_back(ProcessEventEnvelope {
+                            self.queue_pending_process_event(ProcessEventEnvelope {
                                 connection_id,
                                 session_id,
                                 vm_id: vm_id.to_owned(),
                                 process_id: detached_process_id.clone(),
                                 event: ActiveExecutionEvent::Stderr(chunk),
-                            });
+                            })?;
                             emitted_any = true;
                         }
                         ActiveExecutionEvent::Exited(exit_code) => {
                             if let Some(vm) = self.vms.get_mut(vm_id) {
                                 vm.detached_child_processes.remove(&detached_process_id);
                             }
-                            self.pending_process_events.push_back(ProcessEventEnvelope {
+                            self.queue_pending_process_event(ProcessEventEnvelope {
                                 connection_id,
                                 session_id,
                                 vm_id: vm_id.to_owned(),
                                 process_id: detached_process_id.clone(),
                                 event: ActiveExecutionEvent::Exited(exit_code),
-                            });
+                            })?;
                             emitted_any = true;
                             break;
                         }
@@ -3845,7 +4089,7 @@ where
                             )?;
                         }
                         ActiveExecutionEvent::PythonVfsRpcRequest(request) => {
-                            self.handle_python_vfs_rpc_request(vm_id, &root_process_id, request)?;
+                            self.handle_python_vfs_rpc_request(vm_id, &root_process_id, *request)?;
                         }
                         ActiveExecutionEvent::SignalState {
                             signal,
@@ -3954,7 +4198,7 @@ where
                 let Some(envelope) = envelope else {
                     break;
                 };
-                self.pending_process_events.push_back(envelope);
+                self.queue_pending_process_event(envelope)?;
                 emitted_any = true;
 
                 if event_type == "exit" {
@@ -3965,7 +4209,7 @@ where
 
         Ok(emitted_any)
     }
-    fn drain_queued_descendant_javascript_child_process_events(
+    pub(crate) fn drain_queued_descendant_javascript_child_process_events(
         &mut self,
         vm_id: &str,
         process_id: &str,
@@ -3975,14 +4219,27 @@ where
             return Ok(());
         }
         let target_process_id = Self::child_process_path_label(process_id, child_path);
+        let mut child_capacity = self
+            .vms
+            .get(vm_id)
+            .and_then(|vm| vm.active_processes.get(process_id))
+            .and_then(|root| descendant_pending_execution_event_capacity(root, child_path));
 
         let mut deferred = VecDeque::new();
         while let Some(envelope) = self.pending_process_events.pop_front() {
             if envelope.vm_id == vm_id && envelope.process_id == target_process_id {
+                if matches!(child_capacity, Some(0)) {
+                    self.pending_process_events.push_front(envelope);
+                    while let Some(deferred_envelope) = deferred.pop_back() {
+                        self.pending_process_events.push_front(deferred_envelope);
+                    }
+                    return Err(process_event_queue_overflow_error());
+                }
                 if let Some(vm) = self.vms.get_mut(vm_id) {
                     if let Some(root) = vm.active_processes.get_mut(process_id) {
                         if let Some(child) = Self::active_process_by_path_mut(root, child_path) {
-                            child.pending_execution_events.push_back(envelope.event);
+                            child.queue_pending_execution_event(envelope.event)?;
+                            child_capacity = child_capacity.map(|capacity| capacity - 1);
                             continue;
                         }
                     }
@@ -3994,11 +4251,24 @@ where
 
         let mut queued = Vec::new();
         {
+            let transfer_capacity = self
+                .pending_process_event_capacity()
+                .min(child_capacity.unwrap_or(usize::MAX));
             let receiver = self.process_event_receiver.as_mut().ok_or_else(|| {
                 SidecarError::InvalidState(String::from("process event receiver unavailable"))
             })?;
-            while let Ok(envelope) = receiver.try_recv() {
-                queued.push(envelope);
+            loop {
+                if queued.len() >= transfer_capacity {
+                    if receiver.is_empty() {
+                        break;
+                    }
+                    return Err(process_event_queue_overflow_error());
+                }
+                match receiver.try_recv() {
+                    Ok(envelope) => queued.push(envelope),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                }
             }
         }
         for envelope in queued {
@@ -4006,13 +4276,13 @@ where
                 if let Some(vm) = self.vms.get_mut(vm_id) {
                     if let Some(root) = vm.active_processes.get_mut(process_id) {
                         if let Some(child) = Self::active_process_by_path_mut(root, child_path) {
-                            child.pending_execution_events.push_back(envelope.event);
+                            child.queue_pending_execution_event(envelope.event)?;
                             continue;
                         }
                     }
                 }
             }
-            self.pending_process_events.push_back(envelope);
+            self.queue_pending_process_event(envelope)?;
         }
 
         Ok(())
@@ -4057,7 +4327,7 @@ where
                 Ok(None)
             }
             ActiveExecutionEvent::PythonVfsRpcRequest(request) => {
-                self.handle_python_vfs_rpc_request(vm_id, process_id, request)?;
+                self.handle_python_vfs_rpc_request(vm_id, process_id, *request)?;
                 Ok(None)
             }
             ActiveExecutionEvent::SignalState {
@@ -4077,42 +4347,9 @@ where
                 Ok(None)
             }
             ActiveExecutionEvent::Exited(exit_code) => {
-                let became_idle = {
-                    let Some(vm) = self.vms.get_mut(vm_id) else {
-                        return Ok(None);
-                    };
-                    prune_exited_process_snapshots(vm);
-                    let process_table = vm.kernel.list_processes();
-                    let Some(mut process) = vm.active_processes.remove(process_id) else {
-                        return Ok(None);
-                    };
-                    if let Some(info) = process_table.get(&process.kernel_pid) {
-                        vm.exited_process_snapshots
-                            .push_back(ExitedProcessSnapshot {
-                                captured_at: Instant::now(),
-                                process: build_process_snapshot_entry(
-                                    process_id,
-                                    &process,
-                                    info,
-                                    Some(exit_code),
-                                ),
-                            });
-                    }
-                    let detached_children =
-                        Self::adopt_detached_child_processes(process_id, &mut process);
-                    sync_process_host_writes_to_kernel(vm, &process)?;
-                    terminate_child_process_tree(&mut vm.kernel, &mut process);
-                    process.kernel_handle.finish(exit_code);
-                    let _ = vm.kernel.wait_and_reap(process.kernel_pid);
-                    vm.signal_states.remove(process_id);
-                    for (detached_process_id, detached_child) in detached_children {
-                        vm.detached_child_processes
-                            .insert(detached_process_id.clone());
-                        vm.active_processes
-                            .insert(detached_process_id, detached_child);
-                    }
-                    vm.active_processes.is_empty()
-                };
+                let became_idle = self
+                    .finish_active_process_exit(vm_id, process_id, exit_code)?
+                    .unwrap_or(false);
 
                 if became_idle {
                     self.bridge.emit_lifecycle(vm_id, LifecycleState::Ready)?;
@@ -4129,15 +4366,70 @@ where
         }
     }
 
-    pub(crate) fn drain_process_events_blocking(
+    pub(crate) fn finish_active_process_exit(
         &mut self,
         vm_id: &str,
         process_id: &str,
+        exit_code: i32,
+    ) -> Result<Option<bool>, SidecarError> {
+        let Some(vm) = self.vms.get_mut(vm_id) else {
+            log_stale_process_event(&self.bridge, vm_id, process_id, "process exit cleanup");
+            return Ok(None);
+        };
+        if !vm.active_processes.contains_key(process_id) {
+            log_stale_process_event(&self.bridge, vm_id, process_id, "process exit cleanup");
+            return Ok(None);
+        }
+
+        prune_exited_process_snapshots(vm);
+        let process_table = vm.kernel.list_processes();
+        let Some(mut process) = vm.active_processes.remove(process_id) else {
+            return Ok(None);
+        };
+        if let Some(info) = process_table.get(&process.kernel_pid) {
+            vm.exited_process_snapshots
+                .push_back(ExitedProcessSnapshot {
+                    captured_at: Instant::now(),
+                    process: build_process_snapshot_entry(
+                        process_id,
+                        &process,
+                        info,
+                        Some(exit_code),
+                    ),
+                });
+        }
+        let detached_children = Self::adopt_detached_child_processes(process_id, &mut process);
+        sync_process_host_writes_to_kernel(vm, &process)?;
+        terminate_child_process_tree(&mut vm.kernel, &mut process);
+        process.kernel_handle.finish(exit_code);
+        let _ = vm.kernel.wait_and_reap(process.kernel_pid);
+        vm.signal_states.remove(process_id);
+        for (detached_process_id, detached_child) in detached_children {
+            vm.detached_child_processes
+                .insert(detached_process_id.clone());
+            vm.active_processes
+                .insert(detached_process_id, detached_child);
+        }
+
+        Ok(Some(vm.active_processes.is_empty()))
+    }
+
+    pub(crate) fn drain_process_events_blocking_with_limit(
+        &mut self,
+        vm_id: &str,
+        process_id: &str,
+        max_events: usize,
     ) -> Result<Vec<ActiveExecutionEvent>, SidecarError> {
         let mut events = Vec::new();
+        if max_events == 0 {
+            return Ok(events);
+        }
         let mut deadline = Instant::now() + Duration::from_millis(150);
 
         loop {
+            if events.len() >= max_events {
+                break;
+            }
             let event = {
                 let Some(vm) = self.vms.get_mut(vm_id) else {
                     break;
@@ -4162,6 +4454,9 @@ where
                 }
                 let blocking_wait = deadline.saturating_duration_since(Instant::now());
                 if blocking_wait.is_zero() {
+                    break;
+                }
+                if events.len() >= max_events {
                     break;
                 }
                 let delayed_event = {
@@ -4392,10 +4687,8 @@ where
                 hostname,
             )?;
             if let Some(family) = request.family {
-                addresses.retain(|address| match (family, address) {
-                    (4, IpAddr::V4(_)) => true,
-                    (6, IpAddr::V6(_)) => true,
-                    _ => false,
+                addresses.retain(|address| {
+                    matches!((family, address), (4, IpAddr::V4(_)) | (6, IpAddr::V6(_)))
                 });
             }
             Ok(PythonVfsRpcResponsePayload::DnsLookup {
@@ -4456,32 +4749,32 @@ where
                             String::from("pipe"),
                             String::from("pipe"),
                         ],
+                        timeout: None,
+                        kill_signal: None,
                     },
                 },
                 request.max_buffer,
             )
-            .and_then(|payload| {
-                Ok(PythonVfsRpcResponsePayload::SubprocessRun {
-                    exit_code: payload
-                        .get("code")
-                        .and_then(Value::as_i64)
-                        .map(|value| value as i32)
-                        .unwrap_or(1),
-                    stdout: payload
-                        .get("stdout")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    stderr: payload
-                        .get("stderr")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    max_buffer_exceeded: payload
-                        .get("maxBufferExceeded")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                })
+            .map(|payload| PythonVfsRpcResponsePayload::SubprocessRun {
+                exit_code: payload
+                    .get("code")
+                    .and_then(Value::as_i64)
+                    .map(|value| value as i32)
+                    .unwrap_or(1),
+                stdout: payload
+                    .get("stdout")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                stderr: payload
+                    .get("stderr")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                max_buffer_exceeded: payload
+                    .get("maxBufferExceeded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             });
 
         self.respond_python_rpc(vm_id, process_id, request.id, response)
@@ -4587,10 +4880,18 @@ where
         let (command, process_args) = if request.options.shell {
             let tokens = tokenize_shell_free_command(&request.command);
             let requires_shell = command_requires_shell(&request.command)
-                || tokens
-                    .first()
-                    .is_some_and(|command| is_posix_shell_builtin(command));
-            if requires_shell && vm.command_guest_paths.contains_key("sh") {
+                || tokens.first().is_some_and(|command| {
+                    is_posix_shell_builtin(command) || shell_first_token_requires_shell(command)
+                });
+            if requires_shell {
+                if !vm.command_guest_paths.contains_key("sh") {
+                    return Err(SidecarError::InvalidState(format!(
+                        "shell-mode child_process command requires /bin/sh, which is not \
+                         installed in this VM (install a software package that provides sh, \
+                         for example @rivet-dev/agent-os-coreutils): {}",
+                        request.command
+                    )));
+                }
                 (
                     String::from("sh"),
                     vec![String::from("-c"), request.command.clone()],
@@ -4888,13 +5189,6 @@ where
         process_id: &str,
         request: JavascriptChildProcessSpawnRequest,
     ) -> Result<Value, SidecarError> {
-        let redirect = self.direct_shell_redirect_for_javascript_child_process(
-            vm_id,
-            process_id,
-            &[],
-            &request,
-        )?;
-        let request = javascript_child_process_request_for_redirect(request, redirect.as_ref());
         let resolved = {
             let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
             let parent = vm
@@ -4920,10 +5214,6 @@ where
                 .ok_or_else(|| missing_process_error(vm_id, process_id))?;
             (process.kernel_pid, process.allocate_child_process_id())
         };
-        let child_runtime_process_id =
-            Self::child_process_path_label(process_id, &[child_process_id.as_str()]);
-
-        let process_event_sender = self.process_event_sender.clone();
         let sidecar_requests = self.sidecar_requests.clone();
         let vm = self
             .vms
@@ -4955,23 +5245,24 @@ where
                         parent_pid: Some(parent_kernel_pid),
                         env: resolved.env.clone(),
                         cwd: Some(resolved.guest_cwd.clone()),
-                        ..VirtualProcessOptions::default()
                     },
                 )
                 .map_err(kernel_error)?;
             let kernel_pid = kernel_handle.pid();
             let tool_execution = ToolExecution::default();
             let cancelled = tool_execution.cancelled.clone();
-            spawn_tool_process_events(
-                process_event_sender.clone(),
-                sidecar_requests.clone(),
-                vm.connection_id.clone(),
-                vm.session_id.clone(),
-                vm_id.to_owned(),
-                child_runtime_process_id.clone(),
+            let pending_events = tool_execution.pending_events.clone();
+            let events_overflowed = tool_execution.events_overflowed.clone();
+            spawn_tool_process_events(ToolProcessEventRequest {
+                sidecar_requests: sidecar_requests.clone(),
+                connection_id: vm.connection_id.clone(),
+                session_id: vm.session_id.clone(),
+                vm_id: vm_id.to_owned(),
                 tool_resolution,
                 cancelled,
-            );
+                pending_events,
+                events_overflowed,
+            });
             (
                 kernel_pid,
                 kernel_handle,
@@ -5059,6 +5350,14 @@ where
                 }
                 GuestRuntimeKind::WebAssembly => {
                     execution_env.insert(String::from(WASM_STDIO_SYNC_RPC_ENV), String::from("1"));
+                    execution_env.insert(
+                        String::from("AGENT_OS_VIRTUAL_PROCESS_PID"),
+                        kernel_pid.to_string(),
+                    );
+                    execution_env.insert(
+                        String::from("AGENT_OS_VIRTUAL_PROCESS_PPID"),
+                        parent_kernel_pid.to_string(),
+                    );
                     apply_wasm_limit_env(&mut execution_env, vm.kernel.resource_limits());
                     let context = self.wasm_engine.create_context(CreateWasmContextRequest {
                         vm_id: vm_id.to_owned(),
@@ -5109,8 +5408,7 @@ where
                 .with_detached(request.options.detached)
                 .with_guest_cwd(resolved.guest_cwd.clone())
                 .with_env(resolved.env.clone())
-                .with_host_cwd(resolved.host_cwd.clone())
-                .with_child_process_redirect(active_child_process_redirect(redirect.as_ref())),
+                .with_host_cwd(resolved.host_cwd.clone()),
         );
         if let Some(kernel_stdin_writer_fd) = kernel_stdin_writer_fd {
             process
@@ -5138,14 +5436,16 @@ where
         request: JavascriptChildProcessSpawnRequest,
         max_buffer: Option<usize>,
     ) -> Result<Value, SidecarError> {
-        let redirect = self.direct_shell_redirect_for_javascript_child_process(
-            vm_id,
-            process_id,
-            &[],
-            &request,
-        )?;
         let sync_input = javascript_child_process_sync_input_bytes(request.options.input.as_ref())?;
-        let request = javascript_child_process_request_for_redirect(request, redirect.as_ref());
+        let timeout_deadline = request
+            .options
+            .timeout
+            .map(|timeout_ms| Instant::now() + Duration::from_millis(timeout_ms));
+        let timeout_signal = request
+            .options
+            .kill_signal
+            .clone()
+            .unwrap_or_else(|| String::from("SIGTERM"));
         let spawned = self.spawn_javascript_child_process(vm_id, process_id, request)?;
         let child_process_id = spawned
             .get("childId")
@@ -5157,21 +5457,7 @@ where
             })?
             .to_owned();
 
-        let (parent_kernel_pid, child_guest_cwd) =
-            self.javascript_child_process_sync_context(vm_id, process_id, &[], &child_process_id)?;
-        let redirect_input = if let Some(redirect) = redirect.as_ref() {
-            self.javascript_child_process_redirect_stdin(
-                vm_id,
-                parent_kernel_pid,
-                &child_guest_cwd,
-                redirect,
-            )?
-        } else {
-            None
-        };
-        let sync_input = redirect_input.as_ref().or(sync_input.as_ref());
-
-        if let Some(input) = sync_input.map(Vec::as_slice) {
+        if let Some(input) = sync_input.as_deref() {
             self.write_javascript_child_process_stdin(vm_id, process_id, &child_process_id, input)?;
         }
         self.close_javascript_child_process_stdin(vm_id, process_id, &child_process_id)?;
@@ -5181,10 +5467,32 @@ where
         let mut stderr = Vec::new();
         let mut max_buffer_exceeded = false;
         let mut kill_sent = false;
+        let mut timed_out = false;
 
         let exit_code = loop {
+            let wait_ms = if let Some(deadline) = timeout_deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    if !kill_sent {
+                        timed_out = true;
+                        self.kill_javascript_child_process(
+                            vm_id,
+                            process_id,
+                            &child_process_id,
+                            &timeout_signal,
+                        )?;
+                        kill_sent = true;
+                    }
+                    0
+                } else {
+                    u64::try_from(deadline.saturating_duration_since(now).as_millis().min(50))
+                        .unwrap_or(50)
+                }
+            } else {
+                50
+            };
             let event =
-                self.poll_javascript_child_process(vm_id, process_id, &child_process_id, 50)?;
+                self.poll_javascript_child_process(vm_id, process_id, &child_process_id, wait_ms)?;
             if event.is_null() {
                 continue;
             }
@@ -5237,135 +5545,14 @@ where
             }
         };
 
-        self.apply_javascript_child_process_redirect_stdout(
-            vm_id,
-            parent_kernel_pid,
-            &child_guest_cwd,
-            redirect.as_ref(),
-            &mut stdout,
-        )?;
-
         Ok(json!({
             "stdout": String::from_utf8_lossy(&stdout),
             "stderr": String::from_utf8_lossy(&stderr),
             "code": exit_code,
+            "signal": if timed_out { Value::String(timeout_signal) } else { Value::Null },
+            "timedOut": timed_out,
             "maxBufferExceeded": max_buffer_exceeded,
         }))
-    }
-
-    fn direct_shell_redirect_for_javascript_child_process(
-        &self,
-        _vm_id: &str,
-        _process_id: &str,
-        _current_process_path: &[&str],
-        request: &JavascriptChildProcessSpawnRequest,
-    ) -> Result<Option<SimpleShellRedirectCommand>, SidecarError> {
-        let shell_script = if request.options.shell {
-            request.command.as_str()
-        } else if is_shell_command(&request.command)
-            && request.args.len() == 2
-            && request.args.first().is_some_and(|arg| arg == "-c")
-        {
-            request.args[1].as_str()
-        } else {
-            return Ok(None);
-        };
-
-        let Some(parsed) = parse_simple_shell_redirect_command(shell_script) else {
-            return Ok(None);
-        };
-        if !parsed.has_redirects() || is_posix_shell_builtin(&parsed.command) {
-            return Ok(None);
-        }
-        Ok(Some(parsed))
-    }
-
-    fn javascript_child_process_sync_context(
-        &self,
-        vm_id: &str,
-        process_id: &str,
-        current_process_path: &[&str],
-        child_process_id: &str,
-    ) -> Result<(u32, String), SidecarError> {
-        let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
-        let root = vm
-            .active_processes
-            .get(process_id)
-            .ok_or_else(|| missing_process_error(vm_id, process_id))?;
-        let parent = Self::active_process_by_path(root, current_process_path).ok_or_else(|| {
-            SidecarError::InvalidState(format!(
-                "unknown child process path {} during spawn_sync context lookup",
-                Self::child_process_path_label(process_id, current_process_path)
-            ))
-        })?;
-        let child = parent
-            .child_processes
-            .get(child_process_id)
-            .ok_or_else(|| javascript_child_process_gone_error(process_id, &[child_process_id]))?;
-        Ok((parent.kernel_pid, child.guest_cwd.clone()))
-    }
-
-    fn javascript_child_process_redirect_stdin(
-        &mut self,
-        vm_id: &str,
-        parent_kernel_pid: u32,
-        child_guest_cwd: &str,
-        redirect: &SimpleShellRedirectCommand,
-    ) -> Result<Option<Vec<u8>>, SidecarError> {
-        let Some(stdin_path) = redirect.stdin_path.as_deref() else {
-            return Ok(None);
-        };
-        let guest_path = resolve_shell_redirect_guest_path(child_guest_cwd, stdin_path);
-        let vm = self
-            .vms
-            .get_mut(vm_id)
-            .ok_or_else(|| missing_vm_error(vm_id))?;
-        vm.kernel
-            .read_file_for_process(EXECUTION_DRIVER_NAME, parent_kernel_pid, &guest_path)
-            .map(Some)
-            .map_err(kernel_error)
-    }
-
-    fn apply_javascript_child_process_redirect_stdout(
-        &mut self,
-        vm_id: &str,
-        parent_kernel_pid: u32,
-        child_guest_cwd: &str,
-        redirect: Option<&SimpleShellRedirectCommand>,
-        stdout: &mut Vec<u8>,
-    ) -> Result<(), SidecarError> {
-        let Some(redirect) = redirect else {
-            return Ok(());
-        };
-        let Some(stdout_path) = redirect.stdout_path.as_deref() else {
-            return Ok(());
-        };
-        let guest_path = resolve_shell_redirect_guest_path(child_guest_cwd, stdout_path);
-        let vm = self
-            .vms
-            .get_mut(vm_id)
-            .ok_or_else(|| missing_vm_error(vm_id))?;
-        let contents = if redirect.append_stdout {
-            let mut existing = vm
-                .kernel
-                .read_file_for_process(EXECUTION_DRIVER_NAME, parent_kernel_pid, &guest_path)
-                .unwrap_or_default();
-            existing.extend_from_slice(stdout);
-            existing
-        } else {
-            stdout.clone()
-        };
-        vm.kernel
-            .write_file_for_process(
-                EXECUTION_DRIVER_NAME,
-                parent_kernel_pid,
-                &guest_path,
-                contents,
-                None,
-            )
-            .map_err(kernel_error)?;
-        stdout.clear();
-        Ok(())
     }
 
     fn spawn_descendant_javascript_child_process(
@@ -5377,13 +5564,6 @@ where
     ) -> Result<Value, SidecarError> {
         let current_process_label =
             Self::child_process_path_label(process_id, current_process_path);
-        let redirect = self.direct_shell_redirect_for_javascript_child_process(
-            vm_id,
-            process_id,
-            current_process_path,
-            &request,
-        )?;
-        let request = javascript_child_process_request_for_redirect(request, redirect.as_ref());
         let (resolved, parent_kernel_pid) = {
             let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
             let root = vm
@@ -5408,7 +5588,6 @@ where
             )
         };
 
-        let process_event_sender = self.process_event_sender.clone();
         let sidecar_requests = self.sidecar_requests.clone();
         let vm = self
             .vms
@@ -5429,7 +5608,6 @@ where
         };
         let mut child_path = current_process_path.to_vec();
         child_path.push(child_process_id.as_str());
-        let child_runtime_process_id = Self::child_process_path_label(process_id, &child_path);
         let (kernel_pid, kernel_handle, execution, kernel_stdin_writer_fd) = if resolved
             .tool_command
         {
@@ -5456,23 +5634,24 @@ where
                         parent_pid: Some(parent_kernel_pid),
                         env: resolved.env.clone(),
                         cwd: Some(resolved.guest_cwd.clone()),
-                        ..VirtualProcessOptions::default()
                     },
                 )
                 .map_err(kernel_error)?;
             let kernel_pid = kernel_handle.pid();
             let tool_execution = ToolExecution::default();
             let cancelled = tool_execution.cancelled.clone();
-            spawn_tool_process_events(
-                process_event_sender.clone(),
-                sidecar_requests.clone(),
-                vm.connection_id.clone(),
-                vm.session_id.clone(),
-                vm_id.to_owned(),
-                child_runtime_process_id.clone(),
+            let pending_events = tool_execution.pending_events.clone();
+            let events_overflowed = tool_execution.events_overflowed.clone();
+            spawn_tool_process_events(ToolProcessEventRequest {
+                sidecar_requests: sidecar_requests.clone(),
+                connection_id: vm.connection_id.clone(),
+                session_id: vm.session_id.clone(),
+                vm_id: vm_id.to_owned(),
                 tool_resolution,
                 cancelled,
-            );
+                pending_events,
+                events_overflowed,
+            });
             (
                 kernel_pid,
                 kernel_handle,
@@ -5559,6 +5738,14 @@ where
                 }
                 GuestRuntimeKind::WebAssembly => {
                     execution_env.insert(String::from(WASM_STDIO_SYNC_RPC_ENV), String::from("1"));
+                    execution_env.insert(
+                        String::from("AGENT_OS_VIRTUAL_PROCESS_PID"),
+                        kernel_pid.to_string(),
+                    );
+                    execution_env.insert(
+                        String::from("AGENT_OS_VIRTUAL_PROCESS_PPID"),
+                        parent_kernel_pid.to_string(),
+                    );
                     apply_wasm_limit_env(&mut execution_env, vm.kernel.resource_limits());
                     let context = self.wasm_engine.create_context(CreateWasmContextRequest {
                         vm_id: vm_id.to_owned(),
@@ -5615,8 +5802,7 @@ where
                 .with_detached(request.options.detached)
                 .with_guest_cwd(resolved.guest_cwd.clone())
                 .with_env(resolved.env.clone())
-                .with_host_cwd(resolved.host_cwd.clone())
-                .with_child_process_redirect(active_child_process_redirect(redirect.as_ref())),
+                .with_host_cwd(resolved.host_cwd.clone()),
         );
         if let Some(kernel_stdin_writer_fd) = kernel_stdin_writer_fd {
             parent
@@ -5645,14 +5831,16 @@ where
         request: JavascriptChildProcessSpawnRequest,
         max_buffer: Option<usize>,
     ) -> Result<Value, SidecarError> {
-        let redirect = self.direct_shell_redirect_for_javascript_child_process(
-            vm_id,
-            process_id,
-            current_process_path,
-            &request,
-        )?;
         let sync_input = javascript_child_process_sync_input_bytes(request.options.input.as_ref())?;
-        let request = javascript_child_process_request_for_redirect(request, redirect.as_ref());
+        let timeout_deadline = request
+            .options
+            .timeout
+            .map(|timeout_ms| Instant::now() + Duration::from_millis(timeout_ms));
+        let timeout_signal = request
+            .options
+            .kill_signal
+            .clone()
+            .unwrap_or_else(|| String::from("SIGTERM"));
         let spawned = self.spawn_descendant_javascript_child_process(
             vm_id,
             process_id,
@@ -5669,25 +5857,7 @@ where
             })?
             .to_owned();
 
-        let (parent_kernel_pid, child_guest_cwd) = self.javascript_child_process_sync_context(
-            vm_id,
-            process_id,
-            current_process_path,
-            &child_process_id,
-        )?;
-        let redirect_input = if let Some(redirect) = redirect.as_ref() {
-            self.javascript_child_process_redirect_stdin(
-                vm_id,
-                parent_kernel_pid,
-                &child_guest_cwd,
-                redirect,
-            )?
-        } else {
-            None
-        };
-        let sync_input = redirect_input.as_ref().or(sync_input.as_ref());
-
-        if let Some(input) = sync_input.map(Vec::as_slice) {
+        if let Some(input) = sync_input.as_deref() {
             self.write_descendant_javascript_child_process_stdin(
                 vm_id,
                 process_id,
@@ -5708,14 +5878,37 @@ where
         let mut stderr = Vec::new();
         let mut max_buffer_exceeded = false;
         let mut kill_sent = false;
+        let mut timed_out = false;
 
         let exit_code = loop {
+            let wait_ms = if let Some(deadline) = timeout_deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    if !kill_sent {
+                        timed_out = true;
+                        self.kill_descendant_javascript_child_process(
+                            vm_id,
+                            process_id,
+                            current_process_path,
+                            &child_process_id,
+                            &timeout_signal,
+                        )?;
+                        kill_sent = true;
+                    }
+                    0
+                } else {
+                    u64::try_from(deadline.saturating_duration_since(now).as_millis().min(50))
+                        .unwrap_or(50)
+                }
+            } else {
+                50
+            };
             let event = self.poll_descendant_javascript_child_process(
                 vm_id,
                 process_id,
                 current_process_path,
                 &child_process_id,
-                50,
+                wait_ms,
             )?;
             if event.is_null() {
                 continue;
@@ -5771,18 +5964,12 @@ where
             }
         };
 
-        self.apply_javascript_child_process_redirect_stdout(
-            vm_id,
-            parent_kernel_pid,
-            &child_guest_cwd,
-            redirect.as_ref(),
-            &mut stdout,
-        )?;
-
         Ok(json!({
             "stdout": String::from_utf8_lossy(&stdout),
             "stderr": String::from_utf8_lossy(&stderr),
             "code": exit_code,
+            "signal": if timed_out { Value::String(timeout_signal) } else { Value::Null },
+            "timedOut": timed_out,
             "maxBufferExceeded": max_buffer_exceeded,
         }))
     }
@@ -5904,6 +6091,8 @@ where
         let mut child_path = current_process_path.to_vec();
         child_path.push(child_process_id);
         let child_gone_error = || javascript_child_process_gone_error(process_id, &child_path);
+        let deadline = Instant::now() + Duration::from_millis(wait_ms);
+        let mut polled_once = false;
 
         loop {
             self.drain_queued_descendant_javascript_child_process_events(
@@ -5912,9 +6101,15 @@ where
                 &child_path,
             )?;
             enum ChildPollResult {
-                Event(Option<ActiveExecutionEvent>),
+                Event(Box<Option<ActiveExecutionEvent>>),
                 RecoverRuntimeExit,
+                Timeout,
             }
+            let wait = if wait_ms == 0 {
+                Duration::ZERO
+            } else {
+                deadline.saturating_duration_since(Instant::now())
+            };
             let poll_result = {
                 let Some(vm) = self.vms.get_mut(vm_id) else {
                     return Ok(Value::Null);
@@ -5928,13 +6123,13 @@ where
                     return Err(child_gone_error());
                 };
                 if let Some(event) = child.pending_execution_events.pop_front() {
-                    ChildPollResult::Event(Some(event))
+                    ChildPollResult::Event(Box::new(Some(event)))
+                } else if polled_once && wait.is_zero() {
+                    ChildPollResult::Timeout
                 } else {
-                    match child
-                        .execution
-                        .poll_event_blocking(Duration::from_millis(wait_ms))
-                    {
-                        Ok(Some(event)) => ChildPollResult::Event(Some(event)),
+                    polled_once = true;
+                    match child.execution.poll_event_blocking(wait) {
+                        Ok(Some(event)) => ChildPollResult::Event(Box::new(Some(event))),
                         Ok(None) => ChildPollResult::RecoverRuntimeExit,
                         Err(SidecarError::Execution(message))
                             if (child.runtime == GuestRuntimeKind::JavaScript
@@ -5951,14 +6146,15 @@ where
                 }
             };
             let event = match poll_result {
-                ChildPollResult::Event(event) => event,
+                ChildPollResult::Event(event) => *event,
+                ChildPollResult::Timeout => return Ok(Value::Null),
                 ChildPollResult::RecoverRuntimeExit => self
                     .recover_descendant_runtime_child_process_event(
                         vm_id,
                         process_id,
                         current_process_path,
                         child_process_id,
-                        wait_ms,
+                        wait.as_millis().try_into().unwrap_or(u64::MAX),
                     )?,
             };
 
@@ -5968,30 +6164,6 @@ where
 
             match event {
                 ActiveExecutionEvent::Stdout(chunk) => {
-                    let redirected = {
-                        let Some(vm) = self.vms.get_mut(vm_id) else {
-                            return Ok(Value::Null);
-                        };
-                        let Some(parent) = Self::descendant_parent_process_mut(
-                            vm,
-                            process_id,
-                            current_process_path,
-                        ) else {
-                            return Err(child_gone_error());
-                        };
-                        let Some(child) = parent.child_processes.get_mut(child_process_id) else {
-                            return Err(child_gone_error());
-                        };
-                        if let Some(redirect) = child.child_process_redirect.as_mut() {
-                            redirect.stdout.extend_from_slice(&chunk);
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if redirected {
-                        continue;
-                    }
                     return Ok(json!({
                         "type": "stdout",
                         "data": javascript_sync_rpc_bytes_value(&chunk),
@@ -6028,15 +6200,15 @@ where
                             if matches!(next, ActiveExecutionEvent::Exited(_)) {
                                 continue;
                             }
-                            child.pending_execution_events.push_back(next);
+                            child.queue_pending_execution_event(next)?;
                             if Instant::now() >= deadline {
                                 break;
                             }
                         }
                         if !child.pending_execution_events.is_empty() {
-                            child
-                                .pending_execution_events
-                                .push_back(ActiveExecutionEvent::Exited(exit_code));
+                            child.queue_pending_execution_event(ActiveExecutionEvent::Exited(
+                                exit_code,
+                            ))?;
                             true
                         } else {
                             false
@@ -6070,19 +6242,13 @@ where
                             }
                         })
                     };
-                    let (
-                        parent_kernel_pid,
-                        parent_runtime_pid,
-                        parent_v8_signal_session,
-                        should_signal_parent,
-                    ) = {
+                    let (parent_runtime_pid, parent_v8_signal_session, should_signal_parent) = {
                         let Some(parent) =
                             Self::descendant_parent_process(vm, process_id, current_process_path)
                         else {
                             return Ok(Value::Null);
                         };
                         (
-                            parent.kernel_pid,
                             parent.execution.child_pid(),
                             parent.execution.javascript_v8_session_handle().filter(|_| {
                                 matches!(
@@ -6111,11 +6277,6 @@ where
                         Self::child_process_path_label(process_id, &child_path);
                     let detached_children =
                         Self::adopt_detached_child_processes(&child_process_label, &mut child);
-                    apply_active_child_process_redirect_stdout(
-                        &mut vm.kernel,
-                        parent_kernel_pid,
-                        &mut child,
-                    )?;
                     sync_process_host_writes_to_kernel(vm, &child)?;
                     terminate_child_process_tree(&mut vm.kernel, &mut child);
                     child.kernel_handle.finish(exit_code);
@@ -6161,6 +6322,14 @@ where
                             registration,
                         );
                         Ok(Value::Null)
+                    } else if request.method == "process.kill" {
+                        self.handle_descendant_process_kill_rpc(
+                            vm_id,
+                            process_id,
+                            current_process_path,
+                            child_process_id,
+                            &request,
+                        )
                     } else if request.method.starts_with("child_process.") {
                         self.handle_descendant_javascript_child_process_rpc(
                             vm_id,
@@ -6186,17 +6355,17 @@ where
                         let Some(child) = parent.child_processes.get_mut(child_process_id) else {
                             return Ok(Value::Null);
                         };
-                        service_javascript_sync_rpc(
-                            &self.bridge,
+                        service_javascript_sync_rpc(JavascriptSyncRpcServiceRequest {
+                            bridge: &self.bridge,
                             vm_id,
-                            &vm.dns,
-                            &socket_paths,
-                            &mut vm.kernel,
-                            child,
-                            &request,
-                            &resource_limits,
+                            dns: &vm.dns,
+                            socket_paths: &socket_paths,
+                            kernel: &mut vm.kernel,
+                            process: child,
+                            sync_request: &request,
+                            resource_limits: &resource_limits,
                             network_counts,
-                        )
+                        })
                     };
 
                     let Some(vm) = self.vms.get_mut(vm_id) else {
@@ -6210,6 +6379,22 @@ where
                     let Some(child) = parent.child_processes.get_mut(child_process_id) else {
                         return Ok(Value::Null);
                     };
+                    let parent_signal_event = response.as_ref().ok().and_then(|result| {
+                        let target_path_label =
+                            Self::child_process_path_label(process_id, current_process_path);
+                        if request.method != "process.kill"
+                            || result.get("action").and_then(Value::as_str) != Some("user")
+                            || result.get("targetProcessPath").and_then(Value::as_str)
+                                != Some(target_path_label.as_str())
+                        {
+                            return None;
+                        }
+                        Some(json!({
+                            "type": "signal",
+                            "signal": result.get("signal").and_then(Value::as_str).unwrap_or_default(),
+                            "number": result.get("number").and_then(Value::as_i64).unwrap_or_default(),
+                        }))
+                    });
                     match response {
                         Ok(result) => child
                             .execution
@@ -6219,10 +6404,13 @@ where
                             .execution
                             .respond_javascript_sync_rpc_error(
                                 request.id,
-                                &javascript_sync_rpc_error_code(&error),
+                                javascript_sync_rpc_error_code(&error),
                                 error.to_string(),
                             )
                             .or_else(ignore_stale_javascript_sync_rpc_response)?,
+                    }
+                    if let Some(event) = parent_signal_event {
+                        return Ok(event);
                     }
                 }
                 ActiveExecutionEvent::PythonVfsRpcRequest(_) => {
@@ -6416,25 +6604,7 @@ where
         let Some(child) = parent.child_processes.get_mut(child_process_id) else {
             return Ok(());
         };
-        let should_terminate_shared_runtime = child.execution.uses_shared_v8_runtime()
-            && signal != 0
-            && !matches!(
-                signal,
-                libc::SIGHUP
-                    | libc::SIGINT
-                    | libc::SIGTERM
-                    | libc::SIGCHLD
-                    | libc::SIGWINCH
-                    | libc::SIGSTOP
-                    | libc::SIGCONT
-            );
-        if should_terminate_shared_runtime {
-            child.execution.terminate()?;
-        } else {
-            vm.kernel
-                .kill_process(EXECUTION_DRIVER_NAME, child.kernel_pid, signal)
-                .map_err(kernel_error)?;
-        }
+        terminate_tracked_child_process_for_signal(&mut vm.kernel, child, signal)?;
         let child_process_label = if current_process_path.is_empty() {
             child_process_id.to_owned()
         } else {
@@ -6454,6 +6624,223 @@ where
             ]),
         );
         Ok(())
+    }
+
+    fn handle_descendant_process_kill_rpc(
+        &mut self,
+        vm_id: &str,
+        process_id: &str,
+        current_process_path: &[&str],
+        child_process_id: &str,
+        request: &JavascriptSyncRpcRequest,
+    ) -> Result<Value, SidecarError> {
+        let target_pid = javascript_sync_rpc_arg_i32(&request.args, 0, "process.kill target pid")?;
+        let signal_name = javascript_sync_rpc_arg_str(&request.args, 1, "process.kill signal")?;
+        let signal = parse_signal(signal_name)?;
+
+        let mut source_path = current_process_path.to_vec();
+        source_path.push(child_process_id);
+
+        if signal != 0 && target_pid < 0 {
+            let pgid = target_pid.unsigned_abs();
+            let caller_kernel_pid = {
+                let Some(vm) = self.vms.get(vm_id) else {
+                    return Err(SidecarError::InvalidState(String::from(
+                        "ESRCH: unknown VM during process.kill",
+                    )));
+                };
+                let Some(root) = vm.active_processes.get(process_id) else {
+                    return Err(SidecarError::InvalidState(format!(
+                        "ESRCH: unknown process {process_id} during process.kill",
+                    )));
+                };
+                let Some(source) = Self::active_process_by_path(root, &source_path) else {
+                    return Err(SidecarError::InvalidState(format!(
+                        "ESRCH: unknown child process {child_process_id} during process.kill",
+                    )));
+                };
+                source.kernel_pid
+            };
+            let caller_is_member =
+                self.signal_vm_process_group(vm_id, caller_kernel_pid, pgid, signal_name)?;
+            if !caller_is_member {
+                return Ok(Value::Null);
+            }
+            let Some(vm) = self.vms.get_mut(vm_id) else {
+                return Ok(Value::Null);
+            };
+            let Some(root) = vm.active_processes.get_mut(process_id) else {
+                return Ok(Value::Null);
+            };
+            let Some(source) = Self::active_process_by_path_mut(root, &source_path) else {
+                return Ok(Value::Null);
+            };
+            source.pending_self_signal_exit = None;
+            if !matches!(
+                canonical_signal_name(signal),
+                Some("SIGWINCH" | "SIGCHLD" | "SIGCONT" | "SIGURG")
+            ) {
+                source.pending_self_signal_exit = Some(signal);
+            }
+            return Ok(json!({
+                "self": true,
+                "action": "default",
+            }));
+        }
+
+        let Some(vm) = self.vms.get_mut(vm_id) else {
+            return Err(SidecarError::InvalidState(String::from(
+                "ESRCH: unknown VM during process.kill",
+            )));
+        };
+
+        if signal == 0 {
+            vm.kernel
+                .signal_process(EXECUTION_DRIVER_NAME, target_pid, signal)
+                .map_err(kernel_error)?;
+            return Ok(Value::Null);
+        }
+
+        let target_kernel_pid = u32::try_from(target_pid).map_err(|_| {
+            SidecarError::InvalidState(format!("EINVAL: invalid process pid {target_pid}"))
+        })?;
+        let (source_pid, located_target_path) = {
+            let Some(root) = vm.active_processes.get(process_id) else {
+                return Err(SidecarError::InvalidState(format!(
+                    "ESRCH: unknown process {process_id} during process.kill",
+                )));
+            };
+            let Some(source) = Self::active_process_by_path(root, &source_path) else {
+                return Err(SidecarError::InvalidState(format!(
+                    "ESRCH: unknown child process {child_process_id} during process.kill",
+                )));
+            };
+            vm.kernel
+                .signal_process(EXECUTION_DRIVER_NAME, target_pid, 0)
+                .map_err(kernel_error)?;
+            (
+                source.kernel_pid,
+                Self::active_process_path_by_kernel_pid(root, target_kernel_pid),
+            )
+        };
+        let Some(target_path) = located_target_path else {
+            // The target is alive but not part of this root's process tree.
+            // Resolve it VM-wide so cross-tree pids and untracked kernel
+            // processes still receive the signal.
+            self.signal_vm_kernel_pid(vm_id, target_kernel_pid, signal_name)?;
+            return Ok(Value::Null);
+        };
+        let Some(vm) = self.vms.get_mut(vm_id) else {
+            return Err(SidecarError::InvalidState(String::from(
+                "ESRCH: unknown VM during process.kill",
+            )));
+        };
+
+        if source_pid == target_kernel_pid {
+            let Some(root) = vm.active_processes.get_mut(process_id) else {
+                return Ok(Value::Null);
+            };
+            let Some(source) = Self::active_process_by_path_mut(root, &source_path) else {
+                return Ok(Value::Null);
+            };
+            source.pending_self_signal_exit = None;
+            if !matches!(
+                canonical_signal_name(signal),
+                Some("SIGWINCH" | "SIGCHLD" | "SIGCONT" | "SIGURG")
+            ) {
+                source.pending_self_signal_exit = Some(signal);
+            }
+            return Ok(json!({
+                "self": true,
+                "action": "default",
+            }));
+        }
+
+        let signal_key = target_path.last().map(String::as_str).unwrap_or(process_id);
+        let registration = vm
+            .signal_states
+            .get(signal_key)
+            .and_then(|handlers| handlers.get(&(signal as u32)))
+            .cloned();
+
+        let action = match registration
+            .as_ref()
+            .map(|registration| &registration.action)
+        {
+            Some(SignalDispositionAction::Ignore) => "ignore",
+            Some(SignalDispositionAction::User) => {
+                let Some(root) = vm.active_processes.get_mut(process_id) else {
+                    return Ok(Value::Null);
+                };
+                let Some(target) = Self::active_process_by_owned_path_mut(root, &target_path)
+                else {
+                    return Err(SidecarError::InvalidState(format!(
+                        "ESRCH: unknown process pid {target_pid}"
+                    )));
+                };
+                if let Some(session) = target.execution.javascript_v8_session_handle().filter(
+                    |_| matches!(&target.execution, ActiveExecution::Javascript(execution) if execution.uses_shared_v8_runtime())
+                        || matches!(&target.execution, ActiveExecution::Wasm(execution) if execution.uses_shared_v8_runtime()),
+                ) {
+                    dispatch_v8_session_signal_async(session, signal);
+                } else if !dispatch_v8_process_signal(target, signal)? {
+                    return Err(SidecarError::InvalidState(format!(
+                        "unsupported guest signal delivery for pid {target_pid}"
+                    )));
+                }
+                "user"
+            }
+            Some(SignalDispositionAction::Default) | None
+                if matches!(
+                    canonical_signal_name(signal),
+                    Some("SIGWINCH" | "SIGCHLD" | "SIGURG")
+                ) =>
+            {
+                "ignore"
+            }
+            Some(SignalDispositionAction::Default) | None => {
+                let Some(root) = vm.active_processes.get_mut(process_id) else {
+                    return Ok(Value::Null);
+                };
+                let Some(target) = Self::active_process_by_owned_path_mut(root, &target_path)
+                else {
+                    return Err(SidecarError::InvalidState(format!(
+                        "ESRCH: unknown process pid {target_pid}"
+                    )));
+                };
+                apply_active_process_default_signal(&mut vm.kernel, target, signal)?;
+                "default"
+            }
+        };
+
+        let target_path_label = Self::child_process_path_label(
+            process_id,
+            &target_path.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        emit_security_audit_event(
+            &self.bridge,
+            vm_id,
+            "security.process.kill",
+            audit_fields([
+                (String::from("source"), String::from("guest_process")),
+                (String::from("source_pid"), source_pid.to_string()),
+                (String::from("target_pid"), target_pid.to_string()),
+                (String::from("process_id"), process_id.to_owned()),
+                (
+                    String::from("target_process_path"),
+                    target_path_label.clone(),
+                ),
+                (String::from("signal"), signal_name.to_owned()),
+            ]),
+        );
+
+        Ok(json!({
+            "self": false,
+            "action": action,
+            "signal": signal_name,
+            "number": signal,
+            "targetProcessPath": target_path_label,
+        }))
     }
 
     pub(crate) fn poll_javascript_child_process(
@@ -6559,25 +6946,7 @@ where
                     "unknown child process {child_process_id} during kill"
                 ))
             })?;
-        let should_terminate_shared_runtime = child.execution.uses_shared_v8_runtime()
-            && signal != 0
-            && !matches!(
-                signal,
-                libc::SIGHUP
-                    | libc::SIGINT
-                    | libc::SIGTERM
-                    | libc::SIGCHLD
-                    | libc::SIGWINCH
-                    | libc::SIGSTOP
-                    | libc::SIGCONT
-            );
-        if should_terminate_shared_runtime {
-            child.execution.terminate()?;
-        } else {
-            vm.kernel
-                .kill_process(EXECUTION_DRIVER_NAME, child.kernel_pid, signal)
-                .map_err(kernel_error)?;
-        }
+        terminate_tracked_child_process_for_signal(&mut vm.kernel, child, signal)?;
         emit_security_audit_event(
             &self.bridge,
             vm_id,
@@ -6596,6 +6965,210 @@ where
         );
         Ok(())
     }
+
+    /// Delivers a signal to one kernel pid inside a VM, resolving the target
+    /// through the active-process tree first so tracked sidecar executions get
+    /// the same termination handling as a direct `child_process.kill`.
+    /// Untracked kernel processes (for example WASM subprocess trees) receive
+    /// the signal through the kernel process table directly.
+    pub(crate) fn signal_vm_kernel_pid(
+        &mut self,
+        vm_id: &str,
+        target_kernel_pid: u32,
+        signal_name: &str,
+    ) -> Result<(), SidecarError> {
+        let signal = parse_signal(signal_name)?;
+        let located = {
+            let Some(vm) = self.vms.get(vm_id) else {
+                return Err(SidecarError::InvalidState(String::from(
+                    "ESRCH: unknown VM during process.kill",
+                )));
+            };
+            let alive = vm
+                .kernel
+                .list_processes()
+                .get(&target_kernel_pid)
+                .is_some_and(|info| info.status != ProcessStatus::Exited);
+            if !alive {
+                return Err(SidecarError::InvalidState(format!(
+                    "ESRCH: no such process {target_kernel_pid}"
+                )));
+            }
+            vm.active_processes.iter().find_map(|(process_id, root)| {
+                Self::active_process_path_by_kernel_pid(root, target_kernel_pid)
+                    .map(|path| (process_id.clone(), path))
+            })
+        };
+
+        match located {
+            Some((process_id, path)) if path.is_empty() => {
+                self.kill_process_internal(vm_id, &process_id, signal_name)
+            }
+            Some((process_id, path)) => {
+                let Some(vm) = self.vms.get_mut(vm_id) else {
+                    return Ok(());
+                };
+                let Some(root) = vm.active_processes.get_mut(&process_id) else {
+                    return Ok(());
+                };
+                let Some(target) = Self::active_process_by_owned_path_mut(root, &path) else {
+                    return Err(SidecarError::InvalidState(format!(
+                        "ESRCH: no such process {target_kernel_pid}"
+                    )));
+                };
+                terminate_tracked_child_process_for_signal(&mut vm.kernel, target, signal)?;
+                emit_security_audit_event(
+                    &self.bridge,
+                    vm_id,
+                    "security.process.kill",
+                    audit_fields([
+                        (String::from("source"), String::from("guest_process")),
+                        (String::from("target_pid"), target_kernel_pid.to_string()),
+                        (String::from("process_id"), process_id),
+                        (String::from("signal"), signal_name.to_owned()),
+                    ]),
+                );
+                Ok(())
+            }
+            None => {
+                let Some(vm) = self.vms.get_mut(vm_id) else {
+                    return Ok(());
+                };
+                let target_pid = i32::try_from(target_kernel_pid).map_err(|_| {
+                    SidecarError::InvalidState(format!(
+                        "EINVAL: invalid process pid {target_kernel_pid}"
+                    ))
+                })?;
+                vm.kernel
+                    .signal_process(EXECUTION_DRIVER_NAME, target_pid, signal)
+                    .map_err(kernel_error)?;
+                emit_security_audit_event(
+                    &self.bridge,
+                    vm_id,
+                    "security.process.kill",
+                    audit_fields([
+                        (String::from("source"), String::from("guest_process")),
+                        (String::from("target_pid"), target_kernel_pid.to_string()),
+                        (String::from("signal"), signal_name.to_owned()),
+                    ]),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Delivers a signal to every live member of a VM process group, matching
+    /// Linux `kill(-pgid, sig)` semantics. Returns whether the caller itself
+    /// is a member of the group so entry points can apply self-signal
+    /// delivery; the caller is intentionally skipped here.
+    pub(crate) fn signal_vm_process_group(
+        &mut self,
+        vm_id: &str,
+        caller_kernel_pid: u32,
+        pgid: u32,
+        signal_name: &str,
+    ) -> Result<bool, SidecarError> {
+        parse_signal(signal_name)?;
+        let members = {
+            let Some(vm) = self.vms.get(vm_id) else {
+                return Err(SidecarError::InvalidState(String::from(
+                    "ESRCH: unknown VM during process.kill",
+                )));
+            };
+            vm.kernel
+                .list_processes()
+                .into_iter()
+                .filter(|(_, info)| info.pgid == pgid && info.status != ProcessStatus::Exited)
+                .map(|(pid, _)| pid)
+                .collect::<Vec<_>>()
+        };
+        if members.is_empty() {
+            return Err(SidecarError::InvalidState(format!(
+                "ESRCH: no such process group {pgid}"
+            )));
+        }
+
+        let mut caller_is_member = false;
+        for member_pid in members {
+            if member_pid == caller_kernel_pid {
+                caller_is_member = true;
+                continue;
+            }
+            match self.signal_vm_kernel_pid(vm_id, member_pid, signal_name) {
+                Ok(()) => {}
+                // Group members can exit while the group is being signaled. A
+                // vanished member is not an error for the group kill overall.
+                Err(error) if sidecar_error_is_esrch(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(caller_is_member)
+    }
+}
+
+/// Applies a kill signal to a tracked child execution. Shared-runtime
+/// executions for lethal signals are terminated directly with a synthetic
+/// signal exit so child polls observe a prompt close; everything else routes
+/// through the kernel process table.
+fn terminate_tracked_child_process_for_signal(
+    kernel: &mut SidecarKernel,
+    child: &mut ActiveProcess,
+    signal: i32,
+) -> Result<(), SidecarError> {
+    let should_terminate_shared_runtime = child.execution.uses_shared_v8_runtime()
+        && signal != 0
+        && !matches!(
+            signal,
+            libc::SIGHUP
+                | libc::SIGINT
+                | libc::SIGTERM
+                | libc::SIGCHLD
+                | libc::SIGWINCH
+                | libc::SIGSTOP
+                | libc::SIGCONT
+        );
+    if should_terminate_shared_runtime {
+        child.execution.terminate()?;
+        child.pending_self_signal_exit = Some(signal);
+        child.queue_pending_execution_event(ActiveExecutionEvent::Exited(128 + signal))?;
+    } else {
+        kernel
+            .kill_process(EXECUTION_DRIVER_NAME, child.kernel_pid, signal)
+            .map_err(kernel_error)?;
+    }
+    Ok(())
+}
+
+fn sidecar_error_is_esrch(error: &SidecarError) -> bool {
+    error.to_string().contains("ESRCH")
+}
+
+fn apply_active_process_default_signal(
+    kernel: &mut SidecarKernel,
+    process: &mut ActiveProcess,
+    signal: i32,
+) -> Result<(), SidecarError> {
+    if matches!(signal, libc::SIGSTOP | libc::SIGCONT) {
+        return kernel
+            .kill_process(EXECUTION_DRIVER_NAME, process.kernel_pid, signal)
+            .map_err(kernel_error);
+    }
+
+    if signal != 0 && matches!(process.execution, ActiveExecution::Python(_)) {
+        close_kernel_process_stdin(kernel, process)?;
+    }
+
+    if process.execution.uses_shared_v8_runtime() {
+        process.execution.terminate()?;
+        if signal != 0 && matches!(process.execution, ActiveExecution::Wasm(_)) {
+            process.queue_pending_execution_event(ActiveExecutionEvent::Exited(128 + signal))?;
+        }
+        return Ok(());
+    }
+
+    kernel
+        .kill_process(EXECUTION_DRIVER_NAME, process.kernel_pid, signal)
+        .map_err(kernel_error)
 }
 
 fn map_wasm_signal_registration(
@@ -6704,10 +7277,12 @@ fn javascript_child_process_sync_input_bytes(
     match value {
         Value::Null => Ok(None),
         Value::String(text) => Ok(Some(text.as_bytes().to_vec())),
-        other => {
-            javascript_sync_rpc_bytes_arg(&[other.clone()], 0, "child_process.spawn_sync input")
-                .map(Some)
-        }
+        other => javascript_sync_rpc_bytes_arg(
+            std::slice::from_ref(other),
+            0,
+            "child_process.spawn_sync input",
+        )
+        .map(Some),
     }
 }
 
@@ -7514,7 +8089,7 @@ fn sync_host_directory_tree_to_kernel_inner(
                     )
                 });
             let desired_mode = host_shadow_mode(&metadata);
-            let bytes = fs::read(&host_path).map_err(|error| {
+            let bytes = read_host_shadow_file(&host_path, desired_mode).map_err(|error| {
                 SidecarError::Io(format!(
                     "failed to read host shadow file {}: {error}",
                     host_path.display()
@@ -7596,6 +8171,24 @@ fn host_shadow_mode(metadata: &fs::Metadata) -> u32 {
     metadata.permissions().mode() & 0o7777
 }
 
+/// Reads a shadow-root file back into the kernel even when guest-visible mode
+/// bits make it unreadable for the host user. The sidecar is the kernel for
+/// this tree, so guest permission bits (for example a 0o200 write-only file
+/// produced by `chmod` plus a shell append redirect) must not break the
+/// exit-time shadow sync. The original mode is restored after the read.
+fn read_host_shadow_file(host_path: &Path, mode: u32) -> std::io::Result<Vec<u8>> {
+    match fs::read(host_path) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            fs::set_permissions(host_path, fs::Permissions::from_mode(mode | 0o400))?;
+            let result = fs::read(host_path);
+            fs::set_permissions(host_path, fs::Permissions::from_mode(mode))?;
+            result
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn metadata_time_ms(seconds: i64, nanos: i64) -> u64 {
     let seconds = seconds.max(0) as u64;
     let nanos = nanos.max(0) as u64;
@@ -7651,12 +8244,22 @@ fn is_shadow_bootstrap_dir(path: &str) -> bool {
 
 #[cfg(test)]
 mod shadow_sync_tests {
-    use super::is_shadow_bootstrap_dir;
+    use super::{is_protected_agentos_shadow_sync_path, is_shadow_bootstrap_dir};
 
     #[test]
     fn shadow_bootstrap_sync_skips_virtual_home_tree() {
         assert!(is_shadow_bootstrap_dir("/home"));
         assert!(is_shadow_bootstrap_dir("/home/user"));
+    }
+
+    #[test]
+    fn protected_agentos_paths_are_not_shadow_synced() {
+        assert!(is_protected_agentos_shadow_sync_path("/etc/agentos"));
+        assert!(is_protected_agentos_shadow_sync_path(
+            "/etc/agentos/instructions.md"
+        ));
+        assert!(!is_protected_agentos_shadow_sync_path("/etc/agentos-copy"));
+        assert!(!is_protected_agentos_shadow_sync_path("/etc/agentos.md"));
     }
 }
 
@@ -7667,8 +8270,13 @@ fn is_kernel_owned_shadow_sync_path(path: &str) -> bool {
         || path.starts_with("/sys/")
 }
 
+pub(crate) fn is_protected_agentos_shadow_sync_path(path: &str) -> bool {
+    path == "/etc/agentos" || path.starts_with("/etc/agentos/")
+}
+
 fn should_skip_shadow_sync_path(vm: &VmState, guest_path: &str) -> bool {
     is_kernel_owned_shadow_sync_path(guest_path)
+        || is_protected_agentos_shadow_sync_path(guest_path)
         || host_mount_path_for_guest_path_from_mounts(&vm.configuration.mounts, guest_path)
             .is_some()
 }
@@ -8160,6 +8768,7 @@ fn runtime_guest_path_mappings(vm: &VmState) -> Vec<RuntimeGuestPathMapping> {
                         .map(|host_path| RuntimeGuestPathMapping {
                             guest_path: normalize_path(&mount.guest_path),
                             host_path: host_path.to_owned(),
+                            read_only: mount.read_only,
                         })
                 })
                 .flatten()
@@ -8181,6 +8790,7 @@ fn runtime_guest_path_mappings(vm: &VmState) -> Vec<RuntimeGuestPathMapping> {
                 .to_string_lossy()
                 .into_owned(),
             guest_path,
+            read_only: false,
         })
         .collect::<Vec<_>>();
     mappings.append(&mut command_root_mappings);
@@ -8192,6 +8802,7 @@ fn runtime_guest_path_mappings(vm: &VmState) -> Vec<RuntimeGuestPathMapping> {
                 RuntimeGuestPathMapping {
                     guest_path: String::from("/root/node_modules"),
                     host_path: host_root.to_string_lossy().into_owned(),
+                    read_only: mapping.read_only,
                 }
             })
         })
@@ -8200,6 +8811,7 @@ fn runtime_guest_path_mappings(vm: &VmState) -> Vec<RuntimeGuestPathMapping> {
     mappings.push(RuntimeGuestPathMapping {
         guest_path: String::from("/"),
         host_path: vm.cwd.to_string_lossy().into_owned(),
+        read_only: false,
     });
     mappings.sort_by(|left, right| right.guest_path.len().cmp(&left.guest_path.len()));
     mappings.dedup_by(|left, right| {
@@ -9718,6 +10330,10 @@ fn collect_javascript_socket_port_state(
     used_tcp_ports: &mut BTreeMap<JavascriptSocketFamily, BTreeSet<u16>>,
     used_udp_ports: &mut BTreeMap<JavascriptSocketFamily, BTreeSet<u16>>,
 ) {
+    for (family, port) in process.tcp_port_reservations.values() {
+        used_tcp_ports.entry(*family).or_default().insert(*port);
+    }
+
     let mut record_tcp_listener = |guest_addr: SocketAddr, host_port: u16| {
         let family = JavascriptSocketFamily::from_ip(guest_addr.ip());
         used_tcp_ports
@@ -10123,247 +10739,6 @@ fn resolve_wasm_permission_tier(
         .unwrap_or(WasmPermissionTier::Full)
 }
 
-#[derive(Debug)]
-struct SimpleShellRedirectCommand {
-    command: String,
-    args: Vec<String>,
-    stdin_path: Option<String>,
-    stdout_path: Option<String>,
-    append_stdout: bool,
-}
-
-impl SimpleShellRedirectCommand {
-    fn has_redirects(&self) -> bool {
-        self.stdin_path.is_some() || self.stdout_path.is_some()
-    }
-}
-
-fn javascript_child_process_request_for_redirect(
-    request: JavascriptChildProcessSpawnRequest,
-    redirect: Option<&SimpleShellRedirectCommand>,
-) -> JavascriptChildProcessSpawnRequest {
-    let Some(redirect) = redirect else {
-        return request;
-    };
-    let mut options = request.options;
-    options.shell = false;
-    JavascriptChildProcessSpawnRequest {
-        command: redirect.command.clone(),
-        args: redirect.args.clone(),
-        options,
-    }
-}
-
-fn active_child_process_redirect(
-    redirect: Option<&SimpleShellRedirectCommand>,
-) -> Option<ActiveChildProcessRedirect> {
-    let redirect = redirect?;
-    Some(ActiveChildProcessRedirect {
-        stdout_path: redirect.stdout_path.clone()?,
-        append_stdout: redirect.append_stdout,
-        stdout: Vec::new(),
-    })
-}
-
-fn apply_active_child_process_redirect_stdout(
-    kernel: &mut SidecarKernel,
-    parent_kernel_pid: u32,
-    child: &mut ActiveProcess,
-) -> Result<(), SidecarError> {
-    let Some(redirect) = child.child_process_redirect.take() else {
-        return Ok(());
-    };
-    let guest_path = resolve_shell_redirect_guest_path(&child.guest_cwd, &redirect.stdout_path);
-    let contents = if redirect.append_stdout {
-        let mut existing = kernel
-            .read_file_for_process(EXECUTION_DRIVER_NAME, parent_kernel_pid, &guest_path)
-            .unwrap_or_default();
-        existing.extend_from_slice(&redirect.stdout);
-        existing
-    } else {
-        redirect.stdout
-    };
-    kernel
-        .write_file_for_process(
-            EXECUTION_DRIVER_NAME,
-            parent_kernel_pid,
-            &guest_path,
-            contents,
-            None,
-        )
-        .map_err(kernel_error)
-}
-
-fn resolve_shell_redirect_guest_path(child_guest_cwd: &str, redirect_path: &str) -> String {
-    if redirect_path.starts_with('/') {
-        normalize_path(redirect_path)
-    } else {
-        normalize_path(&format!("{child_guest_cwd}/{redirect_path}"))
-    }
-}
-
-fn parse_simple_shell_redirect_command(command: &str) -> Option<SimpleShellRedirectCommand> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-
-    let mut characters = command.chars().peekable();
-    while let Some(character) = characters.next() {
-        if quote.is_none() {
-            if escaped {
-                current.push(character);
-                escaped = false;
-                continue;
-            }
-            if character == '\\' {
-                escaped = true;
-                continue;
-            }
-            if character == '\'' || character == '"' {
-                quote = Some(character);
-                continue;
-            }
-            if character.is_whitespace() {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-                continue;
-            }
-            if character == '<' {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-                tokens.push(String::from("<"));
-                continue;
-            }
-            if character == '>' {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-                if characters.next_if_eq(&'>').is_some() {
-                    tokens.push(String::from(">>"));
-                } else {
-                    tokens.push(String::from(">"));
-                }
-                continue;
-            }
-            if matches!(
-                character,
-                '|' | '&'
-                    | ';'
-                    | '('
-                    | ')'
-                    | '$'
-                    | '`'
-                    | '*'
-                    | '?'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | '~'
-                    | '!'
-            ) {
-                return None;
-            }
-            current.push(character);
-            continue;
-        }
-
-        if quote == Some('\'') {
-            if character == '\'' {
-                quote = None;
-            } else {
-                current.push(character);
-            }
-            continue;
-        }
-
-        if escaped {
-            append_double_quoted_shell_escape(&mut current, character);
-            escaped = false;
-            continue;
-        }
-        if character == '\\' {
-            escaped = true;
-            continue;
-        }
-        if character == '"' {
-            quote = None;
-            continue;
-        }
-        if character == '$' || character == '`' {
-            return None;
-        }
-        current.push(character);
-    }
-
-    if quote.is_some() || escaped {
-        return None;
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    if tokens.is_empty() {
-        return None;
-    }
-
-    let mut command_name = None;
-    let mut args = Vec::new();
-    let mut stdin_path = None;
-    let mut stdout_path = None;
-    let mut append_stdout = false;
-    let mut index = 0;
-    while index < tokens.len() {
-        let token = &tokens[index];
-        if token == "<" || token == ">" || token == ">>" {
-            let redirect_path = tokens.get(index + 1)?;
-            if redirect_path == "<" || redirect_path == ">" || redirect_path == ">>" {
-                return None;
-            }
-            if token == "<" {
-                if stdin_path.is_some() {
-                    return None;
-                }
-                stdin_path = Some(redirect_path.clone());
-            } else {
-                if stdout_path.is_some() {
-                    return None;
-                }
-                stdout_path = Some(redirect_path.clone());
-                append_stdout = token == ">>";
-            }
-            index += 2;
-            continue;
-        }
-
-        if command_name.is_none() {
-            command_name = Some(token.clone());
-        } else {
-            args.push(token.clone());
-        }
-        index += 1;
-    }
-
-    Some(SimpleShellRedirectCommand {
-        command: command_name?,
-        args,
-        stdin_path,
-        stdout_path,
-        append_stdout,
-    })
-}
-
-fn append_double_quoted_shell_escape(current: &mut String, character: char) {
-    if matches!(character, '$' | '`' | '"' | '\\') {
-        current.push(character);
-    } else if character != '\n' {
-        current.push('\\');
-        current.push(character);
-    }
-}
-
 fn tokenize_shell_free_command(command: &str) -> Vec<String> {
     command
         .split_whitespace()
@@ -10391,6 +10766,36 @@ fn is_posix_shell_builtin(command: &str) -> bool {
             | "trap"
             | "umask"
             | "unset"
+    )
+}
+
+/// Single-token checks for shell-mode commands whose first word forces a real
+/// shell even when the command string has no shell metacharacters. This is not
+/// a parser: env-assignment prefixes (`FOO=bar cmd`) and shell reserved words
+/// have no meaning outside `sh`, so whitespace-tokenizing them would silently
+/// run the wrong program.
+fn shell_first_token_requires_shell(token: &str) -> bool {
+    token.contains('=') || is_shell_reserved_word(token)
+}
+
+fn is_shell_reserved_word(token: &str) -> bool {
+    matches!(
+        token,
+        "if" | "then"
+            | "elif"
+            | "else"
+            | "fi"
+            | "for"
+            | "in"
+            | "do"
+            | "done"
+            | "while"
+            | "until"
+            | "case"
+            | "esac"
+            | "{"
+            | "}"
+            | "!"
     )
 }
 
@@ -10504,6 +10909,8 @@ struct RuntimeGuestPathMapping {
     guest_path: String,
     #[serde(rename = "hostPath")]
     host_path: String,
+    #[serde(rename = "readOnly", default)]
+    read_only: bool,
 }
 
 pub(crate) fn host_path_from_runtime_guest_mappings(
@@ -11094,20 +11501,21 @@ fn resolve_udp_bind_addr(
         })
 }
 
-fn resolve_udp_addr<B>(
-    bridge: &SharedBridge<B>,
-    kernel: &SidecarKernel,
-    vm_id: &str,
-    dns: &VmDnsConfig,
-    host: &str,
-    port: u16,
-    family: JavascriptUdpFamily,
-    context: &JavascriptSocketPathContext,
-) -> Result<SocketAddr, SidecarError>
+fn resolve_udp_addr<B>(request: UdpRemoteAddrRequest<'_, B>) -> Result<SocketAddr, SidecarError>
 where
     B: NativeSidecarBridge + Send + 'static,
     BridgeError<B>: fmt::Debug + Send + Sync + 'static,
 {
+    let UdpRemoteAddrRequest {
+        bridge,
+        kernel,
+        vm_id,
+        dns,
+        host,
+        port,
+        family,
+        context,
+    } = request;
     resolve_dns_ip_addrs(
         bridge,
         kernel,
@@ -11926,6 +12334,7 @@ fn sqlite_open_database(
     process: &mut ActiveProcess,
     request: &JavascriptSyncRpcRequest,
 ) -> Result<Value, SidecarError> {
+    ensure_per_process_state_handle_capacity(process.sqlite_databases.len(), "sqlite database")?;
     let path = request.args.first().and_then(Value::as_str);
     let vm_path = path.filter(|value| !value.is_empty() && *value != ":memory:");
     let options = request.args.get(1);
@@ -12072,6 +12481,7 @@ fn sqlite_prepare_statement(
     process: &mut ActiveProcess,
     request: &JavascriptSyncRpcRequest,
 ) -> Result<Value, SidecarError> {
+    ensure_per_process_state_handle_capacity(process.sqlite_statements.len(), "sqlite statement")?;
     let database_id = javascript_sync_rpc_arg_u64(&request.args, 0, "sqlite.prepare database id")?;
     let sql = javascript_sync_rpc_arg_str(&request.args, 1, "sqlite.prepare sql")?;
     let _ = sqlite_database(process, database_id)?;
@@ -12440,6 +12850,18 @@ fn close_sqlite_database(
     Ok(())
 }
 
+fn ensure_per_process_state_handle_capacity(
+    len: usize,
+    label: &str,
+) -> Result<(), SidecarError> {
+    if len >= MAX_PER_PROCESS_STATE_HANDLES {
+        return Err(SidecarError::InvalidState(format!(
+            "{label} handle limit exceeded: limit is {MAX_PER_PROCESS_STATE_HANDLES}"
+        )));
+    }
+    Ok(())
+}
+
 fn sqlite_sync_database(
     kernel: &mut SidecarKernel,
     kernel_pid: u32,
@@ -12715,6 +13137,29 @@ pub(crate) fn javascript_sync_rpc_arg_u32(
         .map_err(|_| SidecarError::InvalidState(format!("{label} must fit within u32")))
 }
 
+pub(crate) fn javascript_sync_rpc_arg_i32(
+    args: &[Value],
+    index: usize,
+    label: &str,
+) -> Result<i32, SidecarError> {
+    let Some(value) = args.get(index) else {
+        return Err(SidecarError::InvalidState(format!("{label} is required")));
+    };
+
+    let numeric = value
+        .as_i64()
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|number| number.is_finite())
+                .map(|number| number as i64)
+        })
+        .ok_or_else(|| SidecarError::InvalidState(format!("{label} must be a numeric argument")))?;
+
+    i32::try_from(numeric)
+        .map_err(|_| SidecarError::InvalidState(format!("{label} must fit within i32")))
+}
+
 pub(crate) fn javascript_sync_rpc_arg_u32_optional(
     args: &[Value],
     index: usize,
@@ -12828,20 +13273,23 @@ fn javascript_sync_rpc_base64_arg(
 }
 
 pub(crate) fn service_javascript_sync_rpc<B>(
-    bridge: &SharedBridge<B>,
-    vm_id: &str,
-    dns: &VmDnsConfig,
-    socket_paths: &JavascriptSocketPathContext,
-    kernel: &mut SidecarKernel,
-    process: &mut ActiveProcess,
-    request: &JavascriptSyncRpcRequest,
-    resource_limits: &ResourceLimits,
-    network_counts: NetworkResourceCounts,
+    request: JavascriptSyncRpcServiceRequest<'_, B>,
 ) -> Result<Value, SidecarError>
 where
     B: NativeSidecarBridge + Send + 'static,
     BridgeError<B>: fmt::Debug + Send + Sync + 'static,
 {
+    let JavascriptSyncRpcServiceRequest {
+        bridge,
+        vm_id,
+        dns,
+        socket_paths,
+        kernel,
+        process,
+        sync_request: request,
+        resource_limits,
+        network_counts,
+    } = request;
     match request.method.as_str() {
         "_resolveModule"
         | "_resolveModuleSync"
@@ -12851,7 +13299,14 @@ where
         | "_loadPolyfill"
         | "__load_polyfill"
         | "_moduleFormat" => service_javascript_internal_bridge_sync_rpc(process, request),
-        "__kernel_stdin_read" => service_javascript_kernel_stdin_sync_rpc(kernel, process, request),
+        "__kernel_stdin_read" => match &process.execution {
+            ActiveExecution::Javascript(execution) => execution
+                .read_kernel_stdin_sync_rpc(request)
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            ActiveExecution::Python(_) | ActiveExecution::Wasm(_) | ActiveExecution::Tool(_) => {
+                service_javascript_kernel_stdin_sync_rpc(kernel, process, request)
+            }
+        },
         "__kernel_stdio_write" => {
             service_javascript_kernel_stdio_write_sync_rpc(kernel, process, request)
         }
@@ -12879,22 +13334,23 @@ where
         | "crypto.diffieHellmanGroup"
         | "crypto.diffieHellmanSessionCreate"
         | "crypto.diffieHellmanSessionCall"
+        | "crypto.diffieHellmanSessionDestroy"
         | "crypto.subtle" => service_javascript_crypto_sync_rpc(process, request),
         "dns.lookup" | "dns.resolve" | "dns.resolve4" | "dns.resolve6" => {
             service_javascript_dns_sync_rpc(bridge, kernel, vm_id, dns, request)
         }
         "net.http_listen" | "net.http_close" | "net.http_wait" | "net.http_respond" => {
-            service_javascript_net_sync_rpc(
+            service_javascript_net_sync_rpc(JavascriptNetSyncRpcServiceRequest {
                 bridge,
                 vm_id,
                 dns,
                 socket_paths,
                 kernel,
                 process,
-                request,
+                sync_request: request,
                 resource_limits,
                 network_counts,
-            )
+            })
         }
         "net.http2_server_listen"
         | "net.http2_server_poll"
@@ -12917,18 +13373,22 @@ where
         | "net.http2_stream_close"
         | "net.http2_stream_pause"
         | "net.http2_stream_resume"
-        | "net.http2_stream_respond_with_file" => service_javascript_http2_sync_rpc(
-            bridge,
-            kernel,
-            vm_id,
-            dns,
-            socket_paths,
-            process,
-            request,
-            resource_limits,
-            network_counts,
-        ),
+        | "net.http2_stream_respond_with_file" => {
+            service_javascript_http2_sync_rpc(JavascriptHttp2SyncRpcServiceRequest {
+                bridge,
+                kernel,
+                vm_id,
+                dns,
+                socket_paths,
+                process,
+                sync_request: request,
+                resource_limits,
+                network_counts,
+            })
+        }
         "net.connect"
+        | "net.reserve_tcp_port"
+        | "net.release_tcp_port"
         | "net.listen"
         | "net.poll"
         | "net.socket_wait_connect"
@@ -12948,17 +13408,19 @@ where
         | "net.shutdown"
         | "net.destroy"
         | "net.server_close"
-        | "tls.get_ciphers" => service_javascript_net_sync_rpc(
-            bridge,
-            vm_id,
-            dns,
-            socket_paths,
-            kernel,
-            process,
-            request,
-            resource_limits,
-            network_counts,
-        ),
+        | "tls.get_ciphers" => {
+            service_javascript_net_sync_rpc(JavascriptNetSyncRpcServiceRequest {
+                bridge,
+                vm_id,
+                dns,
+                socket_paths,
+                kernel,
+                process,
+                sync_request: request,
+                resource_limits,
+                network_counts,
+            })
+        }
         "dgram.createSocket"
         | "dgram.bind"
         | "dgram.send"
@@ -12966,17 +13428,19 @@ where
         | "dgram.close"
         | "dgram.address"
         | "dgram.setBufferSize"
-        | "dgram.getBufferSize" => service_javascript_dgram_sync_rpc(
-            bridge,
-            kernel,
-            vm_id,
-            dns,
-            socket_paths,
-            process,
-            request,
-            resource_limits,
-            network_counts,
-        ),
+        | "dgram.getBufferSize" => {
+            service_javascript_dgram_sync_rpc(JavascriptDgramSyncRpcServiceRequest {
+                bridge,
+                kernel,
+                vm_id,
+                dns,
+                socket_paths,
+                process,
+                sync_request: request,
+                resource_limits,
+                network_counts,
+            })
+        }
         "sqlite.constants"
         | "sqlite.open"
         | "sqlite.close"
@@ -12999,10 +13463,18 @@ where
         }
         "process.kill" => {
             let target_pid =
-                javascript_sync_rpc_arg_u32(&request.args, 0, "process.kill target pid")?;
+                javascript_sync_rpc_arg_i32(&request.args, 0, "process.kill target pid")?;
             let signal = javascript_sync_rpc_arg_str(&request.args, 1, "process.kill signal")?;
             let parsed_signal = parse_signal(signal)?;
-            if target_pid != process.kernel_pid {
+            if parsed_signal == 0 {
+                kernel
+                    .signal_process(EXECUTION_DRIVER_NAME, target_pid, parsed_signal)
+                    .map_err(kernel_error)?;
+                return Ok(Value::Null);
+            }
+            let process_pid = i32::try_from(process.kernel_pid)
+                .map_err(|_| SidecarError::InvalidState("process pid exceeds i32".into()))?;
+            if target_pid != process_pid {
                 return Err(SidecarError::InvalidState(format!(
                     "unknown process pid {target_pid}"
                 )));
@@ -13261,6 +13733,9 @@ pub(crate) fn service_javascript_crypto_sync_rpc(
         "crypto.diffieHellmanSessionCall" => {
             service_javascript_crypto_diffie_hellman_session_call_sync_rpc(process, request)
         }
+        "crypto.diffieHellmanSessionDestroy" => {
+            service_javascript_crypto_diffie_hellman_session_destroy_sync_rpc(process, request)
+        }
         "crypto.subtle" => service_javascript_crypto_subtle_sync_rpc(request),
         _ => Err(SidecarError::InvalidState(format!(
             "unsupported JavaScript crypto sync RPC method {}",
@@ -13390,6 +13865,7 @@ fn service_javascript_crypto_cipheriv_create_sync_rpc(
     process: &mut ActiveProcess,
     request: &JavascriptSyncRpcRequest,
 ) -> Result<Value, SidecarError> {
+    ensure_per_process_state_handle_capacity(process.cipher_sessions.len(), "cipher session")?;
     let mode = javascript_sync_rpc_arg_str(&request.args, 0, "crypto.cipherivCreate mode")?;
     let decrypt = mode == "decipher";
     let algorithm =
@@ -13398,9 +13874,9 @@ fn service_javascript_crypto_cipheriv_create_sync_rpc(
     let iv = javascript_sync_rpc_base64_arg_optional(&request.args, 3, "crypto.cipherivCreate iv")?;
     let options =
         javascript_sync_rpc_json_arg_optional(&request.args, 4, "crypto.cipherivCreate options")?;
-    let auth_tag_len = javascript_crypto_requested_aead_tag_len(&algorithm, options.as_ref())?;
+    let auth_tag_len = javascript_crypto_requested_aead_tag_len(algorithm, options.as_ref())?;
     let context = javascript_crypto_build_cipher_context(
-        &algorithm,
+        algorithm,
         &key,
         iv.as_deref(),
         decrypt,
@@ -13832,6 +14308,10 @@ fn service_javascript_crypto_diffie_hellman_session_create_sync_rpc(
     process: &mut ActiveProcess,
     request: &JavascriptSyncRpcRequest,
 ) -> Result<Value, SidecarError> {
+    ensure_per_process_state_handle_capacity(
+        process.diffie_hellman_sessions.len(),
+        "diffie-hellman session",
+    )?;
     let raw = javascript_sync_rpc_arg_str(
         &request.args,
         0,
@@ -13947,6 +14427,24 @@ fn service_javascript_crypto_diffie_hellman_session_call_sync_rpc(
     ))
 }
 
+fn service_javascript_crypto_diffie_hellman_session_destroy_sync_rpc(
+    process: &mut ActiveProcess,
+    request: &JavascriptSyncRpcRequest,
+) -> Result<Value, SidecarError> {
+    let session_id = javascript_sync_rpc_arg_u64(
+        &request.args,
+        0,
+        "crypto.diffieHellmanSessionDestroy session id",
+    )?;
+    process
+        .diffie_hellman_sessions
+        .remove(&session_id)
+        .ok_or_else(|| {
+            SidecarError::InvalidState(format!("Diffie-Hellman session {session_id} not found"))
+        })?;
+    Ok(Value::Null)
+}
+
 fn service_javascript_crypto_subtle_sync_rpc(
     request: &JavascriptSyncRpcRequest,
 ) -> Result<Value, SidecarError> {
@@ -13985,10 +14483,315 @@ fn service_javascript_crypto_subtle_sync_rpc(
                 })?,
             ))
         }
+        "generateKey" => {
+            let algorithm = parsed.get("algorithm").ok_or_else(|| {
+                SidecarError::InvalidState(String::from(
+                    "crypto.subtle.generateKey missing algorithm",
+                ))
+            })?;
+            let name =
+                javascript_crypto_subtle_algorithm_name(algorithm, "crypto.subtle.generateKey")?;
+            if !matches!(name, "AES-GCM" | "AES-CBC" | "AES-CTR" | "AES-KW") {
+                return Err(SidecarError::InvalidState(format!(
+                    "Unsupported key algorithm: {name}"
+                )));
+            }
+            let length_bits = algorithm
+                .get("length")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(String::from(
+                        "crypto.subtle.generateKey AES algorithm requires length",
+                    ))
+                })?;
+            if length_bits % 8 != 0 {
+                return Err(SidecarError::InvalidState(String::from(
+                    "crypto.subtle.generateKey length must be byte-aligned",
+                )));
+            }
+            let length_bytes = usize::try_from(length_bits / 8).map_err(|_| {
+                SidecarError::InvalidState(String::from(
+                    "crypto.subtle.generateKey length is too large",
+                ))
+            })?;
+            let mut raw = vec![0_u8; length_bytes];
+            rand_bytes(&mut raw).map_err(javascript_crypto_openssl_error)?;
+            let key = javascript_crypto_serialize_subtle_secret_key(
+                &raw,
+                javascript_crypto_normalize_subtle_secret_algorithm(algorithm.clone(), &raw)?,
+                parsed
+                    .get("extractable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                parsed.get("usages").cloned().unwrap_or_else(|| json!([])),
+            )?;
+            Ok(Value::String(
+                serde_json::to_string(&json!({ "key": key })).map_err(|error| {
+                    SidecarError::InvalidState(format!(
+                        "serialize crypto.subtle generated key: {error}"
+                    ))
+                })?,
+            ))
+        }
+        "importKey" => {
+            let format = parsed
+                .get("format")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(String::from(
+                        "crypto.subtle.importKey missing format",
+                    ))
+                })?;
+            if format != "raw" {
+                return Err(SidecarError::InvalidState(format!(
+                    "Unsupported import format: {format}"
+                )));
+            }
+            let key_data = parsed
+                .get("keyData")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(String::from(
+                        "crypto.subtle.importKey missing keyData",
+                    ))
+                })?;
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(key_data)
+                .map_err(|error| {
+                    SidecarError::InvalidState(format!(
+                        "crypto.subtle.importKey keyData base64: {error}"
+                    ))
+                })?;
+            let algorithm = parsed.get("algorithm").ok_or_else(|| {
+                SidecarError::InvalidState(String::from(
+                    "crypto.subtle.importKey missing algorithm",
+                ))
+            })?;
+            let key = javascript_crypto_serialize_subtle_secret_key(
+                &raw,
+                javascript_crypto_normalize_subtle_secret_algorithm(algorithm.clone(), &raw)?,
+                parsed
+                    .get("extractable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                parsed.get("usages").cloned().unwrap_or_else(|| json!([])),
+            )?;
+            Ok(Value::String(
+                serde_json::to_string(&json!({ "key": key })).map_err(|error| {
+                    SidecarError::InvalidState(format!(
+                        "serialize crypto.subtle imported key: {error}"
+                    ))
+                })?,
+            ))
+        }
+        "exportKey" => {
+            let format = parsed
+                .get("format")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(String::from(
+                        "crypto.subtle.exportKey missing format",
+                    ))
+                })?;
+            if format != "raw" {
+                return Err(SidecarError::InvalidState(format!(
+                    "Unsupported export format: {format}"
+                )));
+            }
+            let raw = javascript_crypto_subtle_key_raw(
+                parsed.get("key").ok_or_else(|| {
+                    SidecarError::InvalidState(String::from("crypto.subtle.exportKey missing key"))
+                })?,
+                "crypto.subtle.exportKey key",
+            )?;
+            Ok(Value::String(
+                serde_json::to_string(&json!({
+                    "data": base64::engine::general_purpose::STANDARD.encode(raw),
+                }))
+                .map_err(|error| {
+                    SidecarError::InvalidState(format!("serialize crypto.subtle export: {error}"))
+                })?,
+            ))
+        }
+        "encrypt" | "decrypt" => service_javascript_crypto_subtle_aes_crypt_sync_rpc(op, &parsed),
         _ => Err(SidecarError::InvalidState(format!(
             "Unsupported subtle operation: {op}"
         ))),
     }
+}
+
+fn javascript_crypto_subtle_algorithm_name<'a>(
+    algorithm: &'a Value,
+    label: &str,
+) -> Result<&'a str, SidecarError> {
+    if let Some(name) = algorithm.as_str() {
+        return Ok(name);
+    }
+    algorithm
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| SidecarError::InvalidState(format!("{label} algorithm missing name")))
+}
+
+fn javascript_crypto_normalize_subtle_secret_algorithm(
+    algorithm: Value,
+    raw: &[u8],
+) -> Result<Value, SidecarError> {
+    let mut object = match algorithm {
+        Value::String(name) => {
+            let mut object = Map::new();
+            object.insert(String::from("name"), Value::String(name));
+            object
+        }
+        Value::Object(object) => object,
+        _ => {
+            return Err(SidecarError::InvalidState(String::from(
+                "crypto.subtle secret algorithm must be a string or object",
+            )));
+        }
+    };
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            SidecarError::InvalidState(String::from("crypto.subtle secret algorithm missing name"))
+        })?
+        .to_string();
+    if matches!(name.as_str(), "AES-GCM" | "AES-CBC" | "AES-CTR" | "AES-KW")
+        && !object.contains_key("length")
+    {
+        object.insert(String::from("length"), json!(raw.len() * 8));
+    }
+    Ok(Value::Object(object))
+}
+
+fn javascript_crypto_serialize_subtle_secret_key(
+    raw: &[u8],
+    algorithm: Value,
+    extractable: bool,
+    usages: Value,
+) -> Result<Value, SidecarError> {
+    let raw_base64 = base64::engine::general_purpose::STANDARD.encode(raw);
+    let source_key_object_data = javascript_crypto_serialize_sandbox_key_object(
+        &JavascriptCryptoKeyMaterial::Secret(raw.to_vec()),
+    )?;
+    Ok(json!({
+        "type": "secret",
+        "algorithm": algorithm,
+        "extractable": extractable,
+        "usages": usages,
+        "_raw": raw_base64,
+        "_sourceKeyObjectData": source_key_object_data,
+    }))
+}
+
+fn javascript_crypto_subtle_key_raw(key: &Value, label: &str) -> Result<Vec<u8>, SidecarError> {
+    let raw = key.get("_raw").and_then(Value::as_str).ok_or_else(|| {
+        SidecarError::InvalidState(format!("{label} must be a raw secret CryptoKey"))
+    })?;
+    base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|error| SidecarError::InvalidState(format!("{label} raw base64: {error}")))
+}
+
+fn service_javascript_crypto_subtle_aes_crypt_sync_rpc(
+    op: &str,
+    parsed: &Value,
+) -> Result<Value, SidecarError> {
+    let algorithm = parsed.get("algorithm").ok_or_else(|| {
+        SidecarError::InvalidState(format!("crypto.subtle.{op} missing algorithm"))
+    })?;
+    let name = javascript_crypto_subtle_algorithm_name(algorithm, &format!("crypto.subtle.{op}"))?;
+    if name != "AES-GCM" {
+        return Err(SidecarError::InvalidState(format!(
+            "Unsupported subtle AES operation algorithm: {name}"
+        )));
+    }
+    let key = javascript_crypto_subtle_key_raw(
+        parsed
+            .get("key")
+            .ok_or_else(|| SidecarError::InvalidState(format!("crypto.subtle.{op} missing key")))?,
+        &format!("crypto.subtle.{op} key"),
+    )?;
+    let iv = algorithm.get("iv").and_then(Value::as_str).ok_or_else(|| {
+        SidecarError::InvalidState(format!("crypto.subtle.{op} AES-GCM missing iv"))
+    })?;
+    let iv = base64::engine::general_purpose::STANDARD
+        .decode(iv)
+        .map_err(|error| {
+            SidecarError::InvalidState(format!("crypto.subtle.{op} iv base64: {error}"))
+        })?;
+    let data = parsed
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| SidecarError::InvalidState(format!("crypto.subtle.{op} missing data")))?;
+    let mut data = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|error| {
+            SidecarError::InvalidState(format!("crypto.subtle.{op} data base64: {error}"))
+        })?;
+    let tag_len = javascript_crypto_subtle_aes_gcm_tag_len(algorithm)?;
+    let mut options = Map::new();
+    options.insert(String::from("authTagLength"), json!(tag_len));
+    if let Some(additional_data) = algorithm.get("additionalData").and_then(Value::as_str) {
+        options.insert(
+            String::from("aad"),
+            Value::String(additional_data.to_string()),
+        );
+    }
+    let decrypt = op == "decrypt";
+    if decrypt {
+        if data.len() < tag_len {
+            return Err(SidecarError::InvalidState(String::from(
+                "crypto.subtle.decrypt AES-GCM data shorter than auth tag",
+            )));
+        }
+        let auth_tag = data.split_off(data.len() - tag_len);
+        options.insert(
+            String::from("authTag"),
+            Value::String(base64::engine::general_purpose::STANDARD.encode(auth_tag)),
+        );
+    }
+    let cipher_name = format!("aes-{}-gcm", key.len() * 8);
+    let mut context = javascript_crypto_build_cipher_context(
+        &cipher_name,
+        &key,
+        Some(&iv),
+        decrypt,
+        Some(&Value::Object(options)),
+    )?;
+    let mut output = javascript_crypto_cipher_update(&mut context, &data)?;
+    output.extend(javascript_crypto_cipher_finalize(&mut context)?);
+    if !decrypt {
+        let mut auth_tag = vec![0_u8; tag_len];
+        context
+            .get_tag(&mut auth_tag)
+            .map_err(javascript_crypto_openssl_error)?;
+        output.extend(auth_tag);
+    }
+    Ok(Value::String(
+        serde_json::to_string(&json!({
+            "data": base64::engine::general_purpose::STANDARD.encode(output),
+        }))
+        .map_err(|error| {
+            SidecarError::InvalidState(format!("serialize crypto.subtle {op}: {error}"))
+        })?,
+    ))
+}
+
+fn javascript_crypto_subtle_aes_gcm_tag_len(algorithm: &Value) -> Result<usize, SidecarError> {
+    let tag_bits = algorithm
+        .get("tagLength")
+        .and_then(Value::as_u64)
+        .unwrap_or(128);
+    if !tag_bits.is_multiple_of(8) {
+        return Err(SidecarError::InvalidState(String::from(
+            "crypto.subtle AES-GCM tagLength must be byte-aligned",
+        )));
+    }
+    usize::try_from(tag_bits / 8).map_err(|_| {
+        SidecarError::InvalidState(String::from("crypto.subtle AES-GCM tagLength too large"))
+    })
 }
 
 fn service_javascript_crypto_cipheriv_inner(
@@ -14006,9 +14809,9 @@ fn service_javascript_crypto_cipheriv_inner(
     let data = javascript_sync_rpc_base64_arg(&request.args, 3, &format!("{label} data"))?;
     let options =
         javascript_sync_rpc_json_arg_optional(&request.args, 4, &format!("{label} options"))?;
-    let auth_tag_len = javascript_crypto_requested_aead_tag_len(&algorithm, options.as_ref())?;
+    let auth_tag_len = javascript_crypto_requested_aead_tag_len(algorithm, options.as_ref())?;
     let mut context = javascript_crypto_build_cipher_context(
-        &algorithm,
+        algorithm,
         &key,
         iv.as_deref(),
         decrypt,
@@ -14031,7 +14834,7 @@ fn service_javascript_crypto_cipheriv_inner(
         String::from("data"),
         Value::String(base64::engine::general_purpose::STANDARD.encode(encrypted)),
     );
-    if javascript_crypto_is_aead(&algorithm) {
+    if javascript_crypto_is_aead(algorithm) {
         let mut auth_tag = vec![0_u8; auth_tag_len];
         context
             .get_tag(&mut auth_tag)
@@ -15018,7 +15821,7 @@ fn service_javascript_kernel_stdio_write_sync_rpc(
     } else {
         ActiveExecutionEvent::Stderr(chunk)
     };
-    process.pending_execution_events.push_back(event);
+    process.queue_pending_execution_event(event)?;
 
     Ok(json!(written))
 }
@@ -15105,6 +15908,9 @@ pub(crate) fn write_kernel_process_stdin(
     process: &mut ActiveProcess,
     chunk: &[u8],
 ) -> Result<(), SidecarError> {
+    if process.runtime == GuestRuntimeKind::JavaScript {
+        return Ok(());
+    }
     let Some(writer_fd) = process.kernel_stdin_writer_fd else {
         return Ok(());
     };
@@ -15312,19 +16118,22 @@ fn issue_outbound_http_request(
 }
 
 fn wait_for_loopback_http_response<B>(
-    bridge: &SharedBridge<B>,
-    vm_id: &str,
-    dns: &VmDnsConfig,
-    socket_paths: &JavascriptSocketPathContext,
-    kernel: &mut SidecarKernel,
-    process: &mut ActiveProcess,
-    resource_limits: &ResourceLimits,
-    request_key: (u64, u64),
+    request: LoopbackHttpResponseWaitRequest<'_, B>,
 ) -> Result<String, SidecarError>
 where
     B: NativeSidecarBridge + Send + 'static,
     BridgeError<B>: fmt::Debug + Send + Sync + 'static,
 {
+    let LoopbackHttpResponseWaitRequest {
+        bridge,
+        vm_id,
+        dns,
+        socket_paths,
+        kernel,
+        process,
+        resource_limits,
+        request_key,
+    } = request;
     let deadline = Instant::now() + HTTP_LOOPBACK_REQUEST_TIMEOUT;
     loop {
         if let Some(response) = process
@@ -15354,17 +16163,17 @@ where
         match event {
             ActiveExecutionEvent::JavascriptSyncRpcRequest(request) => {
                 let network_counts = process.network_resource_counts();
-                let response = service_javascript_sync_rpc(
+                let response = service_javascript_sync_rpc(JavascriptSyncRpcServiceRequest {
                     bridge,
                     vm_id,
                     dns,
                     socket_paths,
                     kernel,
                     process,
-                    &request,
+                    sync_request: &request,
                     resource_limits,
                     network_counts,
-                );
+                });
                 match response {
                     Ok(result) => process
                         .execution
@@ -15374,7 +16183,7 @@ where
                         .execution
                         .respond_javascript_sync_rpc_error(
                             request.id,
-                            &javascript_sync_rpc_error_code(&error),
+                            javascript_sync_rpc_error_code(&error),
                             error.to_string(),
                         )
                         .or_else(ignore_stale_javascript_sync_rpc_response)?,
@@ -15392,6 +16201,31 @@ where
             | ActiveExecutionEvent::SignalState { .. } => {}
         }
     }
+}
+
+fn ensure_vm_fetch_response_within_limit(
+    response_json: &str,
+    operation: &str,
+) -> Result<(), SidecarError> {
+    let size = response_json.len();
+    if size > VM_FETCH_BUFFER_LIMIT_BYTES {
+        return Err(SidecarError::Execution(format!(
+            "{operation} payload is {size} bytes, limit is {VM_FETCH_BUFFER_LIMIT_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_vm_fetch_response_frame_within_limit(
+    response: &ResponseFrame,
+    max_frame_bytes: usize,
+) -> Result<(), SidecarError> {
+    let max_frame_bytes = max_frame_bytes.min(VM_FETCH_BUFFER_LIMIT_BYTES);
+    let frame = ProtocolFrame::Response(response.clone());
+    NativeFrameCodec::with_payload_codec(max_frame_bytes, NativePayloadCodec::Bare)
+        .encode(&frame)
+        .map(|_| ())
+        .map_err(|error| SidecarError::FrameTooLarge(error.to_string()))
 }
 
 fn service_javascript_dns_sync_rpc<B>(
@@ -15488,20 +16322,23 @@ where
 }
 
 fn service_javascript_dgram_sync_rpc<B>(
-    bridge: &SharedBridge<B>,
-    kernel: &mut SidecarKernel,
-    vm_id: &str,
-    dns: &VmDnsConfig,
-    socket_paths: &JavascriptSocketPathContext,
-    process: &mut ActiveProcess,
-    request: &JavascriptSyncRpcRequest,
-    resource_limits: &ResourceLimits,
-    network_counts: NetworkResourceCounts,
+    request: JavascriptDgramSyncRpcServiceRequest<'_, B>,
 ) -> Result<Value, SidecarError>
 where
     B: NativeSidecarBridge + Send + 'static,
     BridgeError<B>: fmt::Debug + Send + Sync + 'static,
 {
+    let JavascriptDgramSyncRpcServiceRequest {
+        bridge,
+        kernel,
+        vm_id,
+        dns,
+        socket_paths,
+        process,
+        sync_request: request,
+        resource_limits,
+        network_counts,
+    } = request;
     match request.method.as_str() {
         "dgram.createSocket" => {
             check_network_resource_limit(
@@ -15591,17 +16428,17 @@ where
             let socket = process.udp_sockets.get_mut(socket_id).ok_or_else(|| {
                 SidecarError::InvalidState(format!("unknown UDP socket {socket_id}"))
             })?;
-            let (written, local_addr) = socket.send_to(
+            let (written, local_addr) = socket.send_to(ActiveUdpSendToRequest {
                 bridge,
                 kernel,
-                process.kernel_pid,
+                kernel_pid: process.kernel_pid,
                 vm_id,
                 dns,
-                payload.address.as_deref().unwrap_or("localhost"),
-                payload.port,
-                socket_paths,
-                &chunk,
-            )?;
+                host: payload.address.as_deref().unwrap_or("localhost"),
+                port: payload.port,
+                context: socket_paths,
+                contents: &chunk,
+            })?;
             Ok(json!({
                 "bytes": written,
                 "localAddress": local_addr.ip().to_string(),
@@ -17188,18 +18025,11 @@ fn spawn_http2_server_session(
                                 );
                                 let _ = respond_to.send(Ok(Value::Null));
                             }
-                            Http2SessionCommand::StreamRespondWithFile { stream_id, path, headers_json, options_json, respond_to } => {
+                            Http2SessionCommand::StreamRespondWithFile { stream_id, body, headers_json, options_json, respond_to } => {
                                 let options: JavascriptHttp2FileResponseOptions =
                                     serde_json::from_str(&options_json).unwrap_or_default();
                                 let response = match build_http2_response(&headers_json) {
                                     Ok(response) => response,
-                                    Err(error) => {
-                                        let _ = respond_to.send(Err(error.to_string()));
-                                        continue;
-                                    }
-                                };
-                                let body = match fs::read(&path) {
-                                    Ok(body) => body,
                                     Err(error) => {
                                         let _ = respond_to.send(Err(error.to_string()));
                                         continue;
@@ -17447,20 +18277,23 @@ fn http2_stream_for_id(
 }
 
 fn service_javascript_http2_sync_rpc<B>(
-    bridge: &SharedBridge<B>,
-    kernel: &SidecarKernel,
-    vm_id: &str,
-    dns: &VmDnsConfig,
-    socket_paths: &JavascriptSocketPathContext,
-    process: &mut ActiveProcess,
-    request: &JavascriptSyncRpcRequest,
-    resource_limits: &ResourceLimits,
-    network_counts: NetworkResourceCounts,
+    request: JavascriptHttp2SyncRpcServiceRequest<'_, B>,
 ) -> Result<Value, SidecarError>
 where
     B: NativeSidecarBridge + Send + 'static,
     BridgeError<B>: fmt::Debug + Send + Sync + 'static,
 {
+    let JavascriptHttp2SyncRpcServiceRequest {
+        bridge,
+        kernel,
+        vm_id,
+        dns,
+        socket_paths,
+        process,
+        sync_request: request,
+        resource_limits,
+        network_counts,
+    } = request;
     match request.method.as_str() {
         "net.http2_server_listen" => {
             check_network_resource_limit(
@@ -17586,6 +18419,7 @@ where
             )?;
             let response_json =
                 javascript_sync_rpc_arg_str(&request.args, 2, "net.http2_server_respond payload")?;
+            ensure_vm_fetch_response_within_limit(response_json, "net.http2_server_respond")?;
             serde_json::from_str::<Value>(response_json).map_err(|error| {
                 SidecarError::Execution(format!(
                     "net.http2_server_respond payload must be valid JSON: {error}"
@@ -17984,10 +18818,12 @@ where
             )?;
             let stream = http2_stream_for_id(process, stream_id)?;
             let session = http2_session_for_id(process, stream.session_id)?;
+            let guest_path = resolve_http2_file_response_guest_path(process, path);
+            let body = kernel.read_file(&guest_path).map_err(kernel_error)?;
             send_http2_command(&session, |respond_to| {
                 Http2SessionCommand::StreamRespondWithFile {
                     stream_id,
-                    path: path.to_owned(),
+                    body,
                     headers_json: headers_json.to_owned(),
                     options_json: options_json.to_owned(),
                     respond_to,
@@ -18003,6 +18839,14 @@ where
 const JAVASCRIPT_NET_POLL_MAX_WAIT: Duration = Duration::from_millis(50);
 const EXITED_PROCESS_SNAPSHOT_RETENTION: Duration = Duration::from_secs(2);
 
+fn resolve_http2_file_response_guest_path(process: &ActiveProcess, path: &str) -> String {
+    if Path::new(path).is_absolute() {
+        normalize_path(path)
+    } else {
+        normalize_path(&format!("{}/{}", process.guest_cwd, path))
+    }
+}
+
 pub(crate) fn clamp_javascript_net_poll_wait(wait_ms: u64) -> Duration {
     // WASM net.poll runs on the sidecar's sync-RPC main thread. Guest-controlled waits
     // must stay bounded so one VM cannot stall dispose/shutdown or unrelated VM work.
@@ -18014,20 +18858,23 @@ pub(crate) fn clamp_javascript_net_poll_wait(wait_ms: u64) -> Duration {
 }
 
 pub(crate) fn service_javascript_net_sync_rpc<B>(
-    bridge: &SharedBridge<B>,
-    vm_id: &str,
-    dns: &VmDnsConfig,
-    socket_paths: &JavascriptSocketPathContext,
-    kernel: &mut SidecarKernel,
-    process: &mut ActiveProcess,
-    request: &JavascriptSyncRpcRequest,
-    resource_limits: &ResourceLimits,
-    network_counts: NetworkResourceCounts,
+    request: JavascriptNetSyncRpcServiceRequest<'_, B>,
 ) -> Result<Value, SidecarError>
 where
     B: NativeSidecarBridge + Send + 'static,
     BridgeError<B>: fmt::Debug + Send + Sync + 'static,
 {
+    let JavascriptNetSyncRpcServiceRequest {
+        bridge,
+        vm_id,
+        dns,
+        socket_paths,
+        kernel,
+        process,
+        sync_request: request,
+        resource_limits,
+        network_counts,
+    } = request;
     match request.method.as_str() {
         "net.http_listen" => {
             check_network_resource_limit(
@@ -18113,6 +18960,7 @@ where
                 javascript_sync_rpc_arg_u64(&request.args, 1, "net.http_respond request id")?;
             let response_json =
                 javascript_sync_rpc_arg_str(&request.args, 2, "net.http_respond payload")?;
+            ensure_vm_fetch_response_within_limit(response_json, "net.http_respond")?;
             serde_json::from_str::<Value>(response_json).map_err(|error| {
                 SidecarError::Execution(format!(
                     "net.http_respond payload must be valid JSON: {error}"
@@ -18127,6 +18975,54 @@ where
                 )));
             };
             *pending = Some(response_json.to_owned());
+            Ok(Value::Null)
+        }
+        "net.reserve_tcp_port" => {
+            let payload = request
+                .args
+                .first()
+                .cloned()
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(String::from(
+                        "net.reserve_tcp_port requires a request payload",
+                    ))
+                })
+                .and_then(|value| {
+                    serde_json::from_value::<JavascriptNetReserveTcpPortRequest>(value).map_err(
+                        |error| {
+                            SidecarError::InvalidState(format!(
+                                "invalid net.reserve_tcp_port payload: {error}"
+                            ))
+                        },
+                    )
+                })?;
+            let (family, _bind_host, guest_host) =
+                normalize_tcp_listen_host(payload.host.as_deref())?;
+            let requested_port = payload.port.unwrap_or(0);
+            let port = allocate_guest_listen_port(
+                requested_port,
+                family,
+                &socket_paths.used_tcp_guest_ports,
+                socket_paths.listen_policy,
+            )?;
+            let reservation_id = process.allocate_tcp_port_reservation_id();
+            process
+                .tcp_port_reservations
+                .insert(reservation_id.clone(), (family, port));
+            Ok(json!({
+                "reservationId": reservation_id,
+                "localAddress": guest_host,
+                "localPort": port,
+                "family": match family {
+                    JavascriptSocketFamily::Ipv4 => "IPv4",
+                    JavascriptSocketFamily::Ipv6 => "IPv6",
+                },
+            }))
+        }
+        "net.release_tcp_port" => {
+            let reservation_id =
+                javascript_sync_rpc_arg_str(&request.args, 0, "net.release_tcp_port reservation")?;
+            process.tcp_port_reservations.remove(reservation_id);
             Ok(Value::Null)
         }
         "net.connect" => {
@@ -18173,21 +19069,41 @@ where
                     ))
                 })?;
                 let host = payload.host.as_deref().unwrap_or("localhost");
+                let local_reservation = payload.local_reservation.as_deref().and_then(|id| {
+                    process
+                        .tcp_port_reservations
+                        .remove(id)
+                        .map(|reservation| (id.to_owned(), reservation))
+                });
                 bridge.require_network_access(
                     vm_id,
                     NetworkOperation::Http,
                     format_tcp_resource(host, port),
                 )?;
-                let socket = ActiveTcpSocket::connect(
+                let connect_result = ActiveTcpSocket::connect(ActiveTcpConnectRequest {
                     bridge,
                     kernel,
-                    process.kernel_pid,
+                    kernel_pid: process.kernel_pid,
                     vm_id,
                     dns,
                     host,
                     port,
-                    socket_paths,
-                )?;
+                    local_address: payload.local_address.as_deref(),
+                    local_port: payload.local_port,
+                    local_reservation: local_reservation
+                        .as_ref()
+                        .map(|(_, reservation)| *reservation),
+                    context: socket_paths,
+                });
+                if let Err(error) = connect_result {
+                    if let Some((reservation_id, reservation)) = local_reservation {
+                        process
+                            .tcp_port_reservations
+                            .insert(reservation_id, reservation);
+                    }
+                    return Err(error);
+                }
+                let socket = connect_result?;
                 let socket_id = process.allocate_tcp_socket_id();
                 let local_addr = socket.guest_local_addr;
                 let remote_addr = socket.guest_remote_addr;
@@ -18268,19 +19184,43 @@ where
                     NetworkOperation::Listen,
                     format_tcp_resource(bind_host, requested_port),
                 )?;
-                let port = allocate_guest_listen_port(
-                    requested_port,
-                    family,
-                    &socket_paths.used_tcp_guest_ports,
-                    socket_paths.listen_policy,
-                )?;
-                let listener = ActiveTcpListener::bind_kernel(
+                let local_reservation = payload.local_reservation.as_deref().and_then(|id| {
+                    process
+                        .tcp_port_reservations
+                        .remove(id)
+                        .map(|reservation| (id.to_owned(), reservation))
+                });
+                let port = if requested_port != 0
+                    && local_reservation
+                        .as_ref()
+                        .map(|(_, reservation)| *reservation)
+                        == Some((family, requested_port))
+                {
+                    requested_port
+                } else {
+                    allocate_guest_listen_port(
+                        requested_port,
+                        family,
+                        &socket_paths.used_tcp_guest_ports,
+                        socket_paths.listen_policy,
+                    )?
+                };
+                let listener_result = ActiveTcpListener::bind_kernel(
                     kernel,
                     process.kernel_pid,
                     guest_host,
                     port,
                     payload.backlog,
-                )?;
+                );
+                if let Err(error) = listener_result {
+                    if let Some((reservation_id, reservation)) = local_reservation {
+                        process
+                            .tcp_port_reservations
+                            .insert(reservation_id, reservation);
+                    }
+                    return Err(error);
+                }
+                let listener = listener_result?;
                 let listener_id = process.allocate_tcp_listener_id();
                 let local_addr = listener.guest_local_addr();
                 process.tcp_listeners.insert(listener_id.clone(), listener);
@@ -18871,6 +19811,8 @@ fn signal_name_for_stream_event(signal: i32) -> Option<&'static str> {
     match signal {
         libc::SIGHUP => Some("SIGHUP"),
         libc::SIGINT => Some("SIGINT"),
+        libc::SIGUSR1 => Some("SIGUSR1"),
+        libc::SIGALRM => Some("SIGALRM"),
         libc::SIGCONT => Some("SIGCONT"),
         libc::SIGTERM => Some("SIGTERM"),
         libc::SIGCHLD => Some("SIGCHLD"),
@@ -19133,7 +20075,10 @@ pub(crate) fn javascript_sync_rpc_error_code(error: &SidecarError) -> String {
     if lower.contains("permission denied") {
         return String::from("EACCES");
     }
-    if lower.contains("already exists") || lower.contains("already registered") {
+    if lower.contains("already exists")
+        || lower.contains("already registered")
+        || lower.contains("file exists")
+    {
         return String::from("EEXIST");
     }
     if lower.contains("invalid argument") {
@@ -19209,6 +20154,14 @@ mod error_code_tests {
             "ERR_AGENT_OS_NODE_SYNC_RPC: EACCES: permission denied on /foo",
         ));
         assert_eq!(javascript_sync_rpc_error_code(&error), "EACCES");
+    }
+
+    #[test]
+    fn javascript_sync_rpc_error_code_maps_file_exists_messages() {
+        let error = SidecarError::Io(String::from(
+            "failed to create mapped guest directory /.next/server: File exists (os error 17)",
+        ));
+        assert_eq!(javascript_sync_rpc_error_code(&error), "EEXIST");
     }
 
     #[test]

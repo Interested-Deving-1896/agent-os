@@ -54,6 +54,7 @@ pub(crate) const PYTHON_VFS_RPC_GUEST_ROOT: &str = "/workspace";
 pub(crate) const EXECUTION_SANDBOX_ROOT_ENV: &str = "AGENT_OS_SANDBOX_ROOT";
 pub(crate) const WASM_STDIO_SYNC_RPC_ENV: &str = "AGENT_OS_WASI_STDIO_SYNC_RPC";
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) const HOST_REALPATH_MAX_SYMLINK_DEPTH: usize = 40;
 pub(crate) const DISPOSE_VM_SIGTERM_GRACE: std::time::Duration =
     std::time::Duration::from_millis(100);
@@ -285,6 +286,9 @@ pub(crate) struct VmState {
     pub(crate) connection_id: String,
     pub(crate) session_id: String,
     pub(crate) metadata: BTreeMap<String, String>,
+    /// Operator-tunable VM-scoped runtime limits. Immutable for the VM's lifetime;
+    /// `ConfigureVm` does not mutate limits.
+    pub(crate) limits: crate::limits::VmLimits,
     pub(crate) dns: VmDnsConfig,
     pub(crate) guest_env: BTreeMap<String, String>,
     pub(crate) requested_runtime: GuestRuntimeKind,
@@ -387,7 +391,6 @@ pub(crate) struct ActiveProcess {
     pub(crate) runtime: GuestRuntimeKind,
     pub(crate) detached: bool,
     pub(crate) execution: ActiveExecution,
-    pub(crate) child_process_redirect: Option<ActiveChildProcessRedirect>,
     pub(crate) guest_cwd: String,
     pub(crate) env: BTreeMap<String, String>,
     pub(crate) host_cwd: PathBuf,
@@ -404,6 +407,8 @@ pub(crate) struct ActiveProcess {
     pub(crate) next_tcp_listener_id: usize,
     pub(crate) tcp_sockets: BTreeMap<String, ActiveTcpSocket>,
     pub(crate) next_tcp_socket_id: usize,
+    pub(crate) tcp_port_reservations: BTreeMap<String, (JavascriptSocketFamily, u16)>,
+    pub(crate) next_tcp_port_reservation_id: usize,
     pub(crate) unix_listeners: BTreeMap<String, ActiveUnixListener>,
     pub(crate) next_unix_listener_id: usize,
     pub(crate) unix_sockets: BTreeMap<String, ActiveUnixSocket>,
@@ -418,12 +423,6 @@ pub(crate) struct ActiveProcess {
     pub(crate) next_sqlite_database_id: u64,
     pub(crate) sqlite_statements: BTreeMap<u64, ActiveSqliteStatement>,
     pub(crate) next_sqlite_statement_id: u64,
-}
-
-pub(crate) struct ActiveChildProcessRedirect {
-    pub(crate) stdout_path: String,
-    pub(crate) append_stdout: bool,
-    pub(crate) stdout: Vec<u8>,
 }
 
 pub(crate) struct ActiveMappedHostFd {
@@ -623,7 +622,7 @@ pub(crate) enum Http2SessionCommand {
     },
     StreamRespondWithFile {
         stream_id: u64,
-        path: String,
+        body: Vec<u8>,
         headers_json: String,
         options_json: String,
         respond_to: Sender<Result<Value, String>>,
@@ -862,10 +861,10 @@ impl JavascriptUdpFamily {
     }
 
     pub(crate) fn matches_addr(self, addr: &SocketAddr) -> bool {
-        match (self, addr) {
-            (Self::Ipv4, SocketAddr::V4(_)) | (Self::Ipv6, SocketAddr::V6(_)) => true,
-            _ => false,
-        }
+        matches!(
+            (self, addr),
+            (Self::Ipv4, SocketAddr::V4(_)) | (Self::Ipv6, SocketAddr::V6(_))
+        )
     }
 }
 
@@ -906,12 +905,16 @@ pub(crate) enum ActiveExecution {
 #[derive(Debug, Clone)]
 pub(crate) struct ToolExecution {
     pub(crate) cancelled: Arc<AtomicBool>,
+    pub(crate) pending_events: Arc<Mutex<VecDeque<ActiveExecutionEvent>>>,
+    pub(crate) events_overflowed: Arc<AtomicBool>,
 }
 
 impl Default for ToolExecution {
     fn default() -> Self {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
+            pending_events: Arc::new(Mutex::new(VecDeque::new())),
+            events_overflowed: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -921,7 +924,7 @@ pub(crate) enum ActiveExecutionEvent {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     JavascriptSyncRpcRequest(JavascriptSyncRpcRequest),
-    PythonVfsRpcRequest(PythonVfsRpcRequest),
+    PythonVfsRpcRequest(Box<PythonVfsRpcRequest>),
     SignalState {
         signal: u32,
         registration: SignalHandlerRegistration,

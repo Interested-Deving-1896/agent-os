@@ -1,7 +1,8 @@
 //! Guest filesystem and VFS dispatch extracted from service.rs.
 
 use crate::execution::{
-    host_path_from_runtime_guest_mappings, sync_active_process_host_writes_to_kernel,
+    host_path_from_runtime_guest_mappings, is_protected_agentos_shadow_sync_path,
+    sync_active_process_host_writes_to_kernel,
 };
 use crate::protocol::{
     GuestFilesystemCallRequest, GuestFilesystemOperation, GuestFilesystemResultResponse,
@@ -316,6 +317,35 @@ where
         GuestFilesystemOperation::ReadFile => {
             sync_active_shadow_path_to_kernel(vm, &payload.path)?;
             let bytes = vm.kernel.read_file(&payload.path).map_err(kernel_error)?;
+            let (content, encoding) = encode_guest_filesystem_content(bytes);
+            GuestFilesystemResultResponse {
+                operation: payload.operation,
+                path: payload.path,
+                content: Some(content),
+                encoding: Some(encoding),
+                entries: None,
+                stat: None,
+                exists: None,
+                target: None,
+            }
+        }
+        GuestFilesystemOperation::Pread => {
+            sync_active_shadow_path_to_kernel(vm, &payload.path)?;
+            let offset = payload.offset.ok_or_else(|| {
+                SidecarError::InvalidState(String::from("guest filesystem pread requires offset"))
+            })?;
+            let len = payload.len.ok_or_else(|| {
+                SidecarError::InvalidState(String::from("guest filesystem pread requires len"))
+            })?;
+            let length = usize::try_from(len).map_err(|_| {
+                SidecarError::InvalidState(String::from(
+                    "guest filesystem pread len must fit within usize",
+                ))
+            })?;
+            let bytes = vm
+                .kernel
+                .pread_file(&payload.path, offset, length)
+                .map_err(kernel_error)?;
             let (content, encoding) = encode_guest_filesystem_content(bytes);
             GuestFilesystemResultResponse {
                 operation: payload.operation,
@@ -819,7 +849,7 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                         kernel,
                         kernel_pid,
                         path,
-                        &mapped_host.host_path,
+                        &mapped_host,
                     )?;
                     let opened = open_mapped_runtime_beneath(
                         &mapped_host,
@@ -830,11 +860,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                     let host_path = opened.host_path.clone();
                     return open_mapped_host_fd(
                         process,
-                        path,
                         host_path,
                         opened.handle.proc_path(),
                         flags,
-                        mode,
                     );
                 }
                 Some(MappedRuntimeHostAccess::ReadOnly(_)) => {
@@ -899,7 +927,7 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 } else {
                     ActiveExecutionEvent::Stderr(contents.clone())
                 };
-                process.pending_execution_events.push_back(event);
+                process.queue_pending_execution_event(event)?;
             }
             Ok(json!(written))
         }
@@ -940,7 +968,7 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                     kernel,
                     kernel_pid,
                     path,
-                    &mapped_host.host_path,
+                    &mapped_host,
                 )?;
                 let opened = open_mapped_runtime_beneath(
                     &mapped_host,
@@ -1019,7 +1047,7 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                     kernel,
                     kernel_pid,
                     path,
-                    &mapped_host.host_path,
+                    &mapped_host,
                 )?;
                 let opened = open_mapped_runtime_beneath(
                     &mapped_host,
@@ -1048,18 +1076,9 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                     kernel,
                     kernel_pid,
                     path,
-                    &mapped_host.host_path,
+                    &mapped_host,
                 )?;
-                let parent = open_mapped_runtime_parent_beneath(&mapped_host, "fs.lstat")?;
-                let host_path = parent.host_path.join(&parent.child_name);
-                let metadata = fs::symlink_metadata(mapped_runtime_parent_child_path(&parent))
-                    .map_err(|error| {
-                        SidecarError::Io(format!(
-                            "failed to lstat mapped guest path {} -> {}: {error}",
-                            path,
-                            host_path.display()
-                        ))
-                    })?;
+                let metadata = mapped_runtime_symlink_metadata(&mapped_host, "fs.lstat")?;
                 return Ok(javascript_sync_rpc_host_stat_value(&metadata));
             }
             kernel
@@ -1123,13 +1142,19 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 javascript_sync_rpc_option_bool(&request.args, 1, "recursive").unwrap_or(false);
             match mapped_runtime_host_path(process, path, true) {
                 Some(MappedRuntimeHostAccess::Writable(mapped_host)) => {
-                    if recursive {
-                        ensure_mapped_runtime_parent_dirs(&mapped_host, "fs.mkdir")?;
-                        let parent = open_mapped_runtime_parent_beneath(&mapped_host, "fs.mkdir")?;
-                        create_mapped_runtime_directory(&parent, path, true)?;
+                    if mapped_runtime_relative_path(&mapped_host)? == Path::new(".") {
+                        create_mapped_runtime_root_directory(&mapped_host, recursive)?;
                     } else {
-                        let parent = open_mapped_runtime_parent_beneath(&mapped_host, "fs.mkdir")?;
-                        create_mapped_runtime_directory(&parent, path, false)?;
+                        if recursive {
+                            ensure_mapped_runtime_parent_dirs(&mapped_host, "fs.mkdir")?;
+                            let parent =
+                                open_mapped_runtime_parent_beneath(&mapped_host, "fs.mkdir")?;
+                            create_mapped_runtime_directory(&parent, path, true)?;
+                        } else {
+                            let parent =
+                                open_mapped_runtime_parent_beneath(&mapped_host, "fs.mkdir")?;
+                            create_mapped_runtime_directory(&parent, path, false)?;
+                        }
                     }
                     return Ok(Value::Null);
                 }
@@ -1156,7 +1181,7 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                     kernel,
                     kernel_pid,
                     path,
-                    &mapped_host.host_path,
+                    &mapped_host,
                 )?;
                 let opened = open_mapped_runtime_beneath(
                     &mapped_host,
@@ -1293,16 +1318,7 @@ pub(crate) fn service_javascript_fs_sync_rpc(
         "fs.readlinkSync" | "fs.promises.readlink" => {
             let path = javascript_sync_rpc_arg_str(&request.args, 0, "filesystem readlink path")?;
             if let Some(mapped_host) = mapped_runtime_host_path_for_read(process, path) {
-                let parent = open_mapped_runtime_parent_beneath(&mapped_host, "fs.readlink")?;
-                let host_path = parent.host_path.join(&parent.child_name);
-                let target =
-                    fs::read_link(mapped_runtime_parent_child_path(&parent)).map_err(|error| {
-                        SidecarError::Io(format!(
-                            "failed to read mapped guest symlink {} -> {}: {error}",
-                            path,
-                            host_path.display()
-                        ))
-                    })?;
+                let target = read_mapped_runtime_link(&mapped_host, path, "fs.readlink")?;
                 return Ok(Value::String(target.to_string_lossy().into_owned()));
             }
             kernel
@@ -1321,7 +1337,7 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                     let parent = open_mapped_runtime_parent_beneath(&mapped_host, "fs.symlink")?;
                     let host_path = parent.host_path.join(&parent.child_name);
                     remove_shadow_path_if_exists(&host_path, link_path)?;
-                    symlink(&target, mapped_runtime_parent_child_path(&parent)).map_err(
+                    symlink(target, mapped_runtime_parent_child_path(&parent)).map_err(
                         |error| {
                             SidecarError::Io(format!(
                             "failed to create mapped guest symlink {} -> {} ({target}): {error}",
@@ -1432,7 +1448,7 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                         kernel,
                         kernel_pid,
                         path,
-                        &mapped_host.host_path,
+                        &mapped_host,
                     )?;
                     let opened = open_mapped_runtime_beneath(
                         &mapped_host,
@@ -1486,48 +1502,87 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                 request.method.as_str(),
                 "fs.lutimesSync" | "fs.promises.lutimes"
             );
-            match mapped_runtime_host_path(process, path, true) {
-                Some(MappedRuntimeHostAccess::Writable(mapped_host)) => {
-                    materialize_mapped_host_path_from_kernel(
-                        kernel,
-                        kernel_pid,
-                        path,
-                        &mapped_host.host_path,
-                    )?;
-                    let proc_path;
-                    if follow_symlinks {
-                        let opened = open_mapped_runtime_beneath(
-                            &mapped_host,
-                            "fs.utimes",
-                            OFlag::O_PATH,
-                            Mode::empty(),
-                        )?;
-                        proc_path = opened.handle.proc_path();
+            if let Some(shadow_path) = process_shadow_host_path(process, path) {
+                if fs::symlink_metadata(&shadow_path).is_ok() {
+                    let result = if follow_symlinks {
+                        kernel.utimes_spec(path, atime, mtime)
                     } else {
-                        let parent =
-                            open_mapped_runtime_parent_beneath(&mapped_host, "fs.lutimes")?;
-                        proc_path = mapped_runtime_parent_child_path(&parent);
-                    }
-                    if kernel
-                        .exists_for_process(EXECUTION_DRIVER_NAME, kernel_pid, path)
-                        .map_err(kernel_error)?
-                    {
-                        if follow_symlinks {
-                            kernel
-                                .utimes_spec(path, atime, mtime)
-                                .map_err(kernel_error)?;
-                        } else {
-                            kernel.lutimes(path, atime, mtime).map_err(kernel_error)?;
+                        kernel.lutimes(path, atime, mtime)
+                    };
+                    if let Err(error) = result {
+                        if error.code() != "ENOENT" {
+                            return Err(kernel_error(error));
                         }
                     }
                     apply_host_path_utimens(
-                        &proc_path,
+                        &shadow_path,
                         atime,
                         mtime,
                         follow_symlinks,
-                        &format!("failed to update mapped guest path times {path}"),
+                        &format!("failed to update process shadow path times {path}"),
                     )?;
                     return Ok(Value::Null);
+                }
+            }
+            match mapped_runtime_host_path(process, path, true) {
+                Some(MappedRuntimeHostAccess::Writable(mapped_host)) => {
+                    let mapped_host_exists = match fs::symlink_metadata(&mapped_host.host_path) {
+                        Ok(_) => true,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            materialize_mapped_host_path_from_kernel(
+                                kernel,
+                                kernel_pid,
+                                path,
+                                &mapped_host,
+                            )?;
+                            fs::symlink_metadata(&mapped_host.host_path).is_ok()
+                        }
+                        Err(error) => {
+                            return Err(SidecarError::Io(format!(
+                                "failed to inspect mapped guest path {} -> {}: {error}",
+                                path,
+                                mapped_host.host_path.display()
+                            )));
+                        }
+                    };
+                    if mapped_host_exists {
+                        let proc_path = if follow_symlinks {
+                            let opened = open_mapped_runtime_beneath(
+                                &mapped_host,
+                                "fs.utimes",
+                                OFlag::O_PATH,
+                                Mode::empty(),
+                            )?;
+                            opened.handle.proc_path()
+                        } else {
+                            let parent =
+                                open_mapped_runtime_parent_beneath(&mapped_host, "fs.lutimes")?;
+                            mapped_runtime_parent_child_path(&parent)
+                        };
+                        if kernel
+                            .exists_for_process(EXECUTION_DRIVER_NAME, kernel_pid, path)
+                            .map_err(kernel_error)?
+                        {
+                            let result = if follow_symlinks {
+                                kernel.utimes_spec(path, atime, mtime)
+                            } else {
+                                kernel.lutimes(path, atime, mtime)
+                            };
+                            if let Err(error) = result {
+                                if error.code() != "ENOENT" {
+                                    return Err(kernel_error(error));
+                                }
+                            }
+                        }
+                        apply_host_path_utimens(
+                            &proc_path,
+                            atime,
+                            mtime,
+                            follow_symlinks,
+                            &format!("failed to update mapped guest path times {path}"),
+                        )?;
+                        return Ok(Value::Null);
+                    }
                 }
                 Some(MappedRuntimeHostAccess::ReadOnly(_)) => {
                     return Err(read_only_mapped_runtime_host_path_error(path));
@@ -1537,14 +1592,11 @@ pub(crate) fn service_javascript_fs_sync_rpc(
             if follow_symlinks {
                 kernel
                     .utimes_spec(path, atime, mtime)
-                    .map(|()| Value::Null)
-                    .map_err(kernel_error)
+                    .map_err(kernel_error)?;
             } else {
-                kernel
-                    .lutimes(path, atime, mtime)
-                    .map(|()| Value::Null)
-                    .map_err(kernel_error)
-            }
+                kernel.lutimes(path, atime, mtime).map_err(kernel_error)?;
+            };
+            Ok(Value::Null)
         }
         "fs.futimesSync" => {
             let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "filesystem futimes fd")?;
@@ -1798,6 +1850,36 @@ fn mapped_runtime_host_path_for_read(
     }
 }
 
+fn process_shadow_host_path(process: &ActiveProcess, guest_path: &str) -> Option<PathBuf> {
+    let normalized_guest_path = normalized_process_guest_path(process, guest_path);
+    let normalized_guest_cwd = normalize_path(&process.guest_cwd);
+    let mut host_root = normalize_host_path(&process.host_cwd);
+    for _ in normalized_guest_cwd
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
+        host_root = host_root.parent()?.to_path_buf();
+    }
+    if normalized_guest_path == "/" {
+        Some(host_root)
+    } else {
+        Some(host_root.join(normalized_guest_path.trim_start_matches('/')))
+    }
+}
+
+fn normalized_process_guest_path(process: &ActiveProcess, guest_path: &str) -> String {
+    if guest_path.starts_with('/') {
+        normalize_path(guest_path)
+    } else {
+        normalize_path(&format!(
+            "{}/{}",
+            process.guest_cwd.trim_end_matches('/'),
+            guest_path
+        ))
+    }
+}
+
 fn runtime_host_access_roots(process: &ActiveProcess, key: &str) -> Option<Vec<PathBuf>> {
     process
         .env
@@ -1977,6 +2059,58 @@ fn open_mapped_runtime_parent_beneath(
     })
 }
 
+fn mapped_runtime_symlink_metadata(
+    mapped: &MappedRuntimeHostPath,
+    operation: &str,
+) -> Result<fs::Metadata, SidecarError> {
+    let relative = mapped_runtime_relative_path(mapped)?;
+    if relative == Path::new(".") {
+        return fs::symlink_metadata(&mapped.host_path).map_err(|error| {
+            SidecarError::Io(format!(
+                "failed to lstat mapped guest path {} -> {}: {error}",
+                mapped.guest_path,
+                mapped.host_path.display()
+            ))
+        });
+    }
+
+    let parent = open_mapped_runtime_parent_beneath(mapped, operation)?;
+    let host_path = parent.host_path.join(&parent.child_name);
+    fs::symlink_metadata(mapped_runtime_parent_child_path(&parent)).map_err(|error| {
+        SidecarError::Io(format!(
+            "failed to lstat mapped guest path {} -> {}: {error}",
+            mapped.guest_path,
+            host_path.display()
+        ))
+    })
+}
+
+fn read_mapped_runtime_link(
+    mapped: &MappedRuntimeHostPath,
+    guest_path: &str,
+    operation: &str,
+) -> Result<PathBuf, SidecarError> {
+    if mapped_runtime_relative_path(mapped)? == Path::new(".") {
+        return fs::read_link(&mapped.host_path).map_err(|error| {
+            SidecarError::Io(format!(
+                "failed to read mapped guest symlink {} -> {}: {error}",
+                guest_path,
+                mapped.host_path.display()
+            ))
+        });
+    }
+
+    let parent = open_mapped_runtime_parent_beneath(mapped, operation)?;
+    let host_path = parent.host_path.join(&parent.child_name);
+    fs::read_link(mapped_runtime_parent_child_path(&parent)).map_err(|error| {
+        SidecarError::Io(format!(
+            "failed to read mapped guest symlink {} -> {}: {error}",
+            guest_path,
+            host_path.display()
+        ))
+    })
+}
+
 fn mapped_runtime_host_path_from_fd(
     mapped: &MappedRuntimeHostPath,
     operation: &str,
@@ -2022,6 +2156,39 @@ fn create_mapped_runtime_directory(
             guest_path,
             parent.host_path.join(&parent.child_name).display()
         ))),
+    }
+}
+
+fn create_mapped_runtime_root_directory(
+    mapped: &MappedRuntimeHostPath,
+    recursive: bool,
+) -> Result<(), SidecarError> {
+    let relative = mapped_runtime_relative_path(mapped)?;
+    if relative != Path::new(".") {
+        return Err(SidecarError::InvalidState(format!(
+            "fs.mkdir: mapped guest path {} is not the mapped root",
+            mapped.guest_path
+        )));
+    }
+
+    if recursive {
+        match fs::create_dir_all(&mapped.host_path) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(SidecarError::Io(format!(
+                "failed to create mapped guest directory {} -> {}: {error}",
+                mapped.guest_path,
+                mapped.host_path.display()
+            ))),
+        }
+    } else {
+        match fs::create_dir(&mapped.host_path) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(SidecarError::Io(format!(
+                "failed to create mapped guest directory {} -> {}: {error}",
+                mapped.guest_path,
+                mapped.host_path.display()
+            ))),
+        }
     }
 }
 
@@ -2113,8 +2280,9 @@ fn materialize_mapped_host_path_from_kernel(
     kernel: &mut SidecarKernel,
     kernel_pid: u32,
     guest_path: &str,
-    host_path: &Path,
+    mapped: &MappedRuntimeHostPath,
 ) -> Result<(), SidecarError> {
+    let host_path = &mapped.host_path;
     match fs::symlink_metadata(host_path) {
         Ok(_) => return Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2138,69 +2306,74 @@ fn materialize_mapped_host_path_from_kernel(
         .lstat_for_process(EXECUTION_DRIVER_NAME, kernel_pid, guest_path)
         .map_err(kernel_error)?;
 
-    if let Some(parent) = host_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            SidecarError::Io(format!(
-                "failed to create mapped host parent for {} -> {}: {error}",
-                guest_path,
-                host_path.display()
-            ))
-        })?;
-    }
-
     if stat.is_symbolic_link {
         let target = kernel
             .read_link_for_process(EXECUTION_DRIVER_NAME, kernel_pid, guest_path)
             .map_err(kernel_error)?;
-        symlink(&target, host_path).map_err(|error| {
+        ensure_mapped_runtime_parent_dirs(mapped, "fs.materialize")?;
+        let parent = open_mapped_runtime_parent_beneath(mapped, "fs.materialize")?;
+        symlink(&target, mapped_runtime_parent_child_path(&parent)).map_err(|error| {
             SidecarError::Io(format!(
                 "failed to materialize mapped guest symlink {} -> {} ({target}): {error}",
                 guest_path,
-                host_path.display()
+                parent.host_path.join(&parent.child_name).display()
             ))
         })?;
         return Ok(());
     } else if stat.is_directory {
-        fs::create_dir_all(host_path).map_err(|error| {
-            SidecarError::Io(format!(
-                "failed to materialize mapped guest directory {} -> {}: {error}",
-                guest_path,
-                host_path.display()
-            ))
-        })?;
+        if mapped_runtime_relative_path(mapped)? == Path::new(".") {
+            create_mapped_runtime_root_directory(mapped, true)?;
+        } else {
+            ensure_mapped_runtime_parent_dirs(mapped, "fs.materialize")?;
+            let parent = open_mapped_runtime_parent_beneath(mapped, "fs.materialize")?;
+            create_mapped_runtime_directory(&parent, guest_path, true)?;
+        }
     } else {
         let bytes = kernel
             .read_file_for_process(EXECUTION_DRIVER_NAME, kernel_pid, guest_path)
             .map_err(kernel_error)?;
-        fs::write(host_path, bytes).map_err(|error| {
+        ensure_mapped_runtime_parent_dirs(mapped, "fs.materialize")?;
+        let opened = open_mapped_runtime_beneath(
+            mapped,
+            "fs.materialize",
+            OFlag::O_CREAT | OFlag::O_TRUNC | OFlag::O_WRONLY,
+            Mode::from_bits_truncate(stat.mode & 0o7777),
+        )?;
+        fs::write(opened.handle.proc_path(), bytes).map_err(|error| {
             SidecarError::Io(format!(
                 "failed to materialize mapped guest file {} -> {}: {error}",
                 guest_path,
-                host_path.display()
+                opened.host_path.display()
             ))
         })?;
     }
 
-    fs::set_permissions(host_path, fs::Permissions::from_mode(stat.mode & 0o7777)).map_err(
-        |error| {
-            SidecarError::Io(format!(
-                "failed to set permissions for materialized mapped guest path {} -> {}: {error}",
-                guest_path,
-                host_path.display()
-            ))
-        },
+    let opened = open_mapped_runtime_beneath(
+        mapped,
+        "fs.materialize",
+        OFlag::O_PATH,
+        Mode::empty(),
     )?;
+    fs::set_permissions(
+        opened.handle.proc_path(),
+        fs::Permissions::from_mode(stat.mode & 0o7777),
+    )
+    .map_err(|error| {
+        SidecarError::Io(format!(
+            "failed to set permissions for materialized mapped guest path {} -> {}: {error}",
+            guest_path,
+            opened.host_path.display()
+        ))
+    })?;
 
     Ok(())
 }
 
 fn open_mapped_host_fd(
     process: &mut ActiveProcess,
-    guest_path: &str,
     host_path: PathBuf,
     proc_path: PathBuf,
     flags: u32,
-    mode: Option<u32>,
 ) -> Result<Value, SidecarError> {
     let access_mode = flags & libc::O_ACCMODE as u32;
     let mut options = OpenOptions::new();
@@ -2218,15 +2391,6 @@ fn open_mapped_host_fd(
     if flags & libc::O_APPEND as u32 != 0 {
         options.append(true);
     }
-    if flags & libc::O_CREAT as u32 != 0 {
-        options.create(true);
-    }
-    if flags & libc::O_EXCL as u32 != 0 {
-        options.create_new(true);
-    }
-    if flags & libc::O_TRUNC as u32 != 0 {
-        options.truncate(true);
-    }
 
     let masked_flags = flags
         & !(libc::O_ACCMODE as u32
@@ -2234,13 +2398,11 @@ fn open_mapped_host_fd(
             | libc::O_CREAT as u32
             | libc::O_EXCL as u32
             | libc::O_TRUNC as u32);
-    options.mode(mode.unwrap_or(0o666));
     options.custom_flags(masked_flags as i32);
 
     let file = options.open(&proc_path).map_err(|error| {
         SidecarError::Io(format!(
-            "failed to open mapped guest file {} -> {}: {error}",
-            guest_path,
+            "failed to open mapped guest file {}: {error}",
             host_path.display()
         ))
     })?;
@@ -2708,6 +2870,9 @@ fn sync_active_shadow_path_to_kernel(
 ) -> Result<(), SidecarError> {
     sync_active_process_host_writes_to_kernel(vm)?;
     let guest_path = normalize_path(guest_path);
+    if is_protected_agentos_shadow_sync_path(&guest_path) {
+        return Ok(());
+    }
     let mut host_paths = active_process_shadow_host_paths_for_guest(vm, &guest_path);
     if host_paths.is_empty() && !vm.kernel.exists(&guest_path).unwrap_or(false) {
         host_paths.push(shadow_host_path_for_guest(&vm.cwd, &guest_path));
@@ -2967,12 +3132,21 @@ fn ensure_guest_parent_dir(vm: &mut VmState, guest_path: &str) -> Result<(), Sid
 #[cfg(test)]
 mod tests {
     use super::{
-        create_mapped_runtime_directory, mapped_runtime_relative_path,
-        open_mapped_runtime_parent_beneath, rename_mapped_host_path, MappedRuntimeHostAccess,
+        create_mapped_runtime_directory, create_mapped_runtime_root_directory,
+        mapped_runtime_relative_path, mapped_runtime_symlink_metadata,
+        materialize_mapped_host_path_from_kernel, open_mapped_runtime_parent_beneath,
+        read_mapped_runtime_link, rename_mapped_host_path, MappedRuntimeHostAccess,
         MappedRuntimeHostPath, SidecarError,
     };
     use crate::execution::javascript_sync_rpc_error_code;
+    use crate::state::{SidecarKernel, EXECUTION_DRIVER_NAME, JAVASCRIPT_COMMAND};
+    use agent_os_kernel::command_registry::CommandDriver;
+    use agent_os_kernel::kernel::{KernelVmConfig, SpawnOptions};
+    use agent_os_kernel::mount_table::MountTable;
+    use agent_os_kernel::permissions::Permissions;
+    use agent_os_kernel::vfs::MemoryFileSystem;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2983,6 +3157,42 @@ mod tests {
             host_path: host_root.join("file.txt"),
             host_root: host_root.clone(),
         })
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "{prefix}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn test_kernel_with_process() -> (SidecarKernel, u32) {
+        let mut config = KernelVmConfig::new("vm-mapped-materialize");
+        config.permissions = Permissions::allow_all();
+        let mut kernel = SidecarKernel::new(MountTable::new(MemoryFileSystem::new()), config);
+        kernel
+            .register_driver(CommandDriver::new(
+                EXECUTION_DRIVER_NAME,
+                [JAVASCRIPT_COMMAND],
+            ))
+            .expect("register execution driver");
+        let handle = kernel
+            .spawn_process(
+                JAVASCRIPT_COMMAND,
+                Vec::new(),
+                SpawnOptions {
+                    requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                    cwd: Some(String::from("/")),
+                    ..SpawnOptions::default()
+                },
+            )
+            .expect("spawn kernel process");
+        (kernel, handle.pid())
     }
 
     #[test]
@@ -3046,6 +3256,53 @@ mod tests {
     }
 
     #[test]
+    fn mapped_runtime_root_lstat_uses_root_metadata_without_parent_basename() {
+        let host_root = std::env::temp_dir().join(format!(
+            "agent-os-sidecar-fs-root-lstat-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&host_root).expect("create mapped host root");
+        let mapped = MappedRuntimeHostPath {
+            guest_path: String::from("/node_modules"),
+            host_root: host_root.clone(),
+            host_path: host_root.clone(),
+        };
+
+        let metadata = mapped_runtime_symlink_metadata(&mapped, "test").expect("lstat mapped root");
+        assert!(metadata.is_dir(), "expected mapped root directory metadata");
+
+        fs::remove_dir_all(&host_root).expect("remove mapped host root");
+    }
+
+    #[test]
+    fn mapped_runtime_root_readlink_uses_root_path_without_parent_basename() {
+        let host_parent = std::env::temp_dir().join(format!(
+            "agent-os-sidecar-fs-root-readlink-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        let host_target = host_parent.join("target");
+        let host_link = host_parent.join("link");
+        fs::create_dir_all(&host_target).expect("create mapped host target");
+        std::os::unix::fs::symlink(&host_target, &host_link).expect("create mapped host link");
+        let mapped = MappedRuntimeHostPath {
+            guest_path: String::from("/"),
+            host_root: host_link.clone(),
+            host_path: host_link,
+        };
+
+        let target = read_mapped_runtime_link(&mapped, "/", "test").expect("read mapped root link");
+        assert_eq!(target, host_target);
+
+        fs::remove_dir_all(&host_parent).expect("remove mapped host parent");
+    }
+
+    #[test]
     fn recursive_mapped_directory_create_accepts_existing_directory() {
         let host_root = std::env::temp_dir().join(format!(
             "agent-os-sidecar-fs-existing-dir-{}",
@@ -3071,6 +3328,115 @@ mod tests {
         assert!(
             matches!(non_recursive_error, SidecarError::Io(ref message) if message.contains("File exists")),
             "expected File exists error, got {non_recursive_error:?}"
+        );
+
+        fs::remove_dir_all(&host_root).expect("remove mapped host root");
+    }
+
+    #[test]
+    fn recursive_mapped_root_directory_create_accepts_existing_directory() {
+        let host_root = std::env::temp_dir().join(format!(
+            "agent-os-sidecar-fs-existing-root-dir-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&host_root).expect("create mapped host root");
+        let mapped = MappedRuntimeHostPath {
+            guest_path: String::from("/"),
+            host_root: host_root.clone(),
+            host_path: host_root.clone(),
+        };
+
+        create_mapped_runtime_root_directory(&mapped, true)
+            .expect("recursive root mkdir should accept an existing directory");
+        let non_recursive_error = create_mapped_runtime_root_directory(&mapped, false)
+            .expect_err("non-recursive root mkdir should keep EEXIST behavior");
+        assert!(
+            matches!(non_recursive_error, SidecarError::Io(ref message) if message.contains("File exists")),
+            "expected File exists error, got {non_recursive_error:?}"
+        );
+
+        fs::remove_dir_all(&host_root).expect("remove mapped host root");
+    }
+
+    #[test]
+    fn materialize_mapped_host_path_does_not_follow_symlinked_parents() {
+        let host_root = temp_dir("agent-os-sidecar-fs-materialize-root");
+        let outside = temp_dir("agent-os-sidecar-fs-materialize-outside");
+        std::os::unix::fs::symlink(&outside, host_root.join("link"))
+            .expect("create escape symlink");
+
+        let (mut kernel, pid) = test_kernel_with_process();
+        kernel
+            .write_file_for_process(
+                EXECUTION_DRIVER_NAME,
+                pid,
+                "/workspace/link/out.txt",
+                b"secret".to_vec(),
+                Some(0o644),
+            )
+            .expect("seed guest file");
+        let mapped = MappedRuntimeHostPath {
+            guest_path: String::from("/workspace/link/out.txt"),
+            host_root: host_root.clone(),
+            host_path: host_root.join("link/out.txt"),
+        };
+
+        materialize_mapped_host_path_from_kernel(
+            &mut kernel,
+            pid,
+            "/workspace/link/out.txt",
+            &mapped,
+        )
+        .expect_err("symlinked parent must not be followed during materialization");
+
+        assert!(
+            !outside.join("out.txt").exists(),
+            "materialization wrote through a symlinked mapped parent"
+        );
+
+        fs::remove_dir_all(&host_root).expect("remove mapped host root");
+        fs::remove_dir_all(&outside).expect("remove outside dir");
+    }
+
+    #[test]
+    fn materialize_mapped_host_path_writes_regular_files_beneath_root() {
+        let host_root = temp_dir("agent-os-sidecar-fs-materialize-file");
+        let (mut kernel, pid) = test_kernel_with_process();
+        kernel
+            .write_file_for_process(
+                EXECUTION_DRIVER_NAME,
+                pid,
+                "/workspace/out.txt",
+                b"secret".to_vec(),
+                Some(0o640),
+            )
+            .expect("seed guest file");
+        let mapped = MappedRuntimeHostPath {
+            guest_path: String::from("/workspace/out.txt"),
+            host_root: host_root.clone(),
+            host_path: host_root.join("out.txt"),
+        };
+
+        materialize_mapped_host_path_from_kernel(
+            &mut kernel,
+            pid,
+            "/workspace/out.txt",
+            &mapped,
+        )
+        .expect("materialize regular mapped file");
+
+        let host_path = host_root.join("out.txt");
+        assert_eq!(fs::read(&host_path).expect("read materialized file"), b"secret");
+        assert_eq!(
+            fs::metadata(&host_path)
+                .expect("materialized metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
         );
 
         fs::remove_dir_all(&host_root).expect("remove mapped host root");

@@ -27,9 +27,9 @@ fn generated_invalid_path(seed: u32) -> String {
             path.push('/');
         }
         path.push(char::from(b'a' + ((seed + segment) % 26) as u8));
-        let invalid_byte = if seed % 2 == 0 {
+        let invalid_byte = if seed.is_multiple_of(2) {
             0
-        } else if seed % 5 == 0 {
+        } else if seed.is_multiple_of(5) {
             0x7f
         } else {
             1 + ((seed + segment) % 31) as u8
@@ -400,7 +400,14 @@ fn chmod_chown_utimes_truncate_and_pread_update_metadata_and_contents() {
     assert_eq!(stat.mtime_ms, 1_710_000_000_000);
     assert_eq!(stat.size, 8);
     assert_eq!(stat.blocks, 1);
-    assert_eq!(stat.dev, 1);
+    // Device ids are unique per filesystem instance, so only assert that the
+    // value is stable within this filesystem.
+    assert_ne!(stat.dev, 0);
+    assert_eq!(
+        stat.dev,
+        filesystem.stat("/").expect("stat root").dev,
+        "files in one filesystem instance share its device id"
+    );
     assert_eq!(stat.rdev, 0);
 
     let bytes = filesystem
@@ -419,6 +426,33 @@ fn chmod_chown_utimes_truncate_and_pread_update_metadata_and_contents() {
         .pread("/meta.txt", 100, 4)
         .expect("pread beyond eof")
         .is_empty());
+}
+
+#[test]
+fn oversized_raw_truncate_and_pwrite_fail_without_mutating_file_contents() {
+    let mut filesystem = MemoryFileSystem::new();
+    filesystem
+        .write_file("/huge.txt", b"safe".to_vec())
+        .expect("seed file");
+
+    assert_error_code(filesystem.truncate("/huge.txt", u64::MAX), "ENOMEM");
+    assert_eq!(
+        filesystem
+            .read_file("/huge.txt")
+            .expect("read after failed truncate"),
+        b"safe".to_vec()
+    );
+
+    assert_error_code(
+        filesystem.pwrite("/huge.txt", b"x".to_vec(), u64::MAX),
+        "ENOMEM",
+    );
+    assert_eq!(
+        filesystem
+            .read_file("/huge.txt")
+            .expect("read after failed pwrite"),
+        b"safe".to_vec()
+    );
 }
 
 #[test]
@@ -545,5 +579,32 @@ fn memory_filesystem_snapshot_round_trips_hardlinks_and_symlinks() {
             .expect("stat restored hard link")
             .nlink,
         2
+    );
+}
+
+#[test]
+fn memory_filesystem_instances_have_distinct_device_ids() {
+    let mut first = MemoryFileSystem::new();
+    let mut second = MemoryFileSystem::new();
+    first
+        .write_file("/file.txt", "first")
+        .expect("write file in first filesystem");
+    second
+        .write_file("/file.txt", "second")
+        .expect("write file in second filesystem");
+
+    let first_stat = first.stat("/file.txt").expect("stat first file");
+    let second_stat = second.stat("/file.txt").expect("stat second file");
+
+    // Inode numbers are only unique within one filesystem instance, so file
+    // identity comparisons across layered or mounted compositions need
+    // per-instance device ids.
+    assert_eq!(first_stat.ino, second_stat.ino);
+    assert_ne!(first_stat.dev, second_stat.dev);
+
+    let restored = MemoryFileSystem::from_snapshot(first.snapshot());
+    assert_ne!(
+        restored.lstat("/file.txt").expect("stat restored file").dev,
+        second_stat.dev
     );
 }

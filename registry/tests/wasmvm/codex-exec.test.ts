@@ -1,5 +1,5 @@
 /**
- * Integration tests for codex-exec headless agent WASM binary.
+ * Integration tests for codex-exec command WASM binary.
  *
  * Verifies the codex-exec binary running in WasmVM can:
  *   - Print usage via --help
@@ -8,8 +8,8 @@
  *   - Accept a prompt argument and exit cleanly
  *   - Capture stdout/stderr correctly through the kernel
  *   - Be spawned from the shell (sh -c) via the kernel pipeline
+ *   - Fail fast for session-turn mode until the real Codex agent is wired
  *
- * API-dependent tests are gated behind OPENAI_API_KEY env var.
  * WASM binary tests are gated behind hasWasmBinaries.
  */
 
@@ -17,8 +17,6 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { createWasmVmRuntime } from '@rivet-dev/agent-os-core/test/runtime';
 import { COMMANDS_DIR, createKernel, describeIf, hasWasmBinaries } from '../helpers.js';
 import type { Kernel } from '../helpers.js';
-
-const hasApiKey = !!process.env.OPENAI_API_KEY;
 
 // Minimal in-memory VFS for kernel tests
 class SimpleVFS {
@@ -116,7 +114,7 @@ async function createTestKernel(): Promise<{ kernel: Kernel; vfs: SimpleVFS }> {
   return { kernel, vfs };
 }
 
-describeIf(hasWasmBinaries, 'codex-exec headless agent (WasmVM)', { timeout: 30_000 }, () => {
+describeIf(hasWasmBinaries, 'codex-exec command (WasmVM)', { timeout: 30_000 }, () => {
   let kernel: Kernel;
 
   afterEach(async () => {
@@ -150,9 +148,26 @@ describeIf(hasWasmBinaries, 'codex-exec headless agent (WasmVM)', { timeout: 30_
   it('accepts prompt as argument and exits cleanly', async () => {
     ({ kernel } = await createTestKernel());
     const result = await kernel.exec('codex-exec "list all files"');
-    // Prompt mode is currently a placeholder that echoes the prompt to stderr.
+    // Prompt mode is currently a placeholder that accepts the prompt without echoing it.
     expect(result.stderr).toContain('headless prompt mode is not wired to the provider yet');
-    expect(result.stderr).toContain('list all files');
+    expect(result.stderr).toContain('prompt received');
+    expect(result.stderr).not.toContain('list all files');
+  });
+
+  it('accepts prompt from stdin without echoing it', async () => {
+    ({ kernel } = await createTestKernel());
+    const result = await kernel.exec('codex-exec', { stdin: 'stdin secret prompt\n' });
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toContain('headless prompt mode is not wired to the provider yet');
+    expect(result.stderr).toContain('prompt received');
+    expect(result.stderr).not.toContain('stdin secret prompt');
+  });
+
+  it('rejects oversized stdin prompts', async () => {
+    ({ kernel } = await createTestKernel());
+    const result = await kernel.exec('codex-exec', { stdin: 'x'.repeat(64 * 1024 + 1) });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain('stdin prompt exceeds');
   });
 
   it('prints error when no prompt is provided via arg', async () => {
@@ -184,7 +199,8 @@ describeIf(hasWasmBinaries, 'codex-exec headless agent (WasmVM)', { timeout: 30_
     const result = await kernel.exec('codex-exec "test prompt"');
     // Headless mode outputs to stderr
     expect(result.stderr.length).toBeGreaterThan(0);
-    expect(result.stderr).toContain('prompt: test prompt');
+    expect(result.stderr).toContain('prompt received');
+    expect(result.stderr).not.toContain('test prompt');
   });
 
   it('exits cleanly after completing a single prompt', async () => {
@@ -192,29 +208,14 @@ describeIf(hasWasmBinaries, 'codex-exec headless agent (WasmVM)', { timeout: 30_
     const result = await kernel.exec('codex-exec "hello world"');
     // The process exits with code 0 (brush-shell wraps it)
     // Verify it doesn't hang — the exec() call resolves
-    expect(result.stderr).toContain('hello world');
-  });
-});
-
-describeIf(hasWasmBinaries && hasApiKey, 'codex-exec API integration (requires OPENAI_API_KEY)', { timeout: 60_000 }, () => {
-  let kernel: Kernel;
-
-  afterEach(async () => {
-    await kernel?.dispose();
+    expect(result.stderr).toContain('prompt received');
+    expect(result.stderr).not.toContain('hello world');
   });
 
-  it('with OPENAI_API_KEY env var produces output', async () => {
-    const vfs = new SimpleVFS();
-    const kernel_local = createKernel({ filesystem: vfs as any });
-    kernel = kernel_local;
-    await kernel.mount(createWasmVmRuntime({ commandDirs: [COMMANDS_DIR] }));
-
-    // Since the agent loop is a placeholder, this test verifies that
-    // the binary accepts the prompt and exits without crashing when
-    // the API key is in the environment. Full API integration will be
-    // tested when codex-core is wired in.
-    const result = await kernel.exec('codex-exec "say hello"');
-    // Should at minimum print the prompt back and exit
-    expect(result.stderr).toContain('say hello');
+  it('session-turn mode fails fast instead of calling a bespoke provider loop', async () => {
+    ({ kernel } = await createTestKernel());
+    const result = await kernel.exec('codex-exec --session-turn');
+    expect(result.stdout).toContain('"type":"error"');
+    expect(result.stdout).toContain('real Codex agent package');
   });
 });

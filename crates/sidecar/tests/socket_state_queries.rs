@@ -39,7 +39,8 @@ fn wait_for_process_output(
 
         match event.payload {
             EventPayload::ProcessOutput(output)
-                if output.process_id == process_id && output.chunk.contains(expected) =>
+                if output.process_id == process_id
+                    && String::from_utf8_lossy(&output.chunk).contains(expected) =>
             {
                 return;
             }
@@ -229,8 +230,9 @@ fn v8_signal_delivery_routes_kill_process_and_process_kill() {
 
         match event.payload {
             EventPayload::ProcessOutput(output) if output.process_id == "signal-routing" => {
-                saw_first_sigterm |= output.chunk.contains("sigterm:1");
-                saw_second_sigterm |= output.chunk.contains("sigterm:2");
+                let chunk = String::from_utf8_lossy(&output.chunk);
+                saw_first_sigterm |= chunk.contains("sigterm:1");
+                saw_second_sigterm |= chunk.contains("sigterm:2");
             }
             EventPayload::ProcessExited(exited) if exited.process_id == "signal-routing" => {
                 exit_code = Some(exited.exit_code);
@@ -400,6 +402,15 @@ fn sidecar_queries_listener_udp_and_signal_state() {
         &cwd,
         BTreeMap::new(),
     );
+    let (other_vm_id, _) = create_vm_with_metadata(
+        &mut sidecar,
+        31,
+        &connection_id,
+        &session_id,
+        GuestRuntimeKind::JavaScript,
+        &cwd,
+        BTreeMap::new(),
+    );
 
     execute(
         &mut sidecar,
@@ -450,6 +461,28 @@ fn sidecar_queries_listener_udp_and_signal_state() {
             "timed out waiting for listener snapshot"
         );
         std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let other_vm_listener = sidecar
+        .dispatch_blocking(request(
+            71,
+            OwnershipScope::vm(&connection_id, &session_id, &other_vm_id),
+            RequestPayload::FindListener(FindListenerRequest {
+                host: Some(String::from("127.0.0.1")),
+                port: Some(43111),
+                path: None,
+            }),
+        ))
+        .expect("query tcp listener from another vm");
+    match other_vm_listener.response.payload {
+        ResponsePayload::ListenerSnapshot(snapshot) => {
+            assert!(
+                snapshot.listener.is_none(),
+                "listener from vm {vm_id} leaked into vm {other_vm_id}: {:?}",
+                snapshot.listener
+            );
+        }
+        other => panic!("unexpected other-vm listener response: {other:?}"),
     }
 
     let kill_listener = sidecar
@@ -518,6 +551,27 @@ fn sidecar_queries_listener_udp_and_signal_state() {
             assert_eq!(socket.port, Some(43112));
         }
         other => panic!("unexpected bound udp response: {other:?}"),
+    }
+
+    let other_vm_bound_udp = sidecar
+        .dispatch_blocking(request(
+            72,
+            OwnershipScope::vm(&connection_id, &session_id, &other_vm_id),
+            RequestPayload::FindBoundUdp(FindBoundUdpRequest {
+                host: Some(String::from("127.0.0.1")),
+                port: Some(43112),
+            }),
+        ))
+        .expect("query udp socket from another vm");
+    match other_vm_bound_udp.response.payload {
+        ResponsePayload::BoundUdpSnapshot(snapshot) => {
+            assert!(
+                snapshot.socket.is_none(),
+                "udp socket from vm {vm_id} leaked into vm {other_vm_id}: {:?}",
+                snapshot.socket
+            );
+        }
+        other => panic!("unexpected other-vm udp response: {other:?}"),
     }
 
     let signal_deadline = Instant::now() + Duration::from_secs(5);
@@ -690,9 +744,10 @@ fn sidecar_tracks_javascript_sigchld_and_delivers_it_on_child_exit() {
         if let Some(event) = event {
             match event.payload {
                 EventPayload::ProcessOutput(output) if output.process_id == "sigchld-parent" => {
-                    saw_registered_output |= output.chunk.contains("sigchld-registered");
-                    saw_sigchld_output |= output.chunk.contains("sigchld:1");
-                    saw_final_output |= output.chunk.contains("sigchld-final:1");
+                    let chunk = String::from_utf8_lossy(&output.chunk);
+                    saw_registered_output |= chunk.contains("sigchld-registered");
+                    saw_sigchld_output |= chunk.contains("sigchld:1");
+                    saw_final_output |= chunk.contains("sigchld-final:1");
                 }
                 EventPayload::ProcessExited(exited) if exited.process_id == "sigchld-parent" => {
                     exit_code = Some(exited.exit_code);

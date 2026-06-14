@@ -70,6 +70,7 @@ fn mkdir_request(path: &str, recursive: bool) -> GuestFilesystemCallRequest {
         atime_ms: None,
         mtime_ms: None,
         len: None,
+        offset: None,
     }
 }
 
@@ -232,6 +233,43 @@ fn permission_flags_reject_empty_paths_and_patterns_on_configure() {
         empty_patterns.response.payload,
         "network.rules[0].patterns must not be empty",
     );
+
+    let empty_pattern_operations = sidecar
+        .dispatch_blocking(request(
+            6,
+            OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+            RequestPayload::ConfigureVm(ConfigureVmRequest {
+                mounts: Vec::new(),
+                software: Vec::new(),
+                permissions: Some(PermissionsPolicy {
+                    fs: None,
+                    network: Some(PatternPermissionScope::Rules(PatternPermissionRuleSet {
+                        default: Some(PermissionMode::Deny),
+                        rules: vec![PatternPermissionRule {
+                            mode: PermissionMode::Allow,
+                            operations: Vec::new(),
+                            patterns: vec![String::from("**")],
+                        }],
+                    })),
+                    child_process: None,
+                    process: None,
+                    env: None,
+                    tool: None,
+                }),
+                module_access_cwd: None,
+                instructions: Vec::new(),
+                projected_modules: Vec::new(),
+                command_permissions: Default::default(),
+                allowed_node_builtins: Vec::new(),
+                loopback_exempt_ports: Vec::new(),
+            }),
+        ))
+        .expect("dispatch configure vm with empty network operations");
+
+    expect_invalid_state(
+        empty_pattern_operations.response.payload,
+        "network.rules[0].operations must not be empty",
+    );
 }
 
 #[test]
@@ -246,11 +284,22 @@ fn permission_flags_single_star_paths_do_not_cross_path_separators() {
         PermissionsPolicy {
             fs: Some(FsPermissionScope::Rules(FsPermissionRuleSet {
                 default: Some(PermissionMode::Deny),
-                rules: vec![FsPermissionRule {
-                    mode: PermissionMode::Allow,
-                    operations: vec![String::from("create_dir"), String::from("stat")],
-                    paths: vec![String::from("/tmp/*")],
-                }],
+                rules: vec![
+                    FsPermissionRule {
+                        mode: PermissionMode::Allow,
+                        operations: vec![String::from("read")],
+                        paths: vec![String::from("/tmp")],
+                    },
+                    FsPermissionRule {
+                        mode: PermissionMode::Allow,
+                        operations: vec![
+                            String::from("create_dir"),
+                            String::from("read"),
+                            String::from("stat"),
+                        ],
+                        paths: vec![String::from("/tmp/*")],
+                    },
+                ],
             })),
             network: None,
             child_process: None,
@@ -303,11 +352,22 @@ fn permission_flags_double_star_paths_allow_nested_descendants() {
         PermissionsPolicy {
             fs: Some(FsPermissionScope::Rules(FsPermissionRuleSet {
                 default: Some(PermissionMode::Deny),
-                rules: vec![FsPermissionRule {
-                    mode: PermissionMode::Allow,
-                    operations: vec![String::from("create_dir"), String::from("stat")],
-                    paths: vec![String::from("/tmp/**")],
-                }],
+                rules: vec![
+                    FsPermissionRule {
+                        mode: PermissionMode::Allow,
+                        operations: vec![String::from("read")],
+                        paths: vec![String::from("/tmp")],
+                    },
+                    FsPermissionRule {
+                        mode: PermissionMode::Allow,
+                        operations: vec![
+                            String::from("create_dir"),
+                            String::from("read"),
+                            String::from("stat"),
+                        ],
+                        paths: vec![String::from("/tmp/**")],
+                    },
+                ],
             })),
             network: None,
             child_process: None,

@@ -116,7 +116,7 @@ async function prepareFixtureProject(fixture: FixtureProject): Promise<PreparedF
   const cacheDir = path.join(CACHE_ROOT, `${fixture.name}-${cacheKey}`);
   const readyMarker = path.join(cacheDir, CACHE_READY_MARKER);
 
-  if (await pathExists(readyMarker)) {
+  if (await pathExists(readyMarker) && await cacheHasRequiredInstallArtifacts(fixture, cacheDir)) {
     return { cacheHit: true, cacheKey, projectDir: cacheDir };
   }
 
@@ -210,6 +210,35 @@ async function createFixtureCacheKey(fixture: FixtureProject): Promise<string> {
   }
 
   return hash.digest('hex').slice(0, 16);
+}
+
+async function cacheHasRequiredInstallArtifacts(
+  fixture: FixtureProject,
+  cacheDir: string,
+): Promise<boolean> {
+  if (!(await fixtureDeclaresDependencies(fixture))) {
+    return true;
+  }
+  return pathExists(path.join(cacheDir, 'node_modules'));
+}
+
+async function fixtureDeclaresDependencies(fixture: FixtureProject): Promise<boolean> {
+  const packageJson = JSON.parse(
+    await readFile(path.join(fixture.sourceDir, 'package.json'), 'utf8'),
+  ) as Record<string, unknown>;
+  return [
+    'dependencies',
+    'devDependencies',
+    'optionalDependencies',
+    'peerDependencies',
+  ].some((key) => {
+    const value = packageJson[key];
+    return (
+      value !== null &&
+      typeof value === 'object' &&
+      Object.keys(value).length > 0
+    );
+  });
 }
 
 async function createWorkingFixtureProject(
@@ -406,12 +435,25 @@ async function pathExists(p: string): Promise<boolean> {
   try { await access(p); return true; } catch { return false; }
 }
 
+async function commandAvailable(cmd: string): Promise<boolean> {
+  try {
+    await execFileAsync(cmd, ['--version'], {
+      cwd: WORKSPACE_ROOT,
+      timeout: COMMAND_TIMEOUT_MS,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 const skipReason = skipUnlessWasmBuilt();
 const discoveredFixtures = await discoverFixtures();
+const hasHostBun = await commandAvailable('bun');
 
 describeIf(!(skipReason || discoveredFixtures.length === 0), 'e2e project-matrix through kernel', () => {
   it('discovers at least one fixture project', () => {
@@ -419,7 +461,10 @@ describeIf(!(skipReason || discoveredFixtures.length === 0), 'e2e project-matrix
   });
 
   for (const fixture of discoveredFixtures) {
-    it(
+    const testFixture = fixture.metadata.packageManager === 'bun' && !hasHostBun
+      ? it.skip
+      : it;
+    testFixture(
       `runs fixture ${fixture.name} through kernel with host-node parity`,
       async () => {
         const prepared = await prepareFixtureProject(fixture);

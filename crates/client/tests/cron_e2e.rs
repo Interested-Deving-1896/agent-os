@@ -14,8 +14,7 @@ use chrono::Utc;
 
 #[tokio::test]
 async fn cron_callback_fires_and_registry_round_trips() {
-    if !common::sidecar_available() {
-        eprintln!("skipping cron_callback_fires_and_registry_round_trips: sidecar not built");
+    if !common::require_sidecar("cron_callback_fires_and_registry_round_trips") {
         return;
     }
     let os = common::new_vm().await;
@@ -65,7 +64,10 @@ async fn cron_callback_fires_and_registry_round_trips() {
         }
     }
     assert!(saw_fire, "expected a cron:fire event for the one-shot");
-    assert!(saw_complete, "expected a cron:complete event for the one-shot");
+    assert!(
+        saw_complete,
+        "expected a cron:complete event for the one-shot"
+    );
 
     // Registry surface: schedule a recurring job (won't fire during the test), see it listed, cancel
     // it, and confirm it's gone.

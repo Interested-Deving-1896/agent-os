@@ -14,7 +14,6 @@ use getrandom::getrandom;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs::{self, File};
@@ -29,7 +28,9 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{
-    error::TryRecvError as TokioTryRecvError, unbounded_channel, UnboundedReceiver,
+    channel,
+    error::{TryRecvError as TokioTryRecvError, TrySendError as TokioTrySendError},
+    Receiver as TokioReceiver,
 };
 use tokio::time;
 
@@ -64,6 +65,10 @@ const V8_HEAP_LIMIT_MB_ENV: &str = "AGENT_OS_V8_HEAP_LIMIT_MB";
 const NODE_SYNC_RPC_DEFAULT_DATA_BYTES: usize = 4 * 1024 * 1024;
 const NODE_SYNC_RPC_DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
 const NODE_SYNC_RPC_RESPONSE_QUEUE_CAPACITY: usize = 1;
+const JAVASCRIPT_EVENT_CHANNEL_CAPACITY: usize = 64;
+const JAVASCRIPT_EVENT_PAYLOAD_LIMIT_BYTES: usize = 1024 * 1024;
+const JAVASCRIPT_CAPTURED_OUTPUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const KERNEL_STDIN_BUFFER_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const NODE_WARMUP_MARKER_VERSION: &str = "1";
 const NODE_WARMUP_SPECIFIERS: &[&str] = &[
     "agent-os:builtin/path",
@@ -609,43 +614,71 @@ impl GuestPathTranslator {
             if let Some(suffix) = strip_guest_prefix(&normalized, &mapping.guest_path) {
                 let candidate = join_host_path(&mapping.host_path, suffix);
                 if candidate.exists() {
-                    return Some(candidate);
+                    return self.confine_host_path(candidate);
                 }
                 if let Ok(real_mapping_path) = fs::canonicalize(&mapping.host_path) {
                     let real_candidate = join_host_path(&real_mapping_path, suffix);
                     if real_candidate.exists() {
-                        return Some(real_candidate);
+                        return self.confine_host_path(real_candidate);
                     }
                     if let Some(sibling_candidate) =
                         resolve_pnpm_sibling_host_path(&real_mapping_path, suffix)
                     {
-                        return Some(sibling_candidate);
+                        return self.confine_host_path(sibling_candidate);
                     }
                 }
                 fallback_candidate.get_or_insert(candidate);
             }
         }
         if let Some(suffix) = strip_guest_prefix(&normalized, &self.implicit_guest_cwd) {
-            return Some(join_host_path(&self.implicit_host_cwd, suffix));
+            return self.confine_host_path(join_host_path(&self.implicit_host_cwd, suffix));
         }
 
-        if fallback_candidate.is_some() {
-            return fallback_candidate;
+        if let Some(candidate) = fallback_candidate {
+            return self.confine_host_path(candidate);
         }
 
         if let Some(sandbox_root) = &self.sandbox_root {
-            return Some(join_host_path(
+            return self.confine_host_path(join_host_path(
                 sandbox_root,
                 normalized.trim_start_matches('/'),
             ));
         }
 
-        let path = PathBuf::from(&normalized);
-        if path.is_absolute() {
-            Some(path)
-        } else {
-            None
+        None
+    }
+
+    fn confine_host_path(&self, host_path: PathBuf) -> Option<PathBuf> {
+        let allowed_roots = self.allowed_canonical_host_roots();
+        if allowed_roots.is_empty() {
+            return None;
         }
+
+        if let Ok(canonical_path) = fs::canonicalize(&host_path) {
+            return canonical_path_is_allowed(&canonical_path, &allowed_roots).then_some(host_path);
+        }
+
+        let existing_ancestor = nearest_existing_host_ancestor(&host_path)?;
+        let canonical_ancestor = fs::canonicalize(existing_ancestor).ok()?;
+        canonical_path_is_allowed(&canonical_ancestor, &allowed_roots).then_some(host_path)
+    }
+
+    fn allowed_canonical_host_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        for root in self
+            .mappings
+            .iter()
+            .map(|mapping| mapping.host_path.as_path())
+            .chain(std::iter::once(self.implicit_host_cwd.as_path()))
+            .chain(self.sandbox_root.as_deref())
+        {
+            if let Ok(canonical_root) = fs::canonicalize(root) {
+                if !roots.iter().any(|existing| existing == &canonical_root) {
+                    roots.push(canonical_root);
+                }
+            }
+        }
+        roots
     }
 
     fn canonical_guest_path(&self, guest_path: &str) -> Option<String> {
@@ -709,6 +742,23 @@ fn sort_guest_path_mappings(mappings: &mut [GuestPathMapping]) {
                     .cmp(&left.host_path.components().count())
             })
     });
+}
+
+fn canonical_path_is_allowed(path: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots
+        .iter()
+        .any(|root| path == root || path.starts_with(root))
+}
+
+fn nearest_existing_host_ancestor(path: &Path) -> Option<&Path> {
+    let mut candidate = Some(path);
+    while let Some(current) = candidate {
+        if fs::symlink_metadata(current).is_ok() {
+            return Some(current);
+        }
+        candidate = current.parent();
+    }
+    None
 }
 
 #[doc(hidden)]
@@ -933,6 +983,39 @@ fn translate_legacy_bridge_value_to_v8(value: &Value) -> Value {
     }
 }
 
+fn decode_bridge_output_arg(value: &Value) -> Vec<u8> {
+    match value {
+        Value::String(s) => s.as_bytes().to_vec(),
+        Value::Object(map)
+            if map.get("__type").and_then(Value::as_str) == Some("Buffer")
+                || map.get("__agentOsType").and_then(Value::as_str) == Some("bytes") =>
+        {
+            let base64_value = map
+                .get("data")
+                .or_else(|| map.get("base64"))
+                .and_then(Value::as_str);
+            if let Some(base64_value) = base64_value {
+                if let Some(bytes) = v8_runtime::base64_decode_pub(base64_value) {
+                    return bytes;
+                }
+            }
+            value.to_string().into_bytes()
+        }
+        other => other.to_string().into_bytes(),
+    }
+}
+
+fn decode_bridge_output_args(args: &[Value]) -> Vec<u8> {
+    let mut output = Vec::new();
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 {
+            output.push(b' ');
+        }
+        output.extend(decode_bridge_output_arg(arg));
+    }
+    output
+}
+
 #[derive(Debug)]
 pub enum JavascriptExecutionError {
     EmptyArgv,
@@ -946,6 +1029,7 @@ pub enum JavascriptExecutionError {
     Terminate(std::io::Error),
     StdinClosed,
     Stdin(std::io::Error),
+    OutputBufferExceeded { stream: &'static str, limit: usize },
     EventChannelClosed,
 }
 
@@ -989,6 +1073,12 @@ impl fmt::Display for JavascriptExecutionError {
             }
             Self::StdinClosed => f.write_str("guest JavaScript stdin is already closed"),
             Self::Stdin(err) => write!(f, "failed to write guest stdin: {err}"),
+            Self::OutputBufferExceeded { stream, limit } => {
+                write!(
+                    f,
+                    "guest JavaScript {stream} exceeded the captured output limit of {limit} bytes"
+                )
+            }
             Self::EventChannelClosed => {
                 f.write_str("guest JavaScript event channel closed unexpectedly")
             }
@@ -1002,7 +1092,7 @@ impl std::error::Error for JavascriptExecutionError {}
 pub struct JavascriptExecution {
     execution_id: String,
     child_pid: u32,
-    events: RefCell<UnboundedReceiver<JavascriptExecutionEvent>>,
+    events: tokio::sync::Mutex<TokioReceiver<JavascriptExecutionEvent>>,
     pending_sync_rpc: Arc<Mutex<Option<PendingSyncRpcState>>>,
     kernel_stdin: Arc<LocalKernelStdinBridge>,
     _import_cache_guard: Arc<NodeImportCacheCleanup>,
@@ -1027,10 +1117,11 @@ impl JavascriptExecution {
     }
 
     pub fn write_stdin(&mut self, chunk: &[u8]) -> Result<(), JavascriptExecutionError> {
-        self.kernel_stdin.write(chunk);
-        let payload =
-            v8_runtime::json_to_cbor_payload(&Value::String(String::from_utf8_lossy(chunk).into()))
-                .map_err(JavascriptExecutionError::Stdin)?;
+        self.kernel_stdin.write(chunk)?;
+        let payload = v8_runtime::json_to_cbor_payload(&json!({
+            "dataBase64": v8_runtime::base64_encode_pub(chunk),
+        }))
+        .map_err(JavascriptExecutionError::Stdin)?;
         self.v8_session
             .send_stream_event("stdin", payload)
             .map_err(JavascriptExecutionError::Stdin)
@@ -1042,12 +1133,26 @@ impl JavascriptExecution {
         Ok(())
     }
 
-    pub(crate) fn write_kernel_stdin_only(&mut self, chunk: &[u8]) {
-        self.kernel_stdin.write(chunk);
+    pub(crate) fn write_kernel_stdin_only(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<(), JavascriptExecutionError> {
+        self.kernel_stdin.write(chunk)
     }
 
     pub(crate) fn close_kernel_stdin_only(&mut self) {
         self.kernel_stdin.close();
+    }
+
+    pub fn read_kernel_stdin_sync_rpc(
+        &self,
+        request: &JavascriptSyncRpcRequest,
+    ) -> Result<Value, JavascriptExecutionError> {
+        if request.method != "__kernel_stdin_read" {
+            return Ok(Value::Null);
+        }
+
+        Ok(self.kernel_stdin.read(&request.args))
     }
 
     pub(crate) fn handle_kernel_stdin_sync_rpc(
@@ -1127,7 +1232,8 @@ impl JavascriptExecution {
         timeout: Duration,
     ) -> Result<Option<JavascriptExecutionEvent>, JavascriptExecutionError> {
         if timeout.is_zero() {
-            return match self.events.borrow_mut().try_recv() {
+            let mut events = self.events.lock().await;
+            return match events.try_recv() {
                 Ok(event) => Ok(Some(event)),
                 Err(TokioTryRecvError::Empty) => Ok(None),
                 Err(TokioTryRecvError::Disconnected) => {
@@ -1136,7 +1242,7 @@ impl JavascriptExecution {
             };
         }
 
-        let mut events = self.events.borrow_mut();
+        let mut events = self.events.lock().await;
         match time::timeout(timeout, events.recv()).await {
             Ok(Some(event)) => Ok(Some(event)),
             Ok(None) => Err(JavascriptExecutionError::EventChannelClosed),
@@ -1150,28 +1256,33 @@ impl JavascriptExecution {
     ) -> Result<Option<JavascriptExecutionEvent>, JavascriptExecutionError> {
         let deadline = Instant::now() + timeout;
         loop {
-            match self.events.borrow_mut().try_recv() {
-                Ok(event) => return Ok(Some(event)),
-                Err(TokioTryRecvError::Disconnected) => {
-                    return Err(JavascriptExecutionError::EventChannelClosed);
-                }
-                Err(TokioTryRecvError::Empty) => {
-                    if Instant::now() >= deadline {
-                        return Ok(None);
+            if let Ok(mut events) = self.events.try_lock() {
+                match events.try_recv() {
+                    Ok(event) => return Ok(Some(event)),
+                    Err(TokioTryRecvError::Disconnected) => {
+                        return Err(JavascriptExecutionError::EventChannelClosed);
                     }
-                    thread::sleep(Duration::from_millis(1));
+                    Err(TokioTryRecvError::Empty) => {
+                        if Instant::now() >= deadline {
+                            return Ok(None);
+                        }
+                    }
                 }
             }
+
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
     pub fn wait(mut self) -> Result<JavascriptExecutionResult, JavascriptExecutionError> {
         self.close_stdin()?;
         let mut events = std::mem::replace(
-            &mut self.events,
-            RefCell::new(tokio::sync::mpsc::unbounded_channel().1),
-        )
-        .into_inner();
+            self.events.get_mut(),
+            channel(JAVASCRIPT_EVENT_CHANNEL_CAPACITY).1,
+        );
         let execution_id = std::mem::take(&mut self.execution_id);
 
         let mut stdout = Vec::new();
@@ -1179,8 +1290,12 @@ impl JavascriptExecution {
 
         loop {
             match events.blocking_recv() {
-                Some(JavascriptExecutionEvent::Stdout(chunk)) => stdout.extend(chunk),
-                Some(JavascriptExecutionEvent::Stderr(chunk)) => stderr.extend(chunk),
+                Some(JavascriptExecutionEvent::Stdout(chunk)) => {
+                    append_captured_output(&mut stdout, chunk, "stdout")?;
+                }
+                Some(JavascriptExecutionEvent::Stderr(chunk)) => {
+                    append_captured_output(&mut stderr, chunk, "stderr")?;
+                }
                 Some(JavascriptExecutionEvent::SyncRpcRequest(request)) => {
                     return Err(JavascriptExecutionError::PendingSyncRpcRequest(request.id));
                 }
@@ -1224,6 +1339,28 @@ impl Drop for JavascriptExecution {
     fn drop(&mut self) {
         let _ = self.v8_session.destroy();
     }
+}
+
+fn append_captured_output(
+    target: &mut Vec<u8>,
+    chunk: Vec<u8>,
+    stream: &'static str,
+) -> Result<(), JavascriptExecutionError> {
+    let next_len = target.len().checked_add(chunk.len()).ok_or(
+        JavascriptExecutionError::OutputBufferExceeded {
+            stream,
+            limit: JAVASCRIPT_CAPTURED_OUTPUT_LIMIT_BYTES,
+        },
+    )?;
+    if next_len > JAVASCRIPT_CAPTURED_OUTPUT_LIMIT_BYTES {
+        return Err(JavascriptExecutionError::OutputBufferExceeded {
+            stream,
+            limit: JAVASCRIPT_CAPTURED_OUTPUT_LIMIT_BYTES,
+        });
+    }
+
+    target.extend(chunk);
+    Ok(())
 }
 
 struct V8SessionRegistrationGuard<'a> {
@@ -1286,24 +1423,13 @@ where
     })
 }
 
+#[derive(Default)]
 pub struct JavascriptExecutionEngine {
     next_context_id: usize,
     next_execution_id: usize,
     contexts: BTreeMap<String, JavascriptContext>,
     import_caches: BTreeMap<String, NodeImportCache>,
     v8_host: Option<V8RuntimeHost>,
-}
-
-impl Default for JavascriptExecutionEngine {
-    fn default() -> Self {
-        Self {
-            next_context_id: 0,
-            next_execution_id: 0,
-            contexts: BTreeMap::new(),
-            import_caches: BTreeMap::new(),
-            v8_host: None,
-        }
-    }
 }
 
 impl std::fmt::Debug for JavascriptExecutionEngine {
@@ -1502,7 +1628,7 @@ impl JavascriptExecutionEngine {
         Ok(JavascriptExecution {
             execution_id,
             child_pid: v8_host.child_pid(),
-            events: RefCell::new(events),
+            events: tokio::sync::Mutex::new(events),
             pending_sync_rpc,
             kernel_stdin,
             _import_cache_guard: import_cache_guard,
@@ -2105,6 +2231,10 @@ fn prepend_v8_runtime_shim(
     if (typeof nextEnv.AGENT_OS_VIRTUAL_PROCESS_EXEC_PATH === "string" && nextEnv.AGENT_OS_VIRTUAL_PROCESS_EXEC_PATH.length > 0) {{
       process.execPath = nextEnv.AGENT_OS_VIRTUAL_PROCESS_EXEC_PATH;
     }}
+    if (nextEnv.AGENT_OS_NODE_IPC === "1" && typeof __runtimeInstallProcessIpcBridge === "function") {{
+      process.connected = true;
+      __runtimeInstallProcessIpcBridge();
+    }}
     process.cwd = () => nextCwd;
     process._cwd = nextCwd;
     if (typeof process.getBuiltinModule !== "function") {{
@@ -2163,8 +2293,8 @@ fn spawn_v8_event_bridge(
     _sync_rpc_timeout: Duration,
     v8_session: V8SessionHandle,
     mut local_bridge: LocalBridgeState,
-) -> UnboundedReceiver<JavascriptExecutionEvent> {
-    let (sender, receiver) = unbounded_channel();
+) -> TokioReceiver<JavascriptExecutionEvent> {
+    let (sender, receiver) = channel(JAVASCRIPT_EVENT_CHANNEL_CAPACITY);
 
     thread::spawn(move || {
         let mut emitted_exit = false;
@@ -2193,14 +2323,7 @@ fn spawn_v8_event_bridge(
 
                     // Handle logging locally (produce stdout/stderr events)
                     if method == "_log" || method == "_error" {
-                        let msg = args
-                            .iter()
-                            .map(|a| match a {
-                                Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ");
+                        let output = decode_bridge_output_args(&args);
                         // Respond to the bridge call
                         let _ = v8_session.send_bridge_response(
                             call_id,
@@ -2208,9 +2331,21 @@ fn spawn_v8_event_bridge(
                             v8_runtime::json_to_cbor_payload(&Value::Null).unwrap_or_default(),
                         );
                         if method == "_log" {
-                            let _ = sender.send(JavascriptExecutionEvent::Stdout(msg.into_bytes()));
+                            if !send_javascript_event(
+                                &sender,
+                                &v8_session,
+                                JavascriptExecutionEvent::Stdout(output),
+                            ) {
+                                break;
+                            }
                         } else {
-                            let _ = sender.send(JavascriptExecutionEvent::Stderr(msg.into_bytes()));
+                            if !send_javascript_event(
+                                &sender,
+                                &v8_session,
+                                JavascriptExecutionEvent::Stderr(output),
+                            ) {
+                                break;
+                            }
                         }
                         continue;
                     }
@@ -2266,8 +2401,13 @@ fn spawn_v8_event_bridge(
                         } else {
                             format!("{}\n", err.stack)
                         };
-                        let _ =
-                            sender.send(JavascriptExecutionEvent::Stderr(error_msg.into_bytes()));
+                        if !send_javascript_event(
+                            &sender,
+                            &v8_session,
+                            JavascriptExecutionEvent::Stderr(error_msg.into_bytes()),
+                        ) {
+                            break;
+                        }
                     }
                     emitted_exit = true;
                     Some(JavascriptExecutionEvent::Exited(resolved_exit_code))
@@ -2277,18 +2417,50 @@ fn spawn_v8_event_bridge(
             };
 
             if let Some(event) = event {
-                if sender.send(event).is_err() {
+                if !send_javascript_event(&sender, &v8_session, event) {
                     break;
                 }
             }
         }
 
         if !emitted_exit {
-            let _ = sender.send(JavascriptExecutionEvent::Exited(1));
+            let _ =
+                send_javascript_event(&sender, &v8_session, JavascriptExecutionEvent::Exited(1));
         }
     });
 
     receiver
+}
+
+fn send_javascript_event(
+    sender: &tokio::sync::mpsc::Sender<JavascriptExecutionEvent>,
+    v8_session: &V8SessionHandle,
+    event: JavascriptExecutionEvent,
+) -> bool {
+    if javascript_event_payload_len(&event) > JAVASCRIPT_EVENT_PAYLOAD_LIMIT_BYTES {
+        let _ = v8_session.destroy();
+        return false;
+    }
+
+    match sender.try_send(event) {
+        Ok(()) => true,
+        Err(TokioTrySendError::Full(_)) => {
+            let _ = v8_session.destroy();
+            false
+        }
+        Err(TokioTrySendError::Closed(_)) => false,
+    }
+}
+
+fn javascript_event_payload_len(event: &JavascriptExecutionEvent) -> usize {
+    match event {
+        JavascriptExecutionEvent::Stdout(chunk) | JavascriptExecutionEvent::Stderr(chunk) => {
+            chunk.len()
+        }
+        JavascriptExecutionEvent::SyncRpcRequest(_)
+        | JavascriptExecutionEvent::SignalState { .. }
+        | JavascriptExecutionEvent::Exited(_) => 0,
+    }
 }
 
 /// Handle internal bridge calls that don't need to go to the sidecar.
@@ -2603,8 +2775,9 @@ impl LocalBridgeState {
 
         let resolved = if let Some(builtin) = normalize_builtin_specifier(specifier) {
             Some(builtin)
-        } else if let Some(file_path) = guest_path_from_file_url(specifier) {
-            self.resolve_path(&file_path, mode)
+        } else if specifier.starts_with("file:") {
+            guest_path_from_file_url(specifier)
+                .and_then(|file_path| self.resolve_path(&file_path, mode))
         } else if specifier.starts_with('/') {
             self.resolve_path(specifier, mode)
         } else if specifier.starts_with("./")
@@ -2977,10 +3150,10 @@ fn guest_path_from_file_url(specifier: &str) -> Option<String> {
         pathname = &pathname[slash_index..];
     }
 
-    Some(normalize_guest_path(&percent_decode(pathname)))
+    Some(normalize_guest_path(&percent_decode(pathname)?))
 }
 
-fn percent_decode(raw: &str) -> String {
+fn percent_decode(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     let mut index = 0;
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -2991,7 +3164,10 @@ fn percent_decode(raw: &str) -> String {
                 index += 1;
             }
             b'%' if index + 2 < bytes.len() => {
-                if let Ok(value) = u8::from_str_radix(&raw[index + 1..index + 3], 16) {
+                if let (Some(high), Some(low)) =
+                    (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
+                {
+                    let value = (high << 4) | low;
                     decoded.push(value);
                     index += 3;
                 } else {
@@ -3005,14 +3181,40 @@ fn percent_decode(raw: &str) -> String {
             }
         }
     }
-    String::from_utf8(decoded).expect("decode file URL path")
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl LocalKernelStdinBridge {
-    fn write(&self, chunk: &[u8]) {
+    fn write(&self, chunk: &[u8]) -> Result<(), JavascriptExecutionError> {
         let mut state = self.state.lock().expect("kernel stdin state poisoned");
+        if state.closed {
+            return Err(JavascriptExecutionError::StdinClosed);
+        }
+        let next_len = state.bytes.len().checked_add(chunk.len()).ok_or_else(|| {
+            JavascriptExecutionError::Stdin(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("guest stdin buffer exceeded {KERNEL_STDIN_BUFFER_LIMIT_BYTES} bytes"),
+            ))
+        })?;
+        if next_len > KERNEL_STDIN_BUFFER_LIMIT_BYTES {
+            return Err(JavascriptExecutionError::Stdin(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("guest stdin buffer exceeded {KERNEL_STDIN_BUFFER_LIMIT_BYTES} bytes"),
+            )));
+        }
+
         state.bytes.extend(chunk.iter().copied());
         self.ready.notify_all();
+        Ok(())
     }
 
     fn close(&self) {
@@ -4132,11 +4334,15 @@ class Readable extends Stream {
 }
 
 class Writable extends Stream {
-  constructor() {
+  constructor(options = undefined) {
     super();
     this.writable = true;
     this.writableEnded = false;
     this.destroyed = false;
+    this._writeOption =
+      options && typeof options.write === "function" ? options.write : null;
+    this._destroyOption =
+      options && typeof options.destroy === "function" ? options.destroy : null;
   }
 
   write(chunk, encodingOrCallback, callback) {
@@ -4152,7 +4358,41 @@ class Writable extends Stream {
   }
 
   _write(_chunk, callback) {
-    queueResult(callback);
+    if (!this._writeOption) {
+      queueResult(callback);
+      return;
+    }
+    try {
+      this._writeOption.call(this, _chunk, "buffer", callback);
+    } catch (error) {
+      queueResult(callback, error);
+    }
+  }
+
+  _destroy(error, callback) {
+    if (!this._destroyOption) {
+      queueResult(callback, error);
+      return;
+    }
+    try {
+      this._destroyOption.call(this, error ?? null, callback);
+    } catch (destroyError) {
+      queueResult(callback, destroyError);
+    }
+  }
+
+  destroy(error) {
+    if (this.destroyed) return this;
+    this.destroyed = true;
+    this._destroy(error ?? null, (destroyError) => {
+      const finalError = destroyError ?? error;
+      if (finalError) {
+        this.errored = finalError;
+        this.emit("error", finalError);
+      }
+      this.emit("close");
+    });
+    return this;
   }
 
   end(chunk, encodingOrCallback, callback) {
@@ -4168,7 +4408,7 @@ class Writable extends Stream {
     queueMicrotask(() => {
       queueResult(done);
       this.emit("finish");
-      this.emit("close");
+      this.destroy();
     });
     return this;
   }
@@ -5069,7 +5309,7 @@ export default {
             .unwrap_or_else(|_| format!("\"node:{module_name}\""))
     );
     let mut exports = builtin_named_exports(module_name)
-        .into_iter()
+        .iter()
         .collect::<HashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -5142,10 +5382,18 @@ fn builtin_named_exports(module_name: &str) -> &'static [&'static str] {
             "getHashes",
             "getRandomValues",
             "randomBytes",
+            "randomFillSync",
             "randomUUID",
             "subtle",
         ],
-        "diagnostics_channel" => &["channel", "hasSubscribers", "subscribe", "unsubscribe"],
+        "diagnostics_channel" => &[
+            "Channel",
+            "channel",
+            "hasSubscribers",
+            "subscribe",
+            "tracingChannel",
+            "unsubscribe",
+        ],
         "events" => &[
             "EventEmitter",
             "addAbortListener",
@@ -5396,6 +5644,7 @@ fn builtin_named_exports(module_name: &str) -> &'static [&'static str] {
             "debuglog",
             "deprecate",
             "format",
+            "formatWithOptions",
             "inherits",
             "inspect",
             "parseArgs",
@@ -5433,6 +5682,7 @@ fn builtin_named_exports(module_name: &str) -> &'static [&'static str] {
             "debuglog",
             "deprecate",
             "format",
+            "formatWithOptions",
             "inherits",
             "inspect",
             "isDeepStrictEqual",
@@ -5581,10 +5831,7 @@ fn split_package_request(request: &str) -> Option<(&str, &str)> {
         let subpath = parts.next().unwrap_or("");
         Some((package_name, subpath))
     } else {
-        request
-            .split_once('/')
-            .map(|(package, subpath)| (package, subpath))
-            .or(Some((request, "")))
+        request.split_once('/').or(Some((request, "")))
     }
 }
 
@@ -5827,6 +6074,121 @@ mod tests {
         assert!(error
             .to_string()
             .contains("timed out after 30ms while queueing JavaScript sync RPC response"));
+    }
+
+    #[test]
+    fn javascript_wait_capture_rejects_output_over_limit() {
+        let mut stdout = vec![b'x'; JAVASCRIPT_CAPTURED_OUTPUT_LIMIT_BYTES - 1];
+        append_captured_output(&mut stdout, vec![b'y'], "stdout").expect("fill to limit");
+        assert_eq!(stdout.len(), JAVASCRIPT_CAPTURED_OUTPUT_LIMIT_BYTES);
+
+        let error = append_captured_output(&mut stdout, vec![b'z'], "stdout")
+            .expect_err("captured output over limit should fail");
+        assert!(matches!(
+            error,
+            JavascriptExecutionError::OutputBufferExceeded {
+                stream: "stdout",
+                limit: JAVASCRIPT_CAPTURED_OUTPUT_LIMIT_BYTES,
+            }
+        ));
+    }
+
+    #[test]
+    fn kernel_stdin_bridge_rejects_buffer_over_limit_and_closed_writes() {
+        let bridge = LocalKernelStdinBridge::default();
+        bridge
+            .write(&vec![b'x'; KERNEL_STDIN_BUFFER_LIMIT_BYTES])
+            .expect("fill stdin buffer to limit");
+
+        let error = bridge
+            .write(&[b'y'])
+            .expect_err("stdin buffer over limit should fail");
+        assert!(matches!(error, JavascriptExecutionError::Stdin(_)));
+
+        let bridge = LocalKernelStdinBridge::default();
+        bridge.close();
+        let error = bridge
+            .write(b"x")
+            .expect_err("write after stdin close should fail");
+        assert!(matches!(error, JavascriptExecutionError::StdinClosed));
+    }
+
+    #[test]
+    fn javascript_event_sender_reports_closed_receiver() {
+        let (sender, receiver) = channel(1);
+        drop(receiver);
+        let host = V8RuntimeHost::spawn().expect("spawn V8 runtime host");
+        let session = host.session_handle(String::from("closed-event-sender-test"));
+        assert!(!send_javascript_event(
+            &sender,
+            &session,
+            JavascriptExecutionEvent::Exited(1)
+        ));
+    }
+
+    #[test]
+    fn javascript_event_sender_destroys_session_when_channel_is_full() {
+        let host = V8RuntimeHost::spawn().expect("spawn V8 runtime host");
+        let session_id = format!(
+            "event-overflow-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let receiver = host
+            .register_session(&session_id)
+            .expect("register event overflow session");
+        let session = host.session_handle(session_id.clone());
+        let (sender, _event_receiver) = channel(1);
+
+        assert!(send_javascript_event(
+            &sender,
+            &session,
+            JavascriptExecutionEvent::Stdout(Vec::new())
+        ));
+        assert!(!send_javascript_event(
+            &sender,
+            &session,
+            JavascriptExecutionEvent::Stdout(Vec::new())
+        ));
+
+        drop(receiver);
+        let recovered = host
+            .register_session(&session_id)
+            .expect("overflow should destroy and deregister the session");
+        drop(recovered);
+        host.unregister_session(&session_id);
+    }
+
+    #[test]
+    fn javascript_event_sender_destroys_session_when_event_is_oversized() {
+        let host = V8RuntimeHost::spawn().expect("spawn V8 runtime host");
+        let session_id = format!(
+            "event-oversized-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let receiver = host
+            .register_session(&session_id)
+            .expect("register oversized event session");
+        let session = host.session_handle(session_id.clone());
+        let (sender, _event_receiver) = channel(JAVASCRIPT_EVENT_CHANNEL_CAPACITY);
+
+        assert!(!send_javascript_event(
+            &sender,
+            &session,
+            JavascriptExecutionEvent::Stdout(vec![0; JAVASCRIPT_EVENT_PAYLOAD_LIMIT_BYTES + 1])
+        ));
+
+        drop(receiver);
+        let recovered = host
+            .register_session(&session_id)
+            .expect("oversized event should destroy and deregister the session");
+        drop(recovered);
+        host.unregister_session(&session_id);
     }
 
     #[test]

@@ -3,15 +3,17 @@ use agent_os_kernel::mount_plugin::{
 };
 use agent_os_kernel::mount_table::{MountedFileSystem, MountedVirtualFileSystem};
 use agent_os_kernel::vfs::{
-    normalize_path, VfsError, VfsResult, VirtualDirEntry, VirtualFileSystem, VirtualStat, S_IFDIR,
-    S_IFREG,
+    S_IFDIR, S_IFREG, VfsError, VfsResult, VirtualDirEntry, VirtualFileSystem, VirtualStat,
+    normalize_path,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use url::Url;
 
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_MAX_FULL_READ_BYTES: u64 = 256 * 1024;
@@ -56,20 +58,11 @@ struct SandboxAgentFilesystem {
 
 impl SandboxAgentFilesystem {
     fn from_config(config: SandboxAgentMountConfig) -> Result<Self, PluginError> {
-        let base_url = config.base_url.trim().trim_end_matches('/').to_owned();
-        if base_url.is_empty() {
-            return Err(PluginError::invalid_input(
-                "sandbox_agent mount requires a non-empty baseUrl",
-            ));
-        }
+        let base_url = validate_sandbox_agent_base_url(&config.base_url)?;
 
         let timeout_ms = config.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
         let timeout = Duration::from_millis(timeout_ms);
-        let base_path = match config.base_path.as_deref() {
-            None | Some("") | Some("/") => String::from("/"),
-            Some(path) if path.starts_with('/') => normalize_path(path),
-            Some(path) => path.trim_end_matches('/').to_owned(),
-        };
+        let base_path = normalize_sandbox_agent_base_path(config.base_path.as_deref());
 
         Ok(Self {
             client: SandboxAgentFilesystemClient::new(
@@ -172,29 +165,45 @@ impl SandboxAgentFilesystem {
 
     fn scoped_target(&self, target: &str) -> String {
         if target.starts_with('/') {
-            self.scoped_path(target)
+            let scoped = self.scoped_path(target);
+            if scoped.starts_with('/') {
+                scoped
+            } else {
+                format!("/{scoped}")
+            }
         } else {
             target.to_owned()
         }
     }
 
     fn strip_base_path_prefix<'a>(&self, target: &'a str) -> Option<&'a str> {
-        if self.base_path == "/" || !target.starts_with('/') {
+        if self.base_path == "/" {
             return None;
         }
-        if target == self.base_path {
+
+        let base_path = self.base_path.trim_end_matches('/');
+        if target == base_path {
             Some("")
+        } else if let Some(stripped) = target
+            .strip_prefix(base_path)
+            .filter(|stripped| stripped.starts_with('/'))
+        {
+            Some(stripped)
+        } else if !base_path.starts_with('/') {
+            let absolute_base_path = format!("/{base_path}");
+            if target == absolute_base_path {
+                Some("")
+            } else {
+                target
+                    .strip_prefix(&absolute_base_path)
+                    .filter(|stripped| stripped.starts_with('/'))
+            }
         } else {
-            target
-                .strip_prefix(self.base_path.as_str())
-                .filter(|stripped| stripped.starts_with('/'))
+            None
         }
     }
 
     fn unscoped_target(&self, target: String) -> String {
-        if !target.starts_with('/') {
-            return target;
-        }
         match self.strip_base_path_prefix(&target) {
             Some(stripped) => format!("/{}", stripped.trim_start_matches('/')),
             None => target,
@@ -283,16 +292,15 @@ impl SandboxAgentFilesystem {
             .client
             .run_process(&request)
             .map_err(|error| match error {
-                SandboxAgentClientError::Status { status, problem }
-                    if matches!(status, 404 | 405 | 501) =>
-                {
-                    ProcessFallbackError::Unsupported(
-                        problem
-                            .detail
-                            .or(problem.title)
-                            .unwrap_or_else(|| String::from("process API unavailable")),
-                    )
-                }
+                SandboxAgentClientError::Status {
+                    status: 404 | 405 | 501,
+                    problem,
+                } => ProcessFallbackError::Unsupported(
+                    problem
+                        .detail
+                        .or(problem.title)
+                        .unwrap_or_else(|| String::from("process API unavailable")),
+                ),
                 other => {
                     ProcessFallbackError::Operation(sandbox_client_error_to_vfs(op, path, other))
                 }
@@ -606,15 +614,16 @@ impl VirtualFileSystem for SandboxAgentFilesystem {
 
         match self
             .client
-            .read_fs_file_range(&remote_path, offset, length)
+            .read_fs_file_range(&remote_path, offset, length, self.max_full_read_bytes)
             .map_err(|error| sandbox_client_error_to_vfs("open", path, error))?
         {
             SandboxAgentReadResponse::Partial(content) => Ok(content),
             SandboxAgentReadResponse::Full(content) => {
-                eprintln!(
-                    "warning: sandbox_agent pread '{path}' fell back to a full-file GET because the remote ignored Range; downloaded {} bytes (maxFullReadBytes={})",
-                    content.len(),
-                    self.max_full_read_bytes
+                tracing::warn!(
+                    path,
+                    downloaded_bytes = content.len(),
+                    max_full_read_bytes = self.max_full_read_bytes,
+                    "sandbox_agent pread fell back to full-file get because remote ignored range"
                 );
                 let start = usize::try_from(offset).unwrap_or(usize::MAX);
                 if start >= content.len() {
@@ -663,7 +672,7 @@ impl RemoteProcessRuntime {
                 SandboxAgentProcessRunRequest {
                     command: self.command().to_owned(),
                     args: process_args,
-                    cwd: None,
+                    cwd: Some(String::from("/")),
                     env: None,
                     max_output_bytes: None,
                     timeout_ms: Some(DEFAULT_PROCESS_TIMEOUT_MS),
@@ -678,7 +687,7 @@ impl RemoteProcessRuntime {
                 SandboxAgentProcessRunRequest {
                     command: self.command().to_owned(),
                     args: process_args,
-                    cwd: None,
+                    cwd: Some(String::from("/")),
                     env: None,
                     max_output_bytes: None,
                     timeout_ms: Some(DEFAULT_PROCESS_TIMEOUT_MS),
@@ -716,6 +725,7 @@ impl SandboxAgentFilesystemClient {
             .timeout_connect(timeout)
             .timeout_read(timeout)
             .timeout_write(timeout)
+            .redirects(0)
             .build();
 
         Self {
@@ -753,6 +763,7 @@ impl SandboxAgentFilesystemClient {
         path: &str,
         offset: u64,
         length: usize,
+        max_full_read_bytes: u64,
     ) -> Result<SandboxAgentReadResponse, SandboxAgentClientError> {
         let range_length = u64::try_from(length).unwrap_or(u64::MAX);
         let end = offset.saturating_add(range_length.saturating_sub(1));
@@ -765,10 +776,15 @@ impl SandboxAgentFilesystemClient {
             vec![(String::from("Range"), format!("bytes={offset}-{end}"))],
         )?;
         let status = response.status();
-        let bytes = response_into_bytes(response)?;
         Ok(match status {
-            206 => SandboxAgentReadResponse::Partial(bytes),
-            _ => SandboxAgentReadResponse::Full(bytes),
+            206 => SandboxAgentReadResponse::Partial(response_into_bytes_limited(
+                response,
+                u64::try_from(length).unwrap_or(u64::MAX),
+            )?),
+            _ => SandboxAgentReadResponse::Full(response_into_bytes_limited(
+                response,
+                max_full_read_bytes,
+            )?),
         })
     }
 
@@ -873,12 +889,7 @@ impl SandboxAgentFilesystemClient {
         accept: Option<&str>,
     ) -> Result<Vec<u8>, SandboxAgentClientError> {
         let response = self.request_raw(method, path, query, RequestBody::None, accept)?;
-        let mut reader = response.into_reader();
-        let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|error| SandboxAgentClientError::Decode(error.to_string()))?;
-        Ok(bytes)
+        response_into_bytes(response)
     }
 
     fn request_empty(
@@ -946,6 +957,10 @@ impl SandboxAgentFilesystemClient {
         };
 
         match response {
+            Ok(response) if response.status() >= 300 => Err(SandboxAgentClientError::Status {
+                status: response.status(),
+                problem: read_problem_details(response),
+            }),
             Ok(response) => Ok(response),
             Err(ureq::Error::Status(status, response)) => Err(SandboxAgentClientError::Status {
                 status,
@@ -1073,6 +1088,186 @@ fn response_into_bytes(response: ureq::Response) -> Result<Vec<u8>, SandboxAgent
     Ok(bytes)
 }
 
+fn response_into_bytes_limited(
+    response: ureq::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>, SandboxAgentClientError> {
+    if response
+        .header("Content-Length")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|content_length| content_length > max_bytes)
+    {
+        return Err(SandboxAgentClientError::Decode(format!(
+            "sandbox-agent response exceeded {max_bytes} byte limit"
+        )));
+    }
+
+    let read_limit = max_bytes.saturating_add(1);
+    let mut reader = response.into_reader().take(read_limit);
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|error| SandboxAgentClientError::Decode(error.to_string()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(SandboxAgentClientError::Decode(format!(
+            "sandbox-agent response exceeded {max_bytes} byte limit"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn validate_sandbox_agent_base_url(raw: &str) -> Result<String, PluginError> {
+    validate_sandbox_agent_base_url_with_resolver(raw, resolve_sandbox_agent_base_url_host)
+}
+
+fn validate_sandbox_agent_base_url_with_resolver(
+    raw: &str,
+    resolve_host: impl FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+) -> Result<String, PluginError> {
+    let normalized = raw.trim().trim_end_matches('/').to_owned();
+    if normalized.is_empty() {
+        return Err(PluginError::invalid_input(
+            "sandbox_agent mount requires a non-empty baseUrl",
+        ));
+    }
+
+    let url = Url::parse(&normalized).map_err(|error| {
+        PluginError::invalid_input(format!(
+            "sandbox_agent mount baseUrl is not a valid URL: {error}"
+        ))
+    })?;
+    let host = url.host_str().ok_or_else(|| {
+        PluginError::invalid_input("sandbox_agent mount baseUrl must include a host")
+    })?;
+    let host_for_address = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(PluginError::invalid_input(
+            "sandbox_agent mount baseUrl must not include a query string or fragment",
+        ));
+    }
+
+    let scheme = url.scheme();
+    let port = match scheme {
+        "http" => url.port().unwrap_or(80),
+        "https" => url.port().unwrap_or(443),
+        _ => {
+            return Err(PluginError::invalid_input(
+                "sandbox_agent mount baseUrl must use http or https",
+            ));
+        }
+    };
+
+    if host_for_address.eq_ignore_ascii_case("localhost") {
+        return Ok(normalized);
+    }
+
+    match host_for_address.parse::<IpAddr>() {
+        Ok(ip) => {
+            if ip.is_loopback() {
+                return Ok(normalized);
+            }
+            if is_disallowed_sandbox_agent_base_url_ip(ip) {
+                return Err(PluginError::invalid_input(format!(
+                    "sandbox_agent mount baseUrl must not target a private or local/non-global IP address ({host})"
+                )));
+            }
+            if scheme != "https" {
+                return Err(PluginError::invalid_input(
+                    "sandbox_agent mount non-local baseUrl must use https",
+                ));
+            }
+        }
+        Err(_) => {
+            if scheme != "https" {
+                return Err(PluginError::invalid_input(
+                    "sandbox_agent mount hostname baseUrl must use https unless it targets localhost",
+                ));
+            }
+            let addresses = resolve_host(host_for_address, port).map_err(|error| {
+                PluginError::invalid_input(format!(
+                    "could not resolve sandbox_agent mount baseUrl host '{host}': {error}"
+                ))
+            })?;
+            if addresses.is_empty() {
+                return Err(PluginError::invalid_input(format!(
+                    "could not resolve sandbox_agent mount baseUrl host '{host}'"
+                )));
+            }
+            for address in addresses {
+                if is_disallowed_sandbox_agent_base_url_ip(address.ip()) {
+                    return Err(PluginError::invalid_input(format!(
+                        "sandbox_agent mount baseUrl host '{host}' resolved to a private or local/non-global IP address ({})",
+                        address.ip()
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn resolve_sandbox_agent_base_url_host(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    (host, port)
+        .to_socket_addrs()
+        .map(|addresses| addresses.collect())
+}
+
+fn is_disallowed_sandbox_agent_base_url_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [first, second, third, fourth] = ip.octets();
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                || first == 0
+                || (first == 100 && (second & 0b1100_0000) == 64)
+                || (first == 192
+                    && second == 0
+                    && third == 0
+                    && (fourth <= 8 || fourth == 170 || fourth == 171))
+                || (first == 192 && second == 0 && third == 2)
+                || (first == 192 && second == 88 && third == 99 && fourth == 2)
+                || (first == 198 && (second == 18 || second == 19))
+                || (first == 198 && second == 51 && third == 100)
+                || (first == 203 && second == 0 && third == 113)
+                || first >= 240
+                || (first == 255 && second == 255 && third == 255 && fourth == 255)
+        }
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_disallowed_sandbox_agent_base_url_ip(IpAddr::V4(mapped));
+            }
+
+            let segments = ip.segments();
+            ip.is_loopback()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                || (segments[0] & 0xffc0) == 0xfec0
+                || (segments[0..6] == [0, 0, 0, 0, 0, 0])
+                || (segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2] == 0x0001)
+                || (segments[0] == 0x0100
+                    && segments[1] == 0
+                    && segments[2] == 0
+                    && (segments[3] == 0 || segments[3] == 1))
+                || (segments[0] == 0x2001 && segments[1] == 0)
+                || (segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0)
+                || (segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0010)
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || (segments[0] == 0x3fff && (segments[1] & 0xf000) == 0)
+                || segments[0] == 0x5f00
+                || segments[0] == 0x2002
+        }
+    }
+}
+
 fn sandbox_client_error_to_vfs(
     op: &'static str,
     path: &str,
@@ -1092,9 +1287,7 @@ fn sandbox_client_error_to_vfs(
                 "ENOENT"
             } else if detail.contains("path is not a file") {
                 "EISDIR"
-            } else if detail.contains("destination already exists") {
-                "EEXIST"
-            } else if status == 409 {
+            } else if detail.contains("destination already exists") || status == 409 {
                 "EEXIST"
             } else if status == 400 {
                 "EINVAL"
@@ -1189,6 +1382,22 @@ fn dirname(path: &str) -> String {
     match normalized.rsplit_once('/') {
         Some((head, _)) if !head.is_empty() => head.to_owned(),
         _ => String::from("/"),
+    }
+}
+
+fn normalize_sandbox_agent_base_path(raw: Option<&str>) -> String {
+    match raw {
+        None | Some("") | Some("/") => String::from("/"),
+        Some(path) if path.starts_with('/') => normalize_path(path),
+        Some(path) => {
+            let normalized = normalize_path(&format!("/{path}"));
+            let relative = normalized.trim_start_matches('/');
+            if relative.is_empty() {
+                String::from("/")
+            } else {
+                relative.to_owned()
+            }
+        }
     }
 }
 
@@ -1393,6 +1602,8 @@ const NODE_TRUNCATE_SCRIPT: &str = r#"const fs = require("node:fs/promises");
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    #![allow(dead_code)]
+
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
     use std::fs;
@@ -1701,9 +1912,30 @@ pub(crate) mod test_support {
             ("GET", "/v1/fs/file") => {
                 let path = query.get("path").cloned().unwrap_or_default();
                 let target = resolve_fs_path(root, &path);
+                if path == "/redirect-to-private" {
+                    return_with_logged_request(
+                        requests,
+                        request_index,
+                        send_redirect(&mut stream, "http://169.254.169.254/latest"),
+                    );
+                    return;
+                }
                 match fs::metadata(&target) {
                     Ok(metadata) if metadata.is_file() => match fs::read(&target) {
                         Ok(bytes) => {
+                            if path == "/stream-over-limit" && !range_requests_supported {
+                                return_with_logged_request(
+                                    requests,
+                                    request_index,
+                                    send_bytes_without_content_length(
+                                        &mut stream,
+                                        200,
+                                        "application/octet-stream",
+                                        &bytes,
+                                    ),
+                                );
+                                return;
+                            }
                             if range_requests_supported {
                                 if let Some(range) = headers
                                     .get("range")
@@ -2203,6 +2435,35 @@ pub(crate) mod test_support {
         send_bytes_with_headers(stream, status, content_type, body, &[])
     }
 
+    fn send_redirect(stream: &mut TcpStream, location: &str) -> ResponseOutcome {
+        send_bytes_with_headers(
+            stream,
+            302,
+            "text/plain",
+            b"",
+            &[("Location", location.to_owned())],
+        )
+    }
+
+    fn send_bytes_without_content_length(
+        stream: &mut TcpStream,
+        status: u16,
+        content_type: &str,
+        body: &[u8],
+    ) -> ResponseOutcome {
+        let status_text = status_text(status);
+        let headers = format!(
+            "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n"
+        );
+        let _ = stream.write_all(headers.as_bytes());
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
+        ResponseOutcome {
+            status,
+            body_bytes: body.len(),
+        }
+    }
+
     fn send_bytes_with_headers(
         stream: &mut TcpStream,
         status: u16,
@@ -2210,15 +2471,7 @@ pub(crate) mod test_support {
         body: &[u8],
         extra_headers: &[(&str, String)],
     ) -> ResponseOutcome {
-        let status_text = match status {
-            200 => "OK",
-            206 => "Partial Content",
-            400 => "Bad Request",
-            401 => "Unauthorized",
-            404 => "Not Found",
-            501 => "Not Implemented",
-            _ => "Internal Server Error",
-        };
+        let status_text = status_text(status);
         let mut headers = format!(
             "HTTP/1.1 {status} {status_text}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nConnection: close\r\n",
             body.len()
@@ -2236,6 +2489,19 @@ pub(crate) mod test_support {
         ResponseOutcome {
             status,
             body_bytes: body.len(),
+        }
+    }
+
+    fn status_text(status: u16) -> &'static str {
+        match status {
+            200 => "OK",
+            206 => "Partial Content",
+            302 => "Found",
+            400 => "Bad Request",
+            401 => "Unauthorized",
+            404 => "Not Found",
+            501 => "Not Implemented",
+            _ => "Internal Server Error",
         }
     }
 

@@ -17,7 +17,19 @@
       "convention": "syncPromise",
       "argumentTypes": ["specifier: string", "fromDir: string", "mode?: \"require\" | \"import\""],
       "returnType": "string | null",
-      "names": ["_resolveModule", "_loadFile", "_resolveModuleSync", "_loadFileSync"]
+      "names": ["_resolveModule", "_resolveModuleSync"]
+    },
+    {
+      "convention": "syncPromise",
+      "argumentTypes": ["path: string"],
+      "returnType": "string | null",
+      "names": ["_loadFile", "_loadFileSync"]
+    },
+    {
+      "convention": "syncPromise",
+      "argumentTypes": ["filename: string"],
+      "returnType": "\"module\" | \"commonjs\" | \"json\" | null",
+      "names": ["_moduleFormat"]
     },
     {
       "convention": "syncPromise",
@@ -162,6 +174,7 @@
         "_upgradeSocketWriteRaw",
         "_upgradeSocketEndRaw",
         "_upgradeSocketDestroyRaw",
+        "_networkDnsLookupSyncRaw",
         "_netSocketConnectRaw",
         "_netSocketPollRaw",
         "_netSocketReadRaw",
@@ -174,6 +187,8 @@
         "_netSocketGetTlsClientHelloRaw",
         "_netSocketTlsQueryRaw",
         "_tlsGetCiphersRaw",
+        "_netReserveTcpPortRaw",
+        "_netReleaseTcpPortRaw",
         "_netServerListenRaw",
         "_netServerAcceptRaw",
         "_dgramSocketCreateRaw",

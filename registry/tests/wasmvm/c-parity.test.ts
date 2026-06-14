@@ -106,6 +106,13 @@ class SimpleVFS {
     const data = await this.readFile(path);
     return data.slice(offset, offset + length);
   }
+  async pwrite(path: string, offset: number, content: Uint8Array): Promise<void> {
+    const data = await this.readFile(path);
+    const next = new Uint8Array(Math.max(data.length, offset + content.length));
+    next.set(data);
+    next.set(content, offset);
+    this.files.set(path, next);
+  }
   async readDir(path: string): Promise<string[]> {
     const prefix = path === '/' ? '/' : path + '/';
     const entries: string[] = [];
@@ -181,11 +188,26 @@ describeIf(!skipReason(), 'C parity: native vs WASM', { timeout: 30_000 }, () =>
   let kernel: Kernel;
   let vfs: SimpleVFS;
 
+  async function mountParityKernel(options: { loopbackExemptPorts?: number[] } = {}) {
+    const nextKernel = createKernel({
+      filesystem: vfs as any,
+      ...(options.loopbackExemptPorts
+        ? { loopbackExemptPorts: options.loopbackExemptPorts }
+        : {}),
+    });
+    // C build dir first so C programs take precedence over same-named Rust commands
+    await nextKernel.mount(createWasmVmRuntime({ commandDirs: [C_BUILD_DIR, COMMANDS_DIR] }));
+    return nextKernel;
+  }
+
+  async function recreateKernel(options: { loopbackExemptPorts?: number[] } = {}) {
+    await kernel?.dispose();
+    kernel = await mountParityKernel(options);
+  }
+
   beforeEach(async () => {
     vfs = new SimpleVFS();
-    kernel = createKernel({ filesystem: vfs as any });
-    // C build dir first so C programs take precedence over same-named Rust commands
-    await kernel.mount(createWasmVmRuntime({ commandDirs: [C_BUILD_DIR, COMMANDS_DIR] }));
+    kernel = await mountParityKernel();
   });
 
   afterEach(async () => {
@@ -359,14 +381,15 @@ describeIf(!skipReason(), 'C parity: native vs WASM', { timeout: 30_000 }, () =>
     expect(wasmPid).not.toBe(42);
   });
 
-  itIf(!tier2Skip, 'getppid_test: parent PID is valid and positive', async () => {
+  itIf(!tier2Skip, 'getppid_test: top-level parent PID is valid', async () => {
     const native = await runNative('getppid_test');
     const wasm = await kernel.exec('getppid_test');
 
     expect(wasm.exitCode).toBe(native.exitCode);
     expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
-    expect(wasm.stdout).toContain('ppid_positive=yes');
-    expect(native.stdout).toContain('ppid_positive=yes');
+    expect(wasm.stdout).toContain('ppid_nonnegative=yes');
+    expect(native.stdout).toContain('ppid_nonnegative=yes');
+    expect(wasm.stdout).toContain('ppid=0');
   });
 
   itIf(!tier2Skip, 'userinfo: uid/gid/euid/egid values are specific', async () => {
@@ -534,8 +557,35 @@ describeIf(!skipReason(), 'C parity: native vs WASM', { timeout: 30_000 }, () =>
     expect(wasm.stdout).toContain('sigaction_query_flags=yes');
     expect(wasm.stdout).toContain('sa_resethand_handler_calls=1');
     expect(wasm.stdout).toContain('sa_resethand_reset=yes');
+    expect(wasm.stdout).toContain('sa_restart_handler_calls=1');
     expect(wasm.stdout).toContain('sa_restart_accept=yes');
     expect(wasm.stdout).toContain('sa_restart_child_exit=0');
+    expect(wasm.stdout).toContain('sa_restart_signal_exit=0');
+  });
+
+  itIf(!tier3Skip, 'sigaction_self: self kill dispatches SA_RESETHAND handler', async () => {
+    const native = await runNative('sigaction_self');
+    const wasm = await kernel.exec('sigaction_self');
+
+    expect(wasm.exitCode).toBe(native.exitCode);
+    expect(wasm.exitCode).toBe(0);
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toContain('self_signal_handler_calls=1');
+    expect(wasm.stdout).toContain('self_signal_reset=yes');
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+  });
+
+  itIf(!tier3Skip, 'tcp_accept_spawn: accept spawned child connection', async () => {
+    const env = { ...process.env, PATH: `${NATIVE_DIR}:${process.env.PATH ?? ''}` };
+    const native = await runNative('tcp_accept_spawn', [], { env });
+    const wasm = await kernel.exec('tcp_accept_spawn');
+
+    expect(wasm.exitCode).toBe(native.exitCode);
+    expect(wasm.exitCode).toBe(0);
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toContain('accept_child_message=yes');
+    expect(wasm.stdout).toContain('accept_child_exit=0');
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
   });
 
   itIf(!tier3Skip, 'getppid_verify: child getppid matches parent getpid', async () => {
@@ -877,6 +927,7 @@ describeIf(!skipReason(), 'C parity: native vs WASM', { timeout: 30_000 }, () =>
     const port = (server.address() as import('node:net').AddressInfo).port;
 
     try {
+      await recreateKernel({ loopbackExemptPorts: [port] });
       const native = await runNative('tcp_echo', [String(port)]);
       const wasm = await kernel.exec(`tcp_echo ${port}`);
 
@@ -901,6 +952,7 @@ describeIf(!skipReason(), 'C parity: native vs WASM', { timeout: 30_000 }, () =>
     const port = (server.address() as import('node:net').AddressInfo).port;
 
     try {
+      await recreateKernel({ loopbackExemptPorts: [port] });
       const native = await runNative('http_get', [String(port)]);
       const wasm = await kernel.exec(`http_get ${port}`);
 

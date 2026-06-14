@@ -8,6 +8,19 @@ const BROWSER_BASE_PROJECT_ID = process.env.BROWSER_BASE_PROJECT_ID ?? "";
 const HAS_BROWSERBASE_CREDENTIALS = Boolean(
 	BROWSER_BASE_API_KEY && BROWSER_BASE_PROJECT_ID,
 );
+const REQUIRES_BROWSERBASE_CREDENTIALS = process.env.AGENTOS_E2E_NETWORK === "1";
+
+if (!HAS_BROWSERBASE_CREDENTIALS && REQUIRES_BROWSERBASE_CREDENTIALS) {
+	throw new Error(
+		"Browserbase websocket tests require BROWSER_BASE_API_KEY and BROWSER_BASE_PROJECT_ID when AGENTOS_E2E_NETWORK=1.",
+	);
+}
+
+if (!HAS_BROWSERBASE_CREDENTIALS && !REQUIRES_BROWSERBASE_CREDENTIALS) {
+	console.warn(
+		"Skipping Browserbase websocket tests: source ~/misc/env.txt so BROWSER_BASE_API_KEY and BROWSER_BASE_PROJECT_ID are available.",
+	);
+}
 
 const BROWSERBASE_PERMISSIONS: Permissions = {
 	fs: "allow",
@@ -118,19 +131,6 @@ if (!releaseResponse.ok) {
 console.log("BROWSERBASE_CDP_REPLY:" + cdpReply);
 `;
 
-function testIf(
-	condition: boolean,
-	...args: Parameters<typeof test>
-): void {
-	if (condition) {
-		// @ts-expect-error forwarded test() arguments stay runtime-compatible.
-		test(...args);
-		return;
-	}
-	const [name] = args;
-	test(String(name), () => {});
-}
-
 const CLI_PAGES_SCRIPT = String.raw`
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
@@ -162,11 +162,19 @@ function tailFile(filePath, maxLines = 40) {
   if (!existsSync(filePath)) {
     return "";
   }
-  return readFileSync(filePath, "utf8")
-    .trim()
-    .split("\n")
-    .slice(-maxLines)
-    .join("\n");
+  const stats = statSync(filePath);
+  if (!stats.isFile()) {
+    return "<non-regular file>";
+  }
+  try {
+    return readFileSync(filePath, "utf8")
+      .trim()
+      .split("\n")
+      .slice(-maxLines)
+      .join("\n");
+  } catch (error) {
+    return "<unreadable: " + (error?.code || error?.message || String(error)) + ">";
+  }
 }
 
 function dumpSessionState(session) {
@@ -249,7 +257,8 @@ console.log("BROWSERBASE_PAGES:" + pages);
 const DIRECT_STAGEHAND_INIT_SCRIPT = String.raw`
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
 const browsePath = "/root/node_modules/@browserbasehq/browse-cli/dist/index.js";
@@ -259,10 +268,19 @@ if (!existsSync(browsePath)) {
 }
 
 const browseDir = dirname(dirname(browsePath));
-const stagehandPath = require.resolve("@browserbasehq/stagehand", {
+const stagehandPackagePath = require.resolve("@browserbasehq/stagehand/package.json", {
   paths: [browseDir],
 });
-const { V3 } = require(stagehandPath);
+const stagehandPackage = require(stagehandPackagePath);
+const stagehandImportPath =
+  typeof stagehandPackage.exports?.["."]?.import === "string"
+    ? stagehandPackage.exports["."].import
+    : stagehandPackage.module;
+if (typeof stagehandImportPath !== "string") {
+  throw new Error("Stagehand package does not expose an ESM entrypoint");
+}
+const stagehandPath = join(dirname(stagehandPackagePath), stagehandImportPath);
+const { V3 } = await import(pathToFileURL(stagehandPath).href);
 
 const steps = [];
 function note(step) {
@@ -309,15 +327,10 @@ try {
 `;
 
 const BROWSERBASE_SDK_SCRIPT = String.raw`
-import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
-const sdkPath = "/root/node_modules/.pnpm/@browserbasehq+sdk@2.10.0/node_modules/@browserbasehq/sdk/index.js";
-
-if (!existsSync(sdkPath)) {
-  throw new Error("missing browserbase sdk path");
-}
+const sdkPath = require.resolve("@browserbasehq/sdk");
 
 const Browserbase = require(sdkPath).default;
 const bb = new Browserbase({ apiKey: process.env.BROWSERBASE_API_KEY });
@@ -345,19 +358,33 @@ if (!created?.id || !created?.connectUrl) {
 }
 
 let debugUrl = null;
+let debugError = null;
 try {
   note("before-debug");
   const debug = await bb.sessions.debug(created.id);
   note("after-debug");
   debugUrl = debug?.debuggerUrl ?? null;
+  if (typeof debugUrl !== "string" || !debugUrl.startsWith("http")) {
+    throw new Error("browserbase sdk debug returned unexpected payload");
+  }
 } catch (error) {
-  note("debug-error");
-  debugUrl = String(error);
+  debugError = error;
 }
 
-note("before-release");
-await bb.sessions.update(created.id, { status: "REQUEST_RELEASE" });
-note("after-release");
+try {
+  note("before-release");
+  await bb.sessions.update(created.id, { status: "REQUEST_RELEASE" });
+  note("after-release");
+} catch (releaseError) {
+  if (!debugError) {
+    throw releaseError;
+  }
+  note("release-error");
+}
+
+if (debugError) {
+  throw debugError;
+}
 
 console.log(
   "BROWSERBASE_SDK_RESULT:" +
@@ -443,29 +470,64 @@ if (!created?.id) {
   throw new Error("missing created session id");
 }
 
-console.log("HTTPS_BROWSERBASE_STEP:before-debug");
-const debugResponse = await requestJson(
-  "GET",
-  "/v1/sessions/" + created.id + "/debug",
-  null,
-  agent,
-);
-console.log("HTTPS_BROWSERBASE_STEP:after-debug");
+let debugStatus = 0;
+let debugError = null;
+try {
+  console.log("HTTPS_BROWSERBASE_STEP:before-debug");
+  const debugResponse = await requestJson(
+    "GET",
+    "/v1/sessions/" + created.id + "/debug",
+    null,
+    agent,
+  );
+  console.log("HTTPS_BROWSERBASE_STEP:after-debug");
+  debugStatus = debugResponse.statusCode;
+  if (debugResponse.statusCode < 200 || debugResponse.statusCode >= 300) {
+    throw new Error(
+      "debug failed with " + debugResponse.statusCode + ": " + debugResponse.body,
+    );
+  }
+  const debugPayload = JSON.parse(debugResponse.body);
+  if (
+    typeof debugPayload?.debuggerUrl !== "string" ||
+    !debugPayload.debuggerUrl.startsWith("http")
+  ) {
+    throw new Error("debug returned unexpected payload: " + debugResponse.body);
+  }
+} catch (error) {
+  debugError = error;
+}
 
-console.log("HTTPS_BROWSERBASE_STEP:before-release");
-const releaseResponse = await requestJson(
-  "POST",
-  "/v1/sessions/" + created.id,
-  { status: "REQUEST_RELEASE" },
-  agent,
-);
-console.log("HTTPS_BROWSERBASE_STEP:after-release");
+let releaseResponse = null;
+try {
+  console.log("HTTPS_BROWSERBASE_STEP:before-release");
+  releaseResponse = await requestJson(
+    "POST",
+    "/v1/sessions/" + created.id,
+    { status: "REQUEST_RELEASE" },
+    agent,
+  );
+  console.log("HTTPS_BROWSERBASE_STEP:after-release");
+} catch (releaseError) {
+  if (!debugError) {
+    throw releaseError;
+  }
+  console.log("HTTPS_BROWSERBASE_STEP:release-error");
+}
+
+if (debugError) {
+  throw debugError;
+}
+
+if (!releaseResponse) {
+  throw new Error("missing release response");
+}
 
 console.log(
   "HTTPS_BROWSERBASE_RESULT:" +
     JSON.stringify({
       createStatus: createResponse.statusCode,
-      debugStatus: debugResponse.statusCode,
+      debugStatus,
       releaseStatus: releaseResponse.statusCode,
       sessionId: created.id,
     }),
@@ -832,8 +894,7 @@ describe("Browserbase websocket smoke test", () => {
 		}
 	});
 
-	const browserbaseTest = (...args: Parameters<typeof test>) =>
-		testIf(HAS_BROWSERBASE_CREDENTIALS, ...args);
+	const browserbaseTest = HAS_BROWSERBASE_CREDENTIALS ? test : test.skip;
 
 	browserbaseTest(
 		"opens a Browserbase CDP websocket and completes one command",
@@ -1016,7 +1077,29 @@ describe("Browserbase websocket smoke test", () => {
 
 			const exitCode = await vm.waitProcess(pid);
 			expect(exitCode, `stdout:\n${stdout}\nstderr:\n${stderr}`).toBe(0);
-			expect(stdout).toContain("BROWSERBASE_SDK_RESULT:");
+			const resultLine = stdout
+				.split("\n")
+				.find((line) => line.startsWith("BROWSERBASE_SDK_RESULT:"));
+			expect(resultLine, `stdout:\n${stdout}\nstderr:\n${stderr}`).toBeTruthy();
+			const result = JSON.parse(
+				resultLine!.slice("BROWSERBASE_SDK_RESULT:".length),
+			) as {
+				connectUrl?: string;
+				debugUrl?: string;
+				sessionId?: string;
+				steps?: string[];
+			};
+			expect(result.sessionId).toBeTruthy();
+			expect(result.connectUrl).toMatch(/^wss?:\/\//);
+			expect(result.debugUrl).toMatch(/^https?:\/\//);
+			expect(result.steps).toEqual([
+				"before-create",
+				"after-create",
+				"before-debug",
+				"after-debug",
+				"before-release",
+				"after-release",
+			]);
 		},
 		90_000,
 	);
@@ -1051,7 +1134,25 @@ describe("Browserbase websocket smoke test", () => {
 
 			const exitCode = await vm.waitProcess(pid);
 			expect(exitCode, `stdout:\n${stdout}\nstderr:\n${stderr}`).toBe(0);
-			expect(stdout).toContain("HTTPS_BROWSERBASE_RESULT:");
+			const resultLine = stdout
+				.split("\n")
+				.find((line) => line.startsWith("HTTPS_BROWSERBASE_RESULT:"));
+			expect(resultLine, `stdout:\n${stdout}\nstderr:\n${stderr}`).toBeTruthy();
+			const result = JSON.parse(
+				resultLine!.slice("HTTPS_BROWSERBASE_RESULT:".length),
+			) as {
+				createStatus?: number;
+				debugStatus?: number;
+				releaseStatus?: number;
+				sessionId?: string;
+			};
+			expect(result.sessionId).toBeTruthy();
+			expect(result.createStatus).toBeGreaterThanOrEqual(200);
+			expect(result.createStatus).toBeLessThan(300);
+			expect(result.debugStatus).toBeGreaterThanOrEqual(200);
+			expect(result.debugStatus).toBeLessThan(300);
+			expect(result.releaseStatus).toBeGreaterThanOrEqual(200);
+			expect(result.releaseStatus).toBeLessThan(300);
 		},
 		90_000,
 	);

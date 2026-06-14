@@ -15,7 +15,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 /*
@@ -86,6 +86,10 @@ struct TestJavascriptChildProcessSpawnOptions {
     internal_bootstrap_env: BTreeMap<String, String>,
     #[serde(default)]
     shell: bool,
+    #[serde(default)]
+    timeout: Option<u64>,
+    #[serde(default, rename = "killSignal")]
+    kill_signal: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +100,12 @@ struct TestJavascriptChildProcessSpawnRequest {
     #[serde(default)]
     options: TestJavascriptChildProcessSpawnOptions,
 }
+
+type TestJavascriptChildProcessSpawnSyncRequest = (
+    TestJavascriptChildProcessSpawnRequest,
+    Option<usize>,
+    Option<Vec<u8>>,
+);
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -110,6 +120,10 @@ struct TestLegacyJavascriptChildProcessSpawnOptions {
     shell: bool,
     #[serde(default, rename = "maxBuffer")]
     max_buffer: Option<usize>,
+    #[serde(default)]
+    timeout: Option<u64>,
+    #[serde(default, rename = "killSignal")]
+    kill_signal: Option<String>,
 }
 
 enum HostChildOutputEvent {
@@ -323,6 +337,36 @@ impl HostChildProcessHarness {
         }
         child.stdin.take();
 
+        if let Some(timeout_ms) = request.options.timeout {
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                match child
+                    .try_wait()
+                    .map_err(|error| format!("try_wait for {} failed: {error}", request.command))?
+                {
+                    Some(_) => break,
+                    None if Instant::now() >= deadline => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let signal = request
+                            .options
+                            .kill_signal
+                            .clone()
+                            .unwrap_or_else(|| String::from("SIGTERM"));
+                        return Ok(json!({
+                            "stdout": "",
+                            "stderr": "",
+                            "code": 1,
+                            "signal": signal,
+                            "timedOut": true,
+                            "maxBufferExceeded": false,
+                        }));
+                    }
+                    None => thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        }
+
         let output = child
             .wait_with_output()
             .map_err(|error| format!("wait_with_output for {} failed: {error}", request.command))?;
@@ -337,6 +381,8 @@ impl HostChildProcessHarness {
             "stdout": stdout,
             "stderr": stderr,
             "code": output.status.code().unwrap_or(1),
+            "signal": Value::Null,
+            "timedOut": false,
             "maxBufferExceeded": max_buffer_exceeded,
         }))
     }
@@ -551,20 +597,15 @@ fn parse_test_child_process_spawn_request(
             env: parsed_options.env,
             internal_bootstrap_env: BTreeMap::new(),
             shell: parsed_options.shell,
+            timeout: parsed_options.timeout,
+            kill_signal: parsed_options.kill_signal,
         },
     })
 }
 
 fn parse_test_child_process_spawn_sync_request(
     args: &[Value],
-) -> Result<
-    (
-        TestJavascriptChildProcessSpawnRequest,
-        Option<usize>,
-        Option<Vec<u8>>,
-    ),
-    String,
-> {
+) -> Result<TestJavascriptChildProcessSpawnSyncRequest, String> {
     let request = parse_test_child_process_spawn_request(args)?;
     let parsed_options = args
         .get(2)
@@ -762,6 +803,123 @@ if (process.ppid !== 41) throw new Error(`ppid=${process.ppid}`);
     assert!(result.stderr.is_empty(), "unexpected stderr: {stderr}");
 }
 
+fn javascript_execution_process_kill_rejects_invalid_pid_in_guest_js() {
+    let temp = tempdir().expect("create temp dir");
+    let mut engine = JavascriptExecutionEngine::default();
+    let context = engine.create_context(CreateJavascriptContextRequest {
+        vm_id: String::from("vm-js"),
+        bootstrap_module: None,
+        compile_cache_root: None,
+    });
+
+    let execution = engine
+        .start_execution(StartJavascriptExecutionRequest {
+            vm_id: String::from("vm-js"),
+            context_id: context.context_id,
+            argv: vec![String::from("./entry.mjs")],
+            env: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            inline_code: Some(String::from(
+                r#"
+try {
+  process.kill(Number.NaN, "SIGTERM");
+  console.log(JSON.stringify({ caught: false }));
+} catch (error) {
+  console.log(JSON.stringify({
+    caught: true,
+    name: error && error.name,
+    message: error && error.message,
+  }));
+}
+"#,
+            )),
+        })
+        .expect("start JavaScript execution");
+
+    let result = execution.wait().expect("wait for JavaScript execution");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.exit_code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(result.stderr.is_empty(), "unexpected stderr: {stderr}");
+
+    let output: Value = serde_json::from_slice(&result.stdout).expect("parse stdout JSON");
+    assert_eq!(output.get("caught"), Some(&json!(true)));
+    assert_eq!(output.get("name"), Some(&json!("TypeError")));
+    assert!(
+        output
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("\"pid\" argument")),
+        "unexpected process.kill error output: {output}"
+    );
+}
+
+fn javascript_execution_preserves_binary_process_stdio_writes() {
+    let temp = tempdir().expect("create temp dir");
+    let mut engine = JavascriptExecutionEngine::default();
+    let context = engine.create_context(CreateJavascriptContextRequest {
+        vm_id: String::from("vm-js"),
+        bootstrap_module: None,
+        compile_cache_root: None,
+    });
+
+    let execution = engine
+        .start_execution(StartJavascriptExecutionRequest {
+            vm_id: String::from("vm-js"),
+            context_id: context.context_id,
+            argv: vec![String::from("./entry.mjs")],
+            env: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            inline_code: Some(String::from(
+                r#"
+process.stdout.write(Buffer.from([0x00, 0xbc, 0xff, 0x41]));
+process.stderr.write(Buffer.from([0xfe, 0x00, 0x42]));
+"#,
+            )),
+        })
+        .expect("start JavaScript execution");
+
+    let result = execution.wait().expect("wait for JavaScript execution");
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(result.stdout, vec![0x00, 0xbc, 0xff, 0x41]);
+    assert_eq!(result.stderr, vec![0xfe, 0x00, 0x42]);
+}
+
+fn javascript_execution_intl_number_format_does_not_require_host_icu() {
+    let temp = tempdir().expect("create temp dir");
+    let mut engine = JavascriptExecutionEngine::default();
+    let context = engine.create_context(CreateJavascriptContextRequest {
+        vm_id: String::from("vm-js"),
+        bootstrap_module: None,
+        compile_cache_root: None,
+    });
+
+    let execution = engine
+        .start_execution(StartJavascriptExecutionRequest {
+            vm_id: String::from("vm-js"),
+            context_id: context.context_id,
+            argv: vec![String::from("./entry.mjs")],
+            env: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            inline_code: Some(String::from(
+                r#"
+const formatter = new Intl.NumberFormat("en", {
+  maximumFractionDigits: 2,
+  minimumFractionDigits: 2,
+});
+console.log(formatter.format(1234.5));
+"#,
+            )),
+        })
+        .expect("start JavaScript execution");
+
+    let result = execution.wait().expect("wait for JavaScript execution");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.exit_code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(stdout, "1,234.50\n");
+}
+
 fn javascript_execution_stream_consumers_text_reads_live_stdin() {
     let temp = tempdir().expect("create temp dir");
     let mut engine = JavascriptExecutionEngine::default();
@@ -909,6 +1067,100 @@ process.stdin.once("data", (chunk) => {
         stderr.contains("stderr:hello-live-stdin"),
         "stderr:\n{stderr}"
     );
+}
+
+fn javascript_execution_process_exit_ignores_live_interval_handles() {
+    let temp = tempdir().expect("create temp dir");
+    let mut engine = JavascriptExecutionEngine::default();
+    let context = engine.create_context(CreateJavascriptContextRequest {
+        vm_id: String::from("vm-js"),
+        bootstrap_module: None,
+        compile_cache_root: None,
+    });
+
+    let execution = engine
+        .start_execution(StartJavascriptExecutionRequest {
+            vm_id: String::from("vm-js"),
+            context_id: context.context_id,
+            argv: vec![String::from("./entry.mjs")],
+            env: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            inline_code: Some(String::from(
+                r#"
+process.stdout.write("before exit\n");
+setInterval(() => {
+  process.stdout.write("interval tick\n");
+}, 1000);
+process.exit(7);
+process.stdout.write("after exit\n");
+"#,
+            )),
+        })
+        .expect("start JavaScript execution");
+
+    let mut stdout = Vec::new();
+    let exit_code = loop {
+        match execution
+            .poll_event_blocking(Duration::from_secs(5))
+            .expect("poll JavaScript execution event")
+        {
+            Some(JavascriptExecutionEvent::Stdout(chunk)) => stdout.extend(chunk),
+            Some(JavascriptExecutionEvent::Stderr(chunk)) => {
+                panic!("unexpected stderr: {}", String::from_utf8_lossy(&chunk));
+            }
+            Some(JavascriptExecutionEvent::SignalState { .. }) => {}
+            Some(JavascriptExecutionEvent::SyncRpcRequest(request)) => {
+                panic!("unexpected pending sync RPC request: {}", request.id);
+            }
+            Some(JavascriptExecutionEvent::Exited(code)) => break code,
+            None => panic!("JavaScript execution timed out while awaiting process.exit"),
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout);
+    assert_eq!(exit_code, 7, "stdout:\n{stdout}");
+    assert!(stdout.contains("before exit"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("after exit"), "stdout:\n{stdout}");
+}
+
+fn javascript_execution_process_exit_bypasses_promise_catch_handlers() {
+    let temp = tempdir().expect("create temp dir");
+    let mut engine = JavascriptExecutionEngine::default();
+    let context = engine.create_context(CreateJavascriptContextRequest {
+        vm_id: String::from("vm-js"),
+        bootstrap_module: None,
+        compile_cache_root: None,
+    });
+
+    let execution = engine
+        .start_execution(StartJavascriptExecutionRequest {
+            vm_id: String::from("vm-js"),
+            context_id: context.context_id,
+            argv: vec![String::from("./entry.mjs")],
+            env: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            inline_code: Some(String::from(
+                r#"
+Promise.resolve()
+  .then(() => {
+    process.stdout.write("before exit\n");
+    process.exit(7);
+  })
+  .catch(() => {
+    process.stdout.write("catch handler ran\n");
+    process.exit(2);
+  });
+"#,
+            )),
+        })
+        .expect("start JavaScript execution");
+
+    let result = execution.wait().expect("wait for JavaScript execution");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.exit_code, 7, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("before exit"), "stdout:\n{stdout}");
+    assert!(!stdout.contains("catch handler ran"), "stdout:\n{stdout}");
 }
 
 fn javascript_execution_live_stdin_replays_end_after_late_listener_registration() {
@@ -1147,6 +1399,21 @@ import { performance } from "node:perf_hooks";
 if (typeof performance?.now !== "function") {
   throw new Error("node:perf_hooks did not expose performance.now()");
 }
+const replacementPerformance = {
+  now() {
+    const [seconds, nanoseconds] = process.hrtime();
+    return seconds * 1000 + nanoseconds / 1e6;
+  },
+};
+globalThis.performance = replacementPerformance;
+
+const elapsed = process.hrtime(process.hrtime());
+if (!Array.isArray(elapsed) || elapsed.length !== 2) {
+  throw new Error("process.hrtime returned an invalid delta");
+}
+if (typeof process.hrtime.bigint() !== "bigint") {
+  throw new Error("process.hrtime.bigint did not return a bigint");
+}
 "#,
             )),
         })
@@ -1238,6 +1505,60 @@ for (const builtin of ["inspector", "cluster"]) {
     );
 }
 
+fn javascript_execution_v8_util_format_with_options_matches_node() {
+    let temp = tempdir().expect("create temp dir");
+    write_fixture(
+        &temp.path().join("entry.mjs"),
+        r#"
+import { createRequire } from "node:module";
+import { formatWithOptions as namedFormatWithOptions } from "node:util";
+
+const require = createRequire(import.meta.url);
+const util = require("node:util");
+const circular = {};
+circular.self = circular;
+
+console.log(JSON.stringify({
+  type: typeof util.formatWithOptions,
+  namedType: typeof namedFormatWithOptions,
+  basic: util.formatWithOptions({}, "hello %s %d %j %%", "world", 4, { ok: true }),
+  extra: util.formatWithOptions({ colors: false }, "value", { alpha: 1 }, "tail"),
+  object: util.formatWithOptions({ colors: false, depth: 1 }, "%O", { nested: { value: 1 } }),
+  circular: util.formatWithOptions({}, "%j", circular),
+}));
+"#,
+    );
+
+    let host = run_host_node_json(temp.path(), &temp.path().join("entry.mjs"));
+
+    let mut engine = JavascriptExecutionEngine::default();
+    let context = engine.create_context(CreateJavascriptContextRequest {
+        vm_id: String::from("vm-js"),
+        bootstrap_module: None,
+        compile_cache_root: None,
+    });
+
+    let execution = engine
+        .start_execution(StartJavascriptExecutionRequest {
+            vm_id: String::from("vm-js"),
+            context_id: context.context_id,
+            argv: vec![String::from("./entry.mjs")],
+            env: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            inline_code: None,
+        })
+        .expect("start JavaScript execution");
+
+    let result = execution.wait().expect("wait for JavaScript execution");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.exit_code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
+
+    let guest: Value = serde_json::from_slice(&result.stdout).expect("parse stdout JSON");
+    assert_eq!(guest, host);
+}
+
 fn javascript_execution_provides_async_hooks_and_diagnostics_channel_stubs() {
     let temp = tempdir().expect("create temp dir");
     let mut engine = JavascriptExecutionEngine::default();
@@ -1257,6 +1578,7 @@ fn javascript_execution_provides_async_hooks_and_diagnostics_channel_stubs() {
             inline_code: Some(String::from(
                 r#"
 import { createRequire } from "node:module";
+import { Channel, tracingChannel as importedTracingChannel } from "node:diagnostics_channel";
 
 const require = createRequire(import.meta.url);
 const asyncHooks = require("node:async_hooks");
@@ -1285,6 +1607,48 @@ if (channel.hasSubscribers !== false) {
 }
 if (diagnosticsChannel.hasSubscribers("undici:request:create") !== false) {
   throw new Error("diagnostics_channel.hasSubscribers should be false");
+}
+if (typeof diagnosticsChannel.tracingChannel !== "function") {
+  throw new Error("diagnostics_channel.tracingChannel is missing");
+}
+if (typeof importedTracingChannel !== "function") {
+  throw new Error("diagnostics_channel ESM tracingChannel export is missing");
+}
+if (typeof Channel !== "function") {
+  throw new Error("diagnostics_channel ESM Channel export is missing");
+}
+
+const constructedChannel = new Channel("constructed");
+if (constructedChannel.name !== "constructed" || constructedChannel.hasSubscribers !== false) {
+  throw new Error("diagnostics_channel Channel constructor returned unexpected state");
+}
+
+const tracing = diagnosticsChannel.tracingChannel("agent.test");
+if (tracing.hasSubscribers !== false || tracing.start.hasSubscribers !== false) {
+  throw new Error("diagnostics tracing channel should start without subscribers");
+}
+if (tracing.start.name !== "tracing:agent.test:start") {
+  throw new Error(`unexpected tracing start channel name: ${String(tracing.start.name)}`);
+}
+const runStoresResult = tracing.start.runStores({ token: 1 }, (left, right) => `${left}:${right}`, undefined, "ok", 42);
+if (runStoresResult !== "ok:42") {
+  throw new Error(`diagnostics tracing channel runStores returned ${String(runStoresResult)}`);
+}
+
+let published = null;
+function onPublish(message, name) {
+  published = { message, name };
+}
+tracing.start.subscribe(onPublish);
+if (tracing.hasSubscribers !== true || tracing.start.hasSubscribers !== true) {
+  throw new Error("diagnostics tracing channel did not track subscribers");
+}
+tracing.start.publish({ value: 7 });
+if (published?.name !== "tracing:agent.test:start" || published?.message?.value !== 7) {
+  throw new Error("diagnostics tracing channel did not publish to subscribers");
+}
+if (tracing.start.unsubscribe(onPublish) !== true || tracing.hasSubscribers !== false) {
+  throw new Error("diagnostics tracing channel did not unsubscribe");
 }
 "#,
             )),
@@ -1392,6 +1756,51 @@ if (missingCode !== "MODULE_NOT_FOUND") {
 }
 
 require("./nested/check.cjs");
+"#,
+            )),
+        })
+        .expect("start JavaScript execution");
+
+    let result = execution.wait().expect("wait for JavaScript execution");
+    assert_eq!(result.exit_code, 0);
+    assert!(
+        result.stderr.is_empty(),
+        "unexpected stderr: {:?}",
+        result.stderr
+    );
+}
+
+fn javascript_execution_rejects_native_node_addons() {
+    let temp = tempdir().expect("create temp dir");
+    write_fixture(&temp.path().join("addon.node"), "not a native addon\n");
+
+    let mut engine = JavascriptExecutionEngine::default();
+    let context = engine.create_context(CreateJavascriptContextRequest {
+        vm_id: String::from("vm-js"),
+        bootstrap_module: None,
+        compile_cache_root: None,
+    });
+
+    let execution = engine
+        .start_execution(StartJavascriptExecutionRequest {
+            vm_id: String::from("vm-js"),
+            context_id: context.context_id,
+            argv: vec![String::from("./entry.js")],
+            env: BTreeMap::new(),
+            cwd: temp.path().to_path_buf(),
+            inline_code: Some(String::from(
+                r#"
+let rejected = false;
+try {
+  require("./addon.node");
+} catch (error) {
+  rejected =
+    String(error?.message ?? "").includes(".node extensions are not supported") ||
+    String(error?.message ?? "").includes("native addon loading");
+}
+if (!rejected) {
+  throw new Error("native .node addon should be rejected");
+}
 "#,
             )),
         })
@@ -2040,6 +2449,71 @@ const syncPiped = childProcess.spawnSync("/bin/cat", [], {
   input: Buffer.from("alpha-sync"),
 });
 const syncError = childProcess.spawnSync("/bin/cat", ["definitely-missing-agentos-file"]);
+const syncTimeout = childProcess.spawnSync("/bin/sh", ["-c", "sleep 2"], {
+  timeout: 50,
+  killSignal: "SIGTERM",
+  encoding: "utf8",
+});
+const stdinDestroyChild = childProcess.spawn("/bin/cat", [], {
+  stdio: ["pipe", "pipe", "pipe"],
+});
+if (typeof stdinDestroyChild.stdin.destroy !== "function") {
+  throw new Error("child stdin did not expose destroy()");
+}
+if (
+  typeof stdinDestroyChild.stdout?.destroy !== "function" ||
+  typeof stdinDestroyChild.stderr?.destroy !== "function"
+) {
+  throw new Error("child output streams did not expose destroy()");
+}
+const stdinDestroyStatus = await new Promise((resolve, reject) => {
+  stdinDestroyChild.on("error", reject);
+  stdinDestroyChild.on("close", (code) => resolve(code));
+  stdinDestroyChild.stdin.destroy();
+  if (stdinDestroyChild.stdin.destroyed !== true) {
+    reject(new Error("child stdin destroy() did not mark the stream destroyed"));
+  }
+});
+
+const stdinCallbackResult = await new Promise((resolve, reject) => {
+  const child = childProcess.spawn("/bin/cat", [], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const timer = setTimeout(() => {
+    reject(new Error("spawn(/bin/cat) stdin callback probe did not close within 2s"));
+  }, 2000);
+  const stdout = [];
+  const stderr = [];
+  let writeCallbackError = null;
+  let writeCallbackCalled = false;
+  let endCallbackCalled = false;
+  child.stdout.on("data", (chunk) => {
+    stdout.push(Buffer.from(chunk));
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr.push(Buffer.from(chunk));
+  });
+  child.on("error", reject);
+  child.on("close", (code, signal) => {
+    clearTimeout(timer);
+    resolve({
+      code,
+      signal,
+      writeCallbackCalled,
+      writeCallbackError,
+      endCallbackCalled,
+      stdoutBase64: Buffer.concat(stdout).toString("base64"),
+      stderrBase64: Buffer.concat(stderr).toString("base64"),
+    });
+  });
+  child.stdin.write(Buffer.from("callback:gamma"), (error) => {
+    writeCallbackCalled = true;
+    writeCallbackError = error ? String(error?.message ?? error) : null;
+    child.stdin.end(() => {
+      endCallbackCalled = true;
+    });
+  });
+});
 
 const asyncResult = await new Promise((resolve, reject) => {
   const child = childProcess.spawn("/bin/cat", ["async-out.txt"], {
@@ -2102,6 +2576,20 @@ console.log(JSON.stringify({
   syncErrorStatus: syncError.status,
   syncErrorStdoutBase64: Buffer.from(syncError.stdout ?? []).toString("base64"),
   syncErrorStderrBase64: Buffer.from(syncError.stderr ?? []).toString("base64"),
+  syncTimeoutStatus: syncTimeout.status,
+  syncTimeoutSignal: syncTimeout.signal,
+  syncTimeoutErrorCode: syncTimeout.error?.code,
+  syncTimeoutErrorMessage: syncTimeout.error?.message,
+  syncTimeoutStdout: syncTimeout.stdout,
+  syncTimeoutStderr: syncTimeout.stderr,
+  stdinDestroyStatus,
+  stdinCallbackCode: stdinCallbackResult.code,
+  stdinCallbackSignal: stdinCallbackResult.signal,
+  stdinCallbackWriteCallbackCalled: stdinCallbackResult.writeCallbackCalled,
+  stdinCallbackWriteCallbackError: stdinCallbackResult.writeCallbackError,
+  stdinCallbackEndCallbackCalled: stdinCallbackResult.endCallbackCalled,
+  stdinCallbackStdoutBase64: stdinCallbackResult.stdoutBase64,
+  stdinCallbackStderrBase64: stdinCallbackResult.stderrBase64,
   asyncCode: asyncResult.code,
   asyncSignal: asyncResult.signal,
   asyncStdoutBase64: asyncResult.stdoutBase64,
@@ -2631,6 +3119,10 @@ fn javascript_execution_v8_crypto_basic_operations_emit_expected_sync_rpcs() {
         map_bridge_method("_netSocketConnectRaw"),
         ("net.connect", false)
     );
+    assert_eq!(
+        map_bridge_method("_networkDnsLookupSyncRaw"),
+        ("dns.lookup", false)
+    );
     assert_eq!(map_bridge_method("_netSocketPollRaw"), ("net.poll", false));
 }
 
@@ -2731,6 +3223,9 @@ let output = "";
 pass.on("data", (chunk) => {
   output += Buffer.from(chunk).toString("utf8");
 });
+if (!isReadable(pass) || !isWritable(pass)) {
+  throw new Error("stream helpers misreported passthrough readability");
+}
 pass.end("hello");
 await new Promise((resolve, reject) => {
   pass.once("close", resolve);
@@ -2740,8 +3235,32 @@ await new Promise((resolve, reject) => {
 if (output !== "hello") {
   throw new Error(`unexpected passthrough output: ${output}`);
 }
-if (!isReadable(pass) || !isWritable(pass)) {
-  throw new Error("stream helpers misreported passthrough readability");
+
+const lifecycle = [];
+let writableOutput = "";
+const writable = new Writable({
+  write(chunk, _encoding, callback) {
+    lifecycle.push("write");
+    writableOutput += Buffer.from(chunk).toString("utf8");
+    callback();
+  },
+  destroy(_error, callback) {
+    lifecycle.push("destroy");
+    callback();
+  },
+});
+writable.on("finish", () => lifecycle.push("finish"));
+writable.end("hi");
+await new Promise((resolve, reject) => {
+  writable.once("close", resolve);
+  writable.once("error", reject);
+});
+
+if (writableOutput !== "hi") {
+  throw new Error(`unexpected writable output: ${writableOutput}`);
+}
+if (lifecycle.join(",") !== "write,finish,destroy") {
+  throw new Error(`unexpected writable lifecycle: ${lifecycle.join(",")}`);
 }
 "#,
     );
@@ -3531,9 +4050,14 @@ fn javascript_v8_suite() {
     javascript_contexts_preserve_vm_and_bootstrap_configuration();
     javascript_execution_uses_v8_runtime_without_spawning_guest_node_binary();
     javascript_execution_virtualizes_process_metadata_for_inline_v8_code();
+    javascript_execution_process_kill_rejects_invalid_pid_in_guest_js();
+    javascript_execution_preserves_binary_process_stdio_writes();
+    javascript_execution_intl_number_format_does_not_require_host_icu();
     javascript_execution_stream_consumers_text_reads_live_stdin();
     javascript_execution_process_stdin_async_iterator_finishes_with_live_stdin();
     javascript_execution_process_exit_from_live_stdin_listener_exits_without_waiting_for_eof();
+    javascript_execution_process_exit_ignores_live_interval_handles();
+    javascript_execution_process_exit_bypasses_promise_catch_handlers();
     javascript_execution_live_stdin_replays_end_after_late_listener_registration();
     javascript_execution_file_url_to_path_accepts_guest_absolute_paths();
     javascript_execution_imports_node_events_without_hanging();
@@ -3541,8 +4065,10 @@ fn javascript_v8_suite() {
     javascript_execution_imports_node_fs_promises_without_hanging();
     javascript_execution_imports_node_perf_hooks_without_hanging();
     javascript_execution_exposes_compatibility_shims_and_denies_escape_builtins();
+    javascript_execution_v8_util_format_with_options_matches_node();
     javascript_execution_provides_async_hooks_and_diagnostics_channel_stubs();
     javascript_execution_supports_require_resolve_for_guest_code();
+    javascript_execution_rejects_native_node_addons();
     javascript_execution_surfaces_sync_rpc_requests_from_v8_modules();
     javascript_execution_v8_dgram_bridge_matches_sidecar_rpc_shapes();
     javascript_execution_strips_hashbang_from_module_entrypoints();

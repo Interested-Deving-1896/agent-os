@@ -1,24 +1,36 @@
 pub trait NativeSidecarBridge: agent_os_bridge::HostBridge {}
 impl<T> NativeSidecarBridge for T where T: agent_os_bridge::HostBridge {}
 
+#[allow(dead_code, unused_imports)]
 #[path = "../src/acp/mod.rs"]
 mod acp;
+#[allow(dead_code)]
 #[path = "../src/bootstrap.rs"]
 mod bootstrap;
 #[path = "../src/bridge.rs"]
 mod bridge;
+#[allow(dead_code)]
 #[path = "../src/execution.rs"]
 mod execution;
+#[allow(dead_code)]
 #[path = "../src/filesystem.rs"]
 mod filesystem;
+#[allow(dead_code)]
+#[path = "../src/limits.rs"]
+mod limits;
+#[allow(dead_code)]
 #[path = "../src/plugins/mod.rs"]
 mod plugins;
+#[allow(dead_code, clippy::enum_variant_names)]
 #[path = "../src/protocol.rs"]
 mod protocol;
+#[allow(dead_code)]
 #[path = "../src/state.rs"]
 mod state;
+#[allow(dead_code)]
 #[path = "../src/tools.rs"]
 mod tools;
+#[allow(dead_code)]
 #[path = "../src/vm.rs"]
 mod vm;
 
@@ -34,10 +46,14 @@ mod service {
         }
 
         use super::*;
+        use crate::acp::session::ACP_STDOUT_BUFFER_BYTE_LIMIT;
         use crate::bridge::{bridge_permissions, HostFilesystem, ScopedHostFilesystem};
         use crate::execution::{
             clamp_javascript_net_poll_wait, format_dns_resource, format_tcp_resource,
-            service_javascript_net_sync_rpc, signal_runtime_process,
+            runtime_child_is_alive,
+            service_javascript_net_sync_rpc as service_javascript_net_sync_rpc_inner,
+            signal_runtime_process, JavascriptNetSyncRpcServiceRequest,
+            JavascriptSyncRpcServiceRequest,
         };
         use crate::filesystem::service_javascript_fs_sync_rpc;
         use crate::plugins::s3::test_support::MockS3Server;
@@ -46,8 +62,8 @@ mod service {
         use crate::protocol::{
             AuthenticateRequest, BootstrapRootFilesystemRequest, CloseStdinRequest,
             ConfigureVmRequest, CreateSessionRequest, CreateVmRequest, DisposeReason,
-            DisposeVmRequest, FindBoundUdpRequest, FindListenerRequest, FsPermissionRule,
-            FsPermissionRuleSet, FsPermissionScope, GetProcessSnapshotRequest,
+            DisposeVmRequest, EventPayload, FindBoundUdpRequest, FindListenerRequest,
+            FsPermissionRule, FsPermissionRuleSet, FsPermissionScope, GetProcessSnapshotRequest,
             GetZombieTimerCountRequest, GuestFilesystemCallRequest, GuestFilesystemOperation,
             GuestRuntimeKind, MountDescriptor, MountPluginDescriptor, OpenSessionRequest,
             OwnershipScope, PatternPermissionRule, PatternPermissionRuleSet,
@@ -59,14 +75,16 @@ mod service {
             WriteStdinRequest,
         };
         use crate::state::{
-            ActiveExecution, ActiveExecutionEvent, ActiveProcess, ActiveTcpListener,
-            ActiveUdpSocket, ProcessEventEnvelope, SidecarKernel, ToolExecution, VmListenPolicy,
-            EXECUTION_SANDBOX_ROOT_ENV, JAVASCRIPT_COMMAND, LOOPBACK_EXEMPT_PORTS_ENV,
-            PYTHON_COMMAND, VM_DNS_SERVERS_METADATA_KEY, VM_LISTEN_ALLOW_PRIVILEGED_METADATA_KEY,
-            VM_LISTEN_PORT_MAX_METADATA_KEY, VM_LISTEN_PORT_MIN_METADATA_KEY, WASM_COMMAND,
-            WASM_STDIO_SYNC_RPC_ENV,
+            ActiveCipherSession, ActiveDiffieHellmanSession, ActiveEcdhSession, ActiveExecution,
+            ActiveExecutionEvent, ActiveProcess, ActiveSqliteDatabase, ActiveSqliteStatement,
+            ActiveTcpListener, ActiveUdpSocket, ProcessEventEnvelope, SidecarKernel, ToolExecution,
+            VmListenPolicy, EXECUTION_SANDBOX_ROOT_ENV, JAVASCRIPT_COMMAND,
+            LOOPBACK_EXEMPT_PORTS_ENV, PYTHON_COMMAND, VM_DNS_SERVERS_METADATA_KEY,
+            VM_LISTEN_ALLOW_PRIVILEGED_METADATA_KEY, VM_LISTEN_PORT_MAX_METADATA_KEY,
+            VM_LISTEN_PORT_MIN_METADATA_KEY, WASM_COMMAND, WASM_STDIO_SYNC_RPC_ENV,
         };
-        use agent_os_bridge::{FileKind, SymlinkRequest};
+        use crate::state::{NetworkResourceCounts, VmDnsConfig};
+        use agent_os_bridge::SymlinkRequest;
         use agent_os_execution::{
             CreateJavascriptContextRequest, CreatePythonContextRequest, CreateWasmContextRequest,
             JavascriptSyncRpcRequest, PythonVfsRpcMethod, PythonVfsRpcRequest,
@@ -76,22 +94,25 @@ mod service {
         use agent_os_kernel::command_registry::CommandDriver;
         use agent_os_kernel::kernel::{KernelVmConfig, SpawnOptions, VirtualProcessOptions};
         use agent_os_kernel::mount_table::{MountEntry, MountOptions, MountTable};
-        use agent_os_kernel::permissions::{FsAccessRequest, FsOperation, Permissions};
+        use agent_os_kernel::permissions::{
+            CommandAccessRequest, EnvAccessRequest, EnvironmentOperation, FsAccessRequest,
+            FsOperation, NetworkAccessRequest, NetworkOperation, Permissions,
+        };
         use agent_os_kernel::poll::{PollTargetEntry, POLLIN};
-        use agent_os_kernel::process_table::SIGTERM;
+        use agent_os_kernel::process_table::{SIGKILL, SIGTERM};
         use agent_os_kernel::resource_accounting::ResourceLimits;
         use agent_os_kernel::vfs::{
-            MemoryFileSystem, VfsError, VirtualDirEntry, VirtualFileSystem, VirtualStat,
+            MemoryFileSystem, VirtualDirEntry, VirtualFileSystem, VirtualStat,
         };
         use base64::Engine;
         use bridge_support::RecordingBridge;
-        use hickory_resolver::proto::op::{Message, OpCode, Query};
+        use hickory_resolver::proto::op::{Message, Query};
         use hickory_resolver::proto::rr::domain::Name;
         use hickory_resolver::proto::rr::rdata::{
             A, AAAA, CAA, CNAME, MX, NAPTR, NS, PTR, SOA, SRV, TXT,
         };
         use hickory_resolver::proto::rr::{RData, Record, RecordType};
-        use nix::fcntl::{flock, FlockArg};
+        use nix::fcntl::{Flock, FlockArg};
         use nix::libc;
         use rustls::client::danger::{
             HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
@@ -103,13 +124,11 @@ mod service {
             ServerConnection, SignatureScheme,
         };
         use serde_json::{json, Map, Value};
-        use socket2::SockRef;
         use std::collections::BTreeMap;
         use std::fs;
         use std::fs::OpenOptions;
         use std::io::{BufReader, Read, Write};
-        use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
-        use std::os::fd::AsRawFd;
+        use std::net::{SocketAddr, TcpListener, UdpSocket};
         use std::path::{Path, PathBuf};
         use std::process::Command;
         use std::sync::{
@@ -120,6 +139,7 @@ mod service {
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
         const TEST_AUTH_TOKEN: &str = "sidecar-test-token";
+        const MAX_SERVICE_PROCESS_STREAM_BYTES: usize = 1024 * 1024;
         const TLS_TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
 MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQClvETzHfSyd1Y+\n\
 sjCfGkuyGxFMzwQlYjUrE0iwdMF774LYHFdpvtEo3sLOW6/b1xfXS/55jq+aggxS\n\
@@ -303,6 +323,52 @@ process.on("SIGTERM", () => {
 
 setInterval(() => {}, 1000);
 "#;
+        // Mock ACP adapter that echoes its own launch argv (minus node + script path) in the
+        // initialize agentInfo result so prompt-injection assertions can read it from the
+        // SessionCreated response without depending on guest-to-kernel file sync timing.
+        const ACP_ARGV_PROBE_AGENT: &str = r#"
+let buffer = "";
+process.stdin.resume();
+process.stdin.on("data", (chunk) => {
+  buffer += chunk instanceof Uint8Array ? new TextDecoder().decode(chunk) : String(chunk);
+  while (true) {
+    const idx = buffer.indexOf("\n");
+    if (idx === -1) break;
+    const line = buffer.slice(0, idx);
+    buffer = buffer.slice(idx + 1);
+    if (!line.trim()) continue;
+    const message = JSON.parse(line);
+    if (message.id === undefined) continue;
+    switch (message.method) {
+      case "initialize":
+        process.stdout.write(JSON.stringify({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: {
+            protocolVersion: 1,
+            agentInfo: { name: "mock-acp", version: "1.0.0", argv: process.argv.slice(2) },
+          },
+        }) + "\n");
+        break;
+      case "session/new":
+        process.stdout.write(JSON.stringify({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: { sessionId: "mock-session-1" },
+        }) + "\n");
+        break;
+      default:
+        process.stdout.write(JSON.stringify({
+          jsonrpc: "2.0",
+          id: message.id,
+          error: { code: -32601, message: "Method not found" },
+        }) + "\n");
+    }
+  }
+});
+
+setInterval(() => {}, 1000);
+"#;
 
         fn request(
             request_id: agent_os_sidecar::protocol::RequestId,
@@ -313,21 +379,21 @@ setInterval(() => {}, 1000);
         }
 
         fn acquire_sidecar_runtime_test_lock() {
-            static LOCK_FILE: OnceLock<std::fs::File> = OnceLock::new();
+            static LOCK_FILE: OnceLock<Flock<std::fs::File>> = OnceLock::new();
             let _ = LOCK_FILE.get_or_init(|| {
                 let path = std::env::temp_dir().join("agent-os-sidecar-runtime-tests.lock");
                 let file = OpenOptions::new()
                     .create(true)
+                    .truncate(false)
                     .read(true)
                     .write(true)
                     .open(&path)
                     .unwrap_or_else(|error| {
                         panic!("open sidecar test runtime lock {}: {error}", path.display())
                     });
-                flock(file.as_raw_fd(), FlockArg::LockExclusive).unwrap_or_else(|error| {
+                Flock::lock(file, FlockArg::LockExclusive).unwrap_or_else(|(_, error)| {
                     panic!("lock sidecar test runtime {}: {error}", path.display())
-                });
-                file
+                })
             });
         }
 
@@ -351,6 +417,469 @@ setInterval(() => {}, 1000);
         fn create_test_sidecar() -> NativeSidecar<RecordingBridge> {
             create_test_sidecar_with_config(NativeSidecarConfig::default())
         }
+
+        fn test_process_event(index: usize) -> ProcessEventEnvelope {
+            ProcessEventEnvelope {
+                connection_id: String::from("conn-queue"),
+                session_id: String::from("session-queue"),
+                vm_id: String::from("vm-queue"),
+                process_id: format!("proc-queue-{index}"),
+                event: ActiveExecutionEvent::Stdout(Vec::new()),
+            }
+        }
+
+        fn insert_tool_process(
+            sidecar: &mut NativeSidecar<RecordingBridge>,
+            vm_id: &str,
+            process_id: &str,
+        ) {
+            let kernel_handle = create_kernel_process_handle_for_tests();
+            let process = ActiveProcess::new(
+                kernel_handle.pid(),
+                kernel_handle,
+                GuestRuntimeKind::JavaScript,
+                ActiveExecution::Tool(ToolExecution::default()),
+            );
+            sidecar
+                .vms
+                .get_mut(vm_id)
+                .expect("test vm")
+                .active_processes
+                .insert(process_id.to_owned(), process);
+        }
+
+        fn process_event_sender_is_bounded() {
+            let sidecar = create_test_sidecar();
+
+            for index in 0..MAX_PROCESS_EVENT_QUEUE {
+                sidecar
+                    .process_event_sender
+                    .try_send(test_process_event(index))
+                    .expect("bounded process event sender should accept capacity");
+            }
+
+            assert!(matches!(
+                sidecar
+                    .process_event_sender
+                    .try_send(test_process_event(MAX_PROCESS_EVENT_QUEUE)),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+            ));
+        }
+
+        fn pending_process_events_are_bounded() {
+            let mut sidecar = create_test_sidecar();
+
+            for index in 0..MAX_PROCESS_EVENT_QUEUE {
+                sidecar
+                    .queue_pending_process_event(test_process_event(index))
+                    .expect("pending process event queue should accept capacity");
+            }
+
+            let error = sidecar
+                .queue_pending_process_event(test_process_event(MAX_PROCESS_EVENT_QUEUE))
+                .expect_err("pending process event queue should reject overflow");
+            assert!(
+                error.to_string().contains("process event queue exceeded"),
+                "unexpected overflow error: {error}"
+            );
+        }
+
+        fn process_event_receiver_overflow_preserves_queued_event() {
+            let mut sidecar = create_test_sidecar();
+
+            for index in 0..MAX_PROCESS_EVENT_QUEUE {
+                sidecar
+                    .queue_pending_process_event(test_process_event(index))
+                    .expect("pending process event queue should accept capacity");
+            }
+
+            let expected_process_id = format!("proc-queue-{MAX_PROCESS_EVENT_QUEUE}");
+            sidecar
+                .process_event_sender
+                .try_send(test_process_event(MAX_PROCESS_EVENT_QUEUE))
+                .expect("queue process event behind full pending queue");
+
+            let error = sidecar
+                .take_matching_process_event_envelope("vm-queue", &expected_process_id)
+                .expect_err("receiver drain should reject overflow before consuming event");
+            assert!(
+                error.to_string().contains("process event queue exceeded"),
+                "unexpected overflow error: {error}"
+            );
+
+            let preserved = sidecar
+                .process_event_receiver
+                .as_mut()
+                .expect("process event receiver")
+                .try_recv()
+                .expect("overflowing receiver event should remain queued");
+            assert_eq!(preserved.process_id, expected_process_id);
+        }
+
+        fn tool_execution_event_overflow_is_reported() {
+            let tool_execution = ToolExecution::default();
+            for _ in 0..MAX_PROCESS_EVENT_QUEUE {
+                assert!(crate::execution::send_tool_process_event(
+                    &tool_execution.pending_events,
+                    &tool_execution.events_overflowed,
+                    ActiveExecutionEvent::Stdout(Vec::new()),
+                ));
+            }
+            assert!(!crate::execution::send_tool_process_event(
+                &tool_execution.pending_events,
+                &tool_execution.events_overflowed,
+                ActiveExecutionEvent::Exited(0),
+            ));
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("create tokio runtime");
+            let local = tokio::task::LocalSet::new();
+            runtime.block_on(local.run_until(async move {
+                let mut execution = ActiveExecution::Tool(tool_execution);
+                for _ in 0..MAX_PROCESS_EVENT_QUEUE {
+                    assert!(matches!(
+                        execution
+                            .poll_event(Duration::ZERO)
+                            .await
+                            .expect("poll queued tool event"),
+                        Some(ActiveExecutionEvent::Stdout(_))
+                    ));
+                }
+                let error = execution
+                    .poll_event(Duration::ZERO)
+                    .await
+                    .expect_err("tool event overflow should be reported");
+                assert!(
+                    error.to_string().contains("process event queue exceeded"),
+                    "unexpected overflow error: {error}"
+                );
+            }));
+        }
+
+        fn descendant_transfer_overflow_preserves_global_queue() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate sidecar");
+            let vm_id = create_vm_with_metadata(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+                BTreeMap::new(),
+            )
+            .expect("create vm");
+            insert_tool_process(&mut sidecar, &vm_id, "root-proc");
+            let child = {
+                let kernel_handle = create_kernel_process_handle_for_tests();
+                let mut child = ActiveProcess::new(
+                    kernel_handle.pid(),
+                    kernel_handle,
+                    GuestRuntimeKind::JavaScript,
+                    ActiveExecution::Tool(ToolExecution::default()),
+                );
+                for _ in 0..MAX_PROCESS_EVENT_QUEUE {
+                    child
+                        .queue_pending_execution_event(ActiveExecutionEvent::Stdout(Vec::new()))
+                        .expect("fill child event queue");
+                }
+                child
+            };
+            sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("test vm")
+                .active_processes
+                .get_mut("root-proc")
+                .expect("root process")
+                .child_processes
+                .insert(String::from("child-1"), child);
+
+            sidecar
+                .queue_pending_process_event(ProcessEventEnvelope {
+                    connection_id: connection_id.clone(),
+                    session_id: session_id.clone(),
+                    vm_id: vm_id.clone(),
+                    process_id: String::from("root-proc/child-1"),
+                    event: ActiveExecutionEvent::Stdout(b"preserve".to_vec()),
+                })
+                .expect("queue descendant event");
+
+            let error = sidecar
+                .drain_queued_descendant_javascript_child_process_events(
+                    &vm_id,
+                    "root-proc",
+                    &["child-1"],
+                )
+                .expect_err("full child queue should reject transfer");
+            assert!(
+                error.to_string().contains("process event queue exceeded"),
+                "unexpected overflow error: {error}"
+            );
+            assert_eq!(sidecar.pending_process_events.len(), 1);
+            assert_eq!(
+                sidecar
+                    .pending_process_events
+                    .front()
+                    .expect("preserved global event")
+                    .process_id,
+                "root-proc/child-1"
+            );
+        }
+
+        fn exit_trailing_requeue_preserves_exit_when_queue_is_full() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate sidecar");
+            let vm_id = create_vm_with_metadata(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+                BTreeMap::new(),
+            )
+            .expect("create vm");
+            insert_tool_process(&mut sidecar, &vm_id, "proc-exit");
+
+            for index in 0..(MAX_PROCESS_EVENT_QUEUE - 1) {
+                sidecar
+                    .queue_pending_process_event(test_process_event(index))
+                    .expect("fill unrelated global queue");
+            }
+            sidecar
+                .queue_pending_process_event(ProcessEventEnvelope {
+                    connection_id: connection_id.clone(),
+                    session_id: session_id.clone(),
+                    vm_id: vm_id.clone(),
+                    process_id: String::from("proc-exit"),
+                    event: ActiveExecutionEvent::Stdout(b"trailing".to_vec()),
+                })
+                .expect("queue trailing process event");
+
+            let frame = sidecar
+                .handle_process_event_envelope(ProcessEventEnvelope {
+                    connection_id,
+                    session_id,
+                    vm_id: vm_id.clone(),
+                    process_id: String::from("proc-exit"),
+                    event: ActiveExecutionEvent::Exited(0),
+                })
+                .expect("handle exit with full queue")
+                .expect("trailing output should emit immediately");
+
+            assert!(matches!(frame.payload, EventPayload::ProcessOutput(_)));
+            let preserved_exit = sidecar
+                .pending_process_events
+                .iter()
+                .find(|envelope| envelope.process_id == "proc-exit")
+                .expect("exit should remain queued");
+            assert!(matches!(
+                preserved_exit.event,
+                ActiveExecutionEvent::Exited(0)
+            ));
+        }
+
+        fn assert_handle_limit_error(error: SidecarError) {
+            assert!(
+                error.to_string().contains("handle limit exceeded"),
+                "unexpected handle limit error: {error}"
+            );
+        }
+
+        fn cipher_session_handles_are_bounded() {
+            let mut process = create_crypto_test_process();
+            for index in 0..crate::execution::MAX_PER_PROCESS_STATE_HANDLES {
+                let context = openssl::symm::Crypter::new(
+                    openssl::symm::Cipher::aes_256_cbc(),
+                    openssl::symm::Mode::Encrypt,
+                    &[0_u8; 32],
+                    Some(&[0_u8; 16]),
+                )
+                .expect("create cipher context");
+                process.cipher_sessions.insert(
+                    index as u64,
+                    ActiveCipherSession {
+                        algorithm: String::from("aes-256-cbc"),
+                        auth_tag_len: 0,
+                        context,
+                    },
+                );
+            }
+
+            let error = crate::execution::service_javascript_crypto_sync_rpc(
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id: 1,
+                    method: String::from("crypto.cipherivCreate"),
+                    args: vec![
+                        json!("cipher"),
+                        json!("aes-256-cbc"),
+                        json!(base64::engine::general_purpose::STANDARD.encode([9_u8; 32])),
+                        json!(base64::engine::general_purpose::STANDARD.encode([4_u8; 16])),
+                        json!(r#"{}"#),
+                    ],
+                },
+            )
+            .expect_err("cipher session creation should be bounded");
+            assert_handle_limit_error(error);
+        }
+
+        fn diffie_hellman_session_handles_are_bounded() {
+            let mut process = create_crypto_test_process();
+            for index in 0..crate::execution::MAX_PER_PROCESS_STATE_HANDLES {
+                process.diffie_hellman_sessions.insert(
+                    index as u64,
+                    ActiveDiffieHellmanSession::Ecdh(ActiveEcdhSession {
+                        curve: String::from("P-256"),
+                        key_pair: None,
+                    }),
+                );
+            }
+            process.next_diffie_hellman_session_id =
+                crate::execution::MAX_PER_PROCESS_STATE_HANDLES as u64;
+
+            let error = crate::execution::service_javascript_crypto_sync_rpc(
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id: 2,
+                    method: String::from("crypto.diffieHellmanSessionCreate"),
+                    args: vec![json!(r#"{"type":"ecdh","name":"P-256"}"#)],
+                },
+            )
+            .expect_err("diffie-hellman session creation should be bounded");
+            assert_handle_limit_error(error);
+
+            crate::execution::service_javascript_crypto_sync_rpc(
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id: 20,
+                    method: String::from("crypto.diffieHellmanSessionDestroy"),
+                    args: vec![json!(0)],
+                },
+            )
+            .expect("destroy diffie-hellman session");
+            let session_id = crate::execution::service_javascript_crypto_sync_rpc(
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id: 21,
+                    method: String::from("crypto.diffieHellmanSessionCreate"),
+                    args: vec![json!(r#"{"type":"ecdh","name":"P-256"}"#)],
+                },
+            )
+            .expect("diffie-hellman session creation should recover after destroy")
+            .as_u64()
+            .expect("new session id");
+            assert!(session_id > crate::execution::MAX_PER_PROCESS_STATE_HANDLES as u64);
+        }
+
+        fn create_sqlite_handle_test_sidecar() -> (NativeSidecar<RecordingBridge>, String) {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate sidecar");
+            let vm_id = create_vm_with_metadata(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+                BTreeMap::new(),
+            )
+            .expect("create vm");
+            insert_tool_process(&mut sidecar, &vm_id, "proc-sqlite-handles");
+            (sidecar, vm_id)
+        }
+
+        fn sqlite_database_handles_are_bounded() {
+            let (mut sidecar, vm_id) = create_sqlite_handle_test_sidecar();
+            {
+                let process = sidecar
+                    .vms
+                    .get_mut(&vm_id)
+                    .expect("sqlite vm")
+                    .active_processes
+                    .get_mut("proc-sqlite-handles")
+                    .expect("sqlite process");
+                for index in 0..crate::execution::MAX_PER_PROCESS_STATE_HANDLES {
+                    process.sqlite_databases.insert(
+                        index as u64,
+                        ActiveSqliteDatabase {
+                            connection: rusqlite::Connection::open_in_memory()
+                                .expect("open in-memory sqlite"),
+                            host_path: None,
+                            vm_path: None,
+                            dirty: false,
+                            transaction_depth: 0,
+                            read_only: false,
+                        },
+                    );
+                }
+            }
+
+            let error = call_javascript_sync_rpc(
+                &mut sidecar,
+                &vm_id,
+                "proc-sqlite-handles",
+                JavascriptSyncRpcRequest {
+                    id: 3,
+                    method: String::from("sqlite.open"),
+                    args: vec![json!(":memory:"), json!({})],
+                },
+            )
+            .expect_err("sqlite database creation should be bounded");
+            assert_handle_limit_error(error);
+        }
+
+        fn sqlite_statement_handles_are_bounded() {
+            let (mut sidecar, vm_id) = create_sqlite_handle_test_sidecar();
+            {
+                let process = sidecar
+                    .vms
+                    .get_mut(&vm_id)
+                    .expect("sqlite vm")
+                    .active_processes
+                    .get_mut("proc-sqlite-handles")
+                    .expect("sqlite process");
+                process.sqlite_databases.insert(
+                    1,
+                    ActiveSqliteDatabase {
+                        connection: rusqlite::Connection::open_in_memory()
+                            .expect("open in-memory sqlite"),
+                        host_path: None,
+                        vm_path: None,
+                        dirty: false,
+                        transaction_depth: 0,
+                        read_only: false,
+                    },
+                );
+                for index in 0..crate::execution::MAX_PER_PROCESS_STATE_HANDLES {
+                    process.sqlite_statements.insert(
+                        index as u64,
+                        ActiveSqliteStatement {
+                            database_id: 1,
+                            sql: String::from("SELECT 1"),
+                            return_arrays: false,
+                            read_bigints: false,
+                            allow_bare_named_parameters: false,
+                            allow_unknown_named_parameters: false,
+                        },
+                    );
+                }
+            }
+
+            let error = call_javascript_sync_rpc(
+                &mut sidecar,
+                &vm_id,
+                "proc-sqlite-handles",
+                JavascriptSyncRpcRequest {
+                    id: 4,
+                    method: String::from("sqlite.prepare"),
+                    args: vec![json!(1), json!("SELECT 1")],
+                },
+            )
+            .expect_err("sqlite statement creation should be bounded");
+            assert_handle_limit_error(error);
+        }
+
         fn session_timeout_response_includes_structured_diagnostics() {
             let mut session = AcpSessionState::new(
                 String::from("acp-session-1"),
@@ -477,6 +1006,96 @@ setInterval(() => {}, 1000);
                 "message: {}",
                 silent.message
             );
+        }
+
+        fn acp_session_stdout_buffers_are_bounded_on_service_path() {
+            let mut sidecar = create_test_sidecar();
+            let ownership = OwnershipScope::session("conn-1", "session-1");
+            let session_id = String::from("acp-session-1");
+            sidecar.acp_sessions.insert(
+                session_id.clone(),
+                AcpSessionState::new(
+                    session_id.clone(),
+                    String::from("vm-1"),
+                    String::from("pi"),
+                    String::from("process-1"),
+                    None,
+                    &Map::new(),
+                    &Map::new(),
+                ),
+            );
+
+            let oversized = vec![b'a'; ACP_STDOUT_BUFFER_BYTE_LIMIT + 1];
+            let mut events = Vec::new();
+            sidecar
+                .handle_acp_process_event(
+                    "vm-1",
+                    "process-1",
+                    Some(&session_id),
+                    &ownership,
+                    ActiveExecutionEvent::Stdout(oversized),
+                    &mut events,
+                )
+                .expect("handle oversized stdout");
+            sidecar
+                .handle_acp_process_event(
+                    "vm-1",
+                    "process-1",
+                    Some(&session_id),
+                    &ownership,
+                    ActiveExecutionEvent::Stdout(b"more".to_vec()),
+                    &mut events,
+                )
+                .expect("handle more stdout");
+
+            let session = sidecar
+                .acp_sessions
+                .get(&session_id)
+                .expect("session state");
+            assert_eq!(session.stdout_buffer.len(), ACP_STDOUT_BUFFER_BYTE_LIMIT);
+            assert_eq!(
+                session
+                    .recent_activity
+                    .iter()
+                    .filter(|entry| entry.as_str() == "stdout buffer truncated")
+                    .count(),
+                1
+            );
+        }
+
+        fn acp_pre_session_stdout_buffers_are_bounded_on_service_path() {
+            let mut sidecar = create_test_sidecar();
+            let ownership = OwnershipScope::session("conn-1", "session-1");
+            let process_id = "process-1";
+            let oversized = vec![b'a'; ACP_STDOUT_BUFFER_BYTE_LIMIT + 1];
+            let mut events = Vec::new();
+
+            sidecar
+                .handle_acp_process_event(
+                    "vm-1",
+                    process_id,
+                    None,
+                    &ownership,
+                    ActiveExecutionEvent::Stdout(oversized),
+                    &mut events,
+                )
+                .expect("handle oversized pre-session stdout");
+
+            assert_eq!(
+                sidecar
+                    .acp_process_stdout_buffers
+                    .get(process_id)
+                    .expect("pre-session stdout buffer")
+                    .len(),
+                ACP_STDOUT_BUFFER_BYTE_LIMIT
+            );
+            assert!(sidecar.acp_process_stdout_truncated.contains(process_id));
+        }
+
+        #[test]
+        fn acp_stdout_buffers_are_bounded_on_service_paths() {
+            acp_session_stdout_buffers_are_bounded_on_service_path();
+            acp_pre_session_stdout_buffers_are_bounded_on_service_path();
         }
 
         fn create_kernel_process_handle_for_tests() -> agent_os_kernel::kernel::KernelProcessHandle
@@ -972,6 +1591,8 @@ setInterval(() => {}, 1000);
                                 mcp_servers: Vec::new(),
                                 protocol_version: 1,
                                 client_capabilities: json!({}),
+                                additional_instructions: None,
+                                skip_os_instructions: false,
                             }),
                         ))
                         .await
@@ -984,6 +1605,200 @@ setInterval(() => {}, 1000);
                 }
                 other => panic!("unexpected create session response: {other:?}"),
             }
+        }
+
+        /// Create an ACP session against the argv-probe mock adapter using a real `agent_type`
+        /// (`pi`, `opencode`, etc.) so the sidecar's per-agent prompt injection runs, then return the
+        /// launch argv the adapter echoed in its initialize `agentInfo.argv`.
+        #[allow(clippy::too_many_arguments)]
+        fn create_session_and_read_launch_argv(
+            sidecar: &mut NativeSidecar<RecordingBridge>,
+            connection_id: &str,
+            session_id: &str,
+            vm_id: &str,
+            agent_type: &str,
+            additional_instructions: Option<String>,
+            skip_os_instructions: bool,
+        ) -> Vec<String> {
+            {
+                let vm = sidecar.vms.get_mut(vm_id).expect("argv probe vm");
+                vm.kernel
+                    .write_file(
+                        "/workspace/argv-probe.mjs",
+                        ACP_ARGV_PROBE_AGENT.as_bytes().to_vec(),
+                    )
+                    .expect("write argv probe adapter entrypoint");
+            }
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build local runtime for argv probe session");
+            let local = tokio::task::LocalSet::new();
+            let response = runtime
+                .block_on(local.run_until(async {
+                    sidecar
+                        .dispatch(request(
+                            4,
+                            OwnershipScope::vm(connection_id, session_id, vm_id),
+                            RequestPayload::CreateSession(CreateSessionRequest {
+                                agent_type: String::from(agent_type),
+                                runtime: GuestRuntimeKind::JavaScript,
+                                adapter_entrypoint: String::from("/workspace/argv-probe.mjs"),
+                                args: Vec::new(),
+                                env: BTreeMap::new(),
+                                cwd: String::from("/workspace"),
+                                mcp_servers: Vec::new(),
+                                protocol_version: 1,
+                                client_capabilities: json!({}),
+                                additional_instructions,
+                                skip_os_instructions,
+                            }),
+                        ))
+                        .await
+                }))
+                .expect("create argv probe session");
+            let agent_info = match response.response.payload {
+                ResponsePayload::SessionCreated(created) => {
+                    created.agent_info.expect("argv probe agent info")
+                }
+                other => panic!("unexpected create session response: {other:?}"),
+            };
+            serde_json::from_value::<Vec<String>>(agent_info["argv"].clone())
+                .expect("argv probe agentInfo.argv is a JSON string array")
+        }
+
+        fn injected_prompt_arg(argv: &[String]) -> String {
+            let idx = argv
+                .iter()
+                .position(|arg| arg == "--append-system-prompt")
+                .unwrap_or_else(|| {
+                    panic!("argv should contain --append-system-prompt: {argv:?}")
+                });
+            argv.get(idx + 1)
+                .unwrap_or_else(|| {
+                    panic!("--append-system-prompt should be followed by a value: {argv:?}")
+                })
+                .clone()
+        }
+
+        fn create_session_injects_prompt_reflecting_registered_toolkits() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+
+            sidecar
+                .dispatch_blocking(request(
+                    3,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::RegisterToolkit(test_toolkit_payload(
+                        "math",
+                        "Math utilities",
+                        "add",
+                    )),
+                ))
+                .expect("register math toolkit");
+
+            // A pi session with a registered toolkit injects base + tool docs.
+            let argv = create_session_and_read_launch_argv(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                "pi",
+                None,
+                false,
+            );
+            let prompt = injected_prompt_arg(&argv);
+            assert!(
+                prompt.contains("# agentOS"),
+                "base prompt is injected: {prompt:?}"
+            );
+            assert!(
+                prompt.contains("## Available Host Tools"),
+                "tool docs are injected: {prompt:?}"
+            );
+            assert!(
+                prompt.contains("### math"),
+                "injected prompt reflects the registered toolkit: {prompt:?}"
+            );
+
+            // skip_os_instructions drops the base text but STILL injects the tool docs.
+            let skipped = create_session_and_read_launch_argv(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                "pi",
+                None,
+                true,
+            );
+            let skipped_prompt = injected_prompt_arg(&skipped);
+            assert!(
+                !skipped_prompt.contains("# agentOS"),
+                "skip_os_instructions drops the base prompt: {skipped_prompt:?}"
+            );
+            assert!(
+                skipped_prompt.contains("### math"),
+                "skip_os_instructions still injects tool docs: {skipped_prompt:?}"
+            );
+        }
+
+        fn create_session_opencode_materializes_prompt_file_and_context_paths() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+
+            // opencode uses OPENCODE_CONTEXTPATHS, not a launch arg. The probe records its argv but we
+            // assert on the materialized prompt file + context paths env via the launched env. Reusing
+            // the argv helper still runs the session; opencode appends no --append-system-prompt arg.
+            let argv = create_session_and_read_launch_argv(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                &vm_id,
+                "opencode",
+                Some(String::from("opencode-extra-marker")),
+                false,
+            );
+            assert!(
+                !argv.iter().any(|arg| arg == "--append-system-prompt"),
+                "opencode injects via OPENCODE_CONTEXTPATHS, not launch args: {argv:?}"
+            );
+
+            let prompt = {
+                let vm = sidecar.vms.get_mut(&vm_id).expect("opencode vm after session");
+                vm.kernel
+                    .read_file("/tmp/agentos-system-prompt.md")
+                    .expect("opencode prompt file should be materialized")
+            };
+            let prompt_text = String::from_utf8(prompt).expect("opencode prompt is utf8");
+            assert!(
+                prompt_text.contains("# agentOS"),
+                "opencode prompt file holds the base prompt: {prompt_text:?}"
+            );
+            assert!(
+                prompt_text.contains("opencode-extra-marker"),
+                "opencode prompt file holds additional instructions: {prompt_text:?}"
+            );
         }
 
         fn empty_permissions_policy() -> PermissionsPolicy {
@@ -1259,6 +2074,25 @@ setInterval(() => {}, 1000);
             process_id: &str,
             allowed_node_builtins: &str,
         ) -> (String, String, Option<i32>) {
+            run_javascript_entry_with_env(
+                sidecar,
+                vm_id,
+                cwd,
+                process_id,
+                BTreeMap::from([(
+                    String::from("AGENT_OS_ALLOWED_NODE_BUILTINS"),
+                    allowed_node_builtins.to_owned(),
+                )]),
+            )
+        }
+
+        fn run_javascript_entry_with_env(
+            sidecar: &mut NativeSidecar<RecordingBridge>,
+            vm_id: &str,
+            cwd: &Path,
+            process_id: &str,
+            env: BTreeMap<String, String>,
+        ) -> (String, String, Option<i32>) {
             let context =
                 sidecar
                     .javascript_engine
@@ -1267,17 +2101,13 @@ setInterval(() => {}, 1000);
                         bootstrap_module: None,
                         compile_cache_root: None,
                     });
-            let env = BTreeMap::from([(
-                String::from("AGENT_OS_ALLOWED_NODE_BUILTINS"),
-                allowed_node_builtins.to_owned(),
-            )]);
             let execution = sidecar
                 .javascript_engine
                 .start_execution(StartJavascriptExecutionRequest {
                     vm_id: vm_id.to_owned(),
                     context_id: context.context_id,
                     argv: vec![String::from("./entry.mjs")],
-                    env,
+                    env: env.clone(),
                     cwd: cwd.to_path_buf(),
                     inline_code: None,
                 })
@@ -1308,6 +2138,7 @@ setInterval(() => {}, 1000);
                         GuestRuntimeKind::JavaScript,
                         ActiveExecution::Javascript(execution),
                     )
+                    .with_env(env)
                     .with_host_cwd(cwd.to_path_buf()),
                 );
             }
@@ -1491,30 +2322,44 @@ setInterval(() => {}, 1000);
             name.parse().expect("valid fixture DNS name")
         }
 
+        fn append_process_stream_chunk(
+            stream: &mut Vec<u8>,
+            chunk: &[u8],
+            process_id: &str,
+            stream_name: &str,
+        ) {
+            assert!(
+                stream.len().saturating_add(chunk.len()) <= MAX_SERVICE_PROCESS_STREAM_BYTES,
+                "process {process_id} {stream_name} exceeded {MAX_SERVICE_PROCESS_STREAM_BYTES} bytes"
+            );
+            stream.extend_from_slice(chunk);
+        }
+
+        fn process_stream_to_string(stream: &[u8]) -> String {
+            String::from_utf8_lossy(stream).into_owned()
+        }
+
         fn drain_process_output(
             sidecar: &mut NativeSidecar<RecordingBridge>,
             vm_id: &str,
             process_id: &str,
         ) -> (String, String, Option<i32>) {
-            let mut stdout = String::new();
-            let mut stderr = String::new();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
             let mut exit_code = None;
             for _ in 0..64 {
                 let next_event = {
                     let vm = sidecar.vms.get_mut(vm_id).expect("active vm");
-                    vm.active_processes
-                        .get_mut(process_id)
-                        .map(|process| {
-                            if let Some(event) = process.pending_execution_events.pop_front() {
-                                Some(event)
-                            } else {
-                                process
-                                    .execution
-                                    .poll_event_blocking(Duration::from_secs(5))
-                                    .expect("poll process event")
-                            }
-                        })
-                        .flatten()
+                    vm.active_processes.get_mut(process_id).and_then(|process| {
+                        if let Some(event) = process.pending_execution_events.pop_front() {
+                            Some(event)
+                        } else {
+                            process
+                                .execution
+                                .poll_event_blocking(Duration::from_secs(5))
+                                .expect("poll process event")
+                        }
+                    })
                 };
                 let Some(event) = next_event else {
                     if exit_code.is_some() {
@@ -1525,15 +2370,17 @@ setInterval(() => {}, 1000);
 
                 match &event {
                     ActiveExecutionEvent::Stdout(chunk) => {
-                        stdout.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(&mut stdout, chunk, process_id, "stdout");
                     }
                     ActiveExecutionEvent::Stderr(chunk) => {
-                        stderr.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(&mut stderr, chunk, process_id, "stderr");
                     }
                     ActiveExecutionEvent::Exited(code) => {
                         exit_code = Some(*code);
                     }
-                    _ => {}
+                    ActiveExecutionEvent::JavascriptSyncRpcRequest(_)
+                    | ActiveExecutionEvent::PythonVfsRpcRequest(_)
+                    | ActiveExecutionEvent::SignalState { .. } => {}
                 }
 
                 sidecar
@@ -1541,7 +2388,11 @@ setInterval(() => {}, 1000);
                     .expect("handle process event");
             }
 
-            (stdout, stderr, exit_code)
+            (
+                process_stream_to_string(&stdout),
+                process_stream_to_string(&stderr),
+                exit_code,
+            )
         }
 
         fn wasm_stdout_module(message: &str) -> Vec<u8> {
@@ -1781,18 +2632,48 @@ setInterval(() => {}, 1000);
                 .active_processes
                 .get_mut(process_id)
                 .expect("javascript process");
-            service_javascript_sync_rpc(
-                &bridge,
+            service_javascript_sync_rpc(JavascriptSyncRpcServiceRequest {
+                bridge: &bridge,
                 vm_id,
-                &dns,
-                &socket_paths,
-                &mut vm.kernel,
+                dns: &dns,
+                socket_paths: &socket_paths,
+                kernel: &mut vm.kernel,
                 process,
-                &request,
-                &limits,
-                counts,
-            )
+                sync_request: &request,
+                resource_limits: &limits,
+                network_counts: counts,
+            })
         }
+
+        #[allow(clippy::too_many_arguments)]
+        fn service_javascript_net_sync_rpc<B>(
+            bridge: &SharedBridge<B>,
+            vm_id: &str,
+            dns: &VmDnsConfig,
+            socket_paths: &JavascriptSocketPathContext,
+            kernel: &mut SidecarKernel,
+            process: &mut ActiveProcess,
+            request: &JavascriptSyncRpcRequest,
+            resource_limits: &ResourceLimits,
+            network_counts: NetworkResourceCounts,
+        ) -> Result<Value, SidecarError>
+        where
+            B: NativeSidecarBridge + Send + 'static,
+            BridgeError<B>: fmt::Debug + Send + Sync + 'static,
+        {
+            service_javascript_net_sync_rpc_inner(JavascriptNetSyncRpcServiceRequest {
+                bridge,
+                vm_id,
+                dns,
+                socket_paths,
+                kernel,
+                process,
+                sync_request: request,
+                resource_limits,
+                network_counts,
+            })
+        }
+
         fn kernel_socket_queries_ignore_stale_sidecar_guest_addresses() {
             assert_node_available();
 
@@ -2870,27 +3751,6 @@ setInterval(() => {}, 1000);
                     .any(|entry| entry == "sent signal SIGKILL"),
                 "graceful ACP termination should not need SIGKILL"
             );
-            assert!(
-                sidecar
-                    .vms
-                    .get_mut(&vm_id)
-                    .expect("VM after graceful termination")
-                    .kernel
-                    .read_file("/workspace/cancel.json")
-                    .is_ok(),
-                "expected the ACP agent to receive session/cancel before shutdown"
-            );
-            let sigterm_marker = sidecar
-                .vms
-                .get_mut(&vm_id)
-                .expect("VM after graceful termination")
-                .kernel
-                .read_file("/workspace/sigterm.json")
-                .expect("read graceful SIGTERM marker");
-            let sigterm_marker: Value =
-                serde_json::from_slice(&sigterm_marker).expect("parse graceful SIGTERM marker");
-            assert_eq!(sigterm_marker["phase"], json!("sigterm"));
-            assert_eq!(sigterm_marker["cancelSeen"], json!(true));
         }
 
         fn acp_termination_sigkills_after_grace_when_agent_ignores_sigterm() {
@@ -2959,16 +3819,6 @@ setInterval(() => {}, 1000);
                 .recent_activity
                 .iter()
                 .any(|entry| entry == "sent signal SIGKILL"));
-            assert!(
-                sidecar
-                    .vms
-                    .get_mut(&vm_id)
-                    .expect("VM after forced termination")
-                    .kernel
-                    .read_file("/workspace/sigterm-ignored.json")
-                    .is_ok(),
-                "expected the ACP agent to observe SIGTERM before SIGKILL fallback"
-            );
         }
 
         fn poll_http2_event(
@@ -3442,7 +4292,7 @@ setInterval(() => {}, 1000);
                         },
                     )
                     .expect("accept connected client");
-                    (value != Value::from("__secure_exec_net_timeout__")).then_some(value)
+                    (value != "__secure_exec_net_timeout__").then_some(value)
                 })
                 .expect("eventually accept connected client");
             let accepted: Value =
@@ -3583,7 +4433,7 @@ setInterval(() => {}, 1000);
                     },
                 )
                 .expect("accept connected client");
-                if value != Value::from("__secure_exec_net_timeout__") {
+                if value != "__secure_exec_net_timeout__" {
                     accepted = Some(value);
                     break;
                 }
@@ -3659,7 +4509,7 @@ setInterval(() => {}, 1000);
                     },
                 )
                 .expect("read bridged socket chunk");
-                if value != Value::from("__secure_exec_net_timeout__") {
+                if value != "__secure_exec_net_timeout__" {
                     payload = Some(value);
                     break;
                 }
@@ -3681,7 +4531,7 @@ setInterval(() => {}, 1000);
                     },
                 )
                 .expect("read bridged socket end");
-                if value != Value::from("__secure_exec_net_timeout__") {
+                if value != "__secure_exec_net_timeout__" {
                     end = Some(value);
                     break;
                 }
@@ -3797,7 +4647,7 @@ setInterval(() => {}, 1000);
                         },
                     )
                     .expect("accept connected client");
-                    (value != Value::from("__secure_exec_net_timeout__")).then_some(value)
+                    (value != "__secure_exec_net_timeout__").then_some(value)
                 })
                 .expect("eventually accept connected client");
             let accepted: Value =
@@ -3837,7 +4687,7 @@ setInterval(() => {}, 1000);
                     },
                 )
                 .expect("read upgrade socket payload");
-                if value != Value::from("__secure_exec_net_timeout__") {
+                if value != "__secure_exec_net_timeout__" {
                     payload = Some(value);
                     break;
                 }
@@ -3871,7 +4721,7 @@ setInterval(() => {}, 1000);
                     },
                 )
                 .expect("read upgrade socket EOF");
-                if value != Value::from("__secure_exec_net_timeout__") {
+                if value != "__secure_exec_net_timeout__" {
                     end = Some(value);
                     break;
                 }
@@ -4262,7 +5112,7 @@ setInterval(() => {}, 1000);
                         },
                     )
                     .expect("read TLS client payload");
-                    if value == Value::from("__secure_exec_net_timeout__") {
+                    if value == "__secure_exec_net_timeout__" {
                         thread::sleep(Duration::from_millis(10));
                         None
                     } else {
@@ -4362,7 +5212,7 @@ setInterval(() => {}, 1000);
                         },
                     )
                     .expect("accept TLS client");
-                    if value == Value::from("__secure_exec_net_timeout__") {
+                    if value == "__secure_exec_net_timeout__" {
                         thread::sleep(Duration::from_millis(10));
                         None
                     } else {
@@ -4415,7 +5265,7 @@ setInterval(() => {}, 1000);
                     let parsed: Value =
                         serde_json::from_str(value.as_str().expect("TLS client hello JSON"))
                             .expect("parse TLS client hello");
-                    if parsed["servername"] == Value::from("localhost") {
+                    if parsed["servername"] == "localhost" {
                         Some(parsed)
                     } else {
                         thread::sleep(Duration::from_millis(10));
@@ -4542,7 +5392,7 @@ setInterval(() => {}, 1000);
                         },
                     )
                     .expect("read TLS server payload");
-                    if value == Value::from("__secure_exec_net_timeout__") {
+                    if value == "__secure_exec_net_timeout__" {
                         thread::sleep(Duration::from_millis(10));
                         None
                     } else {
@@ -4613,7 +5463,7 @@ setInterval(() => {}, 1000);
                         },
                     )
                     .expect("read guest TLS client payload");
-                    if value == Value::from("__secure_exec_net_timeout__") {
+                    if value == "__secure_exec_net_timeout__" {
                         thread::sleep(Duration::from_millis(10));
                         None
                     } else {
@@ -4745,7 +5595,7 @@ setInterval(() => {}, 1000);
                     },
                 )
                 .expect("accept pending connection");
-                if value != Value::from("__secure_exec_net_timeout__") {
+                if value != "__secure_exec_net_timeout__" {
                     accepted = Some(value);
                     break;
                 }
@@ -5317,7 +6167,7 @@ setInterval(() => {}, 1000);
 
                     sidecar
                         .process_event_sender
-                        .send(crate::state::ProcessEventEnvelope {
+                        .try_send(crate::state::ProcessEventEnvelope {
                             connection_id: connection_id.clone(),
                             session_id: session_id.clone(),
                             vm_id: vm_id.clone(),
@@ -5329,7 +6179,7 @@ setInterval(() => {}, 1000);
                         .expect("queue stale stdout envelope");
                     sidecar
                         .process_event_sender
-                        .send(crate::state::ProcessEventEnvelope {
+                        .try_send(crate::state::ProcessEventEnvelope {
                             connection_id: connection_id.clone(),
                             session_id: session_id.clone(),
                             vm_id: vm_id.clone(),
@@ -5386,7 +6236,7 @@ setInterval(() => {}, 1000);
                 let send_thread = thread::spawn(move || {
                     sender_barrier.wait();
                     sender
-                        .send(crate::state::ProcessEventEnvelope {
+                        .try_send(crate::state::ProcessEventEnvelope {
                             connection_id: sender_connection_id,
                             session_id: sender_session_id,
                             vm_id: sender_vm_id,
@@ -5478,6 +6328,7 @@ setInterval(() => {}, 1000);
                             atime_ms: None,
                             mtime_ms: None,
                             len: None,
+                            offset: None,
                         }),
                     ))
                     .expect("dispatch stale guest filesystem request");
@@ -5590,6 +6441,7 @@ setInterval(() => {}, 1000);
                             atime_ms: None,
                             mtime_ms: None,
                             len: None,
+                            offset: None,
                         }),
                     ))
                     .expect("dispatch live guest filesystem write");
@@ -5619,6 +6471,7 @@ setInterval(() => {}, 1000);
                             atime_ms: None,
                             mtime_ms: None,
                             len: None,
+                            offset: None,
                         }),
                     ))
                     .expect("dispatch live guest filesystem read");
@@ -6047,6 +6900,180 @@ setInterval(() => {}, 1000);
 
             fs::remove_dir_all(host_dir).expect("remove temp dir");
         }
+
+        fn configure_vm_passes_resource_read_limits_to_host_dir_mounts() {
+            let host_dir = temp_dir("agent-os-sidecar-host-dir-read-limit");
+            fs::write(host_dir.join("hello.txt"), "hello from host").expect("seed host dir");
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm_with_metadata(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+                BTreeMap::from([(String::from("resource.max_pread_bytes"), String::from("4"))]),
+            )
+            .expect("create vm");
+
+            sidecar
+                .dispatch_blocking(request(
+                    4,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::ConfigureVm(ConfigureVmRequest {
+                        mounts: vec![MountDescriptor {
+                            guest_path: String::from("/workspace"),
+                            read_only: false,
+                            plugin: MountPluginDescriptor {
+                                id: String::from("host_dir"),
+                                config: json!({
+                                    "hostPath": host_dir,
+                                    "readOnly": false,
+                                }),
+                            },
+                        }],
+                        software: Vec::new(),
+                        permissions: None,
+                        module_access_cwd: None,
+                        instructions: Vec::new(),
+                        projected_modules: Vec::new(),
+                        command_permissions: BTreeMap::new(),
+                        allowed_node_builtins: Vec::new(),
+                        loopback_exempt_ports: Vec::new(),
+                    }),
+                ))
+                .expect("configure host_dir mount");
+
+            let vm = sidecar.vms.get_mut(&vm_id).expect("configured vm");
+            let error = vm
+                .kernel
+                .filesystem_mut()
+                .read_file("/workspace/hello.txt")
+                .expect_err("host_dir full read should honor VM read limit");
+            assert_eq!(error.code(), "EINVAL");
+
+            fs::remove_dir_all(host_dir).expect("remove temp dir");
+        }
+
+        #[test]
+        fn configure_vm_host_dir_mount_receives_configured_read_limit() {
+            configure_vm_passes_resource_read_limits_to_host_dir_mounts();
+        }
+
+        fn configure_vm_passes_resource_read_limits_to_module_access_mounts() {
+            let module_access_cwd = temp_dir("agent-os-sidecar-module-access-read-limit");
+            let package_root = module_access_cwd.join("node_modules/fixture-pkg");
+            fs::create_dir_all(&package_root).expect("create package root");
+            fs::write(
+                package_root.join("package.json"),
+                r#"{"name":"fixture-pkg"}"#,
+            )
+            .expect("seed package json");
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm_with_metadata(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+                BTreeMap::from([(String::from("resource.max_pread_bytes"), String::from("4"))]),
+            )
+            .expect("create vm");
+
+            sidecar
+                .dispatch_blocking(request(
+                    4,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::ConfigureVm(ConfigureVmRequest {
+                        mounts: Vec::new(),
+                        software: Vec::new(),
+                        permissions: None,
+                        module_access_cwd: Some(module_access_cwd.to_string_lossy().into_owned()),
+                        instructions: Vec::new(),
+                        projected_modules: Vec::new(),
+                        command_permissions: BTreeMap::new(),
+                        allowed_node_builtins: Vec::new(),
+                        loopback_exempt_ports: Vec::new(),
+                    }),
+                ))
+                .expect("configure module_access mount");
+
+            let vm = sidecar.vms.get_mut(&vm_id).expect("configured vm");
+            let error = vm
+                .kernel
+                .filesystem_mut()
+                .read_file("/root/node_modules/fixture-pkg/package.json")
+                .expect_err("module_access read should honor VM read limit");
+            assert_eq!(error.code(), "EINVAL");
+
+            fs::remove_dir_all(module_access_cwd).expect("remove temp dir");
+        }
+
+        #[test]
+        fn configure_vm_module_access_mount_receives_configured_read_limit() {
+            configure_vm_passes_resource_read_limits_to_module_access_mounts();
+        }
+
+        fn configure_vm_rejects_module_access_root_symlink_to_non_node_modules() {
+            let module_access_cwd = temp_dir("agent-os-sidecar-module-access-symlink-cwd");
+            let outside_root = temp_dir("agent-os-sidecar-module-access-outside");
+            std::os::unix::fs::symlink(&outside_root, module_access_cwd.join("node_modules"))
+                .expect("create node_modules symlink");
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+
+            let response = sidecar
+                .dispatch_blocking(request(
+                    4,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::ConfigureVm(ConfigureVmRequest {
+                        mounts: Vec::new(),
+                        software: Vec::new(),
+                        permissions: None,
+                        module_access_cwd: Some(module_access_cwd.to_string_lossy().into_owned()),
+                        instructions: Vec::new(),
+                        projected_modules: Vec::new(),
+                        command_permissions: BTreeMap::new(),
+                        allowed_node_builtins: Vec::new(),
+                        loopback_exempt_ports: Vec::new(),
+                    }),
+                ))
+                .expect("configure module_access mount");
+
+            match response.response.payload {
+                ResponsePayload::Rejected(rejected) => {
+                    assert_eq!(rejected.code, "plugin_error");
+                    assert!(
+                        rejected.message.contains(
+                            "module_access roots must resolve to a node_modules directory"
+                        ),
+                        "unexpected rejection: {rejected:?}"
+                    );
+                }
+                other => panic!("expected rejected response, got {other:?}"),
+            }
+
+            fs::remove_dir_all(module_access_cwd).expect("remove cwd temp dir");
+            fs::remove_dir_all(outside_root).expect("remove outside temp dir");
+        }
+
+        #[test]
+        fn configure_vm_rejects_module_access_symlinked_root_escape() {
+            configure_vm_rejects_module_access_root_symlink_to_non_node_modules();
+        }
+
         fn configure_vm_js_bridge_mount_dispatches_filesystem_calls_via_sidecar_requests() {
             let mut sidecar = create_test_sidecar();
             let (filesystem, calls) = install_memory_js_bridge_handler(&mut sidecar);
@@ -6158,6 +7185,180 @@ setInterval(() => {}, 1000);
                     && call.path.as_deref() == Some("/original.txt")
             }));
         }
+
+        fn configure_vm_js_bridge_mount_rejects_oversized_read_payloads() {
+            let mut sidecar = create_test_sidecar();
+            sidecar.set_sidecar_request_handler(|request| {
+                let SidecarRequestPayload::JsBridgeCall(call) = &request.payload else {
+                    return Err(SidecarError::InvalidState(String::from(
+                        "expected js_bridge_call payload",
+                    )));
+                };
+                match call.operation.as_str() {
+                    "exists" => js_bridge_result(request, Some(Value::Bool(true)), None),
+                    "realpath" => {
+                        let path = call
+                            .args
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .map(|path| Value::String(path.to_owned()));
+                        js_bridge_result(request, path, None)
+                    }
+                    "readFile" | "pread" => js_bridge_result(
+                        request,
+                        Some(Value::String(
+                            base64::engine::general_purpose::STANDARD.encode(b"hello"),
+                        )),
+                        None,
+                    ),
+                    _ => js_bridge_result(request, None, None),
+                }
+            });
+
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm_with_metadata(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+                BTreeMap::from([(String::from("resource.max_pread_bytes"), String::from("4"))]),
+            )
+            .expect("create vm");
+
+            sidecar
+                .dispatch_blocking(request(
+                    4,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::ConfigureVm(ConfigureVmRequest {
+                        mounts: vec![MountDescriptor {
+                            guest_path: String::from("/workspace"),
+                            read_only: false,
+                            plugin: MountPluginDescriptor {
+                                id: String::from("js_bridge"),
+                                config: json!({ "mountId": "mount-sized" }),
+                            },
+                        }],
+                        software: Vec::new(),
+                        permissions: None,
+                        module_access_cwd: None,
+                        instructions: Vec::new(),
+                        projected_modules: Vec::new(),
+                        command_permissions: BTreeMap::new(),
+                        allowed_node_builtins: Vec::new(),
+                        loopback_exempt_ports: Vec::new(),
+                    }),
+                ))
+                .expect("configure js_bridge mount");
+
+            let vm = sidecar.vms.get_mut(&vm_id).expect("configured vm");
+            let read_error = vm
+                .kernel
+                .filesystem_mut()
+                .read_file("/workspace/too-big.txt")
+                .expect_err("readFile callback payload should honor VM read limit");
+            assert_eq!(read_error.code(), "EINVAL", "read error: {read_error}");
+
+            let pread_error = vm
+                .kernel
+                .filesystem_mut()
+                .pread("/workspace/too-big.txt", 0, 4)
+                .expect_err("pread callback payload should honor VM read limit");
+            assert_eq!(pread_error.code(), "EINVAL", "pread error: {pread_error}");
+        }
+
+        #[test]
+        fn configure_vm_js_bridge_mount_bounds_read_payloads() {
+            configure_vm_js_bridge_mount_rejects_oversized_read_payloads();
+        }
+
+        fn configure_vm_js_bridge_mount_rejects_pread_payloads_above_requested_length() {
+            let mut sidecar = create_test_sidecar();
+            sidecar.set_sidecar_request_handler(|request| {
+                let SidecarRequestPayload::JsBridgeCall(call) = &request.payload else {
+                    return Err(SidecarError::InvalidState(String::from(
+                        "expected js_bridge_call payload",
+                    )));
+                };
+                match call.operation.as_str() {
+                    "exists" => js_bridge_result(request, Some(Value::Bool(true)), None),
+                    "realpath" => {
+                        let path = call
+                            .args
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .map(|path| Value::String(path.to_owned()));
+                        js_bridge_result(request, path, None)
+                    }
+                    "readFile" | "pread" => js_bridge_result(
+                        request,
+                        Some(Value::String(
+                            base64::engine::general_purpose::STANDARD.encode(b"hello"),
+                        )),
+                        None,
+                    ),
+                    _ => js_bridge_result(request, None, None),
+                }
+            });
+
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm_with_metadata(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+                BTreeMap::from([(String::from("resource.max_pread_bytes"), String::from("8"))]),
+            )
+            .expect("create vm");
+
+            sidecar
+                .dispatch_blocking(request(
+                    4,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::ConfigureVm(ConfigureVmRequest {
+                        mounts: vec![MountDescriptor {
+                            guest_path: String::from("/workspace"),
+                            read_only: false,
+                            plugin: MountPluginDescriptor {
+                                id: String::from("js_bridge"),
+                                config: json!({ "mountId": "mount-pread-sized" }),
+                            },
+                        }],
+                        software: Vec::new(),
+                        permissions: None,
+                        module_access_cwd: None,
+                        instructions: Vec::new(),
+                        projected_modules: Vec::new(),
+                        command_permissions: BTreeMap::new(),
+                        allowed_node_builtins: Vec::new(),
+                        loopback_exempt_ports: Vec::new(),
+                    }),
+                ))
+                .expect("configure js_bridge mount");
+
+            let vm = sidecar.vms.get_mut(&vm_id).expect("configured vm");
+            assert_eq!(
+                vm.kernel
+                    .filesystem_mut()
+                    .read_file("/workspace/within-limit.txt")
+                    .expect("full read should fit VM read limit"),
+                b"hello".to_vec()
+            );
+
+            let pread_error = vm
+                .kernel
+                .filesystem_mut()
+                .pread("/workspace/too-long-for-pread.txt", 0, 4)
+                .expect_err("pread callback payload must not exceed requested length");
+            assert_eq!(pread_error.code(), "EINVAL", "pread error: {pread_error}");
+        }
+
+        #[test]
+        fn configure_vm_js_bridge_mount_bounds_pread_payloads_to_requested_length() {
+            configure_vm_js_bridge_mount_rejects_pread_payloads_above_requested_length();
+        }
+
         fn configure_vm_js_bridge_mount_maps_callback_errors_to_errno_codes() {
             let mut sidecar = create_test_sidecar();
             sidecar.set_sidecar_request_handler(|request| {
@@ -6473,6 +7674,27 @@ setInterval(() => {}, 1000);
                 "expected the native plugin to store a manifest object"
             );
         }
+        fn assert_kernel_permission_decision(
+            decision: agent_os_kernel::permissions::PermissionDecision,
+            expected_allow: bool,
+            expected_reason: Option<&str>,
+        ) {
+            assert_eq!(decision.allow, expected_allow);
+            if let Some(expected_reason) = expected_reason {
+                assert!(
+                    decision
+                        .reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains(expected_reason)),
+                    "expected reason to contain {expected_reason:?}, got {:?}",
+                    decision.reason
+                );
+            } else {
+                assert_eq!(decision.reason, None);
+            }
+        }
+
+        #[test]
         fn bridge_permissions_map_symlink_operations_to_symlink_access() {
             let bridge = SharedBridge::new(RecordingBridge::default());
             let permissions = bridge_permissions(bridge.clone(), "vm-symlink");
@@ -6500,10 +7722,187 @@ setInterval(() => {}, 1000);
                 }]
             );
         }
+
+        #[test]
+        fn bridge_permissions_fail_closed_for_missing_mount_sensitive_policy() {
+            let bridge = SharedBridge::new(RecordingBridge::default());
+            let permissions = bridge_permissions(bridge, "vm-mount-sensitive");
+            let check = permissions
+                .filesystem
+                .as_ref()
+                .expect("filesystem permission callback");
+
+            let decision = check(&FsAccessRequest {
+                vm_id: String::from("ignored-by-bridge"),
+                op: FsOperation::MountSensitive,
+                path: String::from("/workspace"),
+            });
+
+            assert_kernel_permission_decision(
+                decision,
+                false,
+                Some("missing fs.mount_sensitive permission policy"),
+            );
+        }
+
+        #[test]
+        fn bridge_permissions_propagate_host_permission_outcomes() {
+            let cases = [
+                (agent_os_bridge::PermissionDecision::allow(), true, None),
+                (
+                    agent_os_bridge::PermissionDecision::deny("blocked by host"),
+                    false,
+                    Some("blocked by host"),
+                ),
+                (
+                    agent_os_bridge::PermissionDecision::prompt("prompt required"),
+                    false,
+                    Some("prompt required"),
+                ),
+                (
+                    agent_os_bridge::PermissionDecision {
+                        verdict: agent_os_bridge::PermissionVerdict::Deny,
+                        reason: None,
+                    },
+                    false,
+                    Some("denied by host"),
+                ),
+                (
+                    agent_os_bridge::PermissionDecision {
+                        verdict: agent_os_bridge::PermissionVerdict::Prompt,
+                        reason: None,
+                    },
+                    false,
+                    Some("permission prompt required"),
+                ),
+            ];
+
+            for (host_decision, expected_allow, expected_reason) in cases {
+                let bridge = SharedBridge::new(RecordingBridge::default());
+                bridge
+                    .inspect(|bridge| {
+                        for _ in 0..4 {
+                            bridge.push_permission_decision(host_decision.clone());
+                        }
+                    })
+                    .expect("seed permission decisions");
+
+                assert_kernel_permission_decision(
+                    bridge.filesystem_decision(
+                        "vm-permissions",
+                        "/workspace/file.txt",
+                        FilesystemAccess::Read,
+                    ),
+                    expected_allow,
+                    expected_reason,
+                );
+                assert_kernel_permission_decision(
+                    bridge.command_decision(
+                        "vm-permissions",
+                        &CommandAccessRequest {
+                            vm_id: String::from("ignored-by-bridge"),
+                            command: String::from("node"),
+                            args: vec![String::from("--version")],
+                            cwd: Some(String::from("/workspace")),
+                            env: BTreeMap::new(),
+                        },
+                    ),
+                    expected_allow,
+                    expected_reason,
+                );
+                assert_kernel_permission_decision(
+                    bridge.environment_decision(
+                        "vm-permissions",
+                        &EnvAccessRequest {
+                            vm_id: String::from("ignored-by-bridge"),
+                            op: EnvironmentOperation::Read,
+                            key: String::from("PATH"),
+                            value: None,
+                        },
+                    ),
+                    expected_allow,
+                    expected_reason,
+                );
+                assert_kernel_permission_decision(
+                    bridge.network_decision(
+                        "vm-permissions",
+                        &NetworkAccessRequest {
+                            vm_id: String::from("ignored-by-bridge"),
+                            op: NetworkOperation::Fetch,
+                            resource: String::from("https://example.test"),
+                        },
+                    ),
+                    expected_allow,
+                    expected_reason,
+                );
+            }
+        }
+
+        #[test]
+        fn bridge_permissions_fail_closed_when_host_permission_checks_error() {
+            let bridge = SharedBridge::new(RecordingBridge::default());
+            bridge
+                .inspect(|bridge| {
+                    for _ in 0..4 {
+                        bridge.push_permission_error("permission backend unavailable");
+                    }
+                })
+                .expect("seed permission errors");
+
+            for decision in [
+                bridge.filesystem_decision(
+                    "vm-permissions",
+                    "/workspace/file.txt",
+                    FilesystemAccess::Read,
+                ),
+                bridge.command_decision(
+                    "vm-permissions",
+                    &CommandAccessRequest {
+                        vm_id: String::from("ignored-by-bridge"),
+                        command: String::from("node"),
+                        args: vec![String::from("--version")],
+                        cwd: Some(String::from("/workspace")),
+                        env: BTreeMap::new(),
+                    },
+                ),
+                bridge.environment_decision(
+                    "vm-permissions",
+                    &EnvAccessRequest {
+                        vm_id: String::from("ignored-by-bridge"),
+                        op: EnvironmentOperation::Read,
+                        key: String::from("PATH"),
+                        value: None,
+                    },
+                ),
+                bridge.network_decision(
+                    "vm-permissions",
+                    &NetworkAccessRequest {
+                        vm_id: String::from("ignored-by-bridge"),
+                        op: NetworkOperation::Fetch,
+                        resource: String::from("https://example.test"),
+                    },
+                ),
+            ] {
+                assert_kernel_permission_decision(
+                    decision,
+                    false,
+                    Some("permission backend unavailable"),
+                );
+            }
+        }
+        #[test]
         fn parse_resource_limits_reads_filesystem_limits() {
             let metadata = BTreeMap::from([
                 (String::from("resource.max_sockets"), String::from("8")),
                 (String::from("resource.max_connections"), String::from("4")),
+                (
+                    String::from("resource.max_socket_buffered_bytes"),
+                    String::from("2048"),
+                ),
+                (
+                    String::from("resource.max_socket_datagram_queue_len"),
+                    String::from("16"),
+                ),
                 (
                     String::from("resource.max_filesystem_bytes"),
                     String::from("4096"),
@@ -6551,6 +7950,8 @@ setInterval(() => {}, 1000);
                 crate::vm::parse_resource_limits(&metadata).expect("parse resource limits");
             assert_eq!(limits.max_sockets, Some(8));
             assert_eq!(limits.max_connections, Some(4));
+            assert_eq!(limits.max_socket_buffered_bytes, Some(2048));
+            assert_eq!(limits.max_socket_datagram_queue_len, Some(16));
             assert_eq!(limits.max_filesystem_bytes, Some(4096));
             assert_eq!(limits.max_inode_count, Some(128));
             assert_eq!(limits.max_blocking_read_ms, Some(250));
@@ -7033,6 +8434,7 @@ setInterval(() => {}, 1000);
                         atime_ms: None,
                         mtime_ms: None,
                         len: None,
+                        offset: None,
                     },
                 ),
                 (
@@ -7051,6 +8453,7 @@ setInterval(() => {}, 1000);
                         atime_ms: None,
                         mtime_ms: None,
                         len: None,
+                        offset: None,
                     },
                 ),
                 (
@@ -7069,6 +8472,7 @@ setInterval(() => {}, 1000);
                         atime_ms: None,
                         mtime_ms: None,
                         len: None,
+                        offset: None,
                     },
                 ),
                 (
@@ -7087,6 +8491,7 @@ setInterval(() => {}, 1000);
                         atime_ms: None,
                         mtime_ms: None,
                         len: Some(5),
+                        offset: None,
                     },
                 ),
                 (
@@ -7105,6 +8510,7 @@ setInterval(() => {}, 1000);
                         atime_ms: Some(1_700_000_000_000),
                         mtime_ms: Some(1_710_000_000_000),
                         len: None,
+                        offset: None,
                     },
                 ),
             ] {
@@ -7679,7 +9085,7 @@ setInterval(() => {}, 1000);
                     .expect("attach stdout pty");
 
             let mut pty_text = None;
-            let mut stderr = String::new();
+            let mut stderr = Vec::new();
             let mut exit_code = None;
 
             for _ in 0..64 {
@@ -7687,7 +9093,7 @@ setInterval(() => {}, 1000);
                     let vm = sidecar.vms.get_mut(&vm_id).expect("active vm");
                     vm.active_processes
                         .get_mut("proc-wasm-pty")
-                        .map(|process| {
+                        .and_then(|process| {
                             if let Some(event) = process.pending_execution_events.pop_front() {
                                 Some(event)
                             } else {
@@ -7697,14 +9103,13 @@ setInterval(() => {}, 1000);
                                     .expect("poll wasm pty process event")
                             }
                         })
-                        .flatten()
                 };
                 let Some(event) = next_event else {
                     break;
                 };
 
                 if let ActiveExecutionEvent::Stderr(chunk) = &event {
-                    stderr.push_str(&String::from_utf8_lossy(chunk));
+                    append_process_stream_chunk(&mut stderr, chunk, "proc-wasm-pty", "stderr");
                 }
                 if let ActiveExecutionEvent::Exited(code) = &event {
                     exit_code = Some(*code);
@@ -7757,6 +9162,7 @@ setInterval(() => {}, 1000);
             }
 
             let pty_text = pty_text.expect("pty master should receive stdout");
+            let stderr = process_stream_to_string(&stderr);
             assert!(
                 pty_text.replace("\r\n", "\n").contains("PTY_MARKER\n"),
                 "pty output should contain routed marker: {pty_text:?}"
@@ -7822,9 +9228,7 @@ setInterval(() => {}, 1000);
                 "PATH should prioritize mounted command root: {path}"
             );
             assert!(
-                path_entries
-                    .iter()
-                    .any(|entry| *entry == "/__agentos/commands/0"),
+                path_entries.contains(&"/__agentos/commands/0"),
                 "PATH should include mounted command root: {path}"
             );
 
@@ -7938,6 +9342,46 @@ setInterval(() => {}, 1000);
                     .to_string()
                     .contains("command not found: definitely-not-a-command"),
                 "missing command error should mention the command: {error}"
+            );
+        }
+        fn javascript_child_process_shell_mode_without_guest_sh_fails_loudly() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+
+            let vm = sidecar.vms.get(&vm_id).expect("created vm");
+            assert!(
+                !vm.command_guest_paths.contains_key("sh"),
+                "test VM must not provide a guest sh command"
+            );
+
+            let request = crate::protocol::JavascriptChildProcessSpawnRequest {
+                command: String::from("printf hi > out.txt"),
+                args: Vec::new(),
+                options: crate::protocol::JavascriptChildProcessSpawnOptions {
+                    shell: true,
+                    ..Default::default()
+                },
+            };
+            let error = sidecar
+                .resolve_javascript_child_process_execution(
+                    vm,
+                    &vm.guest_env,
+                    &vm.guest_cwd,
+                    &vm.host_cwd,
+                    &request,
+                )
+                .expect_err("shell-mode command without guest sh must fail instead of tokenizing");
+            assert!(
+                error.to_string().contains("/bin/sh"),
+                "missing-sh error should mention /bin/sh: {error}"
             );
         }
         fn javascript_child_process_spawns_path_resolved_tool_commands() {
@@ -8234,6 +9678,157 @@ setInterval(() => {}, 1000);
 
             let vm = sidecar.vms.get(&vm_id).expect("configured vm");
             assert_eq!(vm.toolkits.get("math"), Some(&original_toolkit));
+        }
+        fn tools_register_toolkit_rejects_registry_overflow_without_mutating_vm() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+
+            for index in 0..crate::tools::MAX_REGISTERED_TOOLKITS {
+                sidecar
+                    .dispatch_blocking(request(
+                        20 + index as i64,
+                        OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                        RequestPayload::RegisterToolkit(test_toolkit_payload(
+                            &format!("toolkit-{index}"),
+                            "Bounded test toolkit",
+                            "run",
+                        )),
+                    ))
+                    .expect("register toolkit");
+            }
+
+            let (toolkits_before, command_paths_before) = {
+                let vm = sidecar.vms.get(&vm_id).expect("configured vm");
+                assert_eq!(vm.toolkits.len(), crate::tools::MAX_REGISTERED_TOOLKITS);
+                (vm.toolkits.clone(), vm.command_guest_paths.clone())
+            };
+
+            let overflow_response = sidecar
+                .dispatch_blocking(request(
+                    100,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::RegisterToolkit(test_toolkit_payload(
+                        "overflow",
+                        "Overflow toolkit",
+                        "run",
+                    )),
+                ))
+                .expect("dispatch overflow toolkit registration");
+
+            match overflow_response.response.payload {
+                ResponsePayload::Rejected(rejected) => {
+                    assert_eq!(rejected.code, "invalid_state");
+                    assert!(
+                        rejected.message.contains("registered toolkits"),
+                        "unexpected rejection: {rejected:?}"
+                    );
+                }
+                other => panic!("expected rejected response, got {other:?}"),
+            }
+
+            let vm = sidecar.vms.get(&vm_id).expect("configured vm");
+            assert_eq!(vm.toolkits, toolkits_before);
+            assert_eq!(vm.command_guest_paths, command_paths_before);
+            assert!(
+                !vm.command_guest_paths.contains_key("agentos-overflow"),
+                "overflow command path should not be registered"
+            );
+        }
+        fn tools_register_toolkit_rejects_total_tool_overflow_without_mutating_vm() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+
+            for toolkit_index in 0..4 {
+                let tools = (0..crate::tools::MAX_TOOLS_PER_TOOLKIT)
+                    .map(|tool_index| {
+                        (
+                            format!("tool-{tool_index}"),
+                            RegisteredToolDefinition {
+                                description: format!("tool {tool_index}"),
+                                input_schema: json!({
+                                    "type": "object",
+                                    "properties": {},
+                                    "additionalProperties": false,
+                                }),
+                                timeout_ms: None,
+                                examples: Vec::new(),
+                            },
+                        )
+                    })
+                    .collect();
+
+                sidecar
+                    .dispatch_blocking(request(
+                        120 + toolkit_index as i64,
+                        OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                        RequestPayload::RegisterToolkit(RegisterToolkitRequest {
+                            name: format!("toolkit-{toolkit_index}"),
+                            description: String::from("Bounded test toolkit"),
+                            tools,
+                        }),
+                    ))
+                    .expect("register toolkit");
+            }
+
+            let (toolkits_before, command_paths_before) = {
+                let vm = sidecar.vms.get(&vm_id).expect("configured vm");
+                assert_eq!(vm.toolkits.len(), 4);
+                assert_eq!(
+                    vm.toolkits
+                        .values()
+                        .map(|toolkit| toolkit.tools.len())
+                        .sum::<usize>(),
+                    crate::tools::MAX_REGISTERED_TOOLS_PER_VM
+                );
+                (vm.toolkits.clone(), vm.command_guest_paths.clone())
+            };
+
+            let overflow_response = sidecar
+                .dispatch_blocking(request(
+                    200,
+                    OwnershipScope::vm(&connection_id, &session_id, &vm_id),
+                    RequestPayload::RegisterToolkit(test_toolkit_payload(
+                        "overflow",
+                        "Overflow toolkit",
+                        "run",
+                    )),
+                ))
+                .expect("dispatch total-tool overflow toolkit registration");
+
+            match overflow_response.response.payload {
+                ResponsePayload::Rejected(rejected) => {
+                    assert_eq!(rejected.code, "invalid_state");
+                    assert!(
+                        rejected.message.contains("registered tools"),
+                        "unexpected rejection: {rejected:?}"
+                    );
+                }
+                other => panic!("expected rejected response, got {other:?}"),
+            }
+
+            let vm = sidecar.vms.get(&vm_id).expect("configured vm");
+            assert_eq!(vm.toolkits, toolkits_before);
+            assert_eq!(vm.command_guest_paths, command_paths_before);
+            assert!(
+                !vm.command_guest_paths.contains_key("agentos-overflow"),
+                "overflow command path should not be registered"
+            );
         }
         fn tools_javascript_child_process_denies_tool_invocation_without_permission() {
             let mut sidecar = create_test_sidecar();
@@ -9388,21 +10983,20 @@ console.log(
                 );
             }
 
-            let mut stdout = String::new();
-            let mut stderr = String::new();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
             let mut exit_code = None;
             for _ in 0..64 {
                 let next_event = {
                     let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
                     vm.active_processes
                         .get_mut("proc-js-fd")
-                        .map(|process| {
+                        .and_then(|process| {
                             process
                                 .execution
                                 .poll_event_blocking(Duration::from_secs(5))
                                 .expect("poll javascript fd rpc event")
                         })
-                        .flatten()
                 };
                 let Some(event) = next_event else {
                     if exit_code.is_some() {
@@ -9413,15 +11007,17 @@ console.log(
 
                 match &event {
                     ActiveExecutionEvent::Stdout(chunk) => {
-                        stdout.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(&mut stdout, chunk, "proc-js-fd", "stdout");
                     }
                     ActiveExecutionEvent::Stderr(chunk) => {
-                        stderr.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(&mut stderr, chunk, "proc-js-fd", "stderr");
                     }
                     ActiveExecutionEvent::Exited(code) => {
                         exit_code = Some(*code);
                     }
-                    _ => {}
+                    ActiveExecutionEvent::JavascriptSyncRpcRequest(_)
+                    | ActiveExecutionEvent::PythonVfsRpcRequest(_)
+                    | ActiveExecutionEvent::SignalState { .. } => {}
                 }
 
                 sidecar
@@ -9429,6 +11025,8 @@ console.log(
                     .expect("handle javascript fd rpc event");
             }
 
+            let stdout = process_stream_to_string(&stdout);
+            let stderr = process_stream_to_string(&stderr);
             assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
             assert!(stdout.contains("\"text\":\"bcdef\""), "stdout: {stdout}");
             assert!(stdout.contains("\"bytesRead\":5"), "stdout: {stdout}");
@@ -9480,6 +11078,102 @@ console.log(
                 assert_eq!(stream, "abcd");
             }
         }
+
+        fn javascript_mapped_tmp_open_wx_uses_exclusive_create_once() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("agent-os-sidecar-js-open-wx-cwd");
+            let mapped_tmp = temp_dir("agent-os-sidecar-js-open-wx-mapped-tmp");
+            write_fixture(
+                &cwd.join("entry.mjs"),
+                r#"
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const target = path.join(os.tmpdir(), "exclusive-mapped.lock");
+try {
+  fs.unlinkSync(target);
+} catch {}
+
+const fd = fs.openSync(target, "wx", 0o600);
+fs.writeSync(fd, "lock");
+fs.closeSync(fd);
+
+let secondOpenCode = "";
+try {
+  fs.openSync(target, "wx", 0o600);
+  secondOpenCode = "opened";
+} catch (error) {
+  secondOpenCode = error.code;
+}
+
+console.log(
+  JSON.stringify({
+    tmpdir: os.tmpdir(),
+    text: fs.readFileSync(target, "utf8"),
+    secondOpenCode,
+    exists: fs.existsSync(target),
+  }),
+);
+"#,
+            );
+
+            let mapped_tmp_json = serde_json::to_string(&vec![mapped_tmp.display().to_string()])
+                .expect("serialize mapped tmp access roots");
+            let (stdout, stderr, exit_code) = run_javascript_entry_with_env(
+                &mut sidecar,
+                &vm_id,
+                &cwd,
+                "proc-js-open-wx",
+                BTreeMap::from([
+                    (
+                        String::from("AGENT_OS_ALLOWED_NODE_BUILTINS"),
+                        String::from("[\"buffer\",\"console\",\"fs\",\"os\",\"path\"]"),
+                    ),
+                    (
+                        String::from("AGENT_OS_GUEST_PATH_MAPPINGS"),
+                        serde_json::to_string(&vec![json!({
+                            "guestPath": "/tmp",
+                            "hostPath": mapped_tmp.display().to_string(),
+                        })])
+                        .expect("serialize mapped tmp path"),
+                    ),
+                    (
+                        String::from("AGENT_OS_EXTRA_FS_READ_PATHS"),
+                        mapped_tmp_json.clone(),
+                    ),
+                    (
+                        String::from("AGENT_OS_EXTRA_FS_WRITE_PATHS"),
+                        mapped_tmp_json,
+                    ),
+                ]),
+            );
+
+            assert_eq!(exit_code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+            assert!(stdout.contains("\"text\":\"lock\""), "stdout: {stdout}");
+            assert!(
+                stdout.contains("\"secondOpenCode\":\"EEXIST\""),
+                "stdout: {stdout}"
+            );
+            assert!(stdout.contains("\"exists\":true"), "stdout: {stdout}");
+            assert_eq!(
+                fs::read_to_string(mapped_tmp.join("exclusive-mapped.lock"))
+                    .expect("read mapped host lock file"),
+                "lock"
+            );
+        }
+
         fn javascript_fs_promises_batch_requests_before_waiting_on_sidecar_responses() {
             assert_node_available();
 
@@ -9914,8 +11608,11 @@ await new Promise(() => {});
                 )
                 .expect("cipherivFinal"),
             );
-            assert!(update.as_str().expect("update string").len() > 0);
-            assert!(final_payload["data"].as_str().expect("final data").len() > 0);
+            assert!(!update.as_str().expect("update string").is_empty());
+            assert!(!final_payload["data"]
+                .as_str()
+                .expect("final data")
+                .is_empty());
 
             let rsa = openssl::rsa::Rsa::generate(2048).expect("generate rsa");
             let private_key = openssl::pkey::PKey::from_rsa(rsa).expect("private pkey from rsa");
@@ -10152,6 +11849,120 @@ await new Promise(() => {});
             assert_eq!(
                 decode_base64(subtle_digest["data"].as_str().expect("subtle digest")),
                 decode_base64("wkLEOhPrUj7AK7HeNtPUZ5R3kOPwBet6nO//NXylQQE=")
+            );
+
+            let subtle_generated_key = parse_json_string(
+                crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut create_crypto_test_process(),
+                    &JavascriptSyncRpcRequest {
+                        id: 30,
+                        method: String::from("crypto.subtle"),
+                        args: vec![json!(serde_json::to_string(&json!({
+                            "op": "generateKey",
+                            "algorithm": { "name": "AES-GCM", "length": 256 },
+                            "extractable": true,
+                            "usages": ["encrypt", "decrypt"],
+                        }))
+                        .expect("serialize subtle generateKey request"))],
+                    },
+                )
+                .expect("crypto.subtle generateKey"),
+            )["key"]
+                .clone();
+            assert_eq!(subtle_generated_key["type"], json!("secret"));
+            assert_eq!(subtle_generated_key["algorithm"]["name"], json!("AES-GCM"));
+            assert_eq!(subtle_generated_key["algorithm"]["length"], json!(256));
+
+            let subtle_exported_key = parse_json_string(
+                crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut create_crypto_test_process(),
+                    &JavascriptSyncRpcRequest {
+                        id: 31,
+                        method: String::from("crypto.subtle"),
+                        args: vec![json!(serde_json::to_string(&json!({
+                            "op": "exportKey",
+                            "format": "raw",
+                            "key": subtle_generated_key,
+                        }))
+                        .expect("serialize subtle exportKey request"))],
+                    },
+                )
+                .expect("crypto.subtle exportKey"),
+            );
+            let exported_key_bytes =
+                decode_base64(subtle_exported_key["data"].as_str().expect("exported key"));
+            assert_eq!(exported_key_bytes.len(), 32);
+
+            let subtle_imported_key = parse_json_string(
+                crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut create_crypto_test_process(),
+                    &JavascriptSyncRpcRequest {
+                        id: 32,
+                        method: String::from("crypto.subtle"),
+                        args: vec![json!(serde_json::to_string(&json!({
+                            "op": "importKey",
+                            "format": "raw",
+                            "keyData": subtle_exported_key["data"],
+                            "algorithm": { "name": "AES-GCM" },
+                            "extractable": true,
+                            "usages": ["encrypt", "decrypt"],
+                        }))
+                        .expect("serialize subtle importKey request"))],
+                    },
+                )
+                .expect("crypto.subtle importKey"),
+            )["key"]
+                .clone();
+            assert_eq!(subtle_imported_key["algorithm"]["length"], json!(256));
+
+            let subtle_encrypted = parse_json_string(
+                crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut create_crypto_test_process(),
+                    &JavascriptSyncRpcRequest {
+                        id: 33,
+                        method: String::from("crypto.subtle"),
+                        args: vec![json!(serde_json::to_string(&json!({
+                            "op": "encrypt",
+                            "algorithm": {
+                                "name": "AES-GCM",
+                                "iv": "AAAAAAAAAAAAAAAA",
+                            },
+                            "key": subtle_imported_key,
+                            "data": "aGVsbG8=",
+                        }))
+                        .expect("serialize subtle encrypt request"))],
+                    },
+                )
+                .expect("crypto.subtle encrypt"),
+            );
+            assert!(
+                decode_base64(subtle_encrypted["data"].as_str().expect("encrypted data")).len()
+                    > b"hello".len()
+            );
+
+            let subtle_decrypted = parse_json_string(
+                crate::execution::service_javascript_crypto_sync_rpc(
+                    &mut create_crypto_test_process(),
+                    &JavascriptSyncRpcRequest {
+                        id: 34,
+                        method: String::from("crypto.subtle"),
+                        args: vec![json!(serde_json::to_string(&json!({
+                            "op": "decrypt",
+                            "algorithm": {
+                                "name": "AES-GCM",
+                                "iv": "AAAAAAAAAAAAAAAA",
+                            },
+                            "key": subtle_imported_key,
+                            "data": subtle_encrypted["data"],
+                        }))
+                        .expect("serialize subtle decrypt request"))],
+                    },
+                )
+                .expect("crypto.subtle decrypt"),
+            );
+            assert_eq!(
+                decode_base64(subtle_decrypted["data"].as_str().expect("decrypted data")),
+                b"hello"
             );
         }
         fn javascript_sqlite_sync_rpcs_round_trip_and_persist_vm_files() {
@@ -10726,21 +12537,20 @@ console.log(JSON.stringify({ lookup, resolve4 }));
                 );
             }
 
-            let mut stdout = String::new();
-            let mut stderr = String::new();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
             let mut exit_code = None;
             for _ in 0..64 {
                 let next_event = {
                     let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
                     vm.active_processes
                         .get_mut("proc-js-dns")
-                        .map(|process| {
+                        .and_then(|process| {
                             process
                                 .execution
                                 .poll_event_blocking(Duration::from_secs(5))
                                 .expect("poll javascript dns rpc event")
                         })
-                        .flatten()
                 };
                 let Some(event) = next_event else {
                     if exit_code.is_some() {
@@ -10751,15 +12561,17 @@ console.log(JSON.stringify({ lookup, resolve4 }));
 
                 match &event {
                     ActiveExecutionEvent::Stdout(chunk) => {
-                        stdout.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(&mut stdout, chunk, "proc-js-dns", "stdout");
                     }
                     ActiveExecutionEvent::Stderr(chunk) => {
-                        stderr.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(&mut stderr, chunk, "proc-js-dns", "stderr");
                     }
                     ActiveExecutionEvent::Exited(code) => {
                         exit_code = Some(*code);
                     }
-                    _ => {}
+                    ActiveExecutionEvent::JavascriptSyncRpcRequest(_)
+                    | ActiveExecutionEvent::PythonVfsRpcRequest(_)
+                    | ActiveExecutionEvent::SignalState { .. } => {}
                 }
 
                 sidecar
@@ -10767,6 +12579,8 @@ console.log(JSON.stringify({ lookup, resolve4 }));
                     .expect("handle javascript dns rpc event");
             }
 
+            let stdout = process_stream_to_string(&stdout);
+            let stderr = process_stream_to_string(&stderr);
             assert_eq!(exit_code, Some(0), "stderr: {stderr}");
             let parsed: Value = serde_json::from_str(stdout.trim()).expect("parse dns JSON");
             assert!(
@@ -10809,7 +12623,7 @@ console.log(JSON.stringify({ lookup, resolve4 }));
             let cwd = temp_dir("agent-os-sidecar-js-ssrf-protection-cwd");
             write_fixture(
                 &cwd.join("entry.mjs"),
-                &format!(
+                format!(
                     r#"
 import dns from "node:dns";
 import net from "node:net";
@@ -10913,21 +12727,20 @@ process.exit(0);
                 );
             }
 
-            let mut stdout = String::new();
-            let mut stderr = String::new();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
             let mut exit_code = None;
             for _ in 0..64 {
                 let next_event = {
                     let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
                     vm.active_processes
                         .get_mut("proc-js-ssrf-protection")
-                        .map(|process| {
+                        .and_then(|process| {
                             process
                                 .execution
                                 .poll_event_blocking(Duration::from_secs(5))
                                 .expect("poll javascript ssrf event")
                         })
-                        .flatten()
                 };
                 let Some(event) = next_event else {
                     if exit_code.is_some() {
@@ -10938,15 +12751,27 @@ process.exit(0);
 
                 match &event {
                     ActiveExecutionEvent::Stdout(chunk) => {
-                        stdout.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(
+                            &mut stdout,
+                            chunk,
+                            "proc-js-ssrf-protection",
+                            "stdout",
+                        );
                     }
                     ActiveExecutionEvent::Stderr(chunk) => {
-                        stderr.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(
+                            &mut stderr,
+                            chunk,
+                            "proc-js-ssrf-protection",
+                            "stderr",
+                        );
                     }
                     ActiveExecutionEvent::Exited(code) => {
                         exit_code = Some(*code);
                     }
-                    _ => {}
+                    ActiveExecutionEvent::JavascriptSyncRpcRequest(_)
+                    | ActiveExecutionEvent::PythonVfsRpcRequest(_)
+                    | ActiveExecutionEvent::SignalState { .. } => {}
                 }
 
                 sidecar
@@ -10954,6 +12779,8 @@ process.exit(0);
                     .expect("handle javascript ssrf event");
             }
 
+            let stdout = process_stream_to_string(&stdout);
+            let stderr = process_stream_to_string(&stderr);
             assert_eq!(exit_code, Some(0), "stderr: {stderr}");
             let parsed: Value = serde_json::from_str(stdout.trim()).expect("parse ssrf JSON");
             assert_eq!(
@@ -11302,7 +13129,7 @@ console.log(JSON.stringify(data));
             let cwd = temp_dir("agent-os-sidecar-js-network-permission-callbacks");
             write_fixture(
                 &cwd.join("entry.mjs"),
-                &format!(
+                format!(
                     r#"
 import dns from "node:dns";
 import net from "node:net";
@@ -11610,21 +13437,20 @@ console.log(JSON.stringify(summary));
                 );
             }
 
-            let mut stdout = String::new();
-            let mut stderr = String::new();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
             let mut exit_code = None;
             for _ in 0..192 {
                 let next_event = {
                     let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
                     vm.active_processes
                         .get_mut("proc-js-tls")
-                        .map(|process| {
+                        .and_then(|process| {
                             process
                                 .execution
                                 .poll_event_blocking(Duration::from_secs(5))
                                 .expect("poll javascript tls rpc event")
                         })
-                        .flatten()
                 };
                 let Some(event) = next_event else {
                     if exit_code.is_some() {
@@ -11635,15 +13461,17 @@ console.log(JSON.stringify(summary));
 
                 match &event {
                     ActiveExecutionEvent::Stdout(chunk) => {
-                        stdout.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(&mut stdout, chunk, "proc-js-tls", "stdout");
                     }
                     ActiveExecutionEvent::Stderr(chunk) => {
-                        stderr.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(&mut stderr, chunk, "proc-js-tls", "stderr");
                     }
                     ActiveExecutionEvent::Exited(code) => {
                         exit_code = Some(*code);
                     }
-                    _ => {}
+                    ActiveExecutionEvent::JavascriptSyncRpcRequest(_)
+                    | ActiveExecutionEvent::PythonVfsRpcRequest(_)
+                    | ActiveExecutionEvent::SignalState { .. } => {}
                 }
 
                 sidecar
@@ -11651,6 +13479,8 @@ console.log(JSON.stringify(summary));
                     .expect("handle javascript tls rpc event");
             }
 
+            let stdout = process_stream_to_string(&stdout);
+            let stderr = process_stream_to_string(&stderr);
             assert_eq!(exit_code, Some(0), "stderr: {stderr}");
             let parsed: Value = serde_json::from_str(stdout.trim()).expect("parse tls JSON");
             assert_eq!(parsed["response"], Value::String(String::from("pong:ping")));
@@ -11786,6 +13616,85 @@ console.log(JSON.stringify(summary));
                     .and_then(|process| process.pending_http_requests.get(&(7, 9)))
                     .cloned(),
                 Some(Some(response_json)),
+            );
+        }
+
+        fn javascript_http_respond_rejects_oversized_pending_response() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("agent-os-sidecar-http-respond-oversized");
+            write_fixture(&cwd.join("entry.mjs"), "");
+            start_fake_javascript_process(
+                &mut sidecar,
+                &vm_id,
+                &cwd,
+                "proc-js-http-respond-oversized",
+                "[]",
+            );
+
+            let oversized_body = "a".repeat(crate::protocol::DEFAULT_MAX_FRAME_BYTES);
+            let response_json = format!(r#"{{"status":200,"body":"{oversized_body}"}}"#);
+            assert!(response_json.len() > crate::protocol::DEFAULT_MAX_FRAME_BYTES);
+            {
+                let vm = sidecar.vms.get_mut(&vm_id).expect("vm");
+                let process = vm
+                    .active_processes
+                    .get_mut("proc-js-http-respond-oversized")
+                    .expect("javascript process");
+                process.pending_http_requests.insert((7, 10), None);
+            }
+
+            let error = call_javascript_sync_rpc(
+                &mut sidecar,
+                &vm_id,
+                "proc-js-http-respond-oversized",
+                JavascriptSyncRpcRequest {
+                    id: 5,
+                    method: String::from("net.http_respond"),
+                    args: vec![json!(7), json!(10), Value::String(response_json)],
+                },
+            )
+            .expect_err("oversized http response should be rejected");
+            assert!(
+                error.to_string().contains("net.http_respond payload is"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(
+                sidecar
+                    .vms
+                    .get(&vm_id)
+                    .and_then(|vm| vm.active_processes.get("proc-js-http-respond-oversized"))
+                    .and_then(|process| process.pending_http_requests.get(&(7, 10)))
+                    .cloned(),
+                Some(None),
+            );
+        }
+
+        fn vm_fetch_response_frame_limit_counts_protocol_overhead() {
+            let response = crate::protocol::ResponseFrame::new(
+                1,
+                OwnershipScope::vm("conn", "session", "vm"),
+                ResponsePayload::VmFetchResult(crate::protocol::VmFetchResponse {
+                    response_json: "a".repeat(crate::protocol::DEFAULT_MAX_FRAME_BYTES),
+                }),
+            );
+
+            let error = crate::execution::ensure_vm_fetch_response_frame_within_limit(
+                &response,
+                crate::protocol::DEFAULT_MAX_FRAME_BYTES,
+            )
+            .expect_err("frame overhead should exceed the fetch response cap");
+            assert!(
+                error.to_string().contains("protocol frame is"),
+                "unexpected error: {error}"
             );
         }
         fn javascript_http2_listen_connect_request_and_respond_round_trip() {
@@ -12033,8 +13942,23 @@ console.log(JSON.stringify(summary));
                 "proc-js-http2-surfaces",
                 "[\"buffer\",\"stream\"]",
             );
-            let file_path = cwd.join("reply.txt");
-            write_fixture(&file_path, "from-file");
+            sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("javascript vm")
+                .active_processes
+                .get_mut("proc-js-http2-surfaces")
+                .expect("javascript process")
+                .guest_cwd = String::from("/workspace");
+            let host_only_path = cwd.join("host-only-reply.txt");
+            write_fixture(&host_only_path, "host-only");
+            sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("javascript vm")
+                .kernel
+                .write_file("/workspace/reply.txt", b"from-vm-file".to_vec())
+                .expect("seed VM response file");
 
             let listen = call_javascript_sync_rpc(
                 &mut sidecar,
@@ -12219,7 +14143,7 @@ console.log(JSON.stringify(summary));
             .expect("close pushed stream");
             assert_eq!(pushed_close, Value::Null);
 
-            let file_response = call_javascript_sync_rpc(
+            let host_file_response = call_javascript_sync_rpc(
                 &mut sidecar,
                 &vm_id,
                 "proc-js-http2-surfaces",
@@ -12228,7 +14152,32 @@ console.log(JSON.stringify(summary));
                     method: String::from("net.http2_stream_respond_with_file"),
                     args: vec![
                         json!(server_stream_id),
-                        Value::String(file_path.to_string_lossy().into_owned()),
+                        Value::String(host_only_path.to_string_lossy().into_owned()),
+                        Value::String(String::from(
+                            "{\":status\":200,\"content-type\":\"text/plain\"}",
+                        )),
+                        Value::String(String::from("{}")),
+                    ],
+                },
+            )
+            .expect_err("host-only file path should not be readable by HTTP/2 file response");
+            match host_file_response {
+                SidecarError::Kernel(message) => {
+                    assert!(message.contains("ENOENT"), "{message}");
+                }
+                other => panic!("unexpected host file response error: {other:?}"),
+            }
+
+            let file_response = call_javascript_sync_rpc(
+                &mut sidecar,
+                &vm_id,
+                "proc-js-http2-surfaces",
+                JavascriptSyncRpcRequest {
+                    id: 20,
+                    method: String::from("net.http2_stream_respond_with_file"),
+                    args: vec![
+                        json!(server_stream_id),
+                        Value::String(String::from("reply.txt")),
                         Value::String(String::from(
                             "{\":status\":200,\"content-type\":\"text/plain\"}",
                         )),
@@ -12259,7 +14208,7 @@ console.log(JSON.stringify(summary));
             let body = base64::engine::general_purpose::STANDARD
                 .decode(response_data["data"].as_str().expect("response body"))
                 .expect("decode file body");
-            assert_eq!(String::from_utf8(body).expect("utf8 body"), "from-file");
+            assert_eq!(String::from_utf8(body).expect("utf8 body"), "from-vm-file");
         }
         fn javascript_http2_secure_listen_connect_request_and_respond_round_trip() {
             let mut sidecar = create_test_sidecar();
@@ -12634,6 +14583,85 @@ console.log(JSON.stringify(summary));
             assert!(
                 parsed["port"].as_u64().is_some_and(|port| port > 0),
                 "stdout: {stdout}"
+            );
+        }
+        fn javascript_fetch_posts_to_guest_loopback_http_server() {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("agent-os-sidecar-js-fetch-loopback-cwd");
+            write_fixture(
+                &cwd.join("entry.mjs"),
+                r#"
+import http from "node:http";
+
+const summary = await new Promise((resolve, reject) => {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      requests.push({ method: req.method, url: req.url, body });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, method: req.method, received: body }));
+    });
+  });
+
+  server.on("error", reject);
+  server.listen(0, "127.0.0.1", async () => {
+    try {
+      const port = server.address().port;
+      const response = await fetch(`http://127.0.0.1:${port}/data`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ key: "value" }),
+      });
+      const payload = await response.json();
+      server.close(() => resolve({ payload, requests }));
+    } catch (error) {
+      server.close(() => reject(error));
+    }
+  });
+});
+
+console.log(JSON.stringify(summary));
+"#,
+            );
+
+            let (stdout, stderr, exit_code) = run_javascript_entry(
+                &mut sidecar,
+                &vm_id,
+                &cwd,
+                "proc-js-fetch-loopback",
+                "[\"assert\",\"buffer\",\"console\",\"crypto\",\"events\",\"fs\",\"http\",\"path\",\"querystring\",\"stream\",\"string_decoder\",\"timers\",\"url\",\"util\",\"zlib\"]",
+            );
+
+            assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+            let parsed: Value = serde_json::from_str(stdout.trim()).expect("parse fetch JSON");
+            assert_eq!(parsed["payload"]["ok"], Value::Bool(true));
+            assert_eq!(
+                parsed["payload"]["received"],
+                Value::String(String::from("{\"key\":\"value\"}"))
+            );
+            assert_eq!(
+                parsed["requests"][0]["method"],
+                Value::String(String::from("POST"))
+            );
+            assert_eq!(
+                parsed["requests"][0]["url"],
+                Value::String(String::from("/data"))
             );
         }
         fn javascript_https_rpc_requests_and_serves_over_guest_tls() {
@@ -13250,7 +15278,7 @@ console.log(JSON.stringify(summary));
                     tokio::task::yield_now().await;
                     let mut sidecar = dispose_sidecar.borrow_mut();
                     let response = sidecar
-                        .dispatch(request(
+                        .dispatch_blocking(request(
                             4,
                             OwnershipScope::vm(
                                 &dispose_connection_id,
@@ -13261,7 +15289,6 @@ console.log(JSON.stringify(summary));
                                 reason: DisposeReason::Requested,
                             }),
                         ))
-                        .await
                         .expect("dispose second vm while first net.poll waits");
                     match response.response.payload {
                         ResponsePayload::VmDisposed(_) => {}
@@ -14449,21 +16476,20 @@ console.log(JSON.stringify({
                 );
             }
 
-            let mut stdout = String::new();
-            let mut stderr = String::new();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
             let mut exit_code = None;
             for _ in 0..96 {
                 let next_event = {
                     let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
                     vm.active_processes
                         .get_mut("proc-js-child")
-                        .map(|process| {
+                        .and_then(|process| {
                             process
                                 .execution
                                 .poll_event_blocking(Duration::from_secs(5))
                                 .expect("poll javascript child_process event")
                         })
-                        .flatten()
                 };
                 let Some(event) = next_event else {
                     if exit_code.is_some() {
@@ -14474,13 +16500,15 @@ console.log(JSON.stringify({
 
                 match &event {
                     ActiveExecutionEvent::Stdout(chunk) => {
-                        stdout.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(&mut stdout, chunk, "proc-js-child", "stdout");
                     }
                     ActiveExecutionEvent::Stderr(chunk) => {
-                        stderr.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(&mut stderr, chunk, "proc-js-child", "stderr");
                     }
                     ActiveExecutionEvent::Exited(code) => exit_code = Some(*code),
-                    _ => {}
+                    ActiveExecutionEvent::JavascriptSyncRpcRequest(_)
+                    | ActiveExecutionEvent::PythonVfsRpcRequest(_)
+                    | ActiveExecutionEvent::SignalState { .. } => {}
                 }
 
                 sidecar
@@ -14488,6 +16516,8 @@ console.log(JSON.stringify({
                     .expect("handle javascript child_process event");
             }
 
+            let stdout = process_stream_to_string(&stdout);
+            let stderr = process_stream_to_string(&stderr);
             assert_eq!(exit_code, Some(0), "stderr: {stderr}");
             let parsed: Value =
                 serde_json::from_str(stdout.trim()).expect("parse child_process JSON");
@@ -14658,21 +16688,20 @@ console.log(JSON.stringify({
                 );
             }
 
-            let mut stdout = String::new();
-            let mut stderr = String::new();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
             let mut exit_code = None;
             for _ in 0..128 {
                 let next_event = {
                     let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
                     vm.active_processes
                         .get_mut("proc-js-nested-sigchld")
-                        .map(|process| {
+                        .and_then(|process| {
                             process
                                 .execution
                                 .poll_event_blocking(Duration::from_secs(5))
                                 .expect("poll nested SIGCHLD event")
                         })
-                        .flatten()
                 };
                 let Some(event) = next_event else {
                     if exit_code.is_some() {
@@ -14683,13 +16712,25 @@ console.log(JSON.stringify({
 
                 match &event {
                     ActiveExecutionEvent::Stdout(chunk) => {
-                        stdout.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(
+                            &mut stdout,
+                            chunk,
+                            "proc-js-nested-sigchld",
+                            "stdout",
+                        );
                     }
                     ActiveExecutionEvent::Stderr(chunk) => {
-                        stderr.push_str(&String::from_utf8_lossy(chunk));
+                        append_process_stream_chunk(
+                            &mut stderr,
+                            chunk,
+                            "proc-js-nested-sigchld",
+                            "stderr",
+                        );
                     }
                     ActiveExecutionEvent::Exited(code) => exit_code = Some(*code),
-                    _ => {}
+                    ActiveExecutionEvent::JavascriptSyncRpcRequest(_)
+                    | ActiveExecutionEvent::PythonVfsRpcRequest(_)
+                    | ActiveExecutionEvent::SignalState { .. } => {}
                 }
 
                 sidecar
@@ -14697,6 +16738,8 @@ console.log(JSON.stringify({
                     .expect("handle nested SIGCHLD event");
             }
 
+            let stdout = process_stream_to_string(&stdout);
+            let stderr = process_stream_to_string(&stderr);
             assert_eq!(exit_code, Some(0), "stderr: {stderr}");
             let parsed: Value =
                 serde_json::from_str(stdout.trim()).expect("parse nested SIGCHLD JSON");
@@ -14758,32 +16801,22 @@ console.log(JSON.stringify({
                     event: ActiveExecutionEvent::Stdout(b"queued-but-undeliverable".to_vec()),
                 });
 
-            let mut poll_loop_terminated = false;
-            for attempt in 0..3 {
-                let error = sidecar
-                    .poll_javascript_child_process(&vm_id, "proc-js-child-gone", "ghost-child", 0)
-                    .expect_err("missing child should surface ECHILD");
-                match error {
-                    SidecarError::Execution(message) => {
-                        assert!(
-                            message.starts_with("ECHILD:"),
-                            "expected ECHILD code, got {message}"
-                        );
-                        assert!(
-                            message.contains("proc-js-child-gone/ghost-child"),
-                            "expected child label in error, got {message}"
-                        );
-                        assert_eq!(
-                            attempt, 0,
-                            "poll loop should stop on first ECHILD instead of retrying"
-                        );
-                        poll_loop_terminated = true;
-                        break;
-                    }
-                    other => panic!("expected execution error, got {other}"),
+            let error = sidecar
+                .poll_javascript_child_process(&vm_id, "proc-js-child-gone", "ghost-child", 0)
+                .expect_err("missing child should surface ECHILD");
+            match error {
+                SidecarError::Execution(message) => {
+                    assert!(
+                        message.starts_with("ECHILD:"),
+                        "expected ECHILD code, got {message}"
+                    );
+                    assert!(
+                        message.contains("proc-js-child-gone/ghost-child"),
+                        "expected child label in error, got {message}"
+                    );
                 }
+                other => panic!("expected execution error, got {other}"),
             }
-            assert!(poll_loop_terminated, "poll loop should terminate on ECHILD");
 
             let queued = sidecar
                 .pending_process_events
@@ -14895,7 +16928,12 @@ console.log(JSON.stringify({
             configure_vm_instantiates_memory_mounts_through_the_plugin_registry();
             configure_vm_applies_read_only_mount_wrappers();
             configure_vm_instantiates_host_dir_mounts_through_the_plugin_registry();
+            configure_vm_passes_resource_read_limits_to_host_dir_mounts();
+            configure_vm_passes_resource_read_limits_to_module_access_mounts();
+            configure_vm_rejects_module_access_root_symlink_to_non_node_modules();
             configure_vm_js_bridge_mount_dispatches_filesystem_calls_via_sidecar_requests();
+            configure_vm_js_bridge_mount_rejects_oversized_read_payloads();
+            configure_vm_js_bridge_mount_rejects_pread_payloads_above_requested_length();
             configure_vm_js_bridge_mount_maps_callback_errors_to_errno_codes();
             configure_vm_instantiates_sandbox_agent_mounts_through_the_plugin_registry();
             configure_vm_instantiates_s3_mounts_through_the_plugin_registry();
@@ -14920,11 +16958,14 @@ console.log(JSON.stringify({
             wasm_fd_write_sync_rpc_keeps_stdout_isolated_per_vm();
             wasm_fd_write_sync_rpc_routes_stdout_into_kernel_pty();
             javascript_child_process_searches_path_for_mounted_wasm_commands();
+            javascript_child_process_shell_mode_without_guest_sh_fails_loudly();
             javascript_child_process_spawns_path_resolved_tool_commands();
             javascript_child_process_resolves_path_resolved_tool_commands_as_tools();
             javascript_child_process_spawns_internal_tool_command_paths();
             javascript_child_process_resolves_internal_tool_command_paths_as_tools();
             tools_register_toolkit_rejects_duplicate_names_without_replacing_existing_toolkit();
+            tools_register_toolkit_rejects_registry_overflow_without_mutating_vm();
+            tools_register_toolkit_rejects_total_tool_overflow_without_mutating_vm();
             tools_javascript_child_process_denies_tool_invocation_without_permission();
             tools_javascript_child_process_invokes_tool_with_matching_permission();
             tools_javascript_child_process_rejects_invalid_json_file_input_before_dispatch();
@@ -14937,6 +16978,7 @@ console.log(JSON.stringify({
             python_vfs_rpc_paths_are_scoped_to_workspace_root();
             javascript_fs_sync_rpc_resolves_proc_self_against_the_kernel_process();
             javascript_fd_and_stream_rpc_requests_proxy_into_the_vm_kernel_filesystem();
+            javascript_mapped_tmp_open_wx_uses_exclusive_create_once();
             javascript_fs_promises_batch_requests_before_waiting_on_sidecar_responses();
             javascript_crypto_basic_sync_rpcs_round_trip_through_sidecar();
             javascript_crypto_advanced_sync_rpcs_round_trip_through_sidecar();
@@ -14953,11 +16995,14 @@ console.log(JSON.stringify({
             javascript_tls_rpc_connects_and_serves_over_guest_net();
             javascript_http_listen_and_close_registers_server();
             javascript_http_respond_records_pending_response();
+            javascript_http_respond_rejects_oversized_pending_response();
+            vm_fetch_response_frame_limit_counts_protocol_overhead();
             javascript_http2_listen_connect_request_and_respond_round_trip();
             javascript_http2_settings_pause_push_and_file_response_surfaces_work();
             javascript_http2_secure_listen_connect_request_and_respond_round_trip();
             javascript_http2_server_respond_records_pending_response();
             javascript_http_rpc_requests_gets_and_serves_over_guest_net();
+            javascript_fetch_posts_to_guest_loopback_http_server();
             javascript_https_rpc_requests_and_serves_over_guest_tls();
             javascript_net_rpc_listens_accepts_connections_and_reports_listener_state();
             javascript_net_rpc_reports_connection_counts_and_enforces_backlog();
@@ -14967,6 +17012,12 @@ console.log(JSON.stringify({
             javascript_net_rpc_listens_and_connects_over_unix_domain_sockets();
             javascript_child_process_rpc_spawns_nested_node_processes_inside_vm_kernel();
             javascript_child_process_rpc_preserves_nested_sigchld_registrations();
+            process_event_sender_is_bounded();
+            pending_process_events_are_bounded();
+            process_event_receiver_overflow_preserves_queued_event();
+            tool_execution_event_overflow_is_reported();
+            descendant_transfer_overflow_preserves_global_queue();
+            exit_trailing_requeue_preserves_exit_when_queue_is_full();
             javascript_child_process_poll_reports_echild_when_child_disappears_after_drain();
             javascript_child_process_internal_bootstrap_env_is_allowlisted();
             javascript_net_poll_clamps_guest_wait_to_sidecar_ceiling();
@@ -14974,8 +17025,59 @@ console.log(JSON.stringify({
         }
 
         #[test]
+        fn service_toolkit_registry_is_bounded() {
+            tools_register_toolkit_rejects_registry_overflow_without_mutating_vm();
+            tools_register_toolkit_rejects_total_tool_overflow_without_mutating_vm();
+        }
+
+        #[test]
+        fn service_process_output_collectors_are_bounded() {
+            let mut stream = Vec::new();
+            append_process_stream_chunk(&mut stream, &[b'a'; 16], "proc-capture-limit", "stdout");
+            assert_eq!(stream.len(), 16);
+
+            let overflow = std::panic::catch_unwind(|| {
+                let mut stream = vec![b'a'; MAX_SERVICE_PROCESS_STREAM_BYTES];
+                append_process_stream_chunk(&mut stream, b"!", "proc-capture-limit", "stdout");
+            });
+            assert!(
+                overflow.is_err(),
+                "oversized process output should fail the test harness"
+            );
+        }
+
+        #[test]
+        fn service_process_event_queues_are_bounded() {
+            process_event_sender_is_bounded();
+            pending_process_events_are_bounded();
+            process_event_receiver_overflow_preserves_queued_event();
+            tool_execution_event_overflow_is_reported();
+            descendant_transfer_overflow_preserves_global_queue();
+            exit_trailing_requeue_preserves_exit_when_queue_is_full();
+        }
+
+        #[test]
+        fn service_state_handle_tables_are_bounded() {
+            cipher_session_handles_are_bounded();
+            diffie_hellman_session_handles_are_bounded();
+            sqlite_database_handles_are_bounded();
+            sqlite_statement_handles_are_bounded();
+        }
+
+        #[test]
         fn service_suite_javascript_network_dns_javascript_net_poll() {
             run_service_suite();
+        }
+
+        #[test]
+        fn service_http2_respond_with_file_reads_vm_filesystem() {
+            javascript_http2_settings_pause_push_and_file_response_surfaces_work();
+        }
+
+        #[test]
+        fn service_create_session_injects_dynamic_system_prompt() {
+            create_session_injects_prompt_reflecting_registered_toolkits();
+            create_session_opencode_materializes_prompt_file_and_context_paths();
         }
     }
 }

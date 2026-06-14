@@ -337,10 +337,16 @@ impl AgentOs {
         Ok(())
     }
 
-    /// Runs the safe guard, then rejects writes to read-only paths (`/proc`, `/proc/*`).
-    pub(crate) fn assert_writable_absolute_path(path: &str) -> std::result::Result<(), ClientError> {
+    /// Runs the safe guard, then rejects writes to read-only paths.
+    pub(crate) fn assert_writable_absolute_path(
+        path: &str,
+    ) -> std::result::Result<(), ClientError> {
         Self::assert_safe_absolute_path(path)?;
-        if path == "/proc" || path.starts_with("/proc/") {
+        if path == "/proc"
+            || path.starts_with("/proc/")
+            || path == "/etc/agentos"
+            || path.starts_with("/etc/agentos/")
+        {
             return Err(ClientError::PathReadOnly(path.to_string()));
         }
         Ok(())
@@ -434,6 +440,7 @@ impl AgentOs {
             atime_ms: None,
             mtime_ms: None,
             len: None,
+            offset: None,
         }
     }
 
@@ -468,9 +475,9 @@ impl AgentOs {
         let result = self
             .guest_fs_call(Self::fs_request(GuestFilesystemOperation::ReadFile, path))
             .await?;
-        let content = result.content.with_context(|| {
-            format!("sidecar returned no file content for {path}")
-        })?;
+        let content = result
+            .content
+            .with_context(|| format!("sidecar returned no file content for {path}"))?;
         match result.encoding {
             Some(RootFilesystemEntryEncoding::Base64) => BASE64
                 .decode(content.as_bytes())
@@ -485,9 +492,10 @@ impl AgentOs {
     async fn kernel_write_file(&self, path: &str, content: &FileContent) -> Result<()> {
         let (encoded, encoding) = match content {
             FileContent::Text(text) => (text.clone(), None),
-            FileContent::Bytes(bytes) => {
-                (BASE64.encode(bytes), Some(RootFilesystemEntryEncoding::Base64))
-            }
+            FileContent::Bytes(bytes) => (
+                BASE64.encode(bytes),
+                Some(RootFilesystemEntryEncoding::Base64),
+            ),
         };
         let mut request = Self::fs_request(GuestFilesystemOperation::WriteFile, path);
         request.content = Some(encoded);
@@ -525,9 +533,7 @@ impl AgentOs {
         let result = self
             .guest_fs_call(Self::fs_request(GuestFilesystemOperation::Stat, path))
             .await?;
-        let stat = result
-            .stat
-            .context("stat response missing stat payload")?;
+        let stat = result.stat.context("stat response missing stat payload")?;
         Ok(Self::virtual_stat_from(stat))
     }
 
@@ -535,9 +541,7 @@ impl AgentOs {
         let result = self
             .guest_fs_call(Self::fs_request(GuestFilesystemOperation::Lstat, path))
             .await?;
-        let stat = result
-            .stat
-            .context("lstat response missing stat payload")?;
+        let stat = result.stat.context("lstat response missing stat payload")?;
         Ok(Self::virtual_stat_from(stat))
     }
 
@@ -612,6 +616,7 @@ impl AgentOs {
         to: &'a str,
     ) -> futures::future::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            Self::assert_writable_absolute_path(to)?;
             let stat = self.kernel_lstat(from).await?;
             if stat.is_symbolic_link {
                 let target = self.kernel_readlink(from).await?;
@@ -651,7 +656,7 @@ impl AgentOs {
         recursive: bool,
     ) -> futures::future::BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let stat = self.kernel_stat(path).await?;
+            let stat = self.kernel_lstat(path).await?;
             if stat.is_directory {
                 if recursive {
                     let entries = self.kernel_readdir(path).await?;
@@ -756,7 +761,7 @@ impl AgentOs {
         if options.recursive {
             return self.mkdirp(path).await;
         }
-        Self::assert_safe_absolute_path(path)?;
+        Self::assert_writable_absolute_path(path)?;
         self.kernel_mkdir(path).await
     }
 
@@ -793,7 +798,7 @@ impl AgentOs {
                     continue;
                 }
                 let full_path = Self::join_child(&dir_path, &name);
-                let s = self.kernel_stat(&full_path).await?;
+                let s = self.kernel_lstat(&full_path).await?;
                 if s.is_symbolic_link {
                     results.push(DirEntry {
                         path: full_path,
@@ -903,8 +908,8 @@ impl AgentOs {
     /// Move a path. `lstat(from)` no-follow; symlink/non-dir -> rename; real dir -> recursive copy
     /// (preserve mode/uid/gid/symlinks) + recursive delete. (TS `move`.)
     pub async fn move_path(&self, from: &str, to: &str) -> Result<()> {
-        Self::assert_safe_absolute_path(from)?;
-        Self::assert_safe_absolute_path(to)?;
+        Self::assert_writable_absolute_path(from)?;
+        Self::assert_writable_absolute_path(to)?;
         let source_stat = self.kernel_lstat(from).await?;
         if !source_stat.is_directory || source_stat.is_symbolic_link {
             return self.kernel_rename(from, to).await;
@@ -913,10 +918,10 @@ impl AgentOs {
         self.delete(from, DeleteOptions { recursive: true }).await
     }
 
-    /// Delete a path. `stat` to discriminate; recursive manually recurses children then `remove_dir`;
+    /// Delete a path. `lstat` to discriminate; recursive manually recurses children then `remove_dir`;
     /// non-recursive dir -> `remove_dir` (ENOTEMPTY if non-empty).
     pub async fn delete(&self, path: &str, options: DeleteOptions) -> Result<()> {
-        Self::assert_safe_absolute_path(path)?;
+        Self::assert_writable_absolute_path(path)?;
         self.delete_inner(path, options.recursive).await
     }
 

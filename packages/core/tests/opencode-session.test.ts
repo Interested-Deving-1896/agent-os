@@ -550,24 +550,21 @@ describe("OpenCode session API integration", () => {
 						via: string;
 					},
 				).toMatchObject({
-					cancelled: false,
+					cancelled: true,
 					requested: true,
-					via: "notification-fallback",
+					via: "prompt-fallback",
 				});
 
 				const promptResponse = await promptPromise;
-				expect(promptResponse.error).toBeUndefined();
-				expect(promptResponse.result).toBeUndefined();
+				expect(promptResponse.response.error).toBeUndefined();
 				expect(
-					mock
-						.getRequests()
-						.some((request) =>
-							hasUserMessageContaining(
-								request,
-								"Take a while and then answer.",
-							),
-						),
-				).toBe(true);
+					(
+						promptResponse.response.result as
+							| { stopReason?: string }
+							| undefined
+					)
+						?.stopReason,
+				).toBe("cancelled");
 			} finally {
 				if (sessionId) {
 					vm.closeSession(sessionId);

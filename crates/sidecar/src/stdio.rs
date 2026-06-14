@@ -13,9 +13,14 @@ use agent_os_bridge::{
 };
 use agent_os_sidecar::protocol::{
     AuthenticatedResponse, NativeFrameCodec, NativePayloadCodec, ProtocolCodecError, ProtocolFrame,
-    RequestId, ResponsePayload, SessionOpenedResponse, SidecarRequestFrame, SidecarResponseFrame,
+    RequestFrame, RequestId, RequestPayload, ResponseFrame, ResponsePayload, SessionOpenedResponse,
+    SessionRpcResponse, SidecarRequestFrame, SidecarResponseFrame,
 };
-use agent_os_sidecar::{NativeSidecar, NativeSidecarConfig, SidecarError, SidecarRequestTransport};
+use agent_os_sidecar::{
+    acp::{JsonRpcId, JsonRpcResponse},
+    DispatchResult, NativeSidecar, NativeSidecarConfig, SidecarError, SidecarRequestTransport,
+};
+use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -26,10 +31,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{channel, unbounded_channel, Receiver};
 use tokio::time;
 
 const EVENT_PUMP_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_STDIN_FRAME_QUEUE: usize = 128;
+const MAX_EVENT_READY_QUEUE: usize = 1;
+const MAX_STDOUT_FRAME_QUEUE: usize = 128;
 
 pub fn run() -> Result<(), Box<dyn Error>> {
     tokio::runtime::Builder::new_current_thread()
@@ -47,9 +55,11 @@ async fn run_async() -> Result<(), Box<dyn Error>> {
     let mut sidecar = NativeSidecar::with_config(LocalBridge::default(), config)?;
     let mut active_sessions = BTreeSet::<SessionScope>::new();
     let mut active_connections = BTreeSet::<String>::new();
-    let (stdin_tx, mut stdin_rx) = unbounded_channel::<Result<Option<ProtocolFrame>, String>>();
-    let (event_ready_tx, mut event_ready_rx) = unbounded_channel::<()>();
-    let (write_tx, write_rx) = mpsc::channel::<ProtocolFrame>();
+    let (stdin_tx, mut stdin_rx) = channel::<Result<Option<ProtocolFrame>, String>>(
+        MAX_STDIN_FRAME_QUEUE,
+    );
+    let (event_ready_tx, mut event_ready_rx) = channel::<()>(MAX_EVENT_READY_QUEUE);
+    let (write_tx, write_rx) = mpsc::sync_channel::<ProtocolFrame>(MAX_STDOUT_FRAME_QUEUE);
     let (write_error_tx, mut write_error_rx) = unbounded_channel::<String>();
     let callback_transport = Arc::new(FrameSidecarRequestTransport::new(write_tx.clone()));
     sidecar.set_sidecar_request_transport(callback_transport.clone());
@@ -59,13 +69,14 @@ async fn run_async() -> Result<(), Box<dyn Error>> {
     let transport_codec = Arc::new(Mutex::new(None::<NativePayloadCodec>));
     let writer_transport_codec = transport_codec.clone();
 
+    let writer_error_tx = write_error_tx.clone();
     thread::spawn(move || {
         let mut writer = io::BufWriter::new(io::stdout());
         while let Ok(frame) = write_rx.recv() {
             if let Err(error) =
                 write_frame(&writer_codec, &mut writer, &frame, &writer_transport_codec)
             {
-                let _ = write_error_tx.send(error.to_string());
+                let _ = writer_error_tx.send(error.to_string());
                 break;
             }
         }
@@ -74,6 +85,7 @@ async fn run_async() -> Result<(), Box<dyn Error>> {
     thread::spawn({
         let callback_transport = callback_transport.clone();
         let transport_codec = transport_codec.clone();
+        let read_error_tx = write_error_tx.clone();
         move || {
             let mut stdin = io::stdin();
             loop {
@@ -89,7 +101,15 @@ async fn run_async() -> Result<(), Box<dyn Error>> {
                 }
                 .map_err(|error: Box<dyn Error>| error.to_string());
                 let should_stop = matches!(frame, Ok(None) | Err(_));
-                if stdin_tx.send(frame).is_err() || should_stop {
+                match enqueue_stdin_frame(&stdin_tx, frame) {
+                    Ok(()) => {}
+                    Err(StdinFrameQueueError::Full(message)) => {
+                        let _ = read_error_tx.send(message);
+                        break;
+                    }
+                    Err(StdinFrameQueueError::Closed) => break,
+                }
+                if should_stop {
                     break;
                 }
             }
@@ -97,8 +117,23 @@ async fn run_async() -> Result<(), Box<dyn Error>> {
     });
 
     flush_sidecar_requests(&mut sidecar, &write_tx)?;
+    let mut pending_frame: Option<ProtocolFrame> = None;
 
     loop {
+        if let Some(frame) = pending_frame.take() {
+            handle_protocol_frame(
+                frame,
+                &mut sidecar,
+                &mut stdin_rx,
+                &mut pending_frame,
+                &write_tx,
+                &mut active_sessions,
+                &mut active_connections,
+            )
+            .await?;
+            continue;
+        }
+
         tokio::select! {
             maybe_frame = stdin_rx.recv() => {
                 let Some(frame) = maybe_frame else {
@@ -107,36 +142,15 @@ async fn run_async() -> Result<(), Box<dyn Error>> {
                 let Some(frame) = frame.map_err(io::Error::other)? else {
                     break;
                 };
-                match frame {
-                    ProtocolFrame::Request(request) => {
-                        let dispatch = sidecar.dispatch(request.clone()).await?;
-                        track_session_state(
-                            &dispatch.response.payload,
-                            &mut active_sessions,
-                            &mut active_connections,
-                        );
-
-                        write_tx.send(ProtocolFrame::Response(dispatch.response)).map_err(|error| {
-                            io::Error::new(io::ErrorKind::BrokenPipe, error.to_string())
-                        })?;
-                        for event in dispatch.events {
-                            write_tx.send(ProtocolFrame::Event(event)).map_err(|error| {
-                                io::Error::new(io::ErrorKind::BrokenPipe, error.to_string())
-                            })?;
-                        }
-                        flush_sidecar_requests(&mut sidecar, &write_tx)?;
-                    }
-                    ProtocolFrame::SidecarResponse(response) => {
-                        sidecar.accept_sidecar_response(response)?;
-                        flush_sidecar_requests(&mut sidecar, &write_tx)?;
-                    }
-                    other => {
-                        return Err(format!(
-                            "expected request or sidecar_response frame on stdin, received {}",
-                            frame_kind(&other)
-                        ).into());
-                    }
-                }
+                handle_protocol_frame(
+                    frame,
+                    &mut sidecar,
+                    &mut stdin_rx,
+                    &mut pending_frame,
+                    &write_tx,
+                    &mut active_sessions,
+                    &mut active_connections,
+                ).await?;
             }
             maybe_ready = event_ready_rx.recv() => {
                 let Some(()) = maybe_ready else {
@@ -149,9 +163,7 @@ async fn run_async() -> Result<(), Box<dyn Error>> {
                             .poll_event(&session.ownership_scope(), Duration::ZERO)
                             .await?
                         {
-                            write_tx.send(ProtocolFrame::Event(frame)).map_err(|error| {
-                                io::Error::new(io::ErrorKind::BrokenPipe, error.to_string())
-                            })?;
+                            send_output_frame(&write_tx, ProtocolFrame::Event(frame))?;
                             emitted_frame = true;
                         }
                     }
@@ -165,7 +177,7 @@ async fn run_async() -> Result<(), Box<dyn Error>> {
             _ = event_pump.tick() => {
                 for session in active_sessions.iter().cloned().collect::<Vec<_>>() {
                     if sidecar.pump_process_events(&session.ownership_scope()).await? {
-                        let _ = event_ready_tx.send(());
+                        let _ = event_ready_tx.try_send(());
                     }
                 }
                 flush_sidecar_requests(&mut sidecar, &write_tx)?;
@@ -180,6 +192,224 @@ async fn run_async() -> Result<(), Box<dyn Error>> {
 
     cleanup_connections(&mut sidecar, &active_connections).await;
     Ok(())
+}
+
+async fn handle_protocol_frame(
+    frame: ProtocolFrame,
+    sidecar: &mut NativeSidecar<LocalBridge>,
+    stdin_rx: &mut Receiver<Result<Option<ProtocolFrame>, String>>,
+    pending_frame: &mut Option<ProtocolFrame>,
+    write_tx: &mpsc::SyncSender<ProtocolFrame>,
+    active_sessions: &mut BTreeSet<SessionScope>,
+    active_connections: &mut BTreeSet<String>,
+) -> Result<(), Box<dyn Error>> {
+    match frame {
+        ProtocolFrame::Request(request) => {
+            let (dispatch, extra_responses) =
+                dispatch_with_prompt_interrupt(sidecar, request.clone(), stdin_rx, pending_frame)
+                    .await?;
+            track_session_state(
+                &dispatch.response.payload,
+                active_sessions,
+                active_connections,
+            );
+
+            send_output_frame(write_tx, ProtocolFrame::Response(dispatch.response))?;
+            for response in extra_responses {
+                send_output_frame(write_tx, ProtocolFrame::Response(response))?;
+            }
+            for event in dispatch.events {
+                send_output_frame(write_tx, ProtocolFrame::Event(event))?;
+            }
+            flush_sidecar_requests(sidecar, write_tx)?;
+        }
+        ProtocolFrame::SidecarResponse(response) => {
+            sidecar.accept_sidecar_response(response)?;
+            flush_sidecar_requests(sidecar, write_tx)?;
+        }
+        other => {
+            return Err(format!(
+                "expected request or sidecar_response frame on stdin, received {}",
+                frame_kind(&other)
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+async fn dispatch_with_prompt_interrupt(
+    sidecar: &mut NativeSidecar<LocalBridge>,
+    request: RequestFrame,
+    stdin_rx: &mut Receiver<Result<Option<ProtocolFrame>, String>>,
+    pending_frame: &mut Option<ProtocolFrame>,
+) -> Result<(DispatchResult, Vec<ResponseFrame>), Box<dyn Error>> {
+    if !is_session_prompt_request(&request) {
+        return Ok((sidecar.dispatch(request).await?, Vec::new()));
+    }
+
+    let mut dispatch = Box::pin(sidecar.dispatch(request.clone()));
+    tokio::select! {
+        result = dispatch.as_mut() => Ok((result?, Vec::new())),
+        maybe_frame = stdin_rx.recv() => {
+            let frame = decode_stdin_frame(maybe_frame)?;
+            if let Some(frame) = frame {
+                if interrupts_session_prompt(&request, &frame) {
+                    drop(dispatch);
+                    let mut extra_responses = Vec::new();
+                    if let Some(response) = interrupted_cancel_response(&request, &frame) {
+                        extra_responses.push(response);
+                    } else {
+                        *pending_frame = Some(frame);
+                    }
+                    return Ok((interrupted_prompt_dispatch(&request), extra_responses));
+                }
+                *pending_frame = Some(frame);
+            }
+            Ok((dispatch.await?, Vec::new()))
+        }
+    }
+}
+
+fn decode_stdin_frame(
+    maybe_frame: Option<Result<Option<ProtocolFrame>, String>>,
+) -> Result<Option<ProtocolFrame>, Box<dyn Error>> {
+    let Some(frame) = maybe_frame else {
+        return Ok(None);
+    };
+    Ok(frame.map_err(io::Error::other)?)
+}
+
+fn is_session_prompt_request(request: &RequestFrame) -> bool {
+    matches!(
+        &request.payload,
+        RequestPayload::SessionRequest(payload) if payload.method == "session/prompt"
+    )
+}
+
+fn interrupts_session_prompt(prompt_request: &RequestFrame, frame: &ProtocolFrame) -> bool {
+    let RequestPayload::SessionRequest(prompt_payload) = &prompt_request.payload else {
+        return false;
+    };
+    match frame {
+        ProtocolFrame::Request(request) => {
+            if request.ownership != prompt_request.ownership {
+                return false;
+            }
+            match &request.payload {
+                RequestPayload::CloseAgentSession(payload) => {
+                    payload.session_id == prompt_payload.session_id
+                }
+                RequestPayload::SessionRequest(payload) => {
+                    payload.session_id == prompt_payload.session_id
+                        && payload.method == "session/cancel"
+                }
+                RequestPayload::KillProcess(_) => true,
+                // Control-plane setup, inspection, filesystem, process plumbing, and
+                // persistence requests run concurrently with an in-flight prompt and
+                // must not interrupt it. DisposeVm is deliberately non-interrupting for
+                // now; see the todo entry about dispose racing a blocked prompt.
+                RequestPayload::Authenticate(_)
+                | RequestPayload::OpenSession(_)
+                | RequestPayload::CreateVm(_)
+                | RequestPayload::CreateSession(_)
+                | RequestPayload::GetSessionState(_)
+                | RequestPayload::DisposeVm(_)
+                | RequestPayload::BootstrapRootFilesystem(_)
+                | RequestPayload::ConfigureVm(_)
+                | RequestPayload::RegisterToolkit(_)
+                | RequestPayload::CreateLayer(_)
+                | RequestPayload::SealLayer(_)
+                | RequestPayload::ImportSnapshot(_)
+                | RequestPayload::ExportSnapshot(_)
+                | RequestPayload::CreateOverlay(_)
+                | RequestPayload::GuestFilesystemCall(_)
+                | RequestPayload::SnapshotRootFilesystem(_)
+                | RequestPayload::Execute(_)
+                | RequestPayload::WriteStdin(_)
+                | RequestPayload::CloseStdin(_)
+                | RequestPayload::GetProcessSnapshot(_)
+                | RequestPayload::FindListener(_)
+                | RequestPayload::FindBoundUdp(_)
+                | RequestPayload::VmFetch(_)
+                | RequestPayload::GetSignalState(_)
+                | RequestPayload::GetZombieTimerCount(_)
+                | RequestPayload::HostFilesystemCall(_)
+                | RequestPayload::PermissionRequest(_)
+                | RequestPayload::PersistenceLoad(_)
+                | RequestPayload::PersistenceFlush(_) => false,
+            }
+        }
+        // Response, Event, and SidecarRequest frames are sidecar-to-host only. If one
+        // arrives on stdin it is requeued and rejected as a protocol error by
+        // handle_protocol_frame, so it must not synthesize a cancelled prompt first.
+        // SidecarResponse frames answer sidecar-initiated callbacks and may be the very
+        // response the blocked prompt dispatch is waiting on, so they never interrupt.
+        ProtocolFrame::Response(_)
+        | ProtocolFrame::Event(_)
+        | ProtocolFrame::SidecarRequest(_)
+        | ProtocolFrame::SidecarResponse(_) => false,
+    }
+}
+
+fn interrupted_prompt_dispatch(request: &RequestFrame) -> DispatchResult {
+    let RequestPayload::SessionRequest(payload) = &request.payload else {
+        unreachable!("interrupted prompt dispatch requires session_request payload");
+    };
+    let response = JsonRpcResponse::success(
+        JsonRpcId::Null,
+        json!({
+            "stopReason": "cancelled",
+        }),
+    );
+    DispatchResult {
+        response: ResponseFrame::new(
+            request.request_id,
+            request.ownership.clone(),
+            ResponsePayload::SessionRpc(SessionRpcResponse {
+                session_id: payload.session_id.clone(),
+                response: serde_json::to_value(response)
+                    .expect("serialize interrupted prompt response"),
+            }),
+        ),
+        events: Vec::new(),
+    }
+}
+
+fn interrupted_cancel_response(
+    prompt_request: &RequestFrame,
+    frame: &ProtocolFrame,
+) -> Option<ResponseFrame> {
+    let RequestPayload::SessionRequest(prompt_payload) = &prompt_request.payload else {
+        return None;
+    };
+    let ProtocolFrame::Request(request) = frame else {
+        return None;
+    };
+    let RequestPayload::SessionRequest(payload) = &request.payload else {
+        return None;
+    };
+    if payload.session_id != prompt_payload.session_id || payload.method != "session/cancel" {
+        return None;
+    }
+
+    let response = JsonRpcResponse::success(
+        JsonRpcId::Null,
+        json!({
+            "cancelled": true,
+            "requested": true,
+            "via": "prompt-interrupt",
+        }),
+    );
+    Some(ResponseFrame::new(
+        request.request_id,
+        request.ownership.clone(),
+        ResponsePayload::SessionRpc(SessionRpcResponse {
+            session_id: payload.session_id.clone(),
+            response: serde_json::to_value(response)
+                .expect("serialize interrupted cancel response"),
+        }),
+    ))
 }
 
 async fn cleanup_connections(
@@ -283,16 +513,47 @@ fn frame_kind(frame: &ProtocolFrame) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StdinFrameQueueError {
+    Full(String),
+    Closed,
+}
+
+fn enqueue_stdin_frame(
+    sender: &tokio::sync::mpsc::Sender<Result<Option<ProtocolFrame>, String>>,
+    frame: Result<Option<ProtocolFrame>, String>,
+) -> Result<(), StdinFrameQueueError> {
+    sender.try_send(frame).map_err(|error| match error {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => StdinFrameQueueError::Full(format!(
+            "stdin frame queue exceeded {MAX_STDIN_FRAME_QUEUE} pending frames"
+        )),
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => StdinFrameQueueError::Closed,
+    })
+}
+
 fn flush_sidecar_requests(
     sidecar: &mut NativeSidecar<LocalBridge>,
-    writer: &mpsc::Sender<ProtocolFrame>,
+    writer: &mpsc::SyncSender<ProtocolFrame>,
 ) -> Result<(), Box<dyn Error>> {
     while let Some(request) = sidecar.pop_sidecar_request() {
-        writer
-            .send(ProtocolFrame::SidecarRequest(request))
-            .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))?;
+        send_output_frame(writer, ProtocolFrame::SidecarRequest(request))?;
     }
     Ok(())
+}
+
+fn send_output_frame(
+    writer: &mpsc::SyncSender<ProtocolFrame>,
+    frame: ProtocolFrame,
+) -> Result<(), io::Error> {
+    writer.try_send(frame).map_err(|error| {
+        let message = match error {
+            mpsc::TrySendError::Full(_) => {
+                format!("stdout frame queue exceeded {MAX_STDOUT_FRAME_QUEUE} pending frames")
+            }
+            mpsc::TrySendError::Disconnected(_) => String::from("stdout writer disconnected"),
+        };
+        io::Error::new(io::ErrorKind::BrokenPipe, message)
+    })
 }
 
 fn default_compile_cache_root() -> PathBuf {
@@ -306,7 +567,8 @@ fn default_compile_cache_root() -> PathBuf {
 mod tests {
     use super::*;
     use agent_os_sidecar::protocol::{
-        AuthenticateRequest, OwnershipScope, RequestFrame, RequestPayload, DEFAULT_MAX_FRAME_BYTES,
+        AuthenticateRequest, CloseAgentSessionRequest, OwnershipScope, RequestFrame,
+        RequestPayload, SessionRequest, DEFAULT_MAX_FRAME_BYTES,
     };
     use std::io::Cursor;
 
@@ -324,6 +586,63 @@ mod tests {
             *error,
             ProtocolCodecError::FrameTooLarge { size: 32, max: 16 }
         ));
+    }
+
+    #[test]
+    fn stdio_work_queues_are_bounded() {
+        let (stdin_tx, _stdin_rx) =
+            channel::<Result<Option<ProtocolFrame>, String>>(MAX_STDIN_FRAME_QUEUE);
+        for _ in 0..MAX_STDIN_FRAME_QUEUE {
+            enqueue_stdin_frame(&stdin_tx, Ok(None))
+                .expect("stdin frame queue should accept capacity");
+        }
+        assert!(matches!(
+            enqueue_stdin_frame(&stdin_tx, Ok(None)),
+            Err(StdinFrameQueueError::Full(_))
+        ));
+
+        let (event_ready_tx, _event_ready_rx) = channel::<()>(MAX_EVENT_READY_QUEUE);
+        event_ready_tx
+            .try_send(())
+            .expect("event-ready queue should accept capacity");
+        assert!(matches!(
+            event_ready_tx.try_send(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
+
+        let (stdout_tx, _stdout_rx) = mpsc::sync_channel(MAX_STDOUT_FRAME_QUEUE);
+        for request_id in 0..MAX_STDOUT_FRAME_QUEUE {
+            send_output_frame(
+                &stdout_tx,
+                ProtocolFrame::Request(RequestFrame::new(
+                    request_id as RequestId,
+                    OwnershipScope::connection("conn-queue"),
+                    RequestPayload::Authenticate(AuthenticateRequest {
+                        client_name: String::from("queue-test"),
+                        auth_token: String::from("token"),
+                        bridge_version: agent_os_bridge::bridge_contract().version,
+                    }),
+                )),
+            )
+            .expect("stdout frame queue should accept capacity");
+        }
+        let error = send_output_frame(
+            &stdout_tx,
+            ProtocolFrame::Request(RequestFrame::new(
+                MAX_STDOUT_FRAME_QUEUE as RequestId,
+                OwnershipScope::connection("conn-queue"),
+                RequestPayload::Authenticate(AuthenticateRequest {
+                    client_name: String::from("queue-test"),
+                    auth_token: String::from("token"),
+                    bridge_version: agent_os_bridge::bridge_contract().version,
+                }),
+            )),
+        )
+        .expect_err("stdout frame queue should reject overflow");
+        assert!(
+            error.to_string().contains("stdout frame queue exceeded"),
+            "unexpected stdout queue error: {error}"
+        );
     }
 
     #[test]
@@ -354,6 +673,72 @@ mod tests {
             *transport_codec.lock().expect("codec lock"),
             Some(NativePayloadCodec::Bare)
         );
+    }
+
+    #[test]
+    fn close_agent_session_interrupts_matching_prompt() {
+        let ownership = OwnershipScope::vm("conn-1", "session-1", "vm-1");
+        let prompt = RequestFrame::new(
+            10,
+            ownership.clone(),
+            RequestPayload::SessionRequest(SessionRequest {
+                session_id: "agent-session-1".to_string(),
+                method: "session/prompt".to_string(),
+                params: None,
+            }),
+        );
+        let close = ProtocolFrame::Request(RequestFrame::new(
+            11,
+            ownership,
+            RequestPayload::CloseAgentSession(CloseAgentSessionRequest {
+                session_id: "agent-session-1".to_string(),
+            }),
+        ));
+
+        assert!(interrupts_session_prompt(&prompt, &close));
+
+        let dispatch = interrupted_prompt_dispatch(&prompt);
+        assert_eq!(dispatch.response.request_id, 10);
+        let ResponsePayload::SessionRpc(response) = dispatch.response.payload else {
+            panic!("expected session rpc response");
+        };
+        assert_eq!(response.session_id, "agent-session-1");
+        assert_eq!(response.response["result"]["stopReason"], "cancelled");
+    }
+
+    #[test]
+    fn session_cancel_interrupt_gets_synthetic_response() {
+        let ownership = OwnershipScope::vm("conn-1", "session-1", "vm-1");
+        let prompt = RequestFrame::new(
+            10,
+            ownership.clone(),
+            RequestPayload::SessionRequest(SessionRequest {
+                session_id: "agent-session-1".to_string(),
+                method: "session/prompt".to_string(),
+                params: None,
+            }),
+        );
+        let cancel = ProtocolFrame::Request(RequestFrame::new(
+            11,
+            ownership,
+            RequestPayload::SessionRequest(SessionRequest {
+                session_id: "agent-session-1".to_string(),
+                method: "session/cancel".to_string(),
+                params: None,
+            }),
+        ));
+
+        let response =
+            interrupted_cancel_response(&prompt, &cancel).expect("cancel should get a response");
+
+        assert_eq!(response.request_id, 11);
+        let ResponsePayload::SessionRpc(response) = response.payload else {
+            panic!("expected session rpc response");
+        };
+        assert_eq!(response.session_id, "agent-session-1");
+        assert_eq!(response.response["result"]["cancelled"], true);
+        assert_eq!(response.response["result"]["requested"], true);
+        assert_eq!(response.response["result"]["via"], "prompt-interrupt");
     }
 }
 
@@ -668,12 +1053,12 @@ impl SessionScope {
 }
 
 struct FrameSidecarRequestTransport {
-    writer: mpsc::Sender<ProtocolFrame>,
+    writer: mpsc::SyncSender<ProtocolFrame>,
     pending: Arc<Mutex<BTreeMap<RequestId, mpsc::SyncSender<SidecarResponseFrame>>>>,
 }
 
 impl FrameSidecarRequestTransport {
-    fn new(writer: mpsc::Sender<ProtocolFrame>) -> Self {
+    fn new(writer: mpsc::SyncSender<ProtocolFrame>) -> Self {
         Self {
             writer,
             pending: Arc::new(Mutex::new(BTreeMap::new())),
@@ -709,10 +1094,7 @@ impl SidecarRequestTransport for FrameSidecarRequestTransport {
                 SidecarError::Bridge(String::from("sidecar callback waiter map lock poisoned"))
             })?
             .insert(request.request_id, sender);
-        if let Err(error) = self
-            .writer
-            .send(ProtocolFrame::SidecarRequest(request.clone()))
-        {
+        if let Err(error) = send_output_frame(&self.writer, ProtocolFrame::SidecarRequest(request.clone())) {
             let _ = self
                 .pending
                 .lock()

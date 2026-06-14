@@ -36,7 +36,9 @@ fn wait_for_process_output(
             continue;
         };
         if let EventPayload::ProcessOutput(output) = event.payload {
-            if output.process_id == process_id && output.chunk.contains(expected) {
+            if output.process_id == process_id
+                && String::from_utf8_lossy(&output.chunk).contains(expected)
+            {
                 return;
             }
         }
@@ -212,8 +214,9 @@ fn embedded_runtime_signal_routes_sigterm_and_process_kill() {
 
         match event.payload {
             EventPayload::ProcessOutput(output) if output.process_id == "signal-routing" => {
-                saw_first_sigterm |= output.chunk.contains("sigterm:1");
-                saw_second_sigterm |= output.chunk.contains("sigterm:2");
+                let chunk = String::from_utf8_lossy(&output.chunk);
+                saw_first_sigterm |= chunk.contains("sigterm:1");
+                saw_second_sigterm |= chunk.contains("sigterm:2");
             }
             EventPayload::ProcessExited(exited) if exited.process_id == "signal-routing" => {
                 exit_code = Some(exited.exit_code);
@@ -341,6 +344,367 @@ fn embedded_runtime_signal_stop_continue_updates_kernel_state_and_guest_handler(
             }),
         ))
         .expect("terminate stopped/continued process");
+}
+
+fn embedded_runtime_kill_process_rejects_invalid_signal_without_killing_process() {
+    assert_node_available();
+
+    let mut sidecar = new_sidecar("embedded-runtime-invalid-signal");
+    let cwd = temp_dir("embedded-runtime-invalid-signal-cwd");
+    let entry = cwd.join("invalid-signal.mjs");
+
+    write_fixture(
+        &entry,
+        [
+            "console.log('invalid-signal-ready');",
+            "setInterval(() => {}, 25);",
+        ]
+        .join("\n"),
+    );
+
+    let connection_id = authenticate(&mut sidecar, "conn-embedded-runtime-invalid-signal");
+    let session_id = open_session(&mut sidecar, 2, &connection_id);
+    let (vm_id, _) = create_vm_with_metadata(
+        &mut sidecar,
+        3,
+        &connection_id,
+        &session_id,
+        GuestRuntimeKind::JavaScript,
+        &cwd,
+        BTreeMap::new(),
+    );
+
+    execute(
+        &mut sidecar,
+        4,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "invalid-signal",
+        GuestRuntimeKind::JavaScript,
+        &entry,
+        Vec::new(),
+    );
+
+    wait_for_process_output(
+        &mut sidecar,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "invalid-signal",
+        "invalid-signal-ready",
+    );
+
+    let ownership = OwnershipScope::vm(&connection_id, &session_id, &vm_id);
+    let invalid_signal = sidecar
+        .dispatch_blocking(request(
+            5,
+            ownership.clone(),
+            RequestPayload::KillProcess(KillProcessRequest {
+                process_id: String::from("invalid-signal"),
+                signal: String::from("SIGBOGUS"),
+            }),
+        ))
+        .expect("dispatch invalid signal");
+    let ResponsePayload::Rejected(response) = invalid_signal.response.payload else {
+        panic!("unexpected invalid signal response");
+    };
+    assert_eq!(response.code, "invalid_state");
+    assert!(
+        response.message.contains("unsupported kill_process signal"),
+        "unexpected invalid signal rejection: {}",
+        response.message
+    );
+
+    wait_for_process_status(
+        &mut sidecar,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "invalid-signal",
+        ProcessSnapshotStatus::Running,
+    );
+
+    sidecar
+        .dispatch_blocking(request(
+            6,
+            ownership,
+            RequestPayload::KillProcess(KillProcessRequest {
+                process_id: String::from("invalid-signal"),
+                signal: String::from("SIGTERM"),
+            }),
+        ))
+        .expect("terminate invalid-signal process");
+}
+
+fn embedded_runtime_process_kill_signal_zero_checks_child_liveness() {
+    assert_node_available();
+
+    let mut sidecar = new_sidecar("embedded-runtime-process-kill-sig0");
+    let cwd = temp_dir("embedded-runtime-process-kill-sig0-cwd");
+    let entry = cwd.join("process-kill-sig0.mjs");
+
+    write_fixture(
+        &entry,
+        [
+            "const { spawn, spawnSync } = require('node:child_process');",
+            "const live = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 5000)'], { stdio: 'ignore' });",
+            "console.log(`live:${process.kill(live.pid, 0)}`);",
+            "live.kill('SIGTERM');",
+            "const stale = spawnSync(process.execPath, ['-e', ''], { encoding: 'utf8' });",
+            "if (typeof stale.pid !== 'number') {",
+            "  throw new Error('spawnSync result did not include child pid');",
+            "}",
+            "let staleResult = 'alive';",
+            "try {",
+            "  process.kill(stale.pid, 0);",
+            "} catch (error) {",
+            "  staleResult = error && typeof error.code === 'string' ? error.code : 'error';",
+            "}",
+            "console.log(`stale:${staleResult}`);",
+            "process.exit(staleResult === 'alive' ? 1 : 0);",
+        ]
+        .join("\n"),
+    );
+
+    let connection_id = authenticate(&mut sidecar, "conn-embedded-runtime-process-kill-sig0");
+    let session_id = open_session(&mut sidecar, 2, &connection_id);
+    let (vm_id, _) = create_vm_with_metadata(
+        &mut sidecar,
+        3,
+        &connection_id,
+        &session_id,
+        GuestRuntimeKind::JavaScript,
+        &cwd,
+        BTreeMap::new(),
+    );
+
+    execute(
+        &mut sidecar,
+        4,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "process-kill-sig0",
+        GuestRuntimeKind::JavaScript,
+        &entry,
+        Vec::new(),
+    );
+
+    let ownership = OwnershipScope::vm(&connection_id, &session_id, &vm_id);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_live = false;
+    let mut saw_stale_esrch = false;
+    let mut exit_code = None;
+
+    while exit_code.is_none() || !saw_live || !saw_stale_esrch {
+        let event = sidecar
+            .poll_event_blocking(&ownership, Duration::from_millis(100))
+            .expect("poll process.kill signal-zero events");
+        let Some(event) = event else {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for process.kill signal-zero output"
+            );
+            continue;
+        };
+
+        match event.payload {
+            EventPayload::ProcessOutput(output) if output.process_id == "process-kill-sig0" => {
+                let chunk = String::from_utf8_lossy(&output.chunk);
+                saw_live |= chunk.contains("live:true");
+                saw_stale_esrch |= chunk.contains("stale:ESRCH");
+            }
+            EventPayload::ProcessExited(exited) if exited.process_id == "process-kill-sig0" => {
+                exit_code = Some(exited.exit_code);
+            }
+            _ => {}
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for process.kill signal-zero completion"
+        );
+    }
+
+    assert!(saw_live, "live child should be visible to signal 0");
+    assert!(
+        saw_stale_esrch,
+        "stale child PID should throw ESRCH for signal 0"
+    );
+    assert_eq!(exit_code, Some(0));
+}
+
+fn embedded_runtime_process_group_kill_terminates_detached_tree() {
+    assert_node_available();
+
+    let mut sidecar = new_sidecar("embedded-runtime-process-group-kill");
+    let cwd = temp_dir("embedded-runtime-process-group-kill-cwd");
+    let parent_entry = cwd.join("group-parent.mjs");
+    let child_entry = cwd.join("group-child.mjs");
+
+    write_fixture(
+        &child_entry,
+        [
+            "import { spawn } from 'node:child_process';",
+            "const makeChild = () => spawn(",
+            "  process.execPath,",
+            "  ['-e', 'setTimeout(() => {}, 100000)'],",
+            "  { stdio: ['ignore', 'ignore', 'ignore'] },",
+            ");",
+            "const first = makeChild();",
+            "const second = makeChild();",
+            "console.log(`group-ready:${first.pid}:${second.pid}`);",
+            "setInterval(() => {}, 1000);",
+        ]
+        .join("\n"),
+    );
+    write_fixture(
+        &parent_entry,
+        [
+            "import { spawn } from 'node:child_process';",
+            "const child = spawn(process.execPath, ['./group-child.mjs'], {",
+            "  detached: true,",
+            "  stdio: ['ignore', 'pipe', 'pipe'],",
+            "});",
+            "let buffered = '';",
+            "const grandchildPids = await new Promise((resolve, reject) => {",
+            "  child.on('error', reject);",
+            "  child.stdout.on('data', (chunk) => {",
+            "    buffered += chunk.toString();",
+            "    const match = buffered.match(/group-ready:(\\d+):(\\d+)/);",
+            "    if (match) {",
+            "      resolve([Number(match[1]), Number(match[2])]);",
+            "    }",
+            "  });",
+            "});",
+            "const closePromise = new Promise((resolve) => {",
+            "  child.on('close', (code, signal) => resolve({ code, signal }));",
+            "});",
+            "const killResult = process.kill(-child.pid, 'SIGKILL');",
+            "console.log('kill-returned:' + killResult);",
+            "const closed = await closePromise;",
+            "console.log('group-close:' + closed.code + ':' + closed.signal);",
+            "const errorCode = (error) => {",
+            "  if (error && typeof error.code === 'string' && error.syscall === 'kill') {",
+            "    return error.code;",
+            "  }",
+            "  return 'missing-errno-error';",
+            "};",
+            "const probe = (pid) => {",
+            "  try {",
+            "    process.kill(pid, 0);",
+            "    return 'alive';",
+            "  } catch (error) {",
+            "    return errorCode(error);",
+            "  }",
+            "};",
+            "console.log('probe-child:' + probe(child.pid));",
+            "console.log('probe-grandchild-a:' + probe(grandchildPids[0]));",
+            "console.log('probe-grandchild-b:' + probe(grandchildPids[1]));",
+            "let missingGroup;",
+            "try {",
+            "  process.kill(-999999, 'SIGKILL');",
+            "  missingGroup = 'no-error';",
+            "} catch (error) {",
+            "  missingGroup = errorCode(error);",
+            "}",
+            "console.log('probe-missing-group:' + missingGroup);",
+        ]
+        .join("\n"),
+    );
+
+    let connection_id = authenticate(&mut sidecar, "conn-embedded-runtime-process-group-kill");
+    let session_id = open_session(&mut sidecar, 2, &connection_id);
+    let (vm_id, _) = create_vm_with_metadata(
+        &mut sidecar,
+        3,
+        &connection_id,
+        &session_id,
+        GuestRuntimeKind::JavaScript,
+        &cwd,
+        BTreeMap::new(),
+    );
+
+    execute(
+        &mut sidecar,
+        4,
+        &connection_id,
+        &session_id,
+        &vm_id,
+        "group-kill-parent",
+        GuestRuntimeKind::JavaScript,
+        &parent_entry,
+        Vec::new(),
+    );
+
+    let ownership = OwnershipScope::vm(&connection_id, &session_id, &vm_id);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut exit_code = None;
+
+    while exit_code.is_none() {
+        let event = sidecar
+            .poll_event_blocking(&ownership, Duration::from_millis(100))
+            .expect("poll process group kill events");
+        let Some(event) = event else {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for group kill completion\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            continue;
+        };
+
+        match event.payload {
+            EventPayload::ProcessOutput(output) if output.process_id == "group-kill-parent" => {
+                let chunk = String::from_utf8_lossy(&output.chunk);
+                match output.channel {
+                    agent_os_sidecar::protocol::StreamChannel::Stdout => stdout.push_str(&chunk),
+                    agent_os_sidecar::protocol::StreamChannel::Stderr => stderr.push_str(&chunk),
+                }
+            }
+            EventPayload::ProcessExited(exited) if exited.process_id == "group-kill-parent" => {
+                exit_code = Some(exited.exit_code);
+            }
+            _ => {}
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for group kill completion\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    assert_eq!(
+        exit_code,
+        Some(0),
+        "group kill parent should exit cleanly\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("kill-returned:true"),
+        "group kill should report success\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("group-close:"),
+        "detached child should emit close after group kill\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("probe-child:ESRCH"),
+        "killed group leader should probe as ESRCH\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("probe-grandchild-a:ESRCH"),
+        "first grandchild should be killed with the group\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("probe-grandchild-b:ESRCH"),
+        "second grandchild should be killed with the group\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("probe-missing-group:ESRCH"),
+        "missing process group should raise ESRCH\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 }
 
 fn embedded_runtime_signal_delivers_sigchld_on_child_exit() {
@@ -476,9 +840,10 @@ fn embedded_runtime_signal_delivers_sigchld_on_child_exit() {
         if let Some(event) = event {
             match event.payload {
                 EventPayload::ProcessOutput(output) if output.process_id == "sigchld-parent" => {
-                    saw_registered_output |= output.chunk.contains("sigchld-registered");
-                    saw_sigchld_output |= output.chunk.contains("sigchld:1");
-                    saw_final_output |= output.chunk.contains("sigchld-final:1");
+                    let chunk = String::from_utf8_lossy(&output.chunk);
+                    saw_registered_output |= chunk.contains("sigchld-registered");
+                    saw_sigchld_output |= chunk.contains("sigchld:1");
+                    saw_final_output |= chunk.contains("sigchld-final:1");
                 }
                 EventPayload::ProcessExited(exited) if exited.process_id == "sigchld-parent" => {
                     exit_code = Some(exited.exit_code);
@@ -507,5 +872,8 @@ fn embedded_runtime_signal_delivers_sigchld_on_child_exit() {
 fn embedded_runtime_signal_suite() {
     embedded_runtime_signal_routes_sigterm_and_process_kill();
     embedded_runtime_signal_stop_continue_updates_kernel_state_and_guest_handler();
+    embedded_runtime_kill_process_rejects_invalid_signal_without_killing_process();
+    embedded_runtime_process_kill_signal_zero_checks_child_liveness();
+    embedded_runtime_process_group_kill_terminates_detached_tree();
     embedded_runtime_signal_delivers_sigchld_on_child_exit();
 }

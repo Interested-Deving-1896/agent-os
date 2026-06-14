@@ -39,6 +39,7 @@ Agent OS is a **fully virtualized operating system**. The kernel, written as a R
 - **Base filesystem rebuild flow:** `pnpm --dir packages/core snapshot:alpine-defaults` writes `alpine-defaults.json`, then `pnpm --dir packages/core build:base-filesystem` rewrites AgentOs-specific values and emits `base-filesystem.json`.
 - **The default VM filesystem model should be Docker-like.** Layered overlay view with one writable upper layer on top of one or more immutable lower snapshot layers.
 - **Everything runs inside the VM.** Agent processes, servers, network requests -- all spawned inside the Agent OS kernel, never on the host. This is a hard rule with no exceptions.
+- **Present normal Linux semantics to tools.** Never bend agent SDKs, shell tools, or adapters around Agent OS quirks when the correct fix is implementing standard Linux/Node/POSIX behavior in the runtime. Agent-specific patches are acceptable only for explicit product policy, configuration, or upstream SDK bugs.
 
 ## Native Binary Distribution
 
@@ -145,11 +146,17 @@ When the user asks to track something in a note, store it in `~/.agents/notes/` 
 ## Error Handling
 
 - Always return anyhow errors from failable Rust functions. Do not glob-import from anyhow. Prefer `.context()` over the `anyhow!` macro.
+- A failing fallback path must rethrow the original error with the fallback's failure attached as context. Never let the fallback's error replace the original.
+
+## Runtime Limits
+
+- **Every new limit-shaped constant must be classified.** Any `MAX_*` / `*_LIMIT` / `*_CAPACITY` / retention / sizing constant added under the scanned roots must get an entry in `crates/sidecar/tests/fixtures/limits-inventory.json`: either `policy` (wired through `VmLimits` with a `wired` field naming its config field) or `invariant`/`policy-deferred` with a one-line rationale. The `cargo test -p agent-os-sidecar --test limits_audit` audit fails when a qualifying constant is unclassified.
 
 ## Fail-By-Default Runtime
 
 - Avoid silent no-ops for required runtime behavior. If a capability is required, validate it and throw an explicit error with actionable context instead of returning early.
 - Do not use optional chaining for required lifecycle and bridge operations. Optional chaining is acceptable only for best-effort diagnostics and cleanup paths (logging hooks, dispose/release cleanup).
+- Never land a public callback, stream, or event API without a wired delivery source. If the source is not wired yet, the doc comment must say so explicitly so callers do not wait on a stream that never yields.
 
 ## Async Rust Locks
 
@@ -167,6 +174,9 @@ When the user asks to track something in a note, store it in `~/.agents/notes/` 
 - Reserve `tokio::time::sleep` for per-call timeouts, retry/reconnect backoff, deliberate debounce windows, or `sleep_until(deadline)` arms in an event-select loop. A `loop { check; sleep }` body is polling and should be event-driven instead.
 - `scc` async methods do not hold locks across `.await` points. Use `entry_async` for atomic read-then-write.
 - Never add unexplained wall-clock defers like `sleep(1ms)` to decouple a spawn from its caller. Use `tokio::task::yield_now().await` or rely on the spawn itself.
+- Polling is forbidden in every language and layer, not just Rust. Never wait for a state change by re-checking in a loop in TypeScript, tests, or shell. Wait on an event: a Notify/watch channel, promise, callback, process exit, or stream EOF. If an external system genuinely offers no event signal, bound the poll with a deadline and justify it in a comment.
+- Never block while holding a lock. No bounded-channel sends, thread joins, or IO under any lock guard. Remove or copy the needed state under the lock, release it, then do the blocking work.
+- Code that registers a waiter or pending entry in a shared queue must remove it on every exit path: success, early drain, timeout, and error.
 
 ## Memory Leaks
 
@@ -175,6 +185,11 @@ When the user asks to track something in a note, store it in `~/.agents/notes/` 
 - Interned leaks must be bounded by unique schema/config identity and must not include unbounded user input such as raw error messages, request paths, or headers.
 - `std::mem::forget` is only acceptable when an FFI handle cannot be dropped in the current context; document the constraint inline, prove the leak is bounded, and prefer routing cleanup through an Env-bearing owner.
 - Spawned futures that capture JS callbacks or other heavy resources must have a guaranteed completion path (e.g. a `CancellationToken` whose clones are guaranteed to drop). A `spawn_local(async move { token.cancelled().await; ... })` only drains if every clone of the token is dropped or cancelled.
+
+## Untrusted Input
+
+- Write parser bounds checks in subtraction form after an explicit minimum-length guard (`len >= off && len - off >= n`), never `off + n > len`, which wraps on 32-bit targets.
+- Cap any allocation whose size derives from untrusted input before allocating.
 
 ## Testing
 
@@ -186,10 +201,15 @@ When the user asks to track something in a note, store it in `~/.agents/notes/` 
 
 - This repo uses jj (Jujutsu) on top of git. **jj's workflow is inverted from git:** the working copy is itself a revision that auto-tracks edits, so you create a new revision *before* making changes (with `jj new`) rather than committing *after* (`git commit`). The description is set separately via `jj describe`. There is no staging step.
 - Before making changes, check whether jj is initialized by running `jj status`. If it fails (e.g. "There is no jj repo in '.'"), run `jj git init --colocate` from the repo root so jj lives alongside the existing `.git` directory. Do NOT run `jj git init` without `--colocate` — that creates a standalone jj repo and breaks the git workflow.
-- **MUST run `jj new` before making any file edits for a new task.** This is the first step of any task that touches files. Run it before reading, before planning, before editing. The only exception is when you are directly fixing or finishing the change at `@` that you just made in this same session. In that case use `jj squash --into <rev>` or `jj edit <rev>`. If you already started editing without running `jj new`, stop and split the changes with `JJ_EDITOR=true jj split <paths>` before continuing. Each revision must be one self-contained change reviewable on its own. Never mix unrelated work into one revision.
+- **One revision = one self-contained change. MUST run `jj new` before starting each change**, before reading, planning, or editing. The unit is the *change*, not the *task*, *request*, or *session*. A single user request routinely contains several unrelated changes (a fix here, a refactor there, a test update); each one is its own revision, so run `jj new` again the moment you move on to the next change. Do not let edits pile up in one revision just because they came from one prompt or one work session.
+- **Heuristic for "is this one revision or several?"** If a single `jj describe` line cannot honestly describe the whole diff without the word "and", or the diff spans unrelated subsystems/concerns (e.g. a test fix plus a build change plus an adapter tweak), it is more than one revision. Err toward more, smaller revisions. A revision touching a dozen files across many subsystems under a vague message like "triage failed tests" is the anti-pattern, not the goal.
+- Run it before reading, before planning, before editing. The only exception is when you are directly fixing or finishing the change at `@` that you just made in this same session. In that case use `jj squash --into <rev>` or `jj edit <rev>`. If you already started editing and find the working copy now mixes unrelated changes, stop immediately and split them apart with `JJ_EDITOR=true jj split <paths>` before continuing. Never mix unrelated work into one revision.
 - Set the revision description with `jj describe -m "[SLOP({full-model-id}-{reasoning})] {conventional commit message}"`. Use conventional commits (`feat`, `fix`, `chore`, `docs`, `refactor`, etc.) with a single-line message. `{full-model-id}` is the canonical model ID (e.g. `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5`). `{reasoning}` is the reasoning effort (`high`, `medium`, `low`, `off`) — include it only if the runtime exposes it; otherwise omit the `-{reasoning}` suffix entirely.
 - Examples: `[SLOP(claude-opus-4-7-high)] feat(metrics): record depot sqlite phase timings` or, when reasoning is not known, `[SLOP(claude-opus-4-7)] fix(pegboard): handle empty ack batch`.
 - **Never add a co-author trailer** (no `Co-Authored-By: ...` line). Descriptions are single-line only.
+- **A revision description must describe its actual diff.** Check the message against `jj diff -r <rev> --stat` before running `jj describe`.
+- Abandon stray empty undescribed revisions before ending a session. Do not leave `jj new` artifacts in the branch.
+- Never commit fetched or vendored source trees. Add the ignore entry before fetching.
 - **Never push to `main` unless explicitly specified by the user.**
 - **Safety:** Never run destructive jj or git commands (`jj git push`, `jj abandon`, `jj squash` into a non-current revision, `jj op restore`, `jj op undo` past your own work, `jj rebase -d main`, `git push --force`, `git reset --hard`) unless the user explicitly requests it.
 
@@ -207,3 +227,4 @@ pnpm lint         # biome check
 - CI and release automation must install the pnpm workspace with `--frozen-lockfile` before Cargo builds that generate V8 bridge assets into `OUT_DIR`. Fork pull requests should run the same `pnpm test` command without `AGENTOS_E2E_NETWORK=1`.
 - When changing V8 bridge registration or snapshot bootstrap code under `crates/v8-runtime/`, rebuild `agent-os-v8-runtime` before rerunning sidecar V8 integration tests. `cargo test -p agent-os-sidecar` can otherwise reuse stale embedded-runtime objects from `target/`.
 - The `crates/v8-runtime` snapshot test (`snapshot::tests::snapshot_consolidated_tests`) currently has to run in isolation: use `cargo test -p agent-os-v8-runtime -- --test-threads=1` for the main suite and `cargo test -p agent-os-v8-runtime snapshot::tests::snapshot_consolidated_tests -- --exact --ignored` separately until the shared test binary teardown SIGSEGV is fixed.
+- Biome honors `.gitignore` (`vcs.useIgnoreFile`), and the core-dump patterns (`**/core`) match `packages/core`, so `pnpm lint` silently skips that entire package. Do not treat a green lint as proof those files were checked. Fixing the pattern requires first cleaning up the package's accumulated lint debt (tracked in `~/.agents/todo/`).

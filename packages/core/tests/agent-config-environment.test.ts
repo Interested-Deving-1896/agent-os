@@ -1,6 +1,5 @@
 import { resolve } from "node:path";
 import claude from "@rivet-dev/agent-os-claude";
-import codex from "@rivet-dev/agent-os-codex-agent";
 import opencode from "@rivet-dev/agent-os-opencode";
 import pi from "@rivet-dev/agent-os-pi";
 import piCli from "@rivet-dev/agent-os-pi-cli";
@@ -159,12 +158,11 @@ describe("agent launch args and env", () => {
 		) as string[];
 
 		expect(agentInfo.argv ?? []).not.toContain("--append-system-prompt");
-		expect(contextPaths).toContain("/etc/agentos/instructions.md");
+		// The base prompt is injected through a sidecar-materialized file plus the default opencode
+		// repo-relative markers, not the old baked /etc/agentos path.
+		expect(contextPaths).toContain("/tmp/agentos-system-prompt.md");
+		expect(contextPaths).not.toContain("/etc/agentos/instructions.md");
+		expect(contextPaths).toContain("CLAUDE.md");
 	});
 
-	test("Codex injects developer instructions through launch args", async () => {
-		const agentInfo = await inspectLaunch("codex", [codex]);
-
-		expect(agentInfo.argv).toContain("--append-developer-instructions");
-	});
 });

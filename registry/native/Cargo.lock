@@ -708,6 +708,7 @@ name = "cmd-cat"
 version = "0.1.0"
 dependencies = [
  "uu_cat",
+ "uucore 0.7.0",
 ]
 
 [[package]]
@@ -742,10 +743,6 @@ dependencies = [
  "codex-network-proxy",
  "codex-otel",
  "secureexec-wasi-http",
- "secureexec-wasi-spawn",
- "serde",
- "serde_json",
- "wasi-ext",
 ]
 
 [[package]]
@@ -3895,6 +3892,7 @@ dependencies = [
 name = "secureexec-wasi-spawn"
 version = "0.1.0"
 dependencies = [
+ "wasi",
  "wasi-ext",
 ]
 

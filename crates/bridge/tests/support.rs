@@ -11,7 +11,7 @@ use agent_os_bridge::{
     StructuredEventRecord, SymlinkRequest, TruncateRequest, WriteExecutionStdinRequest,
     WriteFileRequest,
 };
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,9 +20,21 @@ pub struct StubError {
 }
 
 impl StubError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
     fn missing(kind: &'static str, key: &str) -> Self {
         Self {
             message: format!("missing {kind}: {key}"),
+        }
+    }
+
+    fn invalid(kind: &'static str, key: &str) -> Self {
+        Self {
+            message: format!("invalid {kind}: {key}"),
         }
     }
 }
@@ -37,6 +49,9 @@ pub struct RecordingBridge {
     symlinks: BTreeMap<String, String>,
     snapshots: BTreeMap<String, FilesystemSnapshot>,
     execution_events: VecDeque<ExecutionEvent>,
+    permission_responses: VecDeque<Result<PermissionDecision, StubError>>,
+    worker_create_errors: VecDeque<StubError>,
+    execution_start_errors: VecDeque<StubError>,
     pub filesystem_permission_requests: Vec<FilesystemPermissionRequest>,
     pub permission_checks: Vec<String>,
     pub log_events: Vec<LogRecord>,
@@ -47,6 +62,8 @@ pub struct RecordingBridge {
     pub stdin_writes: Vec<WriteExecutionStdinRequest>,
     pub closed_executions: Vec<ExecutionHandleRequest>,
     pub killed_executions: Vec<KillExecutionRequest>,
+    #[allow(dead_code)]
+    pub terminated_workers: Vec<(String, String, String)>,
 }
 
 impl Default for RecordingBridge {
@@ -63,6 +80,9 @@ impl Default for RecordingBridge {
             symlinks: BTreeMap::new(),
             snapshots: BTreeMap::new(),
             execution_events: VecDeque::new(),
+            permission_responses: VecDeque::new(),
+            worker_create_errors: VecDeque::new(),
+            execution_start_errors: VecDeque::new(),
             filesystem_permission_requests: Vec::new(),
             permission_checks: Vec::new(),
             log_events: Vec::new(),
@@ -73,6 +93,7 @@ impl Default for RecordingBridge {
             stdin_writes: Vec::new(),
             closed_executions: Vec::new(),
             killed_executions: Vec::new(),
+            terminated_workers: Vec::new(),
         }
     }
 }
@@ -95,12 +116,46 @@ impl RecordingBridge {
         self.execution_events.push_back(event);
     }
 
+    pub fn push_permission_decision(&mut self, decision: PermissionDecision) {
+        self.permission_responses.push_back(Ok(decision));
+    }
+
+    pub fn push_permission_error(&mut self, message: impl Into<String>) {
+        self.permission_responses
+            .push_back(Err(StubError::new(message)));
+    }
+
+    pub fn push_worker_create_error(&mut self, message: impl Into<String>) {
+        self.worker_create_errors.push_back(StubError::new(message));
+    }
+
+    pub fn push_execution_start_error(&mut self, message: impl Into<String>) {
+        self.execution_start_errors
+            .push_back(StubError::new(message));
+    }
+
+    pub fn next_worker_create_error(&mut self) -> Option<StubError> {
+        self.worker_create_errors.pop_front()
+    }
+
+    fn next_permission_response(&mut self) -> Result<PermissionDecision, StubError> {
+        self.permission_responses
+            .pop_front()
+            .unwrap_or_else(|| Ok(PermissionDecision::allow()))
+    }
+
     fn metadata_for_path(&self, path: &str, follow_links: bool) -> Result<FileMetadata, StubError> {
+        let mut current_path = path.to_owned();
+        let mut seen_links = BTreeSet::new();
+
         if follow_links {
-            if let Some(target) = self.symlinks.get(path) {
-                return self.metadata_for_path(target, true);
+            while let Some(target) = self.symlinks.get(&current_path) {
+                if !seen_links.insert(current_path.clone()) {
+                    return Err(StubError::invalid("symlink cycle", &current_path));
+                }
+                current_path = target.clone();
             }
-        } else if self.symlinks.contains_key(path) {
+        } else if self.symlinks.contains_key(&current_path) {
             return Ok(FileMetadata {
                 mode: 0o777,
                 size: 0,
@@ -108,7 +163,7 @@ impl RecordingBridge {
             });
         }
 
-        if let Some(bytes) = self.files.get(path) {
+        if let Some(bytes) = self.files.get(&current_path) {
             return Ok(FileMetadata {
                 mode: 0o644,
                 size: bytes.len() as u64,
@@ -116,7 +171,7 @@ impl RecordingBridge {
             });
         }
 
-        if let Some(entries) = self.directories.get(path) {
+        if let Some(entries) = self.directories.get(&current_path) {
             return Ok(FileMetadata {
                 mode: 0o755,
                 size: entries.len() as u64,
@@ -124,7 +179,7 @@ impl RecordingBridge {
             });
         }
 
-        Err(StubError::missing("path", path))
+        Err(StubError::missing("path", &current_path))
     }
 }
 
@@ -235,7 +290,7 @@ impl PermissionBridge for RecordingBridge {
         self.filesystem_permission_requests.push(request.clone());
         self.permission_checks
             .push(format!("fs:{}:{}", request.vm_id, request.path));
-        Ok(PermissionDecision::allow())
+        self.next_permission_response()
     }
 
     fn check_network_access(
@@ -244,7 +299,7 @@ impl PermissionBridge for RecordingBridge {
     ) -> Result<PermissionDecision, Self::Error> {
         self.permission_checks
             .push(format!("net:{}:{}", request.vm_id, request.resource));
-        Ok(PermissionDecision::allow())
+        self.next_permission_response()
     }
 
     fn check_command_execution(
@@ -253,7 +308,7 @@ impl PermissionBridge for RecordingBridge {
     ) -> Result<PermissionDecision, Self::Error> {
         self.permission_checks
             .push(format!("cmd:{}:{}", request.vm_id, request.command));
-        Ok(PermissionDecision::allow())
+        self.next_permission_response()
     }
 
     fn check_environment_access(
@@ -262,7 +317,7 @@ impl PermissionBridge for RecordingBridge {
     ) -> Result<PermissionDecision, Self::Error> {
         self.permission_checks
             .push(format!("env:{}:{}", request.vm_id, request.key));
-        Ok(PermissionDecision::allow())
+        self.next_permission_response()
     }
 }
 
@@ -365,6 +420,10 @@ impl ExecutionBridge for RecordingBridge {
         &mut self,
         _request: StartExecutionRequest,
     ) -> Result<StartedExecution, Self::Error> {
+        if let Some(error) = self.execution_start_errors.pop_front() {
+            return Err(error);
+        }
+
         let execution = StartedExecution {
             execution_id: format!("exec-{}", self.next_execution_id),
         };
@@ -393,4 +452,39 @@ impl ExecutionBridge for RecordingBridge {
     ) -> Result<Option<ExecutionEvent>, Self::Error> {
         Ok(self.execution_events.pop_front())
     }
+}
+
+#[test]
+fn recording_bridge_rejects_symlink_cycles_when_following_metadata() {
+    let mut bridge = RecordingBridge::default();
+    bridge
+        .symlink(SymlinkRequest {
+            vm_id: String::from("vm-1"),
+            target_path: String::from("/b"),
+            link_path: String::from("/a"),
+        })
+        .expect("create first symlink");
+    bridge
+        .symlink(SymlinkRequest {
+            vm_id: String::from("vm-1"),
+            target_path: String::from("/a"),
+            link_path: String::from("/b"),
+        })
+        .expect("create second symlink");
+
+    let error = bridge
+        .stat(PathRequest {
+            vm_id: String::from("vm-1"),
+            path: String::from("/a"),
+        })
+        .expect_err("cycle should be rejected");
+    assert!(error.message.contains("symlink cycle"));
+
+    let metadata = bridge
+        .lstat(PathRequest {
+            vm_id: String::from("vm-1"),
+            path: String::from("/a"),
+        })
+        .expect("lstat should not follow symlink");
+    assert_eq!(metadata.kind, FileKind::SymbolicLink);
 }

@@ -14,6 +14,7 @@ const BRIDGE_CONTRACT_VERSION = 1;
 
 const SIDECAR_GRACEFUL_EXIT_MS = 5_000;
 const SIDECAR_FORCE_EXIT_MS = 2_000;
+export const NATIVE_SIDECAR_FRAME_TIMEOUT_MS = 120_000;
 const DEFAULT_EVENT_BUFFER_CAPACITY = 4_096;
 const ANY_BUFFERED_EVENT_KEY = "*";
 
@@ -160,7 +161,8 @@ type GuestFilesystemOperation =
 	| "chmod"
 	| "chown"
 	| "utimes"
-	| "truncate";
+	| "truncate"
+	| "pread";
 
 export interface SidecarRegisteredToolExample {
 	description: string;
@@ -204,6 +206,8 @@ type RequestPayload =
 			mcp_servers: unknown[];
 			protocol_version?: number;
 			client_capabilities?: unknown;
+			additional_instructions?: string;
+			skip_os_instructions?: boolean;
 	  }
 	| {
 			type: "session_request";
@@ -293,6 +297,7 @@ type RequestPayload =
 			atime_ms?: number;
 			mtime_ms?: number;
 			len?: number;
+			offset?: number;
 	  }
 	| {
 			type: "execute";
@@ -1252,7 +1257,7 @@ export class NativeSidecarProcessClient {
 		);
 		return new NativeSidecarProcessClient(
 			child,
-			options.frameTimeoutMs ?? 60_000,
+			options.frameTimeoutMs ?? NATIVE_SIDECAR_FRAME_TIMEOUT_MS,
 			options.eventBufferCapacity ?? DEFAULT_EVENT_BUFFER_CAPACITY,
 			options.payloadCodec ?? "bare",
 		);
@@ -1363,6 +1368,8 @@ export class NativeSidecarProcessClient {
 			mcpServers?: unknown[];
 			protocolVersion?: number;
 			clientCapabilities?: unknown;
+			additionalInstructions?: string;
+			skipOsInstructions?: boolean;
 		},
 	): Promise<SidecarSessionCreated> {
 		const response = await this.sendRequest({
@@ -1383,6 +1390,10 @@ export class NativeSidecarProcessClient {
 				mcp_servers: options.mcpServers ?? [],
 				protocol_version: options.protocolVersion ?? 1,
 				client_capabilities: options.clientCapabilities ?? {},
+				...(options.additionalInstructions !== undefined
+					? { additional_instructions: options.additionalInstructions }
+					: {}),
+				skip_os_instructions: options.skipOsInstructions ?? false,
 			},
 		});
 		if (response.payload.type !== "session_created") {
@@ -1794,6 +1805,22 @@ export class NativeSidecarProcessClient {
 		const response = await this.guestFilesystemCall(session, vm, {
 			operation: "read_file",
 			path,
+		});
+		return decodeGuestFilesystemContent(response);
+	}
+
+	async pread(
+		session: AuthenticatedSession,
+		vm: CreatedVm,
+		path: string,
+		offset: number,
+		length: number,
+	): Promise<Uint8Array> {
+		const response = await this.guestFilesystemCall(session, vm, {
+			operation: "pread",
+			path,
+			offset,
+			len: length,
 		});
 		return decodeGuestFilesystemContent(response);
 	}
@@ -2918,6 +2945,7 @@ const BARE_GUEST_FILESYSTEM_OPERATION =
 		["chown", 17],
 		["utimes", 18],
 		["truncate", 19],
+		["pread", 20],
 	]);
 const BARE_PERMISSION_MODE = createBareEnumCodec<SidecarPermissionMode>([
 	["allow", 1],
@@ -3462,6 +3490,10 @@ function encodeRequestPayload(
 					"create_session.client_capabilities",
 				),
 			);
+			writer.writeOptional(payload.additional_instructions, (value) =>
+				writer.writeString(value),
+			);
+			writer.writeBool(payload.skip_os_instructions ?? false);
 			return;
 		case "session_request":
 			writer.writeVarUint(5);
@@ -3604,6 +3636,7 @@ function encodeRequestPayload(
 			writer.writeOptional(payload.atime_ms, (value) => writer.writeU64(value));
 			writer.writeOptional(payload.mtime_ms, (value) => writer.writeU64(value));
 			writer.writeOptional(payload.len, (value) => writer.writeU64(value));
+			writer.writeOptional(payload.offset, (value) => writer.writeU64(value));
 			return;
 		case "snapshot_root_filesystem":
 			writer.writeVarUint(18);

@@ -1,4 +1,3 @@
-import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { AgentOs, type Permissions } from "../src/index.js";
@@ -9,8 +8,15 @@ const BROWSER_BASE_PROJECT_ID = process.env.BROWSER_BASE_PROJECT_ID ?? "";
 const HAS_BROWSERBASE_CREDENTIALS = Boolean(
 	BROWSER_BASE_API_KEY && BROWSER_BASE_PROJECT_ID,
 );
+const REQUIRES_BROWSERBASE_CREDENTIALS = process.env.AGENTOS_E2E_NETWORK === "1";
 
-if (!HAS_BROWSERBASE_CREDENTIALS) {
+if (!HAS_BROWSERBASE_CREDENTIALS && REQUIRES_BROWSERBASE_CREDENTIALS) {
+	throw new Error(
+		"Browserbase e2e requires BROWSER_BASE_API_KEY and BROWSER_BASE_PROJECT_ID when AGENTOS_E2E_NETWORK=1.",
+	);
+}
+
+if (!HAS_BROWSERBASE_CREDENTIALS && !REQUIRES_BROWSERBASE_CREDENTIALS) {
 	console.warn(
 		"Skipping Browserbase e2e: source ~/misc/env.txt so BROWSER_BASE_API_KEY and BROWSER_BASE_PROJECT_ID are available.",
 	);
@@ -34,20 +40,9 @@ const BROWSERBASE_PERMISSIONS: Permissions = {
 const BROWSE_PATH = "/root/node_modules/@browserbasehq/browse-cli/dist/index.js";
 const CLI_PATH = "/root/node_modules/@browserbasehq/cli/dist/main.js";
 const JSON_OUTPUT_TIMEOUT_MS = 60_000;
-const SESSION_SCRIPT_PATH = "/tmp/browserbase-session.mjs";
-
-function testIf(
-	condition: boolean,
-	...args: Parameters<typeof test>
-): void {
-	if (condition) {
-		// @ts-expect-error forwarded test() arguments stay runtime-compatible.
-		test(...args);
-		return;
-	}
-	const [name] = args;
-	test(String(name), () => {});
-}
+const BROWSE_COMMAND_SCRIPT_PATH = "/tmp/browserbase-browse-command.mjs";
+const SCREENSHOT_PATH = "/tmp/browserbase-e2e.png";
+const EXAMPLE_URL_PATTERN = /^https:\/\/example\.com\/?$/;
 
 async function runVmNodeCommand(
 	vm: AgentOs,
@@ -172,72 +167,32 @@ console.log(
 );
 `;
 
-const SESSION_SCRIPT = String.raw`
-const mode = process.argv[2];
+const BROWSE_COMMAND_SCRIPT = String.raw`
+import { spawnSync } from "node:child_process";
 
-async function request(path, init) {
-  const response = await fetch("https://api.browserbase.com" + path, {
-    ...init,
-    headers: {
-      "x-bb-api-key": process.env.BROWSERBASE_API_KEY,
-      "content-type": "application/json",
-      ...(init?.headers ?? {}),
-    },
-    signal: AbortSignal.timeout(30_000),
-  });
+const BROWSE_PATH = "/root/node_modules/@browserbasehq/browse-cli/dist/index.js";
+const commandArgs = process.argv.slice(2);
 
-  if (!response.ok) {
-    throw new Error(
-      "Browserbase API " +
-        path +
-        " failed with " +
-        response.status +
-        ": " +
-        (await response.text()),
-    );
-  }
+const result = spawnSync(process.execPath, [
+  BROWSE_PATH,
+  "--json",
+  ...commandArgs,
+], {
+  encoding: "utf8",
+  env: process.env,
+  timeout: 60_000,
+});
 
-  return response.json();
+if (result.error) {
+  throw result.error;
 }
-
-if (mode === "create") {
-  const created = await request("/v1/sessions", {
-    method: "POST",
-    body: JSON.stringify({
-      projectId: process.env.BROWSERBASE_PROJECT_ID,
-      browserSettings: {
-        viewport: { width: 1288, height: 711 },
-      },
-      userMetadata: {
-        agent_os_browserbase_e2e: "true",
-      },
-    }),
-  });
-  console.log(
-    JSON.stringify({
-      connectUrl: created.connectUrl ?? null,
-      id: created.id ?? null,
-      status: created.status ?? null,
-    }),
-  );
-} else if (mode === "release") {
-  const sessionId = process.argv[3];
-  if (!sessionId) {
-    throw new Error("missing session id for release");
-  }
-  const released = await request("/v1/sessions/" + sessionId, {
-    method: "POST",
-    body: JSON.stringify({ status: "REQUEST_RELEASE" }),
-  });
-  console.log(
-    JSON.stringify({
-      id: released.id ?? sessionId,
-      status: released.status ?? "REQUEST_RELEASE",
-    }),
-  );
-} else {
-  throw new Error("unknown mode: " + String(mode));
+if (result.stdout) {
+  process.stdout.write(result.stdout);
 }
+if (result.stderr) {
+  process.stderr.write(result.stderr);
+}
+process.exit(result.status ?? 1);
 `;
 
 describe("Browserbase e2e", () => {
@@ -250,16 +205,21 @@ describe("Browserbase e2e", () => {
 		}
 	});
 
-	const browserbaseTest = (...args: Parameters<typeof test>) =>
-		testIf(HAS_BROWSERBASE_CREDENTIALS, ...args);
+	const browserbaseTest = HAS_BROWSERBASE_CREDENTIALS ? test : test.skip;
 
 	browserbaseTest(
 		"runs Browserbase browser automation inside the VM with restricted guest egress",
 		async () => {
-			const screenshotPath = `/tmp/browserbase-e2e-${Date.now()}.png`;
+			const browseSession = `browserbase-e2e-${Date.now()}`;
 			const browseEnv = {
 				BROWSERBASE_API_KEY: BROWSER_BASE_API_KEY,
 				BROWSERBASE_PROJECT_ID: BROWSER_BASE_PROJECT_ID,
+				BROWSE_SESSION: browseSession,
+				BROWSERBASE_CONFIG_DIR: "/tmp/browserbase-e2e-debug",
+				BROWSERBASE_FLOW_LOGS: "1",
+				BROWSERBASE_CDP_CONNECT_MAX_MS: "5000",
+				BROWSERBASE_SESSION_CREATE_MAX_MS: "10000",
+				STAGEHAND_FIRST_TOP_LEVEL_PAGE_TIMEOUT_MS: "2000",
 			};
 
 			vm = await AgentOs.create({
@@ -267,7 +227,7 @@ describe("Browserbase e2e", () => {
 				permissions: BROWSERBASE_PERMISSIONS,
 			});
 			await vm.writeFile("/tmp/browserbase-e2e.mjs", GUEST_SCRIPT);
-			await vm.writeFile(SESSION_SCRIPT_PATH, SESSION_SCRIPT);
+			await vm.writeFile(BROWSE_COMMAND_SCRIPT_PATH, BROWSE_COMMAND_SCRIPT);
 
 			let stdout = "";
 			let stderr = "";
@@ -306,73 +266,50 @@ describe("Browserbase e2e", () => {
 			expect(checks.cliProjected).toBe(true);
 			expect(checks.browseProjected).toBe(true);
 
-			const created = await runVmNodeJsonCommand<{
-				connectUrl?: string;
-				id?: string;
-				status?: string;
-			}>(
-				vm,
-				SESSION_SCRIPT_PATH,
-				["create"],
-				"Browserbase session create",
-				browseEnv,
-			);
-			expect(created.id).toBeTruthy();
-			expect(created.connectUrl).toMatch(/^wss?:\/\//);
-
 			try {
-				await runVmNodeCommand(
+				const opened = await runVmNodeJsonCommand<{
+					url?: string;
+				}>(
 					vm,
-					BROWSE_PATH,
-					[
-						"--ws",
-						created.connectUrl!,
-						"open",
-						"https://example.com",
-						"--json",
-					],
-					"browse open via direct websocket",
+					BROWSE_COMMAND_SCRIPT_PATH,
+					["open", "https://example.com"],
+					"browse open via direct websocket launcher",
 					browseEnv,
 				);
-				await runVmNodeCommand(
+				expect(opened.url).toMatch(EXAMPLE_URL_PATTERN);
+
+				const screenshot = await runVmNodeJsonCommand<{
+					saved?: string;
+				}>(
 					vm,
-					BROWSE_PATH,
-					[
-						"--ws",
-						created.connectUrl!,
-						"screenshot",
-						screenshotPath,
-						"--json",
-					],
-					"browse screenshot via direct websocket",
+					BROWSE_COMMAND_SCRIPT_PATH,
+					["screenshot", SCREENSHOT_PATH],
+					"browse screenshot path via direct websocket launcher",
 					browseEnv,
 				);
+
+				expect(screenshot.saved).toBe(SCREENSHOT_PATH);
+				const screenshotBytes = await vm.readFile(SCREENSHOT_PATH);
+				expect(screenshotBytes.byteLength).toBeGreaterThanOrEqual(1024);
+				expect(Array.from(screenshotBytes.slice(0, 8))).toEqual([
+					0x89,
+					0x50,
+					0x4e,
+					0x47,
+					0x0d,
+					0x0a,
+					0x1a,
+					0x0a,
+				]);
 			} finally {
-				if (created.id) {
-					await runVmNodeCommand(
-						vm,
-						SESSION_SCRIPT_PATH,
-						["release", created.id],
-						"Browserbase session release",
-						browseEnv,
-					).catch(() => {});
-				}
+				await runVmNodeCommand(
+					vm,
+					BROWSE_COMMAND_SCRIPT_PATH,
+					["stop"],
+					"browse stop launcher",
+					browseEnv,
+				).catch(() => {});
 			}
-
-			expect(existsSync(screenshotPath)).toBe(false);
-
-			const screenshotBytes = await vm.readFile(screenshotPath);
-			expect(screenshotBytes.byteLength).toBeGreaterThanOrEqual(1024);
-			expect(Array.from(screenshotBytes.slice(0, 8))).toEqual([
-				0x89,
-				0x50,
-				0x4e,
-				0x47,
-				0x0d,
-				0x0a,
-				0x1a,
-				0x0a,
-			]);
 		},
 		90_000,
 	);

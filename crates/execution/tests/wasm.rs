@@ -117,7 +117,7 @@ fn parse_warmup_metrics(stderr: &str) -> WasmWarmupMetrics {
     let metrics_line = stderr
         .lines()
         .filter_map(|line| line.strip_prefix(WASM_WARMUP_METRICS_PREFIX))
-        .last()
+        .next_back()
         .expect("warmup metrics line");
 
     WasmWarmupMetrics {
@@ -459,7 +459,7 @@ fn wasm_stdout_chunks_module(chunks: &[&str]) -> Vec<u8> {
         data_offset += chunk_len as u32;
     }
 
-    wat::parse_str(&format!(
+    wat::parse_str(format!(
         r#"
 (module
   (type $fd_write_t (func (param i32 i32 i32 i32) (result i32)))
@@ -593,7 +593,7 @@ fn wasm_write_nested_file_module() -> Vec<u8> {
 }
 
 fn wasm_expect_write_open_errno_module(expected_errno: u32) -> Vec<u8> {
-    wat::parse_str(&format!(
+    wat::parse_str(format!(
         r#"
 (module
   (type $path_open_t (func (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
@@ -850,7 +850,7 @@ fn wasm_execution_stays_inside_v8_runtime_without_host_node_launches() {
         Vec::new(),
         BTreeMap::from([(
             String::from(WASM_MAX_MEMORY_BYTES_ENV),
-            String::from((2 * 65_536).to_string()),
+            (2 * 65_536).to_string(),
         )]),
         WasmPermissionTier::Full,
     );
@@ -1484,13 +1484,13 @@ fn wasm_read_only_tier_blocks_workspace_writes_but_read_write_allows_them() {
     );
 }
 
-fn wasm_read_only_tier_returns_eacces_for_write_open() {
+fn wasm_read_only_tier_returns_rofs_for_write_open() {
     assert_node_available();
 
     let temp = tempdir().expect("create temp dir");
     write_fixture(
         &temp.path().join("guest.wasm"),
-        &wasm_expect_write_open_errno_module(2),
+        &wasm_expect_write_open_errno_module(69),
     );
 
     let mut engine = WasmExecutionEngine::default();
@@ -2295,7 +2295,7 @@ fn wasm_suite() {
     wasm_execution_preserves_stdout_when_signal_state_marker_shares_stdout_chunk();
     wasm_execution_reassembles_split_signal_state_marker_across_stdout_chunks();
     wasm_read_only_tier_blocks_workspace_writes_but_read_write_allows_them();
-    wasm_read_only_tier_returns_eacces_for_write_open();
+    wasm_read_only_tier_returns_rofs_for_write_open();
     wasm_execution_rejects_path_open_escape_outside_preopen();
     wasm_execution_allows_path_open_for_nested_paths_inside_preopen();
     wasm_full_tier_exposes_host_process_imports_but_read_write_does_not();

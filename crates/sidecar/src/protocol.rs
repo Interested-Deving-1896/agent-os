@@ -634,6 +634,7 @@ pub enum GuestFilesystemOperation {
     Chown,
     Utimes,
     Truncate,
+    Pread,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -814,6 +815,10 @@ pub struct CreateSessionRequest {
         with = "json_utf8_value"
     )]
     pub client_capabilities: Value,
+    #[serde(default)]
+    pub additional_instructions: Option<String>,
+    #[serde(default)]
+    pub skip_os_instructions: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1083,6 +1088,8 @@ pub struct GuestFilesystemCallRequest {
     pub mtime_ms: Option<u64>,
     #[serde(default)]
     pub len: Option<u64>,
+    #[serde(default)]
+    pub offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1682,6 +1689,7 @@ impl_bare_string_enum!(GuestFilesystemOperation {
     Chown => ("chown", 17),
     Utimes => ("utimes", 18),
     Truncate => ("truncate", 19),
+    Pread => ("pread", 20),
 });
 
 impl_bare_string_enum!(PermissionMode {
@@ -1847,6 +1855,7 @@ impl_bare_newtype_union_enum!(
 impl_bare_newtype_union_enum!(
     SidecarResponsePayload,
     JsonSidecarResponsePayload,
+    #[allow(clippy::enum_variant_names)]
     #[serde(tag = "type", rename_all = "snake_case")]
     {
         ToolInvocationResult(ToolInvocationResultResponse) = 1,
@@ -2479,7 +2488,7 @@ impl ResponseTracker {
             });
         }
 
-        let pending = self.pending.remove(&response.request_id).ok_or(
+        let pending = self.pending.get(&response.request_id).ok_or(
             ResponseTrackerError::UnmatchedResponse {
                 request_id: response.request_id,
             },
@@ -2488,8 +2497,8 @@ impl ResponseTracker {
         if pending.ownership != response.ownership {
             return Err(ResponseTrackerError::OwnershipMismatch {
                 request_id: response.request_id,
-                expected: pending.ownership,
-                actual: response.ownership.clone(),
+                expected: Box::new(pending.ownership.clone()),
+                actual: Box::new(response.ownership.clone()),
             });
         }
 
@@ -2501,6 +2510,9 @@ impl ResponseTracker {
             });
         }
 
+        self.pending
+            .remove(&response.request_id)
+            .expect("pending response should still exist after validation");
         self.completed.insert(response.request_id);
         self.completed_order.push_back(response.request_id);
         while self.completed.len() > self.completed_cap {
@@ -2526,6 +2538,10 @@ impl SidecarResponseTracker {
             completed_order: VecDeque::new(),
             completed_cap: completed_cap.max(1),
         }
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
     }
 
     pub fn completed_count(&self) -> usize {
@@ -2564,7 +2580,7 @@ impl SidecarResponseTracker {
             });
         }
 
-        let pending = self.pending.remove(&response.request_id).ok_or(
+        let pending = self.pending.get(&response.request_id).ok_or(
             SidecarResponseTrackerError::UnmatchedResponse {
                 request_id: response.request_id,
             },
@@ -2573,8 +2589,8 @@ impl SidecarResponseTracker {
         if pending.ownership != response.ownership {
             return Err(SidecarResponseTrackerError::OwnershipMismatch {
                 request_id: response.request_id,
-                expected: pending.ownership,
-                actual: response.ownership.clone(),
+                expected: Box::new(pending.ownership.clone()),
+                actual: Box::new(response.ownership.clone()),
             });
         }
 
@@ -2586,6 +2602,9 @@ impl SidecarResponseTracker {
             });
         }
 
+        self.pending
+            .remove(&response.request_id)
+            .expect("pending sidecar response should still exist after validation");
         self.completed.insert(response.request_id);
         self.completed_order.push_back(response.request_id);
         while self.completed.len() > self.completed_cap {
@@ -2697,8 +2716,8 @@ pub enum ResponseTrackerError {
     },
     OwnershipMismatch {
         request_id: RequestId,
-        expected: OwnershipScope,
-        actual: OwnershipScope,
+        expected: Box<OwnershipScope>,
+        actual: Box<OwnershipScope>,
     },
     ResponseKindMismatch {
         request_id: RequestId,
@@ -2758,8 +2777,8 @@ pub enum SidecarResponseTrackerError {
     },
     OwnershipMismatch {
         request_id: RequestId,
-        expected: OwnershipScope,
-        actual: OwnershipScope,
+        expected: Box<OwnershipScope>,
+        actual: Box<OwnershipScope>,
     },
     ResponseKindMismatch {
         request_id: RequestId,
@@ -2895,10 +2914,10 @@ enum ExpectedResponseKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExpectedSidecarResponseKind {
-    ToolInvocationResult,
-    PermissionRequestResult,
-    AcpRequestResult,
-    JsBridgeResult,
+    ToolInvocation,
+    PermissionRequest,
+    AcpRequest,
+    JsBridge,
 }
 
 impl ExpectedResponseKind {
@@ -2950,10 +2969,10 @@ impl ExpectedResponseKind {
 impl ExpectedSidecarResponseKind {
     fn as_str(self) -> &'static str {
         match self {
-            Self::ToolInvocationResult => "tool_invocation_result",
-            Self::PermissionRequestResult => "permission_request_result",
-            Self::AcpRequestResult => "acp_request_result",
-            Self::JsBridgeResult => "js_bridge_result",
+            Self::ToolInvocation => "tool_invocation_result",
+            Self::PermissionRequest => "permission_request_result",
+            Self::AcpRequest => "acp_request_result",
+            Self::JsBridge => "js_bridge_result",
         }
     }
 
@@ -3044,10 +3063,10 @@ impl SidecarRequestPayload {
 
     fn expected_response(&self) -> ExpectedSidecarResponseKind {
         match self {
-            Self::ToolInvocation(_) => ExpectedSidecarResponseKind::ToolInvocationResult,
-            Self::PermissionRequest(_) => ExpectedSidecarResponseKind::PermissionRequestResult,
-            Self::AcpRequest(_) => ExpectedSidecarResponseKind::AcpRequestResult,
-            Self::JsBridgeCall(_) => ExpectedSidecarResponseKind::JsBridgeResult,
+            Self::ToolInvocation(_) => ExpectedSidecarResponseKind::ToolInvocation,
+            Self::PermissionRequest(_) => ExpectedSidecarResponseKind::PermissionRequest,
+            Self::AcpRequest(_) => ExpectedSidecarResponseKind::AcpRequest,
+            Self::JsBridgeCall(_) => ExpectedSidecarResponseKind::JsBridge,
         }
     }
 }
@@ -3333,6 +3352,10 @@ pub struct JavascriptChildProcessSpawnOptions {
     pub detached: bool,
     #[serde(default)]
     pub stdio: Vec<String>,
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    #[serde(rename = "killSignal", default)]
+    pub kill_signal: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3352,6 +3375,20 @@ pub struct JavascriptNetConnectRequest {
     pub port: Option<u16>,
     #[serde(default)]
     pub path: Option<String>,
+    #[serde(rename = "localAddress", default)]
+    pub local_address: Option<String>,
+    #[serde(rename = "localPort", default)]
+    pub local_port: Option<u16>,
+    #[serde(rename = "localReservation", default)]
+    pub local_reservation: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JavascriptNetReserveTcpPortRequest {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3364,6 +3401,8 @@ pub struct JavascriptNetListenRequest {
     pub path: Option<String>,
     #[serde(default)]
     pub backlog: Option<u32>,
+    #[serde(rename = "localReservation", default)]
+    pub local_reservation: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

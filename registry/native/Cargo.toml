@@ -143,6 +143,9 @@ members = [
     # git: minimal git implementation
     "crates/libs/git",
     "crates/commands/git",
+    "stubs/codex-otel",
+    "stubs/ctrlc",
+    "stubs/hostname",
 ]
 
 [workspace.package]

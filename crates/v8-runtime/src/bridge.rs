@@ -3,11 +3,12 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::mem::{self, MaybeUninit};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use openssl::version as openssl_version;
+use serde::de;
 use v8::MapFnTo;
 use v8::ValueDeserializerHelper;
 use v8::ValueSerializerHelper;
@@ -20,6 +21,10 @@ use crate::host_call::BridgeCallContext;
 // produce real V8 serialization format (e.g. Bun).
 static USE_CBOR_CODEC: AtomicBool = AtomicBool::new(false);
 static EMBEDDED_CBOR_USERS: AtomicUsize = AtomicUsize::new(0);
+const MAX_CBOR_BRIDGE_DEPTH: usize = 64;
+const MAX_CBOR_BRIDGE_CONTAINER_ITEMS: usize = 100_000;
+const MAX_VM_CONTEXTS: usize = 1024;
+const MAX_PENDING_PROMISES: usize = 1024;
 
 /// Initialize the codec from the SECURE_EXEC_V8_CODEC environment variable.
 /// Call once at process startup before any sessions are created.
@@ -167,81 +172,383 @@ pub fn deserialize_v8_wire_value<'s>(
 // ── CBOR codec ──
 
 /// Convert a V8 value to a ciborium::Value for CBOR serialization.
-fn v8_to_cbor(scope: &mut v8::HandleScope, value: v8::Local<v8::Value>) -> ciborium::Value {
+fn v8_to_cbor(
+    scope: &mut v8::HandleScope,
+    value: v8::Local<v8::Value>,
+) -> Result<ciborium::Value, String> {
+    let mut object_stack = Vec::new();
+    v8_to_cbor_inner(scope, value, 0, &mut object_stack)
+}
+
+fn v8_to_cbor_inner(
+    scope: &mut v8::HandleScope,
+    value: v8::Local<v8::Value>,
+    depth: usize,
+    object_stack: &mut Vec<v8::Global<v8::Object>>,
+) -> Result<ciborium::Value, String> {
+    if depth > MAX_CBOR_BRIDGE_DEPTH {
+        return Err(format!(
+            "CBOR encode depth exceeds limit of {MAX_CBOR_BRIDGE_DEPTH}"
+        ));
+    }
+
     if value.is_null_or_undefined() {
-        return ciborium::Value::Null;
+        return Ok(ciborium::Value::Null);
     }
     if value.is_boolean() {
-        return ciborium::Value::Bool(value.boolean_value(scope));
+        return Ok(ciborium::Value::Bool(value.boolean_value(scope)));
     }
     if value.is_int32() {
-        return ciborium::Value::Integer(value.int32_value(scope).unwrap_or(0).into());
+        return Ok(ciborium::Value::Integer(
+            value.int32_value(scope).unwrap_or(0).into(),
+        ));
     }
     if value.is_number() {
-        return ciborium::Value::Float(value.number_value(scope).unwrap_or(0.0));
+        return Ok(ciborium::Value::Float(
+            value.number_value(scope).unwrap_or(0.0),
+        ));
     }
     if value.is_string() {
         let s = value.to_rust_string_lossy(scope);
-        return ciborium::Value::Text(s);
+        return Ok(ciborium::Value::Text(s));
     }
     if value.is_array_buffer_view() {
         let view = v8::Local::<v8::ArrayBufferView>::try_from(value).unwrap();
         let len = view.byte_length();
         let mut buf = vec![0u8; len];
         view.copy_contents(&mut buf);
-        return ciborium::Value::Bytes(buf);
+        return Ok(ciborium::Value::Bytes(buf));
     }
     if value.is_array() {
+        let obj = value
+            .to_object(scope)
+            .ok_or_else(|| "CBOR encode failed to convert array to object".to_string())?;
+        enter_cbor_object(scope, object_stack, obj)?;
         let arr = v8::Local::<v8::Array>::try_from(value).unwrap();
         let len = arr.length();
-        let mut items = Vec::with_capacity(len as usize);
-        for i in 0..len {
-            if let Some(elem) = arr.get_index(scope, i) {
-                items.push(v8_to_cbor(scope, elem));
-            } else {
-                items.push(ciborium::Value::Null);
+        let item_count = cbor_container_item_count("array", len as usize)?;
+        let mut items = Vec::with_capacity(item_count);
+        let result = (|| {
+            for i in 0..len {
+                if let Some(elem) = arr.get_index(scope, i) {
+                    items.push(v8_to_cbor_inner(scope, elem, depth + 1, object_stack)?);
+                } else {
+                    items.push(ciborium::Value::Null);
+                }
             }
-        }
-        return ciborium::Value::Array(items);
+            Ok(ciborium::Value::Array(items))
+        })();
+        object_stack.pop();
+        return result;
     }
     if value.is_object() {
         let obj = value.to_object(scope).unwrap();
+        enter_cbor_object(scope, object_stack, obj)?;
         let names = obj
             .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
             .unwrap_or_else(|| v8::Array::new(scope, 0));
         let len = names.length();
-        let mut entries = Vec::with_capacity(len as usize);
-        for i in 0..len {
-            let key = names.get_index(scope, i).unwrap();
-            let key_str = key.to_rust_string_lossy(scope);
-            let val = obj
-                .get(scope, key)
-                .unwrap_or_else(|| v8::undefined(scope).into());
-            entries.push((ciborium::Value::Text(key_str), v8_to_cbor(scope, val)));
-        }
-        return ciborium::Value::Map(entries);
+        let item_count = cbor_container_item_count("object", len as usize)?;
+        let mut entries = Vec::with_capacity(item_count);
+        let result = (|| {
+            for i in 0..len {
+                let key = names.get_index(scope, i).unwrap();
+                let key_str = key.to_rust_string_lossy(scope);
+                let val = obj
+                    .get(scope, key)
+                    .unwrap_or_else(|| v8::undefined(scope).into());
+                entries.push((
+                    ciborium::Value::Text(key_str),
+                    v8_to_cbor_inner(scope, val, depth + 1, object_stack)?,
+                ));
+            }
+            Ok(ciborium::Value::Map(entries))
+        })();
+        object_stack.pop();
+        return result;
     }
-    ciborium::Value::Null
+    Ok(ciborium::Value::Null)
+}
+
+fn enter_cbor_object(
+    scope: &mut v8::HandleScope,
+    object_stack: &mut Vec<v8::Global<v8::Object>>,
+    object: v8::Local<v8::Object>,
+) -> Result<(), String> {
+    for previous in object_stack.iter() {
+        let previous = v8::Local::new(scope, previous);
+        if previous.strict_equals(object.into()) {
+            return Err("CBOR encode rejected circular object graph".to_string());
+        }
+    }
+    object_stack.push(v8::Global::new(scope, object));
+    Ok(())
+}
+
+fn cbor_container_item_count(kind: &str, item_count: usize) -> Result<usize, String> {
+    if item_count > MAX_CBOR_BRIDGE_CONTAINER_ITEMS {
+        return Err(format!(
+            "CBOR {kind} item count {item_count} exceeds limit of {MAX_CBOR_BRIDGE_CONTAINER_ITEMS}"
+        ));
+    }
+    Ok(item_count)
+}
+
+struct LimitedCborValue(ciborium::Value);
+
+impl<'de> de::Deserialize<'de> for LimitedCborValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(LimitedCborVisitor).map(Self)
+    }
+}
+
+struct LimitedCborSeed;
+
+impl<'de> de::DeserializeSeed<'de> for LimitedCborSeed {
+    type Value = ciborium::Value;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(LimitedCborVisitor)
+    }
+}
+
+struct LimitedCborVisitor;
+
+impl<'de> de::Visitor<'de> for LimitedCborVisitor {
+    type Value = ciborium::Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a bounded CBOR bridge value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(ciborium::Value::Bool(value))
+    }
+
+    fn visit_f32<E>(self, value: f32) -> Result<Self::Value, E> {
+        Ok(ciborium::Value::Float(value.into()))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+        Ok(ciborium::Value::Float(value))
+    }
+
+    fn visit_i8<E>(self, value: i8) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_i16<E>(self, value: i16) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_i32<E>(self, value: i32) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_i128<E>(self, value: i128) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_u8<E>(self, value: u8) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_u16<E>(self, value: u16) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_u32<E>(self, value: u32) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_u128<E>(self, value: u128) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_char<E>(self, value: char) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(value.into())
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(value.into())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(value.into())
+    }
+
+    fn visit_borrowed_bytes<E>(self, value: &'de [u8]) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(value.into())
+    }
+
+    fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(ciborium::Value::Null)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(ciborium::Value::Null)
+    }
+
+    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        if let Some(item_count) = access.size_hint() {
+            limited_cbor_item_count("array", item_count)?;
+        }
+
+        let mut items = Vec::new();
+        while let Some(item) = access.next_element_seed(LimitedCborSeed)? {
+            limited_cbor_item_count("array", items.len() + 1)?;
+            items.push(item);
+        }
+        Ok(ciborium::Value::Array(items))
+    }
+
+    fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+    where
+        A: de::MapAccess<'de>,
+    {
+        if let Some(item_count) = access.size_hint() {
+            limited_cbor_item_count("map", item_count)?;
+        }
+
+        let mut entries = Vec::new();
+        while let Some(key) = access.next_key_seed(LimitedCborSeed)? {
+            limited_cbor_item_count("map", entries.len() + 1)?;
+            let value = access.next_value_seed(LimitedCborSeed)?;
+            entries.push((key, value));
+        }
+        Ok(ciborium::Value::Map(entries))
+    }
+
+    fn visit_enum<A>(self, access: A) -> Result<Self::Value, A::Error>
+    where
+        A: de::EnumAccess<'de>,
+    {
+        use serde::de::VariantAccess;
+
+        struct TaggedValueVisitor;
+
+        impl<'de> de::Visitor<'de> for TaggedValueVisitor {
+            type Value = ciborium::Value;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a tagged CBOR bridge value")
+            }
+
+            fn visit_seq<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let tag = access
+                    .next_element()?
+                    .ok_or_else(|| de::Error::custom("expected tag"))?;
+                let value = access
+                    .next_element_seed(LimitedCborSeed)?
+                    .ok_or_else(|| de::Error::custom("expected tagged value"))?;
+                Ok(ciborium::Value::Tag(tag, Box::new(value)))
+            }
+        }
+
+        let (name, data): (String, _) = access.variant()?;
+        if name != "@@TAGGED@@" {
+            return Err(de::Error::custom("expected CBOR tag"));
+        }
+        data.tuple_variant(2, TaggedValueVisitor)
+    }
+}
+
+fn limited_cbor_item_count<E: de::Error>(kind: &str, item_count: usize) -> Result<usize, E> {
+    cbor_container_item_count(kind, item_count).map_err(de::Error::custom)
 }
 
 /// Convert a ciborium::Value to a V8 value.
 fn cbor_to_v8<'s>(
     scope: &mut v8::HandleScope<'s>,
     value: &ciborium::Value,
-) -> v8::Local<'s, v8::Value> {
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    cbor_to_v8_inner(scope, value, 0)
+}
+
+fn cbor_to_v8_inner<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    value: &ciborium::Value,
+    depth: usize,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    if depth > MAX_CBOR_BRIDGE_DEPTH {
+        return Err(format!(
+            "CBOR decode depth exceeds limit of {MAX_CBOR_BRIDGE_DEPTH}"
+        ));
+    }
+
     match value {
-        ciborium::Value::Null => v8::null(scope).into(),
-        ciborium::Value::Bool(b) => v8::Boolean::new(scope, *b).into(),
+        ciborium::Value::Null => Ok(v8::null(scope).into()),
+        ciborium::Value::Bool(b) => Ok(v8::Boolean::new(scope, *b).into()),
         ciborium::Value::Integer(n) => {
             let n: i128 = (*n).into();
             if n >= i32::MIN as i128 && n <= i32::MAX as i128 {
-                v8::Integer::new(scope, n as i32).into()
+                Ok(v8::Integer::new(scope, n as i32).into())
             } else {
-                v8::Number::new(scope, n as f64).into()
+                Ok(v8::Number::new(scope, n as f64).into())
             }
         }
-        ciborium::Value::Float(f) => v8::Number::new(scope, *f).into(),
-        ciborium::Value::Text(s) => v8::String::new(scope, s).unwrap().into(),
+        ciborium::Value::Float(f) => Ok(v8::Number::new(scope, *f).into()),
+        ciborium::Value::Text(s) => Ok(v8::String::new(scope, s)
+            .ok_or_else(|| "CBOR decode failed to allocate string".to_string())?
+            .into()),
         ciborium::Value::Bytes(b) => {
             let len = b.len();
             let ab = v8::ArrayBuffer::new(scope, len);
@@ -255,27 +562,31 @@ fn cbor_to_v8<'s>(
                     );
                 }
             }
-            v8::Uint8Array::new(scope, ab, 0, len).unwrap().into()
+            Ok(v8::Uint8Array::new(scope, ab, 0, len)
+                .ok_or_else(|| "CBOR decode failed to allocate byte array".to_string())?
+                .into())
         }
         ciborium::Value::Array(items) => {
+            cbor_container_item_count("array", items.len())?;
             let arr = v8::Array::new(scope, items.len() as i32);
             for (i, item) in items.iter().enumerate() {
-                let val = cbor_to_v8(scope, item);
+                let val = cbor_to_v8_inner(scope, item, depth + 1)?;
                 arr.set_index(scope, i as u32, val);
             }
-            arr.into()
+            Ok(arr.into())
         }
         ciborium::Value::Map(entries) => {
+            cbor_container_item_count("map", entries.len())?;
             let obj = v8::Object::new(scope);
             for (k, v) in entries {
-                let key = cbor_to_v8(scope, k);
-                let val = cbor_to_v8(scope, v);
+                let key = cbor_to_v8_inner(scope, k, depth + 1)?;
+                let val = cbor_to_v8_inner(scope, v, depth + 1)?;
                 obj.set(scope, key, val);
             }
-            obj.into()
+            Ok(obj.into())
         }
-        ciborium::Value::Tag(_, inner) => cbor_to_v8(scope, inner),
-        _ => v8::undefined(scope).into(),
+        ciborium::Value::Tag(_, inner) => cbor_to_v8_inner(scope, inner, depth + 1),
+        _ => Ok(v8::undefined(scope).into()),
     }
 }
 
@@ -284,7 +595,7 @@ pub fn serialize_cbor_value(
     scope: &mut v8::HandleScope,
     value: v8::Local<v8::Value>,
 ) -> Result<Vec<u8>, String> {
-    let cbor_val = v8_to_cbor(scope, value);
+    let cbor_val = v8_to_cbor(scope, value)?;
     let mut buf = Vec::new();
     ciborium::into_writer(&cbor_val, &mut buf).map_err(|e| format!("CBOR encode failed: {}", e))?;
     Ok(buf)
@@ -295,9 +606,10 @@ pub fn deserialize_cbor_value<'s>(
     scope: &mut v8::HandleScope<'s>,
     data: &[u8],
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let cbor_val: ciborium::Value =
-        ciborium::from_reader(data).map_err(|e| format!("CBOR decode failed: {}", e))?;
-    Ok(cbor_to_v8(scope, &cbor_val))
+    let LimitedCborValue(cbor_val) =
+        ciborium::de::from_reader_with_recursion_limit(data, MAX_CBOR_BRIDGE_DEPTH)
+            .map_err(|e| format!("CBOR decode failed: {}", e))?;
+    cbor_to_v8(scope, &cbor_val)
 }
 
 /// Pre-allocated serialization buffers reused across bridge calls within a session.
@@ -312,6 +624,12 @@ impl SessionBuffers {
         SessionBuffers {
             ser_buf: Vec::with_capacity(256),
         }
+    }
+}
+
+impl Default for SessionBuffers {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -351,18 +669,51 @@ pub struct AsyncBridgeFnStore {
 /// Single-threaded: only accessed from the session thread.
 pub struct PendingPromises {
     map: RefCell<HashMap<u64, v8::Global<v8::PromiseResolver>>>,
+    reserved: Cell<usize>,
 }
 
 impl PendingPromises {
     pub fn new() -> Self {
         PendingPromises {
             map: RefCell::new(HashMap::new()),
+            reserved: Cell::new(0),
         }
     }
 
-    /// Store a resolver for a given call_id.
-    pub fn insert(&self, call_id: u64, resolver: v8::Global<v8::PromiseResolver>) {
+    fn capacity_error(&self) -> Option<String> {
+        let len = self.map.borrow().len().saturating_add(self.reserved.get());
+        if len >= MAX_PENDING_PROMISES {
+            return Some(format!(
+                "async bridge pending promise registry exceeded limit of {MAX_PENDING_PROMISES} promises"
+            ));
+        }
+        None
+    }
+
+    fn reserve(&self) -> Result<PendingPromiseReservation<'_>, String> {
+        if let Some(error) = self.capacity_error() {
+            return Err(error);
+        }
+        self.reserved.set(self.reserved.get().saturating_add(1));
+        Ok(PendingPromiseReservation {
+            pending: self,
+            active: true,
+        })
+    }
+
+    fn release_reservation(&self) {
+        self.reserved.set(self.reserved.get().saturating_sub(1));
+    }
+
+    fn insert_reserved(
+        &self,
+        call_id: u64,
+        resolver: v8::Global<v8::PromiseResolver>,
+        mut reservation: PendingPromiseReservation<'_>,
+    ) {
         self.map.borrow_mut().insert(call_id, resolver);
+        reservation.active = false;
+        self.release_reservation();
     }
 
     /// Remove and return the resolver for a given call_id.
@@ -373,6 +724,30 @@ impl PendingPromises {
     /// Number of pending promises.
     pub fn len(&self) -> usize {
         self.map.borrow().len()
+    }
+
+    /// Whether there are no pending promises.
+    pub fn is_empty(&self) -> bool {
+        self.map.borrow().is_empty()
+    }
+}
+
+impl Default for PendingPromises {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct PendingPromiseReservation<'a> {
+    pending: &'a PendingPromises,
+    active: bool,
+}
+
+impl Drop for PendingPromiseReservation<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.pending.release_reservation();
+        }
     }
 }
 
@@ -631,6 +1006,68 @@ thread_local! {
     static NEXT_VM_CONTEXT_ID: Cell<u32> = const { Cell::new(1) };
 }
 
+fn vm_context_capacity_error(current_contexts: usize) -> Option<String> {
+    if current_contexts >= MAX_VM_CONTEXTS {
+        return Some(format!(
+            "node:vm context registry exceeded limit of {MAX_VM_CONTEXTS} contexts"
+        ));
+    }
+    None
+}
+
+fn reserve_vm_context_slot<'s>(
+    scope: &mut v8::HandleScope<'s>,
+    context: v8::Local<'s, v8::Context>,
+) -> Result<u32, String> {
+    VM_CONTEXTS.with(|contexts| {
+        let mut contexts = contexts.borrow_mut();
+        if let Some(error) = vm_context_capacity_error(contexts.len()) {
+            return Err(error);
+        }
+
+        let context_id = next_vm_context_id();
+        contexts.insert(
+            context_id,
+            VmContextState {
+                context: v8::Global::new(scope, context),
+                baseline_keys: HashSet::new(),
+                mirrored_keys: HashSet::new(),
+            },
+        );
+        Ok(context_id)
+    })
+}
+
+fn update_vm_context_slot(
+    context_id: u32,
+    baseline_keys: HashSet<String>,
+    mirrored_keys: HashSet<String>,
+) {
+    VM_CONTEXTS.with(|contexts| {
+        if let Some(state) = contexts.borrow_mut().get_mut(&context_id) {
+            state.baseline_keys = baseline_keys;
+            state.mirrored_keys = mirrored_keys;
+        }
+    });
+}
+
+fn remove_vm_context_slot(context_id: u32) {
+    VM_CONTEXTS.with(|contexts| {
+        contexts.borrow_mut().remove(&context_id);
+    });
+}
+
+#[cfg(test)]
+fn clear_vm_context_registry_for_test() {
+    VM_CONTEXTS.with(|contexts| contexts.borrow_mut().clear());
+    NEXT_VM_CONTEXT_ID.with(|next_id| next_id.set(1));
+}
+
+#[cfg(test)]
+fn vm_context_registry_len_for_test() -> usize {
+    VM_CONTEXTS.with(|contexts| contexts.borrow().len())
+}
+
 fn next_vm_context_id() -> u32 {
     NEXT_VM_CONTEXT_ID.with(|next_id| {
         let id = next_id.get();
@@ -856,10 +1293,17 @@ fn vm_run_script_in_context<'s>(
     code: &str,
     options: &VmRunOptions,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let mut timeout_guard = options.timeout_ms.map(|timeout_ms| {
-        let (abort_tx, _abort_rx) = crossbeam_channel::bounded::<()>(0);
-        crate::timeout::TimeoutGuard::new(timeout_ms, isolate_handle.clone(), abort_tx)
-    });
+    let mut timeout_guard = match options.timeout_ms {
+        Some(timeout_ms) => {
+            let (abort_tx, _abort_rx) = crossbeam_channel::bounded::<()>(0);
+            Some(crate::timeout::TimeoutGuard::new(
+                timeout_ms,
+                isolate_handle.clone(),
+                abort_tx,
+            )?)
+        }
+        None => None,
+    };
 
     let mut result = None;
     let mut exception = None;
@@ -901,7 +1345,7 @@ fn vm_run_script_in_context<'s>(
                         .expect("vm failure message");
                     let thrown = tc
                         .exception()
-                        .unwrap_or_else(|| v8::Exception::error(tc, failure_message).into());
+                        .unwrap_or_else(|| v8::Exception::error(tc, failure_message));
                     exception = Some(vm_apply_script_origin_to_error(
                         crate::execution::extract_error_info(tc, thrown),
                         options,
@@ -913,7 +1357,7 @@ fn vm_run_script_in_context<'s>(
                     .expect("vm failure message");
                 let thrown = tc
                     .exception()
-                    .unwrap_or_else(|| v8::Exception::error(tc, failure_message).into());
+                    .unwrap_or_else(|| v8::Exception::error(tc, failure_message));
                 exception = Some(vm_apply_script_origin_to_error(
                     crate::execution::extract_error_info(tc, thrown),
                     options,
@@ -968,6 +1412,17 @@ fn vm_create_context_value<'s>(
         .to_object(scope)
         .ok_or_else(|| String::from("vm.createContext expected an object sandbox"))?;
     let context = v8::Context::new(scope, Default::default());
+    let context_id = match reserve_vm_context_slot(scope, context) {
+        Ok(context_id) => context_id,
+        Err(message) => {
+            return Ok(vm_throw_error(
+                scope,
+                &message,
+                Some("ERR_AGENT_OS_VM_CONTEXT_LIMIT"),
+                false,
+            ));
+        }
+    };
     {
         let context_scope = &mut v8::ContextScope::new(scope, context);
         let global = context.global(context_scope);
@@ -990,23 +1445,39 @@ fn vm_create_context_value<'s>(
         let global = context.global(context_scope);
         vm_collect_object_keys(context_scope, global)
     };
-    let mirrored_keys = {
-        let context_scope = &mut v8::ContextScope::new(scope, context);
-        let global = context.global(context_scope);
-        vm_copy_sandbox_into_context(context_scope, sandbox, global, &HashSet::new())
+    let mirrored_keys = match {
+        let tc = &mut v8::TryCatch::new(scope);
+        let mirrored_keys = {
+            let context_scope = &mut v8::ContextScope::new(tc, context);
+            let global = context.global(context_scope);
+            vm_copy_sandbox_into_context(context_scope, sandbox, global, &HashSet::new())
+        };
+        if tc.has_caught() {
+            Err(tc
+                .exception()
+                .map(|exception| v8::Global::new(tc, exception)))
+        } else {
+            Ok(mirrored_keys)
+        }
+    } {
+        Ok(mirrored_keys) => mirrored_keys,
+        Err(exception) => {
+            remove_vm_context_slot(context_id);
+            if let Some(exception) = exception {
+                let exception = v8::Local::new(scope, &exception);
+                scope.throw_exception(exception);
+                return Ok(exception);
+            }
+            return Ok(vm_throw_error(
+                scope,
+                "vm.createContext failed while mirroring sandbox properties",
+                None,
+                false,
+            ));
+        }
     };
 
-    let context_id = next_vm_context_id();
-    VM_CONTEXTS.with(|contexts| {
-        contexts.borrow_mut().insert(
-            context_id,
-            VmContextState {
-                context: v8::Global::new(scope, context),
-                baseline_keys,
-                mirrored_keys,
-            },
-        );
-    });
+    update_vm_context_slot(context_id, baseline_keys, mirrored_keys);
     Ok(v8::Integer::new_from_unsigned(scope, context_id).into())
 }
 
@@ -1192,17 +1663,14 @@ fn sync_bridge_callback<'s>(
     }
 
     // Serialize V8 arguments into reusable buffer (avoids per-call allocation)
-    let encoded_args = {
-        let mut bufs = buffers.borrow_mut();
-        match serialize_v8_args_into(scope, &args, &mut bufs.ser_buf) {
-            Ok(()) => bufs.ser_buf.clone(),
-            Err(err) => {
-                let msg = v8::String::new(scope, &format!("bridge serialization error: {}", err))
-                    .unwrap();
-                let exc = v8::Exception::error(scope, msg);
-                scope.throw_exception(exc);
-                return;
-            }
+    let encoded_args = match serialize_v8_args_with_session_buffer(scope, &args, buffers) {
+        Ok(encoded_args) => encoded_args,
+        Err(err) => {
+            let msg =
+                v8::String::new(scope, &format!("bridge serialization error: {}", err)).unwrap();
+            let exc = v8::Exception::error(scope, msg);
+            scope.throw_exception(exc);
+            return;
         }
     };
 
@@ -1332,6 +1800,43 @@ fn build_bridge_apply_wrapper<'s>(
         .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
 }
 
+fn serialize_v8_args_with_session_buffer(
+    scope: &mut v8::HandleScope,
+    args: &v8::FunctionCallbackArguments,
+    buffers: &RefCell<SessionBuffers>,
+) -> Result<Vec<u8>, String> {
+    let mut ser_buf = {
+        let mut bufs = buffers.borrow_mut();
+        mem::take(&mut bufs.ser_buf)
+    };
+
+    let result = serialize_v8_args_into(scope, args, &mut ser_buf).map(|()| ser_buf.clone());
+
+    {
+        let mut bufs = buffers.borrow_mut();
+        bufs.ser_buf = ser_buf;
+    }
+
+    result
+}
+
+fn reject_promise_with_error(
+    scope: &mut v8::HandleScope,
+    resolver: v8::Local<v8::PromiseResolver>,
+    message: &str,
+    code: Option<&str>,
+) {
+    let msg = v8::String::new(scope, message).unwrap();
+    let exc = v8::Exception::error(scope, msg);
+    if let Some(code) = code {
+        let exc_object = exc.to_object(scope).unwrap();
+        let code_key = v8::String::new(scope, "code").unwrap();
+        let code_value = v8::String::new(scope, code).unwrap();
+        let _ = exc_object.set(scope, code_key.into(), code_value.into());
+    }
+    resolver.reject(scope, exc);
+}
+
 /// V8 FunctionTemplate callback for async promise-returning bridge calls.
 fn async_bridge_callback(
     scope: &mut v8::HandleScope,
@@ -1369,18 +1874,29 @@ fn async_bridge_callback(
     // Get the promise to return to V8
     let promise = resolver.get_promise(scope);
 
+    let reservation = match pending.reserve() {
+        Ok(reservation) => reservation,
+        Err(err_msg) => {
+            reject_promise_with_error(
+                scope,
+                resolver,
+                &err_msg,
+                Some("ERR_AGENT_OS_BRIDGE_PENDING_PROMISE_LIMIT"),
+            );
+            rv.set(promise.into());
+            return;
+        }
+    };
+
     // Serialize V8 arguments into reusable buffer (avoids per-call allocation)
-    let encoded_args = {
-        let mut bufs = buffers.borrow_mut();
-        match serialize_v8_args_into(scope, &args, &mut bufs.ser_buf) {
-            Ok(()) => bufs.ser_buf.clone(),
-            Err(err) => {
-                let msg = v8::String::new(scope, &format!("bridge serialization error: {}", err))
-                    .unwrap();
-                let exc = v8::Exception::error(scope, msg);
-                scope.throw_exception(exc);
-                return;
-            }
+    let encoded_args = match serialize_v8_args_with_session_buffer(scope, &args, buffers) {
+        Ok(encoded_args) => encoded_args,
+        Err(err) => {
+            let msg =
+                v8::String::new(scope, &format!("bridge serialization error: {}", err)).unwrap();
+            let exc = v8::Exception::error(scope, msg);
+            scope.throw_exception(exc);
+            return;
         }
     };
 
@@ -1389,13 +1905,11 @@ fn async_bridge_callback(
         Ok(call_id) => {
             // Store resolver in pending promises map
             let global_resolver = v8::Global::new(scope, resolver);
-            pending.insert(call_id, global_resolver);
+            pending.insert_reserved(call_id, global_resolver, reservation);
         }
         Err(err_msg) => {
             // Reject the promise immediately if send fails
-            let msg = v8::String::new(scope, &err_msg).unwrap();
-            let exc = v8::Exception::error(scope, msg);
-            resolver.reject(scope, exc);
+            reject_promise_with_error(scope, resolver, &err_msg, None);
         }
     }
 
@@ -1568,7 +2082,42 @@ fn is_errno_segment(segment: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::bridge_error_code;
+    use super::{
+        MAX_CBOR_BRIDGE_CONTAINER_ITEMS, MAX_CBOR_BRIDGE_DEPTH, MAX_PENDING_PROMISES,
+        MAX_VM_CONTEXTS, PendingPromises, SessionBuffers, bridge_error_code,
+        clear_vm_context_registry_for_test, deserialize_cbor_value, register_async_bridge_fns,
+        register_sync_bridge_fns, serialize_cbor_value, vm_context_capacity_error,
+        vm_context_registry_len_for_test,
+    };
+    use crate::host_call::BridgeCallContext;
+    use crate::ipc_binary::{self, BinaryFrame};
+    use crate::isolate;
+    use std::cell::RefCell;
+    use std::io::{Cursor, Write};
+    use std::sync::{Arc, Mutex};
+
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+
+    fn bridge_call_count(bytes: &[u8]) -> usize {
+        let mut cursor = Cursor::new(bytes);
+        let mut count = 0;
+        while let Ok(frame) = ipc_binary::read_frame(&mut cursor) {
+            if matches!(frame, BinaryFrame::BridgeCall { .. }) {
+                count += 1;
+            }
+        }
+        count
+    }
 
     #[test]
     fn bridge_error_code_rejects_guest_controlled_errno_segments() {
@@ -1591,5 +2140,353 @@ mod tests {
             Some("ENOENT")
         );
         assert_eq!(bridge_error_code("EEXIST: already exists"), Some("EEXIST"));
+    }
+
+    #[test]
+    fn bridge_v8_hardening_rejects_cbor_abuse_and_vm_context_reentry_overflow() {
+        isolate::init_v8_platform();
+
+        let mut isolate = isolate::create_isolate(None);
+        let context = isolate::create_context(&mut isolate);
+        let scope = &mut v8::HandleScope::new(&mut isolate);
+        let context = v8::Local::new(scope, &context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let object = v8::Object::new(scope);
+        let self_key = v8::String::new(scope, "self").unwrap();
+        assert!(object.set(scope, self_key.into(), object.into()).is_some());
+
+        let error = serialize_cbor_value(scope, object.into()).expect_err("cycle rejected");
+        assert!(
+            error.contains("circular object graph"),
+            "unexpected error: {error}"
+        );
+
+        let source = v8::String::new(
+            scope,
+            &format!(
+                "const sparse = []; sparse.length = {}; sparse",
+                MAX_CBOR_BRIDGE_CONTAINER_ITEMS + 1
+            ),
+        )
+        .unwrap();
+        let script = v8::Script::compile(scope, source, None).unwrap();
+        let sparse = script.run(scope).unwrap();
+        let error = serialize_cbor_value(scope, sparse).expect_err("sparse array rejected");
+        assert!(
+            error.contains(&format!(
+                "item count {} exceeds limit",
+                MAX_CBOR_BRIDGE_CONTAINER_ITEMS + 1
+            )),
+            "unexpected error: {error}"
+        );
+
+        let mut value = ciborium::Value::Null;
+        for _ in 0..=MAX_CBOR_BRIDGE_DEPTH {
+            value = ciborium::Value::Array(vec![value]);
+        }
+        let mut encoded = Vec::new();
+        ciborium::into_writer(&value, &mut encoded).unwrap();
+        let error = deserialize_cbor_value(scope, &encoded).expect_err("depth rejected");
+        assert!(
+            error.contains("CBOR decode failed"),
+            "unexpected error: {error}"
+        );
+
+        let oversized_len = (MAX_CBOR_BRIDGE_CONTAINER_ITEMS + 1) as u32;
+        let oversized_array_header = [
+            0x9a,
+            (oversized_len >> 24) as u8,
+            (oversized_len >> 16) as u8,
+            (oversized_len >> 8) as u8,
+            oversized_len as u8,
+        ];
+        let error = deserialize_cbor_value(scope, &oversized_array_header)
+            .expect_err("oversized array rejected before element allocation");
+        assert!(
+            error.contains(&format!(
+                "item count {} exceeds limit",
+                MAX_CBOR_BRIDGE_CONTAINER_ITEMS + 1
+            )),
+            "unexpected error: {error}"
+        );
+
+        clear_vm_context_registry_for_test();
+        let bridge_ctx = BridgeCallContext::new(
+            Box::new(Vec::new()),
+            Box::new(Cursor::new(Vec::new())),
+            String::from("test-session"),
+        );
+        let session_buffers = RefCell::new(SessionBuffers::new());
+        let _bridge_fns = register_sync_bridge_fns(
+            scope,
+            &bridge_ctx as *const BridgeCallContext,
+            &session_buffers as *const RefCell<SessionBuffers>,
+            &["_vmCreateContext"],
+        );
+
+        let source = format!(
+            r#"
+            for (let i = 0; i < {fill_count}; i++) {{
+                _vmCreateContext({{}});
+            }}
+
+            let innerCode;
+            const sandbox = {{}};
+            Object.defineProperty(sandbox, "x", {{
+                get() {{
+                    try {{
+                        _vmCreateContext({{}});
+                    }} catch (error) {{
+                        innerCode = error && error.code;
+                    }}
+                    return 1;
+                }},
+                enumerable: true,
+            }});
+
+            const outerId = _vmCreateContext(sandbox);
+            let limitCode;
+            try {{
+                _vmCreateContext({{}});
+            }} catch (error) {{
+                limitCode = error && error.code;
+            }}
+
+            JSON.stringify({{
+                innerCode,
+                limitCode,
+                outerIsInteger: Number.isInteger(outerId),
+            }})
+            "#,
+            fill_count = MAX_VM_CONTEXTS - 1,
+        );
+        {
+            let tc = &mut v8::TryCatch::new(scope);
+            let source = v8::String::new(tc, &source).unwrap();
+            let script = v8::Script::compile(tc, source, None).unwrap();
+            let result = script.run(tc);
+            assert!(
+                !tc.has_caught(),
+                "unexpected exception while testing vm cap"
+            );
+            let details = result
+                .expect("vm context cap script result")
+                .to_rust_string_lossy(tc);
+            assert_eq!(
+                details,
+                r#"{"innerCode":"ERR_AGENT_OS_VM_CONTEXT_LIMIT","limitCode":"ERR_AGENT_OS_VM_CONTEXT_LIMIT","outerIsInteger":true}"#,
+                "vm context cap script should observe limit errors"
+            );
+        }
+        assert_eq!(vm_context_registry_len_for_test(), MAX_VM_CONTEXTS);
+        clear_vm_context_registry_for_test();
+
+        let source = r#"
+            (() => {
+                let thrownMessage;
+                const sandbox = {};
+                Object.defineProperty(sandbox, "x", {
+                    get() {
+                        throw new Error("sandbox getter failed");
+                    },
+                    enumerable: true,
+                });
+                try {
+                    _vmCreateContext(sandbox);
+                } catch (error) {
+                    thrownMessage = error && error.message;
+                }
+
+                const nextId = _vmCreateContext({});
+                return JSON.stringify({
+                    thrownMessage,
+                    nextIsInteger: Number.isInteger(nextId),
+                });
+            })()
+        "#;
+        {
+            let tc = &mut v8::TryCatch::new(scope);
+            let source = v8::String::new(tc, source).unwrap();
+            let script = v8::Script::compile(tc, source, None).unwrap();
+            let result = script.run(tc);
+            if tc.has_caught() {
+                let exception = tc
+                    .exception()
+                    .map(|exception| exception.to_rust_string_lossy(tc))
+                    .unwrap_or_else(|| String::from("<missing exception>"));
+                panic!("unexpected exception while testing vm rollback: {exception}");
+            }
+            let details = result
+                .expect("vm context rollback script result")
+                .to_rust_string_lossy(tc);
+            assert_eq!(
+                details, r#"{"thrownMessage":"sandbox getter failed","nextIsInteger":true}"#,
+                "vm context rollback script should preserve the getter exception and keep registry usable"
+            );
+        }
+        assert_eq!(vm_context_registry_len_for_test(), 1);
+        clear_vm_context_registry_for_test();
+
+        let async_writer = Arc::new(Mutex::new(Vec::new()));
+        let async_bridge_ctx = BridgeCallContext::new(
+            Box::new(SharedWriter(Arc::clone(&async_writer))),
+            Box::new(Cursor::new(Vec::new())),
+            String::from("test-session"),
+        );
+        let async_pending = PendingPromises::new();
+        let _async_bridge_fns = register_async_bridge_fns(
+            scope,
+            &async_bridge_ctx as *const BridgeCallContext,
+            &async_pending as *const PendingPromises,
+            &session_buffers as *const RefCell<SessionBuffers>,
+            &["_asyncFn"],
+        );
+        let source = format!(
+            r#"
+            for (let i = 0; i < {fill_count}; i++) {{
+                _asyncFn(i);
+            }}
+            globalThis.__overflowPromise = _asyncFn("overflow");
+            "#,
+            fill_count = MAX_PENDING_PROMISES,
+        );
+        {
+            let tc = &mut v8::TryCatch::new(scope);
+            let source = v8::String::new(tc, &source).unwrap();
+            let script = v8::Script::compile(tc, source, None).unwrap();
+            assert!(script.run(tc).is_some());
+            assert!(!tc.has_caught(), "async overflow should reject, not throw");
+        }
+        assert_eq!(async_pending.len(), MAX_PENDING_PROMISES);
+        assert_eq!(
+            bridge_call_count(&async_writer.lock().unwrap()),
+            MAX_PENDING_PROMISES
+        );
+        {
+            let key = v8::String::new(scope, "__overflowPromise").unwrap();
+            let value = context.global(scope).get(scope, key.into()).unwrap();
+            let promise = v8::Local::<v8::Promise>::try_from(value).unwrap();
+            assert_eq!(promise.state(), v8::PromiseState::Rejected);
+            let rejection = promise.result(scope);
+            let rejection = v8::Local::<v8::Object>::try_from(rejection).unwrap();
+            let code_key = v8::String::new(scope, "code").unwrap();
+            let code = rejection.get(scope, code_key.into()).unwrap();
+            assert_eq!(
+                code.to_rust_string_lossy(scope),
+                "ERR_AGENT_OS_BRIDGE_PENDING_PROMISE_LIMIT"
+            );
+        }
+
+        let reentrant_writer = Arc::new(Mutex::new(Vec::new()));
+        let reentrant_bridge_ctx = BridgeCallContext::new(
+            Box::new(SharedWriter(Arc::clone(&reentrant_writer))),
+            Box::new(Cursor::new(Vec::new())),
+            String::from("test-session"),
+        );
+        let reentrant_pending = PendingPromises::new();
+        let _reentrant_async_bridge_fns = register_async_bridge_fns(
+            scope,
+            &reentrant_bridge_ctx as *const BridgeCallContext,
+            &reentrant_pending as *const PendingPromises,
+            &session_buffers as *const RefCell<SessionBuffers>,
+            &["_asyncFn"],
+        );
+        let source = format!(
+            r#"
+            for (let i = 0; i < {fill_count}; i++) {{
+                _asyncFn(i);
+            }}
+            let innerPromise;
+            const reentrantArg = {{}};
+            Object.defineProperty(reentrantArg, "x", {{
+                get() {{
+                    innerPromise = _asyncFn("inner");
+                    return 1;
+                }},
+                enumerable: true,
+            }});
+            globalThis.__reentrantOuterPromise = _asyncFn(reentrantArg);
+            globalThis.__reentrantInnerPromise = innerPromise;
+            "#,
+            fill_count = MAX_PENDING_PROMISES - 1,
+        );
+        {
+            let tc = &mut v8::TryCatch::new(scope);
+            let source = v8::String::new(tc, &source).unwrap();
+            let script = v8::Script::compile(tc, source, None).unwrap();
+            assert!(script.run(tc).is_some());
+            assert!(!tc.has_caught(), "async reentry should reject, not throw");
+        }
+        assert_eq!(reentrant_pending.len(), MAX_PENDING_PROMISES);
+        assert_eq!(
+            bridge_call_count(&reentrant_writer.lock().unwrap()),
+            MAX_PENDING_PROMISES
+        );
+        {
+            let key = v8::String::new(scope, "__reentrantInnerPromise").unwrap();
+            let value = context.global(scope).get(scope, key.into()).unwrap();
+            let promise = v8::Local::<v8::Promise>::try_from(value).unwrap();
+            assert_eq!(promise.state(), v8::PromiseState::Rejected);
+            let rejection = promise.result(scope);
+            let rejection = v8::Local::<v8::Object>::try_from(rejection).unwrap();
+            let code_key = v8::String::new(scope, "code").unwrap();
+            let code = rejection.get(scope, code_key.into()).unwrap();
+            assert_eq!(
+                code.to_rust_string_lossy(scope),
+                "ERR_AGENT_OS_BRIDGE_PENDING_PROMISE_LIMIT"
+            );
+        }
+
+        let buffer_reentry_writer = Arc::new(Mutex::new(Vec::new()));
+        let buffer_reentry_bridge_ctx = BridgeCallContext::new(
+            Box::new(SharedWriter(Arc::clone(&buffer_reentry_writer))),
+            Box::new(Cursor::new(Vec::new())),
+            String::from("test-session"),
+        );
+        let buffer_reentry_pending = PendingPromises::new();
+        let _buffer_reentry_async_bridge_fns = register_async_bridge_fns(
+            scope,
+            &buffer_reentry_bridge_ctx as *const BridgeCallContext,
+            &buffer_reentry_pending as *const PendingPromises,
+            &session_buffers as *const RefCell<SessionBuffers>,
+            &["_asyncFn"],
+        );
+        let source = r#"
+            let bufferInnerPromise;
+            const bufferReentrantArg = {};
+            Object.defineProperty(bufferReentrantArg, "x", {
+                get() {
+                    bufferInnerPromise = _asyncFn("inner");
+                    return 1;
+                },
+                enumerable: true,
+            });
+            globalThis.__bufferOuterPromise = _asyncFn(bufferReentrantArg);
+            globalThis.__bufferInnerPromise = bufferInnerPromise;
+        "#;
+        {
+            let tc = &mut v8::TryCatch::new(scope);
+            let source = v8::String::new(tc, source).unwrap();
+            let script = v8::Script::compile(tc, source, None).unwrap();
+            assert!(script.run(tc).is_some());
+            assert!(
+                !tc.has_caught(),
+                "async serialization reentry should not panic or throw"
+            );
+        }
+        assert_eq!(buffer_reentry_pending.len(), 2);
+        assert_eq!(bridge_call_count(&buffer_reentry_writer.lock().unwrap()), 2);
+    }
+
+    #[test]
+    fn vm_context_capacity_error_trips_at_registry_limit() {
+        assert!(vm_context_capacity_error(MAX_VM_CONTEXTS - 1).is_none());
+
+        let error = vm_context_capacity_error(MAX_VM_CONTEXTS).expect("limit error");
+        assert!(
+            error.contains(&format!("limit of {MAX_VM_CONTEXTS} contexts")),
+            "unexpected error: {error}"
+        );
     }
 }

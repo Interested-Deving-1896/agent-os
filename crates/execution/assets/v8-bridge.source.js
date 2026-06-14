@@ -3204,6 +3204,11 @@ var __bridge = (() => {
       rationale: "Host synchronous file-loading bridge reference."
     },
     {
+      name: "_moduleFormat",
+      classification: "hardened",
+      rationale: "Host module-format bridge reference used to enforce CommonJS and ESM boundaries."
+    },
+    {
       name: "_scheduleTimer",
       classification: "hardened",
       rationale: "Host timer bridge reference used by process timers."
@@ -3317,6 +3322,11 @@ var __bridge = (() => {
       name: "_cryptoDiffieHellmanSessionCall",
       classification: "hardened",
       rationale: "Host Diffie-Hellman/ECDH session method bridge reference."
+    },
+    {
+      name: "_cryptoDiffieHellmanSessionDestroy",
+      classification: "hardened",
+      rationale: "Host Diffie-Hellman/ECDH session release bridge reference."
     },
     {
       name: "_cryptoSubtle",
@@ -3769,6 +3779,16 @@ var __bridge = (() => {
       rationale: "Host TLS cipher-list bridge reference."
     },
     {
+      name: "_netReserveTcpPortRaw",
+      classification: "hardened",
+      rationale: "Host net TCP port reservation bridge reference."
+    },
+    {
+      name: "_netReleaseTcpPortRaw",
+      classification: "hardened",
+      rationale: "Host net TCP port release bridge reference."
+    },
+    {
       name: "_netServerListenRaw",
       classification: "hardened",
       rationale: "Host net server listen bridge reference."
@@ -4141,6 +4161,9 @@ var __bridge = (() => {
     }
   }
   function _waitForActiveHandles() {
+    if (typeof _exited !== "undefined" && _exited) {
+      return Promise.resolve();
+    }
     const getPendingTimerCount = globalThis._getPendingTimerCount;
     const waitForTimerDrain = globalThis._waitForTimerDrain;
     const hasHandles = _getActiveHandles().length > 0;
@@ -7538,12 +7561,50 @@ var __bridge = (() => {
     read(fd, buffer, offset, length, position, callback) {
       if (callback) {
         const cb = callback;
-        try {
-          const bytesRead = fs.readSync(fd, buffer, offset, length, position);
-          queueMicrotask(() => cb(null, bytesRead, buffer));
-        } catch (e) {
-          queueMicrotask(() => cb(e));
+        if (fd === 0 && (position === null || position === void 0) && typeof _kernelStdinRead !== "undefined") {
+          const target = new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length);
+          const attemptKernelStdinRead = () => {
+            _kernelStdinRead.apply(void 0, [length, 100], {
+              result: { promise: true }
+            }).then((next) => {
+              if (next == null) {
+                setTimeout(attemptKernelStdinRead, 1);
+                return;
+              }
+              if (next?.done) {
+                queueMicrotask(() => cb(null, 0, buffer));
+                return;
+              }
+              const dataBase64 = String(next?.dataBase64 ?? "");
+              if (!dataBase64) {
+                setTimeout(attemptKernelStdinRead, 1);
+                return;
+              }
+              const bytes = import_buffer.Buffer.from(dataBase64, "base64");
+              const bytesRead = Math.min(length, bytes.length);
+              target.set(bytes.subarray(0, bytesRead), 0);
+              queueMicrotask(() => cb(null, bytesRead, buffer));
+            }, (error) => {
+              queueMicrotask(() => cb(error));
+            });
+          };
+          attemptKernelStdinRead();
+          return;
         }
+        const attemptRead = () => {
+          try {
+            const bytesRead = fs.readSync(fd, buffer, offset, length, position);
+            queueMicrotask(() => cb(null, bytesRead, buffer));
+          } catch (e) {
+            const msg = e?.message ?? String(e);
+            if (msg.includes("EAGAIN")) {
+              setTimeout(attemptRead, 1);
+              return;
+            }
+            queueMicrotask(() => cb(e));
+          }
+        };
+        attemptRead();
       } else {
         return Promise.resolve(fs.readSync(fd, buffer, offset, length, position));
       }
@@ -8574,6 +8635,41 @@ var __bridge = (() => {
     }
     return payload;
   }
+  const CHILD_PROCESS_IPC_FRAME_PREFIX = "\x1EAGENTOS_IPC:";
+  function encodeChildProcessIpcFrame(message) {
+    const json = JSON.stringify(message);
+    const encoded = typeof Buffer !== "undefined" ? Buffer.from(json, "utf8").toString("base64") : btoa(json);
+    return `${CHILD_PROCESS_IPC_FRAME_PREFIX}${encoded}\n`;
+  }
+  function decodeChildProcessIpcFramePayload(payload) {
+    const json = typeof Buffer !== "undefined" ? Buffer.from(payload, "base64").toString("utf8") : atob(payload);
+    return JSON.parse(json);
+  }
+  function splitChildProcessIpcFrames(buffer, chunk) {
+    const text = `${buffer}${typeof Buffer !== "undefined" ? Buffer.from(chunk).toString("utf8") : String(chunk)}`;
+    const messages = [];
+    const output = [];
+    let cursor = 0;
+    while (true) {
+      const frameStart = text.indexOf(CHILD_PROCESS_IPC_FRAME_PREFIX, cursor);
+      if (frameStart === -1) {
+        output.push(text.slice(cursor));
+        return { buffer: "", messages, output: output.join("") };
+      }
+      output.push(text.slice(cursor, frameStart));
+      const payloadStart = frameStart + CHILD_PROCESS_IPC_FRAME_PREFIX.length;
+      const frameEnd = text.indexOf("\n", payloadStart);
+      if (frameEnd === -1) {
+        return { buffer: text.slice(frameStart), messages, output: output.join("") };
+      }
+      try {
+        messages.push(decodeChildProcessIpcFramePayload(text.slice(payloadStart, frameEnd)));
+      } catch (error) {
+        output.push(text.slice(frameStart, frameEnd + 1));
+      }
+      cursor = frameEnd + 1;
+    }
+  }
   function dispatchChildProcessPollResult(sessionId, next) {
     if (!next || typeof next !== "object") {
       return false;
@@ -8679,12 +8775,26 @@ var __bridge = (() => {
     if (!child) return;
     if (type === "stdout") {
       const buf = typeof Buffer !== "undefined" ? Buffer.from(data) : data;
+      if (child._ipcEnabled) {
+        const parsed = splitChildProcessIpcFrames(child._ipcStdoutBuffer, buf);
+        child._ipcStdoutBuffer = parsed.buffer;
+        for (const message of parsed.messages) {
+          child._emitOrQueueIpcMessage(message);
+        }
+        if (parsed.output.length === 0) {
+          return;
+        }
+        child.stdout.emit("data", typeof Buffer !== "undefined" ? Buffer.from(parsed.output, "utf8") : parsed.output);
+        return;
+      }
       child.stdout.emit("data", buf);
     } else if (type === "stderr") {
       const buf = typeof Buffer !== "undefined" ? Buffer.from(data) : data;
       child.stderr.emit("data", buf);
     } else if (type === "exit") {
       completeDetachedChildBootstrap(child);
+      const wasConnected = child.connected;
+      child.connected = false;
       const signalCode = child._pendingSignalCode ?? (data && typeof data === "object" ? data.signal ?? null : null);
       const exitCode = data && typeof data === "object" ? data.code : data;
       child._pendingSignalCode = null;
@@ -8692,6 +8802,9 @@ var __bridge = (() => {
       child.exitCode = signalCode == null ? exitCode : null;
       child.stdout.emit("end");
       child.stderr.emit("end");
+      if (wasConnected) {
+        child.emit("disconnect");
+      }
       child.emit("close", child.exitCode, child.signalCode);
       child.emit("exit", child.exitCode, child.signalCode);
       childProcessInstances.delete(sessionId);
@@ -8755,6 +8868,7 @@ var __bridge = (() => {
     }
   };
   exposeCustomGlobal("_childProcessDispatch", childProcessDispatch);
+  var CHILD_PROCESS_POLL_DRAIN_LIMIT = 64;
   function scheduleChildProcessPoll(sessionId, delayMs = 0) {
     const child = childProcessInstances.get(sessionId);
     if (!child || typeof _childProcessPoll === "undefined" || child._pollScheduled) {
@@ -8767,19 +8881,20 @@ var __bridge = (() => {
       if (!childProcessInstances.has(sessionId)) {
         return;
       }
-      consumeDetachedChildBootstrapPoll(child);
-      const next = normalizeChildProcessBridgePayload(
-        _childProcessPoll.applySync(void 0, [sessionId, 10])
-      );
-      if (!next || typeof next !== "object") {
-        scheduleChildProcessPoll(sessionId, 5);
-        return;
-      }
-      if (dispatchChildProcessPollResult(sessionId, next)) {
-        if (next.type !== "exit") {
-          scheduleChildProcessPoll(sessionId, 0);
+      let drained = 0;
+      while (drained < CHILD_PROCESS_POLL_DRAIN_LIMIT && childProcessInstances.has(sessionId)) {
+        consumeDetachedChildBootstrapPoll(child);
+        const next = normalizeChildProcessBridgePayload(
+          _childProcessPoll.applySync(void 0, [sessionId, drained === 0 ? 10 : 0])
+        );
+        if (!next || typeof next !== "object") {
+          scheduleChildProcessPoll(sessionId, drained === 0 ? 5 : 0);
+          return;
         }
-        return;
+        drained += 1;
+        if (dispatchChildProcessPollResult(sessionId, next) && next.type === "exit") {
+          return;
+        }
       }
       scheduleChildProcessPoll(sessionId, 0);
     }, delayMs);
@@ -8917,34 +9032,87 @@ var __bridge = (() => {
     _handleId = null;
     _handleDescription = "";
     _handleRefed = false;
+    _ipcEnabled = false;
+    _ipcStdoutBuffer = "";
+    _ipcQueuedMessages = [];
     spawnfile = "";
     spawnargs = [];
     stdin;
     stdout;
-    stderr;
-    stdio;
+        stderr;
+        stdio;
     constructor() {
       this.stdin = {
         writable: true,
-        write(_data) {
+        destroyed: false,
+        _listeners: {},
+        _onceListeners: {},
+        write(_data, encodingOrCallback, callback) {
+          const done = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+          if (done) {
+            queueMicrotask(() => done(null));
+          }
           return true;
         },
-        end() {
+        end(dataOrCallback, encodingOrCallback, callback) {
+          const done = typeof dataOrCallback === "function" ? dataOrCallback : typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
           this.writable = false;
+          if (done) {
+            queueMicrotask(() => done());
+          }
         },
-        on() {
+        destroy() {
+          this.writable = false;
+          this.destroyed = true;
+          this.emit("close");
           return this;
         },
-        once() {
+        on(event, listener) {
+          if (!this._listeners[event]) this._listeners[event] = [];
+          this._listeners[event].push(listener);
           return this;
         },
-        emit() {
-          return false;
+        once(event, listener) {
+          if (!this._onceListeners[event]) this._onceListeners[event] = [];
+          this._onceListeners[event].push(listener);
+          return this;
+        },
+        off(event, listener) {
+          if (this._listeners[event]) {
+            const idx = this._listeners[event].indexOf(listener);
+            if (idx !== -1) this._listeners[event].splice(idx, 1);
+          }
+          if (this._onceListeners[event]) {
+            const idx = this._onceListeners[event].indexOf(listener);
+            if (idx !== -1) this._onceListeners[event].splice(idx, 1);
+          }
+          return this;
+        },
+        removeListener(event, listener) {
+          return this.off(event, listener);
+        },
+        emit(event, ...args) {
+          let handled = false;
+          if (this._listeners[event]) {
+            this._listeners[event].forEach((fn) => {
+              fn(...args);
+              handled = true;
+            });
+          }
+          if (this._onceListeners[event]) {
+            this._onceListeners[event].forEach((fn) => {
+              fn(...args);
+              handled = true;
+            });
+            this._onceListeners[event] = [];
+          }
+          return handled;
         }
       };
       this.stdout = {
         readable: true,
         isTTY: false,
+        destroyed: false,
         _listeners: {},
         _onceListeners: {},
         _bufferedChunks: [],
@@ -9024,6 +9192,13 @@ var __bridge = (() => {
           return this;
         },
         resume() {
+          return this;
+        },
+        destroy() {
+          this.readable = false;
+          this._ended = true;
+          this.destroyed = true;
+          this.emit("close");
           return this;
         },
         [Symbol.asyncIterator]() {
@@ -9033,6 +9208,7 @@ var __bridge = (() => {
       this.stderr = {
         readable: true,
         isTTY: false,
+        destroyed: false,
         _listeners: {},
         _onceListeners: {},
         _bufferedChunks: [],
@@ -9112,6 +9288,13 @@ var __bridge = (() => {
           return this;
         },
         resume() {
+          return this;
+        },
+        destroy() {
+          this.readable = false;
+          this._ended = true;
+          this.destroyed = true;
+          this.emit("close");
           return this;
         },
         [Symbol.asyncIterator]() {
@@ -9124,12 +9307,18 @@ var __bridge = (() => {
       if (!this._listeners[event]) this._listeners[event] = [];
       this._listeners[event].push(listener);
       this._checkMaxListeners(event);
+      if (event === "message") {
+        this._flushQueuedIpcMessages();
+      }
       return this;
     }
     once(event, listener) {
       if (!this._onceListeners[event]) this._onceListeners[event] = [];
       this._onceListeners[event].push(listener);
       this._checkMaxListeners(event);
+      if (event === "message") {
+        this._flushQueuedIpcMessages();
+      }
       return this;
     }
     off(event, listener) {
@@ -9163,6 +9352,26 @@ var __bridge = (() => {
           }
         }
       }
+    }
+    _hasIpcMessageListeners() {
+      return (this._listeners.message?.length ?? 0) > 0 || (this._onceListeners.message?.length ?? 0) > 0;
+    }
+    _emitOrQueueIpcMessage(message) {
+      if (!this._hasIpcMessageListeners()) {
+        this._ipcQueuedMessages.push(message);
+        return false;
+      }
+      return this.emit("message", message, void 0);
+    }
+    _flushQueuedIpcMessages() {
+      if (this._ipcQueuedMessages.length === 0) {
+        return;
+      }
+      queueMicrotask(() => {
+        while (this._ipcQueuedMessages.length > 0 && this._hasIpcMessageListeners()) {
+          this.emit("message", this._ipcQueuedMessages.shift(), void 0);
+        }
+      });
     }
     emit(event, ...args) {
       let handled = false;
@@ -9212,6 +9421,25 @@ var __bridge = (() => {
     }
     disconnect() {
       this.connected = false;
+      this.emit("disconnect");
+    }
+    send(message, sendHandleOrOptions, optionsOrCallback, maybeCallback) {
+      if (!this.connected || !this._ipcEnabled || this._sessionId == null) {
+        return false;
+      }
+      const callback = typeof sendHandleOrOptions === "function" ? sendHandleOrOptions : typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
+      try {
+        const frame = encodeChildProcessIpcFrame(message);
+        this.stdin.write(frame, "utf8", callback);
+        return true;
+      } catch (error) {
+        if (callback) {
+          queueMicrotask(() => callback(error));
+          return false;
+        }
+        this.emit("error", error);
+        return false;
+      }
     }
     _complete(stdout, stderr, code) {
       const signalCode = this._pendingSignalCode ?? this.signalCode;
@@ -9232,227 +9460,14 @@ var __bridge = (() => {
       this.emit("exit", this.exitCode, this.signalCode);
     }
   };
-  function parseSimpleExecCommand(command) {
-    const tokens = [];
-    let current = "";
-    let quote = null;
-    let escaped = false;
-    for (const character of String(command)) {
-      if (quote === null) {
-        if (escaped) {
-          current += character;
-          escaped = false;
-          continue;
-        }
-        if (character === "\\") {
-          escaped = true;
-          continue;
-        }
-        if (character === "'" || character === '"') {
-          quote = character;
-          continue;
-        }
-        if (/\s/.test(character)) {
-          if (current) {
-            tokens.push(current);
-            current = "";
-          }
-          continue;
-        }
-        if ("|&;<>()$`*?[]{}~".includes(character)) {
-          return null;
-        }
-        current += character;
-        continue;
-      }
-      if (quote === "'") {
-        if (character === "'") {
-          quote = null;
-          continue;
-        }
-        current += character;
-        continue;
-      }
-      if (escaped) {
-        current += character;
-        escaped = false;
-        continue;
-      }
-      if (character === "\\") {
-        escaped = true;
-        continue;
-      }
-      if (character === '"') {
-        quote = null;
-        continue;
-      }
-      if (character === "$" || character === "`") {
-        return null;
-      }
-      current += character;
-    }
-    if (quote !== null || escaped) {
-      return null;
-    }
-    if (current) {
-      tokens.push(current);
-    }
-    return tokens.length > 0 ? tokens : null;
-  }
-  function appendDoubleQuotedShellEscape(current, character) {
-    if (character === '"' || character === "\\" || character === "$" || character === "`") {
-      return current + character;
-    }
-    if (character === "\n") {
-      return current;
-    }
-    return current + "\\" + character;
-  }
-  function parseSimpleExecCommandWithRedirects(command) {
-    const tokens = [];
-    let current = "";
-    let quote = null;
-    let escaped = false;
-    const flushCurrent = () => {
-      if (current) {
-        tokens.push(current);
-        current = "";
-      }
-    };
-    for (let index = 0; index < String(command).length; index += 1) {
-      const character = String(command)[index];
-      if (quote === null) {
-        if (escaped) {
-          current += character;
-          escaped = false;
-          continue;
-        }
-        if (character === "\\") {
-          escaped = true;
-          continue;
-        }
-        if (character === "'" || character === '"') {
-          quote = character;
-          continue;
-        }
-        if (/\s/.test(character)) {
-          flushCurrent();
-          continue;
-        }
-        if (character === "<") {
-          flushCurrent();
-          tokens.push("<");
-          continue;
-        }
-        if (character === ">") {
-          flushCurrent();
-          if (String(command)[index + 1] === ">") {
-            tokens.push(">>");
-            index += 1;
-          } else {
-            tokens.push(">");
-          }
-          continue;
-        }
-        if ("|&;()$`*?[]{}~!".includes(character)) {
-          return null;
-        }
-        current += character;
-        continue;
-      }
-      if (quote === "'") {
-        if (character === "'") {
-          quote = null;
-        } else {
-          current += character;
-        }
-        continue;
-      }
-      if (escaped) {
-        current = appendDoubleQuotedShellEscape(current, character);
-        escaped = false;
-        continue;
-      }
-      if (character === "\\") {
-        escaped = true;
-        continue;
-      }
-      if (character === '"') {
-        quote = null;
-        continue;
-      }
-      if (character === "$" || character === "`") {
-        return null;
-      }
-      current += character;
-    }
-    if (quote !== null || escaped) {
-      return null;
-    }
-    flushCurrent();
-    if (tokens.length === 0) {
-      return null;
-    }
-    let commandName;
-    const args = [];
-    let stdinPath;
-    let stdoutPath;
-    let appendStdout = false;
-    for (let index = 0; index < tokens.length; index += 1) {
-      const token = tokens[index];
-      if (token === "<" || token === ">" || token === ">>") {
-        const redirectPath = tokens[index + 1];
-        if (!redirectPath || redirectPath === "<" || redirectPath === ">" || redirectPath === ">>") {
-          return null;
-        }
-        if (token === "<") {
-          if (stdinPath !== undefined) return null;
-          stdinPath = redirectPath;
-        } else {
-          if (stdoutPath !== undefined) return null;
-          stdoutPath = redirectPath;
-          appendStdout = token === ">>";
-        }
-        index += 1;
-        continue;
-      }
-      if (!commandName) {
-        commandName = token;
-      } else {
-        args.push(token);
-      }
-    }
-    return commandName ? { command: commandName, args, stdinPath, stdoutPath, appendStdout } : null;
-  }
-  function resolveChildProcessRedirectPath(cwd, targetPath) {
-    return targetPath.startsWith("/") ? pathStdlibModuleNs.posix.normalize(targetPath) : pathStdlibModuleNs.posix.normalize(pathStdlibModuleNs.posix.join(cwd, targetPath));
-  }
-  function resolveExecShellInvocation(command) {
-    const parsed = parseSimpleExecCommand(command);
-    if (parsed && (parsed[0] === "sh" || parsed[0] === "/bin/sh") && parsed[1] === "-c" && parsed.length === 3) {
-      return {
-        command: parsed[0],
-        args: parsed.slice(1),
-        shell: false,
-        shellScript: parsed[2]
-      };
-    }
-    return {
-      command,
-      args: [],
-      shell: true,
-      shellScript: null
-    };
-  }
   function exec(command, options, callback) {
     if (typeof options === "function") {
       callback = options;
       options = {};
     }
-    const invocation = resolveExecShellInvocation(command);
-    const child = spawn(invocation.command, invocation.args, {
+    const child = spawn(command, [], {
       ...options,
-      shell: invocation.shell
+      shell: true
     });
     child.spawnargs = [command];
     child.spawnfile = command;
@@ -9535,85 +9550,15 @@ var __bridge = (() => {
     }
     const effectiveCwd = opts.cwd ?? (typeof process !== "undefined" ? process.cwd() : "/");
     const maxBuffer = opts.maxBuffer ?? 1024 * 1024;
-    const redirect = parseSimpleExecCommandWithRedirects(command);
-    if (redirect?.stdoutPath) {
-      const stdoutPath = resolveChildProcessRedirectPath(effectiveCwd, redirect.stdoutPath);
-      const runOptions = {
-        cwd: effectiveCwd,
-        env: opts.env,
-        input: redirect.stdinPath != null ? fs_default.readFileSync(resolveChildProcessRedirectPath(effectiveCwd, redirect.stdinPath)) : opts.input,
-        maxBuffer,
-        shell: false
-      };
-      const jsonResult = _childProcessSpawnSync.applySyncPromise(void 0, [
-        redirect.command,
-        JSON.stringify(redirect.args),
-        JSON.stringify({
-          cwd: runOptions.cwd,
-          env: runOptions.env,
-          input: runOptions.input == null ? null : encodeBridgeBytes(runOptions.input),
-          maxBuffer: runOptions.maxBuffer,
-          shell: false
-        })
-      ]);
-      const result = typeof jsonResult === "string" ? JSON.parse(jsonResult) : jsonResult;
-      if (result.maxBufferExceeded) {
-        const err = new Error("stdout maxBuffer length exceeded");
-        err.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
-        err.stdout = result.stdout;
-        err.stderr = result.stderr;
-        throw err;
-      }
-      if (result.code !== 0) {
-        const err = new Error("Command failed: " + command);
-        err.status = result.code;
-        err.stdout = result.stdout;
-        err.stderr = result.stderr;
-        err.output = [null, result.stdout, result.stderr];
-        throw err;
-      }
-      const redirectedStdout = typeof Buffer !== "undefined" ? Buffer.from(result.stdout) : result.stdout;
-      if (redirect.appendStdout) {
-        let existing = typeof Buffer !== "undefined" ? Buffer.from("") : "";
-        try {
-          existing = fs_default.readFileSync(stdoutPath);
-        } catch {
-        }
-        fs_default.writeFileSync(stdoutPath, typeof Buffer !== "undefined" ? Buffer.concat([Buffer.from(existing), redirectedStdout]) : `${existing}${redirectedStdout}`);
-      } else {
-        fs_default.writeFileSync(stdoutPath, redirectedStdout);
-      }
-      if (opts.encoding === "buffer" || !opts.encoding) {
-        return typeof Buffer !== "undefined" ? Buffer.from("") : "";
-      }
-      return "";
-    }
-    const invocation = resolveExecShellInvocation(command);
-    const shellExitMatch = invocation.shellScript?.trim().match(/^exit(?:\s+(-?\d+))?$/);
-    if (shellExitMatch) {
-      const exitCode = Number.parseInt(shellExitMatch[1] ?? "0", 10);
-      if (exitCode !== 0) {
-        const err = new Error("Command failed: " + command);
-        err.status = exitCode;
-        err.stdout = "";
-        err.stderr = "";
-        err.output = [null, "", ""];
-        throw err;
-      }
-      if (opts.encoding === "buffer" || !opts.encoding) {
-        return typeof Buffer !== "undefined" ? Buffer.from("") : "";
-      }
-      return "";
-    }
     const jsonResult = _childProcessSpawnSync.applySyncPromise(void 0, [
-      invocation.command,
-      JSON.stringify(invocation.args),
+      command,
+      JSON.stringify([]),
       JSON.stringify({
         cwd: effectiveCwd,
         env: opts.env,
         input: opts.input == null ? null : encodeBridgeBytes(opts.input),
         maxBuffer,
-        shell: invocation.shell
+        shell: true
       })
     ]);
     const result = typeof jsonResult === "string" ? JSON.parse(jsonResult) : jsonResult;
@@ -9691,17 +9636,52 @@ var __bridge = (() => {
         _registerHandle(child._handleId, child._handleDescription);
         child._handleRefed = true;
       }
-      child.stdin.write = (data) => {
+      child.stdin.write = (data, encodingOrCallback, callback) => {
+        const done = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
         if (typeof _childProcessStdinWrite === "undefined") return false;
         const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-        _childProcessStdinWrite.applySync(void 0, [sessionId, bytes]);
+        try {
+          _childProcessStdinWrite.applySync(void 0, [sessionId, bytes]);
+        } catch (error) {
+          if (done) {
+            queueMicrotask(() => done(error));
+            return false;
+          }
+          child.stdin.emit("error", error);
+          return false;
+        }
+        if (done) {
+          queueMicrotask(() => done(null));
+        }
         return true;
       };
-      child.stdin.end = () => {
+      child.stdin.end = (dataOrCallback, encodingOrCallback, callback) => {
+        const done = typeof dataOrCallback === "function" ? dataOrCallback : typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+        if (dataOrCallback != null && typeof dataOrCallback !== "function") {
+          child.stdin.write(dataOrCallback, typeof encodingOrCallback === "string" ? encodingOrCallback : void 0);
+        }
         if (typeof _childProcessStdinClose !== "undefined") {
-          _childProcessStdinClose.applySync(void 0, [sessionId]);
+          try {
+            _childProcessStdinClose.applySync(void 0, [sessionId]);
+          } catch (error) {
+            if (done) {
+              queueMicrotask(() => done(error));
+              return;
+            }
+            child.stdin.emit("error", error);
+            return;
+          }
         }
         child.stdin.writable = false;
+        if (done) {
+          queueMicrotask(() => done());
+        }
+      };
+      child.stdin.destroy = () => {
+        child.stdin.end();
+        child.stdin.destroyed = true;
+        child.stdin.emit("close");
+        return child.stdin;
       };
       child.kill = (signal) => {
         if (typeof _childProcessKill === "undefined") return false;
@@ -9755,6 +9735,8 @@ var __bridge = (() => {
       const effectiveCwd = opts.cwd ?? (typeof process !== "undefined" ? process.cwd() : "/");
       const maxBuffer = opts.maxBuffer;
       const useBufferOutput = opts.encoding == null || opts.encoding === "buffer";
+      const timeout = Number.isInteger(opts.timeout) && opts.timeout > 0 ? opts.timeout : null;
+      const killSignal = normalizeChildProcessSignal(opts.killSignal).signalCode ?? "SIGTERM";
       const jsonResult = _childProcessSpawnSync.applySyncPromise(void 0, [
         command,
         JSON.stringify(argsArray),
@@ -9763,12 +9745,27 @@ var __bridge = (() => {
           env: opts.env,
           input: opts.input == null ? null : encodeBridgeBytes(opts.input),
           maxBuffer,
-          shell: opts.shell === true || typeof opts.shell === "string"
+          shell: opts.shell === true || typeof opts.shell === "string",
+          timeout,
+          killSignal
         })
       ]);
       const result = typeof jsonResult === "string" ? JSON.parse(jsonResult) : jsonResult;
       const stdoutValue = useBufferOutput && typeof Buffer !== "undefined" ? Buffer.from(result.stdout) : result.stdout;
       const stderrValue = useBufferOutput && typeof Buffer !== "undefined" ? Buffer.from(result.stderr) : result.stderr;
+      if (result.timedOut) {
+        const err = new Error(`spawnSync ${command} ETIMEDOUT`);
+        err.code = "ETIMEDOUT";
+        return {
+          pid: _nextChildPid++,
+          output: [null, stdoutValue, stderrValue],
+          stdout: stdoutValue,
+          stderr: stderrValue,
+          status: null,
+          signal: result.signal ?? killSignal,
+          error: err
+        };
+      }
       if (result.maxBufferExceeded) {
         const err = new Error("stdout maxBuffer length exceeded");
         err.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
@@ -9908,13 +9905,37 @@ var __bridge = (() => {
     }
     return typeof result.stdout === "string" ? result.stdout : result.stdout.toString(opts.encoding);
   }
-  function fork(_modulePath, _args, _options) {
-    const child = new ChildProcess();
-    child.spawnfile = typeof _modulePath === "string" ? _modulePath : "";
-    child.spawnargs = child.spawnfile ? [child.spawnfile] : [];
-    queueMicrotask(() => {
-      child.emit("error", new Error("child_process.fork is not supported in sandbox"));
+  function fork(modulePath, args, options) {
+    if (typeof modulePath !== "string" || modulePath.length === 0) {
+      throw new TypeError("The \"modulePath\" argument must be of type string");
+    }
+    let argsArray = [];
+    let opts = {};
+    if (Array.isArray(args)) {
+      argsArray = args.slice();
+      opts = options || {};
+    } else {
+      opts = args || {};
+    }
+    const effectiveCwd = opts.cwd ?? (typeof process !== "undefined" ? process.cwd() : "/");
+    const execArgv = Array.isArray(opts.execArgv) ? opts.execArgv : typeof process !== "undefined" && Array.isArray(process.execArgv) ? process.execArgv : [];
+    const env = {
+      ...(typeof process !== "undefined" ? process.env : {}),
+      ...(opts.env || {}),
+      AGENT_OS_NODE_IPC: "1"
+    };
+    const child = spawn(opts.execPath || (typeof process !== "undefined" ? process.execPath : "node"), [
+      ...execArgv,
+      modulePath,
+      ...argsArray
+    ], {
+      ...opts,
+      cwd: effectiveCwd,
+      env,
+      shell: false
     });
+    child._ipcEnabled = true;
+    child.connected = true;
     return child;
   }
   var childProcess = {
@@ -17424,7 +17445,9 @@ ${headerLines}\r
     _loopbackServer = null;
     _loopbackBuffer = Buffer.alloc(0);
     _loopbackDispatchRunning = false;
+    _loopbackDispatchPending = false;
     _loopbackReadableEnded = false;
+    _loopbackUpgradeSocket = null;
     _loopbackEventQueue = Promise.resolve();
     _encoding;
     _noDelayState = false;
@@ -17551,6 +17574,13 @@ ${headerLines}\r
       if (this._loopbackServer) {
         debugBridgeNetwork("socket write loopback", this._socketId, buf.length);
         this.bytesWritten += buf.length;
+        if (this._loopbackUpgradeSocket) {
+          this._touchTimeout();
+          this._loopbackUpgradeSocket._pushData(buf);
+          const cb2 = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+          if (cb2) cb2();
+          return true;
+        }
         this._loopbackBuffer = Buffer.concat([this._loopbackBuffer, buf]);
         this._touchTimeout();
         this._dispatchLoopbackHttpRequest();
@@ -17592,7 +17622,11 @@ ${headerLines}\r
         }
       });
       if (this._loopbackServer) {
-        if (!this._loopbackReadableEnded) {
+        if (this._loopbackUpgradeSocket) {
+          queueMicrotask(() => {
+            this._loopbackUpgradeSocket?._pushEnd();
+          });
+        } else if (!this._loopbackReadableEnded) {
           queueMicrotask(() => {
             this._closeLoopbackReadable();
           });
@@ -17621,6 +17655,8 @@ ${headerLines}\r
         this._bridgeReadPollTimer = null;
       }
       if (this._loopbackServer) {
+        this._loopbackUpgradeSocket?.destroy(error);
+        this._loopbackUpgradeSocket = null;
         this._loopbackServer = null;
         if (error) {
           this._emitNet("error", error);
@@ -18032,12 +18068,22 @@ ${headerLines}\r
       }
     }
     _dispatchLoopbackHttpRequest() {
-      if (!this._loopbackServer || this._loopbackDispatchRunning || this.destroyed) {
+      if (!this._loopbackServer || this.destroyed) {
+        return;
+      }
+      if (this._loopbackDispatchRunning) {
+        this._loopbackDispatchPending = true;
         return;
       }
       this._loopbackDispatchRunning = true;
       void this._processLoopbackHttpRequests().finally(() => {
         this._loopbackDispatchRunning = false;
+        if (this._loopbackDispatchPending && this._loopbackBuffer.length > 0) {
+          this._loopbackDispatchPending = false;
+          this._dispatchLoopbackHttpRequest();
+        } else {
+          this._loopbackDispatchPending = false;
+        }
       });
     }
     async _processLoopbackHttpRequests() {
@@ -18127,13 +18173,19 @@ ${headerLines}\r
         return;
       }
       try {
+        const socket = new DirectTunnelSocket({
+          host: this.remoteAddress,
+          port: this.remotePort
+        });
+        socket._attachPeer({
+          _pushData: (data) => this._pushLoopbackData(data),
+          _pushEnd: () => this._closeLoopbackReadable()
+        });
+        this._loopbackUpgradeSocket = socket;
         this._loopbackServer._emit(
           "upgrade",
           new ServerIncomingMessage(request),
-          new DirectTunnelSocket({
-            host: this.remoteAddress,
-            port: this.remotePort
-          }),
+          socket,
           head
         );
       } catch (error) {
@@ -21109,10 +21161,12 @@ ${headerLines}\r
     return emitEventRecords(emitter, metaEvent, args);
   }
   function cloneEventListeners(emitter, event) {
+    ensureEventEmitterInitialized(emitter);
     const listeners = emitter._events[event];
     return Array.isArray(listeners) ? listeners.slice() : [];
   }
   function removeEventListenerRecord(emitter, event, listener, onceOnly = false) {
+    ensureEventEmitterInitialized(emitter);
     const listeners = emitter._events[event];
     if (!Array.isArray(listeners) || listeners.length === 0) {
       return emitter;
@@ -21248,6 +21302,18 @@ ${headerLines}\r
     target._maxListeners = eventsDefaultMaxListeners;
     target._maxListenersWarned = /* @__PURE__ */ new Set();
   }
+  function ensureEventEmitterInitialized(target) {
+    if (!target || (typeof target !== "object" && typeof target !== "function")) {
+      return;
+    }
+    if (typeof target._events === "undefined") {
+      initializeEventEmitter(target);
+      return;
+    }
+    if (!(target._maxListenersWarned instanceof Set)) {
+      target._maxListenersWarned = /* @__PURE__ */ new Set();
+    }
+  }
   function createMaxListenersExceededWarning(emitter, event, total) {
     const maxListeners = Number.isFinite(emitter._maxListeners) ? emitter._maxListeners : eventsDefaultMaxListeners;
     const warning = new Error(
@@ -21260,6 +21326,7 @@ ${headerLines}\r
     return warning;
   }
   function maybeWarnEventEmitterListeners(emitter, event, total) {
+    ensureEventEmitterInitialized(emitter);
     if (!(emitter._maxListenersWarned instanceof Set)) {
       emitter._maxListenersWarned = /* @__PURE__ */ new Set();
     }
@@ -21277,6 +21344,7 @@ ${headerLines}\r
     }
   }
   function addEventListenerRecord(emitter, event, record, prepend = false) {
+    ensureEventEmitterInitialized(emitter);
     const listeners = emitter._events[event] ?? [];
     if (prepend) {
       listeners.unshift(record);
@@ -21346,6 +21414,7 @@ ${headerLines}\r
     return removeEventListenerRecord(this, String(event), listener);
   };
   EventEmitter.prototype.removeAllListeners = function(event) {
+    ensureEventEmitterInitialized(this);
     if (typeof event === "undefined") {
       for (const key of Object.keys(this._events)) {
         if (key === "removeListener") {
@@ -21380,13 +21449,16 @@ ${headerLines}\r
     return topLevelEventListenerCount(this, String(event));
   };
   EventEmitter.prototype.eventNames = function() {
+    ensureEventEmitterInitialized(this);
     return Object.keys(this._events);
   };
   EventEmitter.prototype.setMaxListeners = function(n) {
+    ensureEventEmitterInitialized(this);
     this._maxListeners = Number(n);
     return this;
   };
   EventEmitter.prototype.getMaxListeners = function() {
+    ensureEventEmitterInitialized(this);
     return Number.isFinite(this._maxListeners) ? this._maxListeners : eventsDefaultMaxListeners;
   };
   EventEmitter.once = once;
@@ -21438,11 +21510,12 @@ ${headerLines}\r
     };
   }
   var config2 = readProcessConfig();
+  var processClockNow = typeof performance !== "undefined" && performance && typeof performance.now === "function" ? performance.now.bind(performance) : Date.now;
   function getNowMs() {
     if (config2.timingMitigation === "freeze" && typeof config2.frozenTimeMs === "number") {
       return config2.frozenTimeMs;
     }
-    return typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+    return processClockNow();
   }
   var _processStartTime = getNowMs();
   var BUFFER_MAX_LENGTH = typeof import_buffer2.Buffer.kMaxLength === "number" ? import_buffer2.Buffer.kMaxLength : 2147483647;
@@ -21554,6 +21627,28 @@ ${headerLines}\r
   }
   function _isTrackedProcessSignalEventName(eventName) {
     return typeof eventName === "string" && _trackedProcessSignalEvents.has(eventName);
+  }
+  var _processKillErrnoByCode = { ESRCH: 3, EPERM: 1, EINVAL: 22 };
+  function _createProcessKillError(error) {
+    const message = String((error && error.message) || error || "");
+    let code = null;
+    if (error && typeof error.code === "string" && Object.prototype.hasOwnProperty.call(_processKillErrnoByCode, error.code)) {
+      code = error.code;
+    } else if (/\bESRCH\b/.test(message)) {
+      code = "ESRCH";
+    } else if (/\bEINVAL\b/.test(message)) {
+      code = "EINVAL";
+    } else if (/\bEPERM\b/.test(message) || /permission denied/i.test(message)) {
+      code = "EPERM";
+    }
+    if (code === null) {
+      return error instanceof Error ? error : new Error(message);
+    }
+    const err = new Error(`kill ${code}`);
+    err.code = code;
+    err.errno = -_processKillErrnoByCode[code];
+    err.syscall = "kill";
+    return err;
   }
   var _processListeners = {};
   var _processOnceListeners = {};
@@ -21744,11 +21839,10 @@ ${headerLines}\r
         if (idx !== -1) onceListeners[event].splice(idx, 1);
       }
     };
-    const decoder = new TextDecoder();
     const stream = {
       write(data, encodingOrCallback, callback) {
         if (data instanceof Uint8Array || typeof import_buffer2.Buffer !== "undefined" && import_buffer2.Buffer.isBuffer(data)) {
-          options.write(decoder.decode(data));
+          options.write(data);
         } else {
           options.write(String(data));
         }
@@ -21844,6 +21938,29 @@ ${headerLines}\r
       this._stderr = stderr;
       this._counts = new Map();
       this._times = new Map();
+      for (const method of [
+        "assert",
+        "clear",
+        "count",
+        "countReset",
+        "debug",
+        "dir",
+        "dirxml",
+        "error",
+        "group",
+        "groupCollapsed",
+        "groupEnd",
+        "info",
+        "log",
+        "table",
+        "time",
+        "timeEnd",
+        "timeLog",
+        "trace",
+        "warn"
+      ]) {
+        this[method] = this[method].bind(this);
+      }
     }
     log(...args) {
       this._stdout.write(formatConsoleLine(args));
@@ -22472,11 +22589,34 @@ ${headerLines}\r
     if (eventType !== "stdin" || getStdinEnded()) {
       return;
     }
-    const chunk = typeof payload === "string" ? payload : payload == null ? "" : import_buffer2.Buffer.from(payload).toString("utf8");
+    let chunk;
+    let binary = false;
+    if (payload && typeof payload === "object" && typeof payload.dataBase64 === "string") {
+      const bytes = import_buffer2.Buffer.from(payload.dataBase64, "base64");
+      if (bytes.length === 0) {
+        return;
+      }
+      if (!_stdin.encoding && getStdinFlowMode()) {
+        emitStdinListeners("data", bytes);
+        maybeEmitLiveStdinTerminalEvents();
+        return;
+      }
+      chunk = _stdin.encoding ? bytes.toString(_stdin.encoding) : bytes.toString("latin1");
+      binary = !_stdin.encoding;
+    } else {
+      chunk = typeof payload === "string" ? payload : payload == null ? "" : import_buffer2.Buffer.from(payload).toString("utf8");
+    }
     if (!chunk) {
       return;
     }
     _stdinLiveBuffer += chunk;
+    if (binary && !_stdin.encoding && getStdinFlowMode()) {
+      const buffered = _stdinLiveBuffer;
+      _stdinLiveBuffer = "";
+      emitStdinListeners("data", import_buffer2.Buffer.from(buffered, "latin1"));
+      maybeEmitLiveStdinTerminalEvents();
+      return;
+    }
     flushLiveStdinBuffer();
   }
   var _stdin = {
@@ -22951,13 +23091,28 @@ ${headerLines}\r
       return readLiveProcessResourceUsage();
     },
     kill(pid, signal) {
+      if (typeof pid !== "number" || !Number.isFinite(pid) || !Number.isInteger(pid)) {
+        throw new TypeError(`The "pid" argument must be an integer. Received ${String(pid)}`);
+      }
       const sigNum = _resolveSignal(signal);
       const sigName = _signalNamesByNumber[sigNum] ?? `SIG${sigNum}`;
       if (typeof _processKill !== "undefined") {
-        const rawResult = _processKill.applySyncPromise(void 0, [pid, sigName]);
-        if (pid === process2.pid) {
-          const result = typeof rawResult === "string" ? JSON.parse(rawResult) : rawResult;
-          const action = result && typeof result === "object" && typeof result.action === "string" ? result.action : "default";
+        let rawResult;
+        try {
+          rawResult = _processKill.applySyncPromise(void 0, [pid, sigName]);
+        } catch (error) {
+          throw _createProcessKillError(error);
+        }
+        let result = rawResult;
+        if (typeof result === "string") {
+          try {
+            result = JSON.parse(result);
+          } catch {
+            result = null;
+          }
+        }
+        if (result && typeof result === "object" && result.self === true) {
+          const action = typeof result.action === "string" ? result.action : "default";
           return _deliverProcessSignal(sigNum, action);
         }
         return true;
@@ -23051,7 +23206,7 @@ ${headerLines}\r
     stderr: _stderr,
     stdin: _stdin,
     // Process state
-    connected: false,
+    connected: config2.env?.AGENT_OS_NODE_IPC === "1",
     // Module info (will be set by createRequire)
     mainModule: void 0,
     // No-op methods for compatibility
@@ -23089,11 +23244,35 @@ ${headerLines}\r
     },
     setUncaughtExceptionCaptureCallback() {
     },
-    // Send for IPC (no-op)
-    send() {
-      return false;
+    send(message, sendHandleOrOptions, optionsOrCallback, maybeCallback) {
+      const callback = typeof sendHandleOrOptions === "function" ? sendHandleOrOptions : typeof optionsOrCallback === "function" ? optionsOrCallback : maybeCallback;
+      if (!process2.connected) {
+        return false;
+      }
+      try {
+        process2.stdout.write(encodeChildProcessIpcFrame(message));
+        if (callback) {
+          queueMicrotask(() => callback(null));
+        }
+        return true;
+      } catch (error) {
+        if (callback) {
+          queueMicrotask(() => callback(error));
+          return false;
+        }
+        throw error;
+      }
     },
     disconnect() {
+      if (!process2.connected) {
+        return;
+      }
+      process2.connected = false;
+      if (process2._agentOsIpcHandleId && typeof _unregisterHandle === "function") {
+        _unregisterHandle(process2._agentOsIpcHandleId);
+        process2._agentOsIpcHandleId = null;
+      }
+      _emit("disconnect");
     },
     // Report
     report: {
@@ -23117,6 +23296,26 @@ ${headerLines}\r
     _cwd: config2.cwd,
     _umask: 18
   };
+  function installProcessIpcBridge() {
+    const ipcEnabled = config2.env?.AGENT_OS_NODE_IPC === "1" || globalThis.__agentOsProcessConfigEnv?.AGENT_OS_NODE_IPC === "1";
+    if (!ipcEnabled || process2._agentOsIpcInstalled) {
+      return;
+    }
+    process2._agentOsIpcInstalled = true;
+    process2.connected = true;
+    if (!process2._agentOsIpcHandleId && typeof _registerHandle === "function") {
+      process2._agentOsIpcHandleId = `process-ipc:${process2.pid}`;
+      _registerHandle(process2._agentOsIpcHandleId, "child_process IPC channel");
+    }
+    let ipcInputBuffer = "";
+    process2.stdin.on("data", (chunk) => {
+      const parsed = splitChildProcessIpcFrames(ipcInputBuffer, chunk);
+      ipcInputBuffer = parsed.buffer;
+      for (const message of parsed.messages) {
+        _emit("message", message, void 0);
+      }
+    });
+  }
   function applyProcessConfig(nextConfig) {
     syncLiveStdinHandle(false);
     _stdinLiveBuffer = "";
@@ -23145,6 +23344,7 @@ ${headerLines}\r
     process2.argv = nextConfig.argv;
     process2.argv0 = nextConfig.argv[0] || "node";
     process2.env = nextConfig.env;
+    process2.connected = nextConfig.env?.AGENT_OS_NODE_IPC === "1";
     process2._cwd = nextConfig.cwd;
     process2.stdin.paused = true;
     process2.stdin.encoding = null;
@@ -23155,6 +23355,8 @@ ${headerLines}\r
     applyProcessConfig(readProcessConfig());
   });
   process2.off = process2.removeListener;
+  exposeCustomGlobal("__runtimeInstallProcessIpcBridge", installProcessIpcBridge);
+  installProcessIpcBridge();
   process2.memoryUsage.rss = function() {
     return readLiveProcessMemoryUsage().rss;
   };
@@ -23796,26 +23998,97 @@ ${headerLines}\r
     error.code = "ERR_ACCESS_DENIED";
     return error;
   }
-  var builtinDiagnosticsChannelModule = {
-    channel(name = "") {
-      const channelName = String(name);
-      return {
-        name: channelName,
-        hasSubscribers: false,
-        publish() {
-        },
-        subscribe() {
-        },
-        unsubscribe() {
+  class DiagnosticsChannel {
+    constructor(name = "") {
+      this.name = String(name);
+      this._subscribers = /* @__PURE__ */ new Set();
+    }
+    get hasSubscribers() {
+      return this._subscribers.size > 0;
+    }
+    publish(message) {
+      for (const subscriber of Array.from(this._subscribers)) {
+        subscriber(message, this.name);
+      }
+    }
+    subscribe(subscriber) {
+      if (typeof subscriber === "function") {
+        this._subscribers.add(subscriber);
+      }
+    }
+    unsubscribe(subscriber) {
+      return this._subscribers.delete(subscriber);
+    }
+    runStores(context, callback, thisArg, ...args) {
+      if (typeof callback !== "function") {
+        return callback;
+      }
+      return callback.apply(thisArg, args);
+    }
+  }
+  var diagnosticsChannelCache = /* @__PURE__ */ new Map();
+  function getDiagnosticsChannel(name = "") {
+    const channelName = String(name);
+    let existing = diagnosticsChannelCache.get(channelName);
+    if (!existing) {
+      existing = new DiagnosticsChannel(channelName);
+      diagnosticsChannelCache.set(channelName, existing);
+    }
+    return existing;
+  }
+  function createDiagnosticsTracingChannel(name = "") {
+    const channelName = String(name);
+    const tracing = {
+      start: getDiagnosticsChannel(`tracing:${channelName}:start`),
+      end: getDiagnosticsChannel(`tracing:${channelName}:end`),
+      asyncStart: getDiagnosticsChannel(`tracing:${channelName}:asyncStart`),
+      asyncEnd: getDiagnosticsChannel(`tracing:${channelName}:asyncEnd`),
+      error: getDiagnosticsChannel(`tracing:${channelName}:error`),
+      subscribe() {
+      },
+      unsubscribe() {
+        return true;
+      },
+      traceSync(fn, context, thisArg, ...args) {
+        if (typeof fn !== "function") {
+          return fn;
         }
-      };
+        return fn.apply(thisArg, args);
+      },
+      tracePromise(fn, context, thisArg, ...args) {
+        if (typeof fn !== "function") {
+          return Promise.resolve(fn);
+        }
+        return Promise.resolve(fn.apply(thisArg, args));
+      },
+      traceCallback(fn, position, context, thisArg, ...args) {
+        if (typeof fn !== "function") {
+          return fn;
+        }
+        return fn.apply(thisArg, args);
+      }
+    };
+    Object.defineProperty(tracing, "hasSubscribers", {
+      get() {
+        return tracing.start.hasSubscribers || tracing.end.hasSubscribers || tracing.asyncStart.hasSubscribers || tracing.asyncEnd.hasSubscribers || tracing.error.hasSubscribers;
+      },
+      enumerable: false,
+      configurable: true
+    });
+    return tracing;
+  }
+  var builtinDiagnosticsChannelModule = {
+    Channel: DiagnosticsChannel,
+    channel: getDiagnosticsChannel,
+    hasSubscribers(name = "") {
+      return getDiagnosticsChannel(name).hasSubscribers;
     },
-    hasSubscribers() {
-      return false;
+    subscribe(name = "", subscriber) {
+      return getDiagnosticsChannel(name).subscribe(subscriber);
     },
-    subscribe() {
-    },
-    unsubscribe() {
+    tracingChannel: createDiagnosticsTracingChannel,
+    unsubscribe(name = "", subscriber) {
+      return getDiagnosticsChannel(name).unsubscribe(subscriber);
     }
   };
   var asyncLocalStorageInstances = /* @__PURE__ */ new Set();
@@ -23975,10 +24248,16 @@ ${headerLines}\r
     const nativePromiseThen = Promise.prototype.then;
     Promise.prototype.then = function(onFulfilled, onRejected) {
       const snapshot = snapshotAsyncLocalStorageStores();
+      const wrappedRejected = typeof onRejected === "function" ? (error) => {
+        if (isProcessExitError(error)) {
+          throw error;
+        }
+        return onRejected(error);
+      } : onRejected;
       return nativePromiseThen.call(
         this,
         wrapAsyncLocalStorageCallback(onFulfilled, snapshot),
-        wrapAsyncLocalStorageCallback(onRejected, snapshot)
+        wrapAsyncLocalStorageCallback(wrappedRejected, snapshot)
       );
     };
     Object.defineProperty(Promise.prototype, "__agentOsAsyncLocalStoragePatched", {
@@ -24059,6 +24338,9 @@ ${headerLines}\r
   var _timerEntries = /* @__PURE__ */ new Map();
   var _timerDrainResolvers = [];
   function getRefedTimerCount() {
+    if (typeof _exited !== "undefined" && _exited) {
+      return 0;
+    }
     let count = 0;
     for (const entry of _timerEntries.values()) {
       if (entry.handle?.hasRef?.() !== false) {
@@ -24136,6 +24418,10 @@ ${headerLines}\r
       if (!outcome.handled && outcome.rethrow !== null) {
         throw outcome.rethrow;
       }
+      return;
+    }
+    if (typeof _exited !== "undefined" && _exited) {
+      checkTimerDrain();
       return;
     }
     if (entry.repeat && _timerEntries.has(timerId)) {
@@ -25057,6 +25343,12 @@ ${headerLines}\r
     }
     return args;
   }
+  const diffieHellmanSessionFinalizer = typeof FinalizationRegistry === "function" ? new FinalizationRegistry((sessionId) => {
+    try {
+      callCryptoSync(_cryptoDiffieHellmanSessionDestroy, "createDiffieHellman", [sessionId]);
+    } catch {
+    }
+  }) : null;
   class BuiltinDiffieHellmanSession {
     _sessionId;
     constructor(request) {
@@ -25065,8 +25357,27 @@ ${headerLines}\r
         name: request.name,
         args: (request.args || []).map((entry) => serializeBridgeValue(entry))
       })]));
+      diffieHellmanSessionFinalizer?.register(this, this._sessionId, this);
+    }
+    _destroySession() {
+      if (this._sessionId == null) {
+        return;
+      }
+      const sessionId = this._sessionId;
+      this._sessionId = null;
+      diffieHellmanSessionFinalizer?.unregister(this);
+      callCryptoSync(_cryptoDiffieHellmanSessionDestroy, "createDiffieHellman", [sessionId]);
+    }
+    dispose() {
+      this._destroySession();
+    }
+    [Symbol.dispose || Symbol.for("Symbol.dispose")]() {
+      this._destroySession();
     }
     _call(method, args = []) {
+      if (this._sessionId == null) {
+        throw new Error("Diffie-Hellman session has been destroyed");
+      }
       const response = JSON.parse(String(callCryptoSync(_cryptoDiffieHellmanSessionCall, "createDiffieHellman", [
         this._sessionId,
         JSON.stringify({
@@ -25365,6 +25676,25 @@ ${headerLines}\r
     getHashes() {
       return ["md5", "sha1", "sha224", "sha256", "sha384", "sha512"];
     },
+    getCiphers() {
+      return [
+        "aes-128-cbc",
+        "aes-128-ctr",
+        "aes-128-gcm",
+        "aes-192-cbc",
+        "aes-192-ctr",
+        "aes-192-gcm",
+        "aes-256-cbc",
+        "aes-256-ctr",
+        "aes-256-gcm",
+        "aes128",
+        "aes192",
+        "aes256"
+      ];
+    },
+    getCurves() {
+      return ["prime256v1", "secp256k1", "secp384r1", "secp521r1"];
+    },
     getRandomValues(array) {
       return cryptoPolyfill.getRandomValues(array);
     },
@@ -25449,9 +25779,71 @@ ${headerLines}\r
       return typeof locales === "string" ? [locales] : [];
     }
   }
-  function installSafeIntlDateTimeFormat(target) {
+  function normalizeFractionDigitOption(value, fallback) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return fallback;
+    return Math.min(20, Math.max(0, Math.trunc(number)));
+  }
+  function applySafeNumberGrouping(value) {
+    const [integer, fraction] = value.split(".");
+    const sign = integer.startsWith("-") ? "-" : "";
+    const digits = sign ? integer.slice(1) : integer;
+    const grouped = digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    return fraction === void 0 ? `${sign}${grouped}` : `${sign}${grouped}.${fraction}`;
+  }
+  class SafeNumberFormat {
+    constructor(locales = "en-US", options = {}) {
+      this.locales = locales;
+      this.options = options && typeof options === "object" ? { ...options } : {};
+      this.format = this.format.bind(this);
+    }
+    format(value) {
+      const number = Number(value);
+      if (Number.isNaN(number)) return "NaN";
+      if (number === Infinity) return "∞";
+      if (number === -Infinity) return "-∞";
+      const minimumFractionDigits = normalizeFractionDigitOption(this.options.minimumFractionDigits, 0);
+      const maximumFractionDigits = Math.max(
+        minimumFractionDigits,
+        normalizeFractionDigitOption(this.options.maximumFractionDigits, Math.max(minimumFractionDigits, 3))
+      );
+      let formatted = number.toFixed(maximumFractionDigits);
+      if (maximumFractionDigits > minimumFractionDigits) {
+        formatted = formatted.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+        const fractionLength = formatted.includes(".") ? formatted.length - formatted.indexOf(".") - 1 : 0;
+        if (fractionLength < minimumFractionDigits) {
+          formatted += `${fractionLength === 0 ? "." : ""}${"0".repeat(minimumFractionDigits - fractionLength)}`;
+        }
+      }
+      if (this.options.useGrouping === false) return formatted;
+      return applySafeNumberGrouping(formatted);
+    }
+    formatToParts(value) {
+      return [{ type: "literal", value: this.format(value) }];
+    }
+    resolvedOptions() {
+      const locale = Array.isArray(this.locales) ? this.locales.find((entry) => typeof entry === "string") || "en-US" : typeof this.locales === "string" ? this.locales : "en-US";
+      return {
+        locale,
+        numberingSystem: "latn",
+        style: "decimal",
+        minimumFractionDigits: normalizeFractionDigitOption(this.options.minimumFractionDigits, 0),
+        maximumFractionDigits: normalizeFractionDigitOption(this.options.maximumFractionDigits, 3),
+        useGrouping: this.options.useGrouping !== false,
+        ...this.options
+      };
+    }
+    static supportedLocalesOf(locales) {
+      if (Array.isArray(locales)) {
+        return locales.filter((entry) => typeof entry === "string");
+      }
+      return typeof locales === "string" ? [locales] : [];
+    }
+  }
+  function installSafeIntlFormatters(target) {
     const existingIntl = target.Intl && typeof target.Intl === "object" ? target.Intl : {};
     existingIntl.DateTimeFormat = SafeDateTimeFormat;
+    existingIntl.NumberFormat = SafeNumberFormat;
     target.Intl = existingIntl;
     Date.prototype.toLocaleString = function(locales, options) {
       return new target.Intl.DateTimeFormat(locales, options).format(this);
@@ -25466,6 +25858,9 @@ ${headerLines}\r
         second: "2-digit",
         ...(options || {})
       }).format(this);
+    };
+    Number.prototype.toLocaleString = function(locales, options) {
+      return new target.Intl.NumberFormat(locales, options).format(this.valueOf());
     };
   }
   function encodeFilePathSegment(value) {
@@ -25492,6 +25887,63 @@ ${headerLines}\r
       pathname = `/${pathname}`;
     }
     return pathname;
+  }
+  function installBuiltinUtilFormatWithOptions(builtinUtilModule) {
+    if (!builtinUtilModule || typeof builtinUtilModule.formatWithOptions === "function") {
+      return builtinUtilModule;
+    }
+    builtinUtilModule.formatWithOptions = function formatWithOptions(inspectOptions, format, ...args) {
+      const inspectValue = (value) => {
+        if (typeof builtinUtilModule.inspect === "function") {
+          return builtinUtilModule.inspect(value, inspectOptions);
+        }
+        try {
+          return JSON.stringify(value);
+        } catch {
+          return String(value);
+        }
+      };
+      const formatValue = (value) => typeof value === "string" ? value : inspectValue(value);
+      if (typeof format !== "string") {
+        return [format, ...args].map(formatValue).join(" ");
+      }
+      let index = 0;
+      const formatted = format.replace(/%[sdifjoO%]/g, (token) => {
+        if (token === "%%") {
+          return "%";
+        }
+        if (index >= args.length) {
+          return token;
+        }
+        const value = args[index++];
+        switch (token) {
+          case "%s":
+            return String(value);
+          case "%d":
+            return Number(value).toString();
+          case "%i":
+            return Number.parseInt(value, 10).toString();
+          case "%f":
+            return Number.parseFloat(value).toString();
+          case "%j":
+            try {
+              return JSON.stringify(value);
+            } catch {
+              return "[Circular]";
+            }
+          case "%o":
+          case "%O":
+            return inspectValue(value);
+          default:
+            return token;
+        }
+      });
+      if (index >= args.length) {
+        return formatted;
+      }
+      return [formatted, ...args.slice(index).map(formatValue)].join(" ");
+    };
+    return builtinUtilModule;
   }
   function setupGlobals() {
     const g = globalThis;
@@ -25537,6 +25989,7 @@ ${headerLines}\r
     if (builtinUtilModule?.types) {
       builtinUtilModule.types.isProxy = () => false;
     }
+    installBuiltinUtilFormatWithOptions(builtinUtilModule);
     if (typeof g.atob === "undefined" || typeof g.btoa === "undefined") {
       const base64 = require_base64_js();
       if (typeof g.atob === "undefined") {
@@ -25590,7 +26043,7 @@ ${headerLines}\r
     g.Headers = UndiciHeaders;
     g.Request = UndiciRequest;
     g.Response = UndiciResponse;
-    installSafeIntlDateTimeFormat(g);
+    installSafeIntlFormatters(g);
   }
 
   // .agent/recovery/secure-exec/nodejs/src/bridge/module.ts
@@ -25664,6 +26117,30 @@ ${headerLines}\r
     requireFn.main = globalThis.process?.mainModule;
     requireFn.extensions = defaultRequireExtensions;
     return requireFn;
+  }
+  function createRequireEsmError(filename) {
+    const error = new Error(`require() of ES Module ${filename} is not supported.`);
+    error.code = "ERR_REQUIRE_ESM";
+    return error;
+  }
+  function createModuleFormatBridgeMissingError(filename) {
+    const error = new Error(
+      `Agent OS module format bridge is not registered; cannot require ${filename}.`
+    );
+    error.code = "ERR_AGENT_OS_MODULE_FORMAT_BRIDGE_MISSING";
+    return error;
+  }
+  function assertCommonjsLoadable(filename) {
+    if (
+      typeof _moduleFormat === "undefined" ||
+      typeof _moduleFormat.applySyncPromise !== "function"
+    ) {
+      throw createModuleFormatBridgeMissingError(filename);
+    }
+    const format = _moduleFormat.applySyncPromise(void 0, [filename]);
+    if (format === "module") {
+      throw createRequireEsmError(filename);
+    }
   }
   function createRequire(filename) {
     if (typeof filename !== "string" && !(filename instanceof URL)) {
@@ -25740,6 +26217,7 @@ ${headerLines}\r
     static _extensions = {
       ...defaultRequireExtensions,
       ".js": function(module, filename) {
+        assertCommonjsLoadable(filename);
         const content = typeof _loadFile !== "undefined" ? _loadFile.applySyncPromise(void 0, [
           filename
         ]) : _requireFrom("fs", "/").readFileSync(filename, "utf8");
@@ -26383,11 +26861,11 @@ ${headerLines}\r
       case "url":
         return builtinUrlStdlibModule;
       case "sys":
-        return globalThis.__agentOsBuiltinUtilModule;
+        return installBuiltinUtilFormatWithOptions(globalThis.__agentOsBuiltinUtilModule);
       case "util":
-        return globalThis.__agentOsBuiltinUtilModule;
+        return installBuiltinUtilFormatWithOptions(globalThis.__agentOsBuiltinUtilModule);
       case "util/types":
-        return globalThis.__agentOsBuiltinUtilModule.types;
+        return installBuiltinUtilFormatWithOptions(globalThis.__agentOsBuiltinUtilModule).types;
       case "child_process":
         return _childProcessModule;
       case "console":
@@ -26455,10 +26933,11 @@ ${headerLines}\r
     if (Object.prototype.hasOwnProperty.call(_moduleCache, resolved)) {
       return _moduleCache[resolved].exports;
     }
+    assertCommonjsLoadable(resolved);
     const module = new Module(resolved, { path: parentPath });
     _moduleCache[resolved] = module;
     try {
-      const extension = resolved.endsWith(".json") ? ".json" : ".js";
+      const extension = resolved.endsWith(".json") ? ".json" : resolved.endsWith(".node") ? ".node" : ".js";
       const loader = Module._extensions[extension] ?? Module._extensions[".js"];
       loader(module, resolved);
       module.loaded = true;

@@ -2,12 +2,23 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFLNK: u32 = 0o120000;
-const MEMORY_FILESYSTEM_DEVICE_ID: u64 = 1;
+
+// Each MemoryFileSystem instance gets its own device id, like a Linux
+// superblock. Inode numbers are only unique within one instance, so layered
+// or mounted compositions need distinct dev values for (dev, ino) file
+// identity comparisons to be meaningful. The counter starts above the small
+// constants reserved for synthetic device and pipe stats.
+static NEXT_MEMORY_FILESYSTEM_DEVICE_ID: AtomicU64 = AtomicU64::new(256);
+
+fn allocate_memory_filesystem_device_id() -> u64 {
+    NEXT_MEMORY_FILESYSTEM_DEVICE_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 const DEFAULT_UID: u32 = 1000;
 const DEFAULT_GID: u32 = 1000;
@@ -217,6 +228,10 @@ pub trait VirtualFileSystem {
         Ok(entries)
     }
     fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>>;
+    /// Writes caller-owned bytes into the filesystem.
+    ///
+    /// This raw VFS primitive does not enforce VM resource policy. Kernel entry
+    /// points must preflight file sizes and inode growth before calling it.
     fn write_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()>;
     fn write_file_with_mode(
         &mut self,
@@ -243,9 +258,12 @@ pub trait VirtualFileSystem {
         let _ = mode;
         self.create_file_exclusive(path, content)
     }
+    /// Appends caller-owned bytes into the filesystem after checking that the
+    /// in-memory file can grow without overflowing addressable memory.
     fn append_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<u64> {
         let content = content.into();
         let mut existing = self.read_file(path)?;
+        reserve_file_growth(&mut existing, content.len())?;
         existing.extend_from_slice(&content);
         let new_len = existing.len() as u64;
         self.write_file(path, existing)?;
@@ -309,18 +327,29 @@ pub trait VirtualFileSystem {
         )?;
         self.utimes(path, atime_ms, mtime_ms)
     }
+    /// Resizes a file. VM resource policy must be enforced by the caller.
     fn truncate(&mut self, path: &str, length: u64) -> VfsResult<()>;
     fn pread(&mut self, path: &str, offset: u64, length: usize) -> VfsResult<Vec<u8>>;
+    /// Writes caller-owned bytes at an offset after checking that the in-memory
+    /// file can grow without overflowing addressable memory.
     fn pwrite(&mut self, path: &str, content: impl Into<Vec<u8>>, offset: u64) -> VfsResult<()> {
         let content = content.into();
         let mut existing = self.read_file(path)?;
-        let start = offset as usize;
+        let start = checked_file_len(offset, "pwrite offset")?;
         if start > existing.len() {
-            existing.resize(start, 0);
+            resize_file_data(&mut existing, start)?;
         }
-        let end = start.saturating_add(content.len());
+        let end = start.checked_add(content.len()).ok_or_else(|| {
+            VfsError::new(
+                "ENOMEM",
+                format!(
+                    "pwrite result length overflows addressable memory: offset {offset}, content length {}",
+                    content.len()
+                ),
+            )
+        })?;
         if end > existing.len() {
-            existing.resize(end, 0);
+            resize_file_data(&mut existing, end)?;
         }
         existing[start..end].copy_from_slice(&content);
         self.write_file(path, existing)
@@ -397,6 +426,7 @@ pub struct MemoryFileSystemSnapshot {
 
 #[derive(Debug)]
 pub struct MemoryFileSystem {
+    device_id: u64,
     path_index: BTreeMap<String, u64>,
     inodes: BTreeMap<u64, Inode>,
     next_ino: u64,
@@ -405,6 +435,7 @@ pub struct MemoryFileSystem {
 impl MemoryFileSystem {
     pub fn new() -> Self {
         let mut filesystem = Self {
+            device_id: allocate_memory_filesystem_device_id(),
             path_index: BTreeMap::new(),
             inodes: BTreeMap::new(),
             next_ino: 1,
@@ -413,6 +444,69 @@ impl MemoryFileSystem {
         let root_ino = filesystem.allocate_inode(InodeKind::Directory, S_IFDIR | 0o755);
         filesystem.path_index.insert(String::from("/"), root_ino);
         filesystem
+    }
+
+    pub fn read_dir_filtered_limited<F>(
+        &mut self,
+        path: &str,
+        max_entries: usize,
+        mut include: F,
+    ) -> VfsResult<Vec<String>>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.assert_directory_path(path, "scandir")?;
+        let resolved = self.resolve_path(path, 0)?;
+        self.inode_mut_for_existing_path(&resolved, "scandir", false)?
+            .metadata
+            .atime_ms = now_ms();
+        let prefix = if resolved == "/" {
+            String::from("/")
+        } else {
+            format!("{resolved}/")
+        };
+
+        let mut entries = BTreeMap::<String, String>::new();
+        for (candidate_path, _) in self.path_index.range(prefix.clone()..) {
+            if !candidate_path.starts_with(&prefix) {
+                break;
+            }
+
+            let rest = &candidate_path[prefix.len()..];
+            if rest.is_empty() || rest.contains('/') || !include(rest) {
+                continue;
+            }
+
+            entries.insert(String::from(rest), String::from(rest));
+            if entries.len() > max_entries {
+                return Err(VfsError::new(
+                    "ENOMEM",
+                    format!(
+                        "directory listing for '{path}' exceeds configured limit of {max_entries} entries"
+                    ),
+                ));
+            }
+        }
+
+        Ok(entries.into_values().collect())
+    }
+
+    pub fn link_count_in_subtree(&self, ino: u64, path: &str) -> usize {
+        let normalized = normalize_path(path);
+        let prefix = if normalized == "/" {
+            String::from("/")
+        } else {
+            format!("{normalized}/")
+        };
+
+        self.path_index
+            .iter()
+            .filter(|(candidate_path, candidate_ino)| {
+                **candidate_ino == ino
+                    && (candidate_path.as_str() == normalized
+                        || candidate_path.starts_with(&prefix))
+            })
+            .count()
     }
 
     fn allocate_inode(&mut self, kind: InodeKind, mode: u32) -> u64 {
@@ -695,7 +789,7 @@ impl MemoryFileSystem {
             mode: inode.metadata.mode,
             size,
             blocks: block_count_for_size(size),
-            dev: MEMORY_FILESYSTEM_DEVICE_ID,
+            dev: self.device_id,
             rdev: 0,
             is_directory: matches!(inode.kind, InodeKind::Directory),
             is_symbolic_link: matches!(inode.kind, InodeKind::SymbolicLink { .. }),
@@ -713,6 +807,10 @@ impl MemoryFileSystem {
         }
     }
 
+    /// Clones the full in-memory filesystem state.
+    ///
+    /// Callers that expose snapshots outside the kernel must enforce their own
+    /// byte and inode limits before reaching this raw clone operation.
     pub fn snapshot(&self) -> MemoryFileSystemSnapshot {
         MemoryFileSystemSnapshot {
             path_index: self.path_index.clone(),
@@ -760,6 +858,7 @@ impl MemoryFileSystem {
 
     pub fn from_snapshot(snapshot: MemoryFileSystemSnapshot) -> Self {
         Self {
+            device_id: allocate_memory_filesystem_device_id(),
             path_index: snapshot.path_index,
             inodes: snapshot
                 .inodes
@@ -824,40 +923,7 @@ impl VirtualFileSystem for MemoryFileSystem {
     }
 
     fn read_dir_limited(&mut self, path: &str, max_entries: usize) -> VfsResult<Vec<String>> {
-        self.assert_directory_path(path, "scandir")?;
-        let resolved = self.resolve_path(path, 0)?;
-        self.inode_mut_for_existing_path(&resolved, "scandir", false)?
-            .metadata
-            .atime_ms = now_ms();
-        let prefix = if resolved == "/" {
-            String::from("/")
-        } else {
-            format!("{resolved}/")
-        };
-
-        let mut entries = BTreeMap::<String, String>::new();
-        for (candidate_path, _) in self.path_index.range(prefix.clone()..) {
-            if !candidate_path.starts_with(&prefix) {
-                break;
-            }
-
-            let rest = &candidate_path[prefix.len()..];
-            if rest.is_empty() || rest.contains('/') {
-                continue;
-            }
-
-            entries.insert(String::from(rest), String::from(rest));
-            if entries.len() > max_entries {
-                return Err(VfsError::new(
-                    "ENOMEM",
-                    format!(
-                        "directory listing for '{path}' exceeds configured limit of {max_entries} entries"
-                    ),
-                ));
-            }
-        }
-
-        Ok(entries.into_values().collect())
+        self.read_dir_filtered_limited(path, max_entries, |_| true)
     }
 
     fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>> {
@@ -949,6 +1015,7 @@ impl VirtualFileSystem for MemoryFileSystem {
         let now = now_ms();
         match &mut inode.kind {
             InodeKind::File { data: existing } => {
+                reserve_file_growth(existing, data.len())?;
                 existing.extend_from_slice(&data);
                 inode.metadata.mtime_ms = now;
                 inode.metadata.ctime_ms = now;
@@ -1283,7 +1350,7 @@ impl VirtualFileSystem for MemoryFileSystem {
         let now = now_ms();
         match &mut inode.kind {
             InodeKind::File { data } => {
-                data.resize(length as usize, 0);
+                resize_file_data(data, checked_file_len(length, "truncate length")?)?;
                 inode.metadata.mtime_ms = now;
                 inode.metadata.ctime_ms = now;
                 Ok(())
@@ -1397,6 +1464,35 @@ fn block_count_for_size(size: u64) -> u64 {
     } else {
         size.div_ceil(512)
     }
+}
+
+fn checked_file_len(value: u64, description: &'static str) -> VfsResult<usize> {
+    usize::try_from(value).map_err(|_| {
+        VfsError::new(
+            "EINVAL",
+            format!("{description} exceeds addressable memory: {value}"),
+        )
+    })
+}
+
+fn reserve_file_growth(data: &mut Vec<u8>, additional: usize) -> VfsResult<()> {
+    data.try_reserve(additional).map_err(|error| {
+        VfsError::new(
+            "ENOMEM",
+            format!(
+                "file growth exceeds addressable memory: current length {}, additional {additional}: {error}",
+                data.len()
+            ),
+        )
+    })
+}
+
+fn resize_file_data(data: &mut Vec<u8>, new_len: usize) -> VfsResult<()> {
+    if new_len > data.len() {
+        reserve_file_growth(data, new_len - data.len())?;
+    }
+    data.resize(new_len, 0);
+    Ok(())
 }
 
 fn dirname(path: &str) -> String {

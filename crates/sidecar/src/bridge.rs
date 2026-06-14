@@ -1,5 +1,7 @@
 //! Host bridge filesystem and permission plumbing extracted from service.rs.
 
+#![cfg_attr(test, allow(dead_code))]
+
 use crate::plugins::register_native_mount_plugins;
 use crate::service::{
     audit_fields, emit_security_audit_event, filesystem_permission_capability, plugin_error,
@@ -1017,6 +1019,13 @@ pub(crate) struct MountPluginContext<B> {
     pub(crate) session_id: String,
     pub(crate) vm_id: String,
     pub(crate) sidecar_requests: SharedSidecarRequestClient,
+    pub(crate) max_pread_bytes: Option<usize>,
+}
+
+impl<B> crate::plugins::host_dir::HostDirReadLimitContext for MountPluginContext<B> {
+    fn host_dir_max_read_bytes(&self) -> Option<usize> {
+        self.max_pread_bytes
+    }
 }
 
 #[derive(Debug)]
@@ -1084,7 +1093,9 @@ where
                         "fs",
                         Some(&request.path),
                     )
-                    .unwrap_or_else(PermissionDecision::allow)
+                    .unwrap_or_else(|| {
+                        PermissionDecision::deny("missing fs.mount_sensitive permission policy")
+                    })
             } else {
                 filesystem_bridge.filesystem_decision(&filesystem_vm_id, &request.path, access)
             };

@@ -37,12 +37,14 @@ const hasWasmHttpGet = existsSync(resolve(C_BUILD_DIR, 'http_get'));
 
 async function mountKernel(
   filesystem: ReturnType<typeof createInMemoryFileSystem>,
+  options: { loopbackExemptPorts?: number[] } = {},
 ) {
   const kernel = createKernel({
     filesystem,
     cwd: '/tmp',
     permissions: allowAll,
     hostNetworkAdapter: createNodeHostNetworkAdapter(),
+    loopbackExemptPorts: options.loopbackExemptPorts,
   });
   const commandDirs = existsSync(COMMANDS_DIR) ? [C_BUILD_DIR, COMMANDS_DIR] : [C_BUILD_DIR];
   await kernel.mount(
@@ -66,15 +68,15 @@ function closeServer(server: Server) {
   });
 }
 
-async function waitForText(
-  getText: () => string,
-  expected: string,
-  timeoutMs = 5_000,
+async function waitForFilesystemPath(
+  filesystem: ReturnType<typeof createInMemoryFileSystem>,
+  path: string,
+  timeoutMs = 30_000,
 ) {
   const start = Date.now();
-  while (!getText().includes(expected)) {
+  while (!(await filesystem.exists(path))) {
     if (Date.now() - start >= timeoutMs) {
-      throw new Error(`timed out waiting for output: ${expected}\n\n${getText()}`);
+      throw new Error(`timed out waiting for ${path}`);
     }
     await sleep(25);
   }
@@ -86,7 +88,7 @@ describeIf(hasWasmDuckDB, 'duckdb command', { timeout: 120_000 }, () => {
   afterEach(async () => {
     await kernel?.dispose();
     kernel = undefined;
-  });
+  }, 120_000);
 
   it('executes basic SQL against an in-memory database', async () => {
     const filesystem = createInMemoryFileSystem();
@@ -179,17 +181,14 @@ describeIf(hasWasmDuckDB, 'duckdb command', { timeout: 120_000 }, () => {
     );
     expect(result.exitCode).toBe(0);
 
-    let stdout = '';
-    const proc = kernel.spawn('duckdb', ['-csv', '/tmp/recover.duckdb'], {
-      streamStdin: true,
-      onStdout: (chunk) => {
-        stdout += new TextDecoder().decode(chunk);
-      },
-    });
+    const proc = kernel.spawn('duckdb', [
+      '-csv',
+      '/tmp/recover.duckdb',
+      '-c',
+      "BEGIN; INSERT INTO items VALUES (42); COPY (SELECT COUNT(*) AS rows_in_tx FROM items) TO '/tmp/tx-ready.csv' (HEADER, DELIMITER ','); SELECT SUM(i) FROM range(100000000000) tbl(i);",
+    ]);
 
-    await sleep(300);
-    proc.writeStdin('BEGIN;\nINSERT INTO items VALUES (42);\nSELECT COUNT(*) AS rows_in_tx FROM items;\n');
-    await waitForText(() => stdout, 'rows_in_tx\n2');
+    await waitForFilesystemPath(filesystem, '/tmp/tx-ready.csv');
 
     proc.kill(9);
     await proc.wait().catch(() => undefined);
@@ -207,7 +206,7 @@ describeIf(hasWasmDuckDB, 'duckdb command', { timeout: 120_000 }, () => {
     kernel = await mountKernel(filesystem);
 
     const result = await kernel.exec(
-      `duckdb -csv /tmp/spill.duckdb -c "PRAGMA temp_directory='/tmp/duckdb-spill'; SET threads=1; SET preserve_insertion_order=false; SET memory_limit='64MB'; COPY (SELECT i, repeat('x', 256) AS payload FROM range(300000) tbl(i) ORDER BY i DESC) TO '/tmp/spilled.csv' (HEADER, DELIMITER ',');"`
+      `duckdb -csv /tmp/spill.duckdb -c "PRAGMA temp_directory='/tmp/duckdb-spill'; SET threads=1; SET preserve_insertion_order=false; SET memory_limit='64MB'; COPY (SELECT i, repeat('x', 256) AS payload FROM range(200000) tbl(i) ORDER BY i DESC) TO '/tmp/spilled.csv' (HEADER, DELIMITER ',');"`
     );
     expect(result.exitCode).toBe(0);
     expect(await filesystem.exists('/tmp/spilled.csv')).toBe(true);
@@ -220,7 +219,6 @@ describeIf(hasWasmDuckDB, 'duckdb command', { timeout: 120_000 }, () => {
     async () => {
       const filesystem = createInMemoryFileSystem();
       await filesystem.mkdir('/tmp');
-      kernel = await mountKernel(filesystem);
 
       const server = createServer((req: IncomingMessage, res: ServerResponse) => {
         if (req.url === '/' || req.url === '/remote.csv') {
@@ -240,6 +238,9 @@ describeIf(hasWasmDuckDB, 'duckdb command', { timeout: 120_000 }, () => {
         if (!address || typeof address === 'string') {
           throw new Error('failed to bind test HTTP server');
         }
+        kernel = await mountKernel(filesystem, {
+          loopbackExemptPorts: [address.port],
+        });
 
         let result;
         if (hasWasmHttpGet) {

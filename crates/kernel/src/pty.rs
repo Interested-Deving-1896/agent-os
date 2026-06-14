@@ -216,6 +216,7 @@ enum PtyEndKind {
 
 #[derive(Debug, Default)]
 struct PendingRead {
+    length: usize,
     result: Option<Option<Vec<u8>>>,
 }
 
@@ -534,6 +535,14 @@ impl PtyManager {
 
                         if !pty.output_buffer.is_empty() {
                             let result = drain_buffer(&mut pty.output_buffer, length);
+                            // This reader consumed buffered data directly, so its queued waiter
+                            // entry must be removed or a later delivery will assign data to an
+                            // orphan.
+                            if let Some(id) = waiter_id.take() {
+                                pty.waiting_input_reads.retain(|queued| *queued != id);
+                                pty.waiting_output_reads.retain(|queued| *queued != id);
+                                state.waiters.remove(&id);
+                            }
                             self.notify_waiters_and_pollers();
                             return Ok(Some(result));
                         }
@@ -555,6 +564,14 @@ impl PtyManager {
 
                         if !pty.input_buffer.is_empty() {
                             let result = drain_buffer(&mut pty.input_buffer, length);
+                            // This reader consumed buffered data directly, so its queued waiter
+                            // entry must be removed or a later delivery will assign data to an
+                            // orphan.
+                            if let Some(id) = waiter_id.take() {
+                                pty.waiting_input_reads.retain(|queued| *queued != id);
+                                pty.waiting_output_reads.retain(|queued| *queued != id);
+                                state.waiters.remove(&id);
+                            }
                             self.notify_waiters_and_pollers();
                             return Ok(Some(result));
                         }
@@ -574,7 +591,13 @@ impl PtyManager {
             } else {
                 let next = state.next_waiter_id;
                 state.next_waiter_id += 1;
-                state.waiters.insert(next, PendingRead::default());
+                state.waiters.insert(
+                    next,
+                    PendingRead {
+                        length,
+                        result: None,
+                    },
+                );
                 let Some(pty) = state.ptys.get_mut(&pty_ref.pty_id) else {
                     state.waiters.remove(&next);
                     return Err(PtyError::bad_file_descriptor("PTY not found"));
@@ -806,6 +829,18 @@ impl PtyManager {
             .sum()
     }
 
+    pub fn pending_read_waiter_count(&self) -> usize {
+        lock_or_recover(&self.inner.state).waiters.len()
+    }
+
+    pub fn queued_read_waiter_count(&self) -> usize {
+        lock_or_recover(&self.inner.state)
+            .ptys
+            .values()
+            .map(|pty| pty.waiting_input_reads.len() + pty.waiting_output_reads.len())
+            .sum()
+    }
+
     pub fn path_for(&self, description_id: u64) -> Option<String> {
         let state = lock_or_recover(&self.inner.state);
         let pty_ref = state.desc_to_pty.get(&description_id)?;
@@ -887,20 +922,20 @@ fn process_input(
 
             if byte == pty.termios.cc.verase || byte == 0x08 {
                 if !pty.line_buffer.is_empty() {
-                    pty.line_buffer.pop();
                     if pty.termios.echo {
                         deliver_output(pty, waiters, &[0x08, 0x20, 0x08], true)?;
                     }
+                    pty.line_buffer.pop();
                 }
                 continue;
             }
 
             if byte == b'\n' {
-                pty.line_buffer.push(b'\n');
+                let mut line = pty.line_buffer.clone();
+                line.push(b'\n');
                 if pty.termios.echo {
-                    deliver_output(pty, waiters, &[b'\r', b'\n'], true)?;
+                    deliver_output(pty, waiters, b"\r\n", true)?;
                 }
-                let line = pty.line_buffer.clone();
                 deliver_input(pty, waiters, &line)?;
                 pty.line_buffer.clear();
                 continue;
@@ -909,10 +944,10 @@ fn process_input(
             if pty.line_buffer.len() >= MAX_CANON {
                 continue;
             }
-            pty.line_buffer.push(byte);
             if pty.termios.echo {
                 deliver_output(pty, waiters, &[byte], true)?;
             }
+            pty.line_buffer.push(byte);
         } else {
             if pty.termios.echo {
                 deliver_output(pty, waiters, &[byte], true)?;
@@ -941,7 +976,13 @@ fn deliver_input(
 ) -> PtyResult<()> {
     if let Some(waiter_id) = pty.waiting_input_reads.pop_front() {
         if let Some(waiter) = waiters.get_mut(&waiter_id) {
-            waiter.result = Some(Some(data.to_vec()));
+            if data.len() <= waiter.length {
+                waiter.result = Some(Some(data.to_vec()));
+            } else {
+                let (head, tail) = data.split_at(waiter.length);
+                waiter.result = Some(Some(head.to_vec()));
+                pty.input_buffer.push_front(tail.to_vec());
+            }
             return Ok(());
         }
     }
@@ -962,7 +1003,13 @@ fn deliver_output(
 ) -> PtyResult<()> {
     if let Some(waiter_id) = pty.waiting_output_reads.pop_front() {
         if let Some(waiter) = waiters.get_mut(&waiter_id) {
-            waiter.result = Some(Some(data.to_vec()));
+            if data.len() <= waiter.length {
+                waiter.result = Some(Some(data.to_vec()));
+            } else {
+                let (head, tail) = data.split_at(waiter.length);
+                waiter.result = Some(Some(head.to_vec()));
+                pty.output_buffer.push_front(tail.to_vec());
+            }
             return Ok(());
         }
     }

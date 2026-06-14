@@ -12,13 +12,13 @@ use crate::signal::{NodeSignalDispositionAction, NodeSignalHandlerRegistration};
 use crate::v8_host::V8SessionHandle;
 use crate::v8_runtime;
 use base64::Engine as _;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::io::{Read, Write};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -52,6 +52,8 @@ const DEFAULT_WASM_GUEST_PATH: &str =
 // instead of burning minutes on a stalled prewarm session.
 const DEFAULT_WASM_PREWARM_TIMEOUT_MS: u64 = 30_000;
 const MAX_SYNC_WASM_PREWARM_MODULE_BYTES: u64 = 16 * 1024 * 1024;
+const WASM_CAPTURED_OUTPUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const WASM_SYNC_READ_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const WASM_INLINE_RUNNER_ENTRYPOINT: &str = "./__agent_os_wasm_runner__.mjs";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +187,10 @@ pub enum WasmExecutionError {
     RpcResponse(String),
     StdinClosed,
     Stdin(std::io::Error),
+    OutputBufferExceeded {
+        stream: &'static str,
+        limit: usize,
+    },
     EventChannelClosed,
 }
 
@@ -280,6 +286,12 @@ impl fmt::Display for WasmExecutionError {
             }
             Self::StdinClosed => f.write_str("guest WebAssembly stdin is already closed"),
             Self::Stdin(err) => write!(f, "failed to write guest stdin: {err}"),
+            Self::OutputBufferExceeded { stream, limit } => {
+                write!(
+                    f,
+                    "guest WebAssembly {stream} exceeded the captured output limit of {limit} bytes"
+                )
+            }
             Self::EventChannelClosed => {
                 f.write_str("guest WebAssembly event channel closed unexpectedly")
             }
@@ -318,6 +330,7 @@ struct WasmInternalSyncRpc {
 struct WasmGuestPathMapping {
     guest_path: String,
     host_path: PathBuf,
+    read_only: bool,
 }
 
 impl WasmExecution {
@@ -467,8 +480,12 @@ impl WasmExecution {
                 .unwrap_or_else(|| Duration::from_millis(50));
 
             match self.poll_event_blocking(poll_timeout)? {
-                Some(WasmExecutionEvent::Stdout(chunk)) => stdout.extend(chunk),
-                Some(WasmExecutionEvent::Stderr(chunk)) => stderr.extend(chunk),
+                Some(WasmExecutionEvent::Stdout(chunk)) => {
+                    append_wasm_captured_output(&mut stdout, &chunk, "stdout")?;
+                }
+                Some(WasmExecutionEvent::Stderr(chunk)) => {
+                    append_wasm_captured_output(&mut stderr, &chunk, "stderr")?;
+                }
                 Some(WasmExecutionEvent::SyncRpcRequest(request)) => {
                     if self.handle_wait_sync_rpc_request(&request, &mut stdout, &mut stderr)? {
                         continue;
@@ -493,7 +510,11 @@ impl WasmExecution {
             if let Some(limit) = self.execution_timeout {
                 if started.elapsed() >= limit {
                     let _ = self.inner.terminate();
-                    stderr.extend_from_slice(b"WebAssembly fuel budget exhausted\n");
+                    append_wasm_captured_output(
+                        &mut stderr,
+                        b"WebAssembly fuel budget exhausted\n",
+                        "stderr",
+                    )?;
                     return Ok(WasmExecutionResult {
                         execution_id: self.execution_id,
                         exit_code: WASM_TIMEOUT_EXIT_CODE,
@@ -580,17 +601,36 @@ impl WasmExecution {
             StreamChannel::Stdout => &mut self.stdout_stream_buffer,
             StreamChannel::Stderr => &mut self.stderr_stream_buffer,
         };
+        let stream = match channel {
+            StreamChannel::Stdout => "stdout",
+            StreamChannel::Stderr => "stderr",
+        };
+        ensure_wasm_output_capacity(buffer.len(), chunk.len(), stream)?;
         buffer.extend_from_slice(&chunk);
 
+        let mut pending_stream_chunk = Vec::new();
         while let Some(newline_index) = buffer.iter().position(|byte| *byte == b'\n') {
             let line = buffer.drain(..=newline_index).collect::<Vec<_>>();
             if let Some(signal_state) = parse_wasm_signal_state_line(&line)? {
+                if !pending_stream_chunk.is_empty() {
+                    self.pending_events.push_back(match channel {
+                        StreamChannel::Stdout => {
+                            WasmExecutionEvent::Stdout(std::mem::take(&mut pending_stream_chunk))
+                        }
+                        StreamChannel::Stderr => {
+                            WasmExecutionEvent::Stderr(std::mem::take(&mut pending_stream_chunk))
+                        }
+                    });
+                }
                 self.pending_events.push_back(signal_state);
                 continue;
             }
+            pending_stream_chunk.extend_from_slice(&line);
+        }
+        if !pending_stream_chunk.is_empty() {
             self.pending_events.push_back(match channel {
-                StreamChannel::Stdout => WasmExecutionEvent::Stdout(line),
-                StreamChannel::Stderr => WasmExecutionEvent::Stderr(line),
+                StreamChannel::Stdout => WasmExecutionEvent::Stdout(pending_stream_chunk),
+                StreamChannel::Stderr => WasmExecutionEvent::Stderr(pending_stream_chunk),
             });
         }
 
@@ -635,15 +675,15 @@ impl WasmExecution {
                 "missing __kernel_stdio_write descriptor",
             )));
         };
-        let Some(bytes) = decode_wasm_bytes_arg(request.args.get(1)) else {
-            return Err(WasmExecutionError::RpcResponse(String::from(
-                "missing __kernel_stdio_write payload bytes",
-            )));
-        };
+        let bytes = decode_wasm_bytes_arg(
+            request.args.get(1),
+            "__kernel_stdio_write payload bytes",
+            WASM_CAPTURED_OUTPUT_LIMIT_BYTES,
+        )?;
 
         match descriptor {
-            1 => stdout.extend_from_slice(&bytes),
-            2 => stderr.extend_from_slice(&bytes),
+            1 => append_wasm_captured_output(stdout, &bytes, "stdout")?,
+            2 => append_wasm_captured_output(stderr, &bytes, "stderr")?,
             other => {
                 return Err(WasmExecutionError::RpcResponse(format!(
                     "unsupported __kernel_stdio_write descriptor {other}",
@@ -756,9 +796,11 @@ impl WasmExecutionEngine {
             &javascript_context_id,
             &resolved_module,
             &request,
-            frozen_time_ms,
-            false,
-            warmup_metrics.as_deref(),
+            WasmJavascriptExecutionOptions {
+                frozen_time_ms,
+                prewarm_only: false,
+                warmup_metrics: warmup_metrics.as_deref(),
+            },
         )?;
         let child_pid = javascript_execution.child_pid();
         let guest_path_mappings = wasm_guest_path_mappings(&request);
@@ -823,6 +865,9 @@ fn map_javascript_error(error: JavascriptExecutionError) -> WasmExecutionError {
         JavascriptExecutionError::Terminate(error) => WasmExecutionError::Spawn(error),
         JavascriptExecutionError::StdinClosed => WasmExecutionError::StdinClosed,
         JavascriptExecutionError::Stdin(error) => WasmExecutionError::Stdin(error),
+        JavascriptExecutionError::OutputBufferExceeded { stream, limit } => {
+            WasmExecutionError::OutputBufferExceeded { stream, limit }
+        }
         JavascriptExecutionError::EventChannelClosed => WasmExecutionError::EventChannelClosed,
     }
 }
@@ -867,7 +912,24 @@ fn handle_internal_wasm_sync_rpc_request(
             return Ok(false);
         };
         let flags = request.args.get(1).unwrap_or(&Value::Null);
-        let file = open_wasm_guest_file(&host_path, flags)?;
+        if wasm_open_flags_require_write(flags)
+            && wasm_host_path_is_read_only(&host_path, internal_sync_rpc)
+        {
+            return respond_wasm_sync_rpc_value(
+                execution,
+                request,
+                path,
+                Err(wasm_read_only_filesystem_error(path)),
+            )
+            .map(|()| true);
+        }
+        let file = match open_wasm_guest_file(&host_path, flags) {
+            Ok(file) => file,
+            Err(error) => {
+                return respond_wasm_sync_rpc_value(execution, request, path, Err(error))
+                    .map(|()| true);
+            }
+        };
         let fd = internal_sync_rpc.next_fd;
         internal_sync_rpc.next_fd += 1;
         internal_sync_rpc.open_files.insert(fd, file);
@@ -952,6 +1014,15 @@ fn handle_internal_wasm_sync_rpc_request(
         let Some(host_path) = translate_wasm_guest_path(path, internal_sync_rpc) else {
             return Ok(false);
         };
+        if wasm_host_path_is_read_only(&host_path, internal_sync_rpc) {
+            return respond_wasm_sync_rpc_unit(
+                execution,
+                request,
+                path,
+                Err(wasm_read_only_filesystem_error(path)),
+            )
+            .map(|()| true);
+        }
         let mode = request.args.get(1).and_then(Value::as_u64).unwrap_or(0) as u32;
         let result = (|| -> Result<(), std::io::Error> {
             let mut permissions = fs::metadata(&host_path)?.permissions();
@@ -970,6 +1041,15 @@ fn handle_internal_wasm_sync_rpc_request(
         let Some(host_path) = translate_wasm_guest_path(path, internal_sync_rpc) else {
             return Ok(false);
         };
+        if wasm_host_path_is_read_only(&host_path, internal_sync_rpc) {
+            return respond_wasm_sync_rpc_unit(
+                execution,
+                request,
+                path,
+                Err(wasm_read_only_filesystem_error(path)),
+            )
+            .map(|()| true);
+        }
         let recursive = request
             .args
             .get(1)
@@ -999,6 +1079,15 @@ fn handle_internal_wasm_sync_rpc_request(
         let Some(host_path) = translate_wasm_guest_path(path, internal_sync_rpc) else {
             return Ok(false);
         };
+        if wasm_host_path_is_read_only(&host_path, internal_sync_rpc) {
+            return respond_wasm_sync_rpc_unit(
+                execution,
+                request,
+                path,
+                Err(wasm_read_only_filesystem_error(path)),
+            )
+            .map(|()| true);
+        }
         return respond_wasm_sync_rpc_unit(execution, request, path, fs::remove_dir(&host_path))
             .map(|()| true);
     }
@@ -1012,6 +1101,15 @@ fn handle_internal_wasm_sync_rpc_request(
         let Some(host_path) = translate_wasm_guest_path(path, internal_sync_rpc) else {
             return Ok(false);
         };
+        if wasm_host_path_is_read_only(&host_path, internal_sync_rpc) {
+            return respond_wasm_sync_rpc_unit(
+                execution,
+                request,
+                path,
+                Err(wasm_read_only_filesystem_error(path)),
+            )
+            .map(|()| true);
+        }
         return respond_wasm_sync_rpc_unit(execution, request, path, fs::remove_file(&host_path))
             .map(|()| true);
     }
@@ -1034,6 +1132,19 @@ fn handle_internal_wasm_sync_rpc_request(
         else {
             return Ok(false);
         };
+        if wasm_mutation_touches_read_only_mapping(
+            &host_source,
+            &host_destination,
+            internal_sync_rpc,
+        ) {
+            return respond_wasm_sync_rpc_unit(
+                execution,
+                request,
+                source,
+                Err(wasm_read_only_filesystem_error(source)),
+            )
+            .map(|()| true);
+        }
         return respond_wasm_sync_rpc_unit(
             execution,
             request,
@@ -1061,6 +1172,17 @@ fn handle_internal_wasm_sync_rpc_request(
         else {
             return Ok(false);
         };
+        if wasm_host_path_is_read_only(&host_source, internal_sync_rpc)
+            || wasm_host_path_is_read_only(&host_destination, internal_sync_rpc)
+        {
+            return respond_wasm_sync_rpc_unit(
+                execution,
+                request,
+                source,
+                Err(wasm_read_only_filesystem_error(source)),
+            )
+            .map(|()| true);
+        }
         return respond_wasm_sync_rpc_unit(
             execution,
             request,
@@ -1092,6 +1214,15 @@ fn handle_internal_wasm_sync_rpc_request(
         let Some(host_link_path) = translate_wasm_guest_path(link_path, internal_sync_rpc) else {
             return Ok(false);
         };
+        if wasm_host_path_is_read_only(&host_link_path, internal_sync_rpc) {
+            return respond_wasm_sync_rpc_unit(
+                execution,
+                request,
+                link_path,
+                Err(wasm_read_only_filesystem_error(link_path)),
+            )
+            .map(|()| true);
+        }
         return respond_wasm_sync_rpc_unit(
             execution,
             request,
@@ -1131,8 +1262,12 @@ fn handle_internal_wasm_sync_rpc_request(
         let Some(host_path) = translate_wasm_guest_path(path, internal_sync_rpc) else {
             return Ok(false);
         };
-        let target = fs::read_link(&host_path)
-            .map(|target| Value::String(target.to_string_lossy().into_owned()));
+        let target = fs::read_link(&host_path).map(|target| {
+            Value::String(
+                translate_wasm_host_symlink_target(&target, internal_sync_rpc)
+                    .unwrap_or_else(|| target.to_string_lossy().into_owned()),
+            )
+        });
         return respond_wasm_sync_rpc_value(execution, request, path, target).map(|()| true);
     }
 
@@ -1142,17 +1277,20 @@ fn handle_internal_wasm_sync_rpc_request(
                 "missing fs.writeSync fd",
             )));
         };
-        let bytes = decode_wasm_bytes_arg(request.args.get(1)).ok_or_else(|| {
-            WasmExecutionError::RpcResponse(String::from("missing fs.writeSync bytes"))
-        })?;
+        let bytes = decode_wasm_bytes_arg(
+            request.args.get(1),
+            "fs.writeSync bytes",
+            WASM_CAPTURED_OUTPUT_LIMIT_BYTES,
+        )?;
         if fd == 1 || fd == 2 {
+            let bytes_len = bytes.len();
             internal_sync_rpc.pending_events.push_back(if fd == 1 {
-                WasmExecutionEvent::Stdout(bytes.clone())
+                WasmExecutionEvent::Stdout(bytes)
             } else {
-                WasmExecutionEvent::Stderr(bytes.clone())
+                WasmExecutionEvent::Stderr(bytes)
             });
             execution
-                .respond_sync_rpc_success(request.id, json!(bytes.len()))
+                .respond_sync_rpc_success(request.id, json!(bytes_len))
                 .map_err(map_javascript_error)?;
             return Ok(true);
         }
@@ -1160,11 +1298,12 @@ fn handle_internal_wasm_sync_rpc_request(
         let Some(file) = internal_sync_rpc.open_files.get_mut(&(fd as u32)) else {
             return Ok(false);
         };
-        if let Some(position) = position {
-            file.seek(SeekFrom::Start(position))
-                .map_err(WasmExecutionError::Spawn)?;
-        }
-        let written = file.write(&bytes).map_err(WasmExecutionError::Spawn)?;
+        let written = if let Some(position) = position {
+            file.write_at(&bytes, position)
+                .map_err(WasmExecutionError::Spawn)?
+        } else {
+            file.write(&bytes).map_err(WasmExecutionError::Spawn)?
+        };
         execution
             .respond_sync_rpc_success(request.id, json!(written))
             .map_err(map_javascript_error)?;
@@ -1177,17 +1316,18 @@ fn handle_internal_wasm_sync_rpc_request(
                 "missing fs.readSync fd",
             )));
         };
-        let length = request.args.get(1).and_then(Value::as_u64).unwrap_or(0) as usize;
+        let length = wasm_sync_read_length(request.args.get(1).and_then(Value::as_u64))?;
         let position = request.args.get(2).and_then(Value::as_u64);
         let Some(file) = internal_sync_rpc.open_files.get_mut(&(fd as u32)) else {
             return Ok(false);
         };
-        if let Some(position) = position {
-            file.seek(SeekFrom::Start(position))
-                .map_err(WasmExecutionError::Spawn)?;
-        }
         let mut buffer = vec![0u8; length];
-        let bytes_read = file.read(&mut buffer).map_err(WasmExecutionError::Spawn)?;
+        let bytes_read = if let Some(position) = position {
+            file.read_at(&mut buffer, position)
+                .map_err(WasmExecutionError::Spawn)?
+        } else {
+            file.read(&mut buffer).map_err(WasmExecutionError::Spawn)?
+        };
         buffer.truncate(bytes_read);
         execution
             .respond_sync_rpc_success(
@@ -1209,7 +1349,7 @@ fn translate_wasm_guest_path(
     internal_sync_rpc: &WasmInternalSyncRpc,
 ) -> Option<PathBuf> {
     if let Some(host_path) = translate_wasm_host_runtime_path(path, internal_sync_rpc) {
-        return Some(host_path);
+        return confine_wasm_host_path(host_path, internal_sync_rpc);
     }
 
     let normalized_path = if path.starts_with('/') {
@@ -1230,11 +1370,17 @@ fn translate_wasm_guest_path(
     }
     for mapping in &internal_sync_rpc.guest_path_mappings {
         if let Some(suffix) = strip_guest_prefix(&normalized_path, &mapping.guest_path) {
-            return Some(join_host_path(&mapping.host_path, &suffix));
+            return confine_wasm_host_path(
+                join_host_path(&mapping.host_path, &suffix),
+                internal_sync_rpc,
+            );
         }
     }
     if let Some(suffix) = strip_guest_prefix(&normalized_path, &internal_sync_rpc.guest_cwd) {
-        return Some(join_host_path(&internal_sync_rpc.host_cwd, &suffix));
+        return confine_wasm_host_path(
+            join_host_path(&internal_sync_rpc.host_cwd, &suffix),
+            internal_sync_rpc,
+        );
     }
     if normalized_path.starts_with('/') {
         let root_candidate = internal_sync_rpc
@@ -1243,7 +1389,7 @@ fn translate_wasm_guest_path(
             .map(|root| join_host_path(root, normalized_path.trim_start_matches('/')));
         if let Some(candidate) = root_candidate.as_ref() {
             if candidate.exists() {
-                return Some(candidate.clone());
+                return confine_wasm_host_path(candidate.clone(), internal_sync_rpc);
             }
         }
 
@@ -1261,7 +1407,7 @@ fn translate_wasm_guest_path(
                 {
                     let candidate = join_host_path(&mapping.host_path, &suffix);
                     if candidate.exists() {
-                        return Some(candidate);
+                        return confine_wasm_host_path(candidate, internal_sync_rpc);
                     }
                 }
             }
@@ -1270,12 +1416,70 @@ fn translate_wasm_guest_path(
             {
                 let candidate = join_host_path(&internal_sync_rpc.host_cwd, &suffix);
                 if candidate.exists() {
-                    return Some(candidate);
+                    return confine_wasm_host_path(candidate, internal_sync_rpc);
                 }
             }
         }
 
-        return root_candidate;
+        return root_candidate.and_then(|path| confine_wasm_host_path(path, internal_sync_rpc));
+    }
+    None
+}
+
+fn confine_wasm_host_path(
+    host_path: PathBuf,
+    internal_sync_rpc: &WasmInternalSyncRpc,
+) -> Option<PathBuf> {
+    if host_path == internal_sync_rpc.module_host_path {
+        return Some(host_path);
+    }
+
+    let allowed_roots = wasm_allowed_host_roots(internal_sync_rpc);
+    if allowed_roots.is_empty() {
+        return None;
+    }
+
+    if let Ok(canonical_path) = fs::canonicalize(&host_path) {
+        return wasm_canonical_path_is_allowed(&canonical_path, &allowed_roots)
+            .then_some(host_path);
+    }
+
+    let existing_ancestor = nearest_existing_wasm_host_ancestor(&host_path)?;
+    let canonical_ancestor = fs::canonicalize(existing_ancestor).ok()?;
+    wasm_canonical_path_is_allowed(&canonical_ancestor, &allowed_roots).then_some(host_path)
+}
+
+fn wasm_allowed_host_roots(internal_sync_rpc: &WasmInternalSyncRpc) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for root in internal_sync_rpc
+        .guest_path_mappings
+        .iter()
+        .map(|mapping| mapping.host_path.as_path())
+        .chain(std::iter::once(internal_sync_rpc.host_cwd.as_path()))
+        .chain(internal_sync_rpc.sandbox_root.as_deref())
+    {
+        if let Ok(canonical_root) = fs::canonicalize(root) {
+            if !roots.iter().any(|existing| existing == &canonical_root) {
+                roots.push(canonical_root);
+            }
+        }
+    }
+    roots
+}
+
+fn wasm_canonical_path_is_allowed(path: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots
+        .iter()
+        .any(|root| path == root || path.starts_with(root))
+}
+
+fn nearest_existing_wasm_host_ancestor(path: &Path) -> Option<&Path> {
+    let mut candidate = Some(path);
+    while let Some(current) = candidate {
+        if fs::symlink_metadata(current).is_ok() {
+            return Some(current);
+        }
+        candidate = current.parent();
     }
     None
 }
@@ -1315,6 +1519,96 @@ fn translate_wasm_host_runtime_path(
     }
 
     None
+}
+
+fn translate_wasm_host_symlink_target(
+    target: &Path,
+    internal_sync_rpc: &WasmInternalSyncRpc,
+) -> Option<String> {
+    if !target.is_absolute() {
+        return None;
+    }
+
+    for mapping in &internal_sync_rpc.guest_path_mappings {
+        if let Ok(suffix) = target.strip_prefix(&mapping.host_path) {
+            return Some(join_guest_path(
+                &mapping.guest_path,
+                &suffix.to_string_lossy().replace('\\', "/"),
+            ));
+        }
+    }
+
+    if let Some(suffix) = target
+        .strip_prefix(&internal_sync_rpc.host_cwd)
+        .ok()
+        .filter(|_| internal_sync_rpc.guest_cwd.starts_with('/'))
+    {
+        return Some(join_guest_path(
+            &internal_sync_rpc.guest_cwd,
+            &suffix.to_string_lossy().replace('\\', "/"),
+        ));
+    }
+
+    if let Some(sandbox_root) = internal_sync_rpc.sandbox_root.as_ref() {
+        if let Ok(suffix) = target.strip_prefix(sandbox_root) {
+            return Some(join_guest_path(
+                "/",
+                &suffix.to_string_lossy().replace('\\', "/"),
+            ));
+        }
+    }
+
+    None
+}
+
+fn wasm_host_path_is_read_only(host_path: &Path, internal_sync_rpc: &WasmInternalSyncRpc) -> bool {
+    let canonical_path = fs::canonicalize(host_path)
+        .ok()
+        .or_else(|| {
+            nearest_existing_wasm_host_ancestor(host_path)
+                .and_then(|ancestor| fs::canonicalize(ancestor).ok())
+        })
+        .unwrap_or_else(|| host_path.to_path_buf());
+
+    internal_sync_rpc
+        .guest_path_mappings
+        .iter()
+        .filter_map(|mapping| {
+            let root = fs::canonicalize(&mapping.host_path).ok()?;
+            (canonical_path == root || canonical_path.starts_with(&root))
+                .then_some((root.components().count(), mapping.read_only))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .is_some_and(|(_, read_only)| read_only)
+}
+
+fn wasm_mutation_touches_read_only_mapping(
+    source: &Path,
+    destination: &Path,
+    internal_sync_rpc: &WasmInternalSyncRpc,
+) -> bool {
+    wasm_host_path_is_read_only(source, internal_sync_rpc)
+        || wasm_host_path_is_read_only(destination, internal_sync_rpc)
+}
+
+fn wasm_open_flags_require_write(flags: &Value) -> bool {
+    match flags.as_str() {
+        Some(value) => value.contains('w') || value.contains('a') || value.contains('+'),
+        None if flags.as_u64().unwrap_or(0) == 0 => false,
+        _ => {
+            let numeric = flags.as_u64().unwrap_or(0);
+            (numeric & 0o1) != 0
+                || (numeric & 0o2) != 0
+                || (numeric & 0o100) != 0
+                || (numeric & 0o1000) != 0
+                || (numeric & 0o2000) != 0
+        }
+    }
+}
+
+fn wasm_read_only_filesystem_error(path: &str) -> std::io::Error {
+    let _ = path;
+    std::io::Error::from_raw_os_error(30)
 }
 
 fn respond_wasm_sync_rpc_metadata(
@@ -1362,6 +1656,10 @@ fn respond_wasm_sync_rpc_value(
 
 fn wasm_sync_rpc_error_code(error: &std::io::Error) -> &'static str {
     use std::io::ErrorKind;
+
+    if error.raw_os_error() == Some(30) {
+        return "EROFS";
+    }
 
     match error.kind() {
         ErrorKind::NotFound => "ENOENT",
@@ -1415,15 +1713,94 @@ fn join_host_path(base: &Path, suffix: &str) -> PathBuf {
         .fold(base.to_path_buf(), |path, segment| path.join(segment))
 }
 
-fn decode_wasm_bytes_arg(value: Option<&Value>) -> Option<Vec<u8>> {
-    let value = value?;
-    let base64 = value.as_object()?.get("base64")?.as_str()?;
+fn decode_wasm_bytes_arg(
+    value: Option<&Value>,
+    label: &'static str,
+    limit: usize,
+) -> Result<Vec<u8>, WasmExecutionError> {
+    let base64 = value
+        .and_then(Value::as_object)
+        .and_then(|value| value.get("base64"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| WasmExecutionError::RpcResponse(format!("missing {label}")))?;
+    let decoded_len = base64_decoded_len(base64)
+        .ok_or_else(|| WasmExecutionError::RpcResponse(format!("invalid {label} base64")))?;
+    if decoded_len > limit {
+        return Err(WasmExecutionError::OutputBufferExceeded {
+            stream: label,
+            limit,
+        });
+    }
     base64::engine::general_purpose::STANDARD
         .decode(base64)
-        .ok()
+        .map_err(|_| WasmExecutionError::RpcResponse(format!("invalid {label} base64")))
 }
 
-fn open_wasm_guest_file(path: &Path, flags: &Value) -> Result<fs::File, WasmExecutionError> {
+fn base64_decoded_len(base64: &str) -> Option<usize> {
+    let len = base64.len();
+    let padding = base64
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'=')
+        .take(2)
+        .count();
+    let full_quads = len / 4;
+    let remainder = len % 4;
+    let base_len = full_quads.checked_mul(3)?.checked_sub(padding)?;
+    match remainder {
+        0 => Some(base_len),
+        1 => None,
+        2 => base_len.checked_add(1),
+        3 => base_len.checked_add(2),
+        _ => None,
+    }
+}
+
+fn append_wasm_captured_output(
+    buffer: &mut Vec<u8>,
+    chunk: &[u8],
+    stream: &'static str,
+) -> Result<(), WasmExecutionError> {
+    ensure_wasm_output_capacity(buffer.len(), chunk.len(), stream)?;
+    buffer.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn ensure_wasm_output_capacity(
+    current_len: usize,
+    chunk_len: usize,
+    stream: &'static str,
+) -> Result<(), WasmExecutionError> {
+    let Some(next_len) = current_len.checked_add(chunk_len) else {
+        return Err(WasmExecutionError::OutputBufferExceeded {
+            stream,
+            limit: WASM_CAPTURED_OUTPUT_LIMIT_BYTES,
+        });
+    };
+    if next_len > WASM_CAPTURED_OUTPUT_LIMIT_BYTES {
+        return Err(WasmExecutionError::OutputBufferExceeded {
+            stream,
+            limit: WASM_CAPTURED_OUTPUT_LIMIT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn wasm_sync_read_length(length: Option<u64>) -> Result<usize, WasmExecutionError> {
+    let length = length.unwrap_or(0);
+    let length = usize::try_from(length).map_err(|_| {
+        WasmExecutionError::InvalidLimit(format!("fs.readSync length {length} exceeds host usize"))
+    })?;
+    if length > WASM_SYNC_READ_LIMIT_BYTES {
+        return Err(WasmExecutionError::InvalidLimit(format!(
+            "fs.readSync length {length} exceeds maximum {WASM_SYNC_READ_LIMIT_BYTES}"
+        )));
+    }
+    Ok(length)
+}
+
+fn open_wasm_guest_file(path: &Path, flags: &Value) -> std::io::Result<fs::File> {
     let mut options = OpenOptions::new();
     let flags_label = flags.to_string();
 
@@ -1448,9 +1825,10 @@ fn open_wasm_guest_file(path: &Path, flags: &Value) -> Result<fs::File, WasmExec
         }
         _ => {
             let numeric = flags.as_u64().ok_or_else(|| {
-                WasmExecutionError::RpcResponse(format!(
-                    "unsupported fs.openSync flags: {flags_label}"
-                ))
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unsupported fs.openSync flags: {flags_label}"),
+                )
             })?;
             let write_only = (numeric & 0o1) != 0;
             let read_write = (numeric & 0o2) != 0;
@@ -1478,14 +1856,14 @@ fn open_wasm_guest_file(path: &Path, flags: &Value) -> Result<fs::File, WasmExec
     }
 
     options.open(path).map_err(|error| {
-        WasmExecutionError::Spawn(std::io::Error::new(
+        std::io::Error::new(
             error.kind(),
             format!(
                 "failed to open guest file {} with flags {}: {error}",
                 path.display(),
                 flags_label
             ),
-        ))
+        )
     })
 }
 
@@ -1516,7 +1894,7 @@ fn translate_wasm_signal_state_sync_rpc_request(
         .args
         .get(2)
         .and_then(Value::as_str)
-        .map(|value| serde_json::from_str::<Vec<u32>>(value))
+        .map(serde_json::from_str::<Vec<u32>>)
         .transpose()
         .map_err(|error| WasmExecutionError::RpcResponse(error.to_string()))?
         .unwrap_or_default();
@@ -1598,19 +1976,28 @@ fn parse_wasm_signal_state_line(
     }))
 }
 
+struct WasmJavascriptExecutionOptions<'a> {
+    frozen_time_ms: u128,
+    prewarm_only: bool,
+    warmup_metrics: Option<&'a [u8]>,
+}
+
 fn start_wasm_javascript_execution(
     javascript_engine: &mut JavascriptExecutionEngine,
     import_cache: &NodeImportCache,
     javascript_context_id: &str,
     resolved_module: &ResolvedWasmModule,
     request: &StartWasmExecutionRequest,
-    frozen_time_ms: u128,
-    prewarm_only: bool,
-    warmup_metrics: Option<&[u8]>,
+    options: WasmJavascriptExecutionOptions<'_>,
 ) -> Result<JavascriptExecution, WasmExecutionError> {
-    let internal_env =
-        build_wasm_internal_env(resolved_module, request, frozen_time_ms, prewarm_only);
-    let inline_code = build_wasm_runner_module_source(import_cache, &internal_env, warmup_metrics)?;
+    let internal_env = build_wasm_internal_env(
+        resolved_module,
+        request,
+        options.frozen_time_ms,
+        options.prewarm_only,
+    );
+    let inline_code =
+        build_wasm_runner_module_source(import_cache, &internal_env, options.warmup_metrics)?;
     let mut env = request.env.clone();
     env.extend(
         internal_env
@@ -1748,6 +2135,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
   const __agentOsWasiErrnoNoent = 44;
   const __agentOsWasiErrnoNosys = 52;
   const __agentOsWasiErrnoNotdir = 54;
+  const __agentOsWasiErrnoPipe = 64;
   const __agentOsWasiErrnoRofs = 69;
   const __agentOsWasiFiletypeUnknown = 0;
   const __agentOsWasiFiletypeCharacterDevice = 2;
@@ -1765,6 +2153,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
   const __agentOsWasiWhenceSet = 0;
   const __agentOsWasiWhenceCur = 1;
   const __agentOsWasiWhenceEnd = 2;
+  const __agentOsWasmSyncReadLimitBytes = {WASM_SYNC_READ_LIMIT_BYTES};
   const __agentOsKernelStdioSyncRpcEnabled = () =>
     process?.env?.AGENT_OS_WASI_STDIO_SYNC_RPC === "1";
   const __agentOsWasiDebugEnabled = () => process?.env?.AGENT_OS_WASM_WASI_DEBUG === "1";
@@ -1806,6 +2195,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
           kind: "preopen",
           guestPath: String(guestPath),
           hostPath: normalized.hostPath,
+          readOnly: normalized.readOnly,
           rightsBase: normalized.rightsBase,
           rightsInheriting: normalized.rightsInheriting,
           fdFlags: 0,
@@ -1880,6 +2270,21 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
       return new Uint8Array(memory.buffer);
     }}
 
+    _boundedIovLength(iovs, iovsLen) {{
+      const view = this._memoryView();
+      let length = 0;
+      for (let index = 0; index < (Number(iovsLen) >>> 0); index += 1) {{
+        const entryOffset = (Number(iovs) >>> 0) + index * 8;
+        length += view.getUint32(entryOffset + 4, true);
+        if (length > __agentOsWasmSyncReadLimitBytes) {{
+          throw new RangeError(
+            `WASI read iov length ${{length}} exceeds ${{__agentOsWasmSyncReadLimitBytes}}`,
+          );
+        }}
+      }}
+      return length >>> 0;
+    }}
+
     _normalizeRights(value, fallback) {{
       try {{
         return BigInt(value);
@@ -1892,6 +2297,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
       if (typeof value === "string") {{
         return {{
           hostPath: String(value),
+          readOnly: false,
           rightsBase: __agentOsWasiDefaultRightsBase,
           rightsInheriting: __agentOsWasiDefaultRightsInheriting,
         }};
@@ -1901,6 +2307,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
       }}
       return {{
         hostPath: String(value.hostPath),
+        readOnly: value.readOnly === true,
         rightsBase: this._normalizeRights(
           value.rightsBase,
           __agentOsWasiDefaultRightsBase,
@@ -2045,6 +2452,13 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
       pipe.chunks.push(chunk);
     }}
 
+    _pipeHasReaders(pipe) {{
+      return (
+        (pipe?.readHandleCount ?? 0) > 0 ||
+        (pipe?.consumers?.size ?? 0) > 0
+      );
+    }}
+
     _flushPipeConsumers(pipe) {{
       if (
         !pipe ||
@@ -2167,6 +2581,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
     }}
 
     _collectIovs(iovs, iovsLen) {{
+      const totalLength = this._boundedIovLength(iovs, iovsLen);
       const view = this._memoryView();
       const chunks = [];
       for (let index = 0; index < (Number(iovsLen) >>> 0); index += 1) {{
@@ -2175,7 +2590,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         const len = view.getUint32(entryOffset + 4, true);
         chunks.push(this._readBytes(ptr, len));
       }}
-      return Buffer.concat(chunks);
+      return Buffer.concat(chunks, totalLength);
     }}
 
     _writeToIovs(iovs, iovsLen, bytes) {{
@@ -2291,6 +2706,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         displayFd: Number(fd) >>> 0,
         refCount: 1,
         open: true,
+        readOnly: entry.readOnly === true,
       }};
     }}
 
@@ -2343,19 +2759,36 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
       return null;
     }}
 
+    _sidecarManagedProcess() {{
+      if (
+        typeof __agentOsWasmInternalEnv?.AGENT_OS_SANDBOX_ROOT === "string" &&
+        __agentOsWasmInternalEnv.AGENT_OS_SANDBOX_ROOT.length > 0
+      ) {{
+        return true;
+      }}
+      return (
+        typeof process?.env?.AGENT_OS_SANDBOX_ROOT === "string" &&
+        process.env.AGENT_OS_SANDBOX_ROOT.length > 0
+      );
+    }}
+
+    _descriptorDirectoryFsPath(entry) {{
+      if (
+        (entry?.kind === "preopen" || entry?.kind === "directory") &&
+        this._sidecarManagedProcess()
+      ) {{
+        return this._descriptorGuestPath(entry);
+      }}
+      return this._descriptorFsPath(entry);
+    }}
+
     _descriptorGuestPath(entry) {{
       if (!entry) {{
         return null;
       }}
       const guestPath = typeof entry.guestPath === "string" ? entry.guestPath : null;
       if (guestPath === ".") {{
-        const pwd =
-          typeof this.env?.PWD === "string" && this.env.PWD.startsWith("/")
-            ? this.env.PWD
-            : typeof this.env?.HOME === "string" && this.env.HOME.startsWith("/")
-              ? this.env.HOME
-              : "/";
-        return __agentOsPath().posix.normalize(pwd);
+        return this._currentGuestCwd();
       }}
       if (typeof guestPath === "string" && guestPath.length > 0) {{
         return __agentOsPath().posix.normalize(guestPath);
@@ -2363,7 +2796,61 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
       return null;
     }}
 
-    _resolveHostPathForGuestPath(guestPath) {{
+    _descriptorPreopenName(entry) {{
+      if (!entry) {{
+        return null;
+      }}
+      const guestPath = typeof entry.guestPath === "string" ? entry.guestPath : null;
+      if (guestPath === ".") {{
+        return this._descriptorGuestPath(entry);
+      }}
+      if (typeof guestPath === "string" && guestPath.length > 0) {{
+        return __agentOsPath().posix.normalize(guestPath);
+      }}
+      return null;
+    }}
+
+    _currentDirectoryPreopen() {{
+      for (const entry of this.fdTable.values()) {{
+        if (entry?.kind === "preopen" && entry.guestPath === ".") {{
+          return entry;
+        }}
+      }}
+      return null;
+    }}
+
+    _descriptorPathBase(entry, target) {{
+      const baseGuestPath = this._descriptorGuestPath(entry);
+      if (typeof baseGuestPath !== "string") {{
+        return null;
+      }}
+      return {{
+        entry,
+        guestPath: baseGuestPath,
+        hostPath: typeof entry?.hostPath === "string" ? entry.hostPath : null,
+      }};
+    }}
+
+    _hostPathExists(hostPath) {{
+      try {{
+        __agentOsFs().statSync(hostPath);
+        return true;
+      }} catch {{
+        return false;
+      }}
+    }}
+
+    _currentGuestCwd() {{
+      const pwd =
+        typeof this.env?.PWD === "string" && this.env.PWD.startsWith("/")
+          ? this.env.PWD
+          : typeof this.env?.HOME === "string" && this.env.HOME.startsWith("/")
+            ? this.env.HOME
+            : "/";
+      return __agentOsPath().posix.normalize(pwd);
+    }}
+
+    _resolveHostMappingForGuestPath(guestPath) {{
       const normalized = __agentOsPath().posix.normalize(guestPath);
       const mappings = [];
       for (const entry of this.fdTable.values()) {{
@@ -2374,7 +2861,11 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         if (typeof guestRoot !== "string") {{
           continue;
         }}
-        mappings.push({{ guestRoot, hostPath: entry.hostPath }});
+        mappings.push({{
+          guestRoot,
+          hostPath: entry.hostPath,
+          readOnly: entry.readOnly === true,
+        }});
       }}
       mappings.sort((left, right) => right.guestRoot.length - left.guestRoot.length);
 
@@ -2392,35 +2883,110 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
             : mapping.guestRoot === "/"
               ? normalized.slice(1)
               : normalized.slice(mapping.guestRoot.length + 1);
-        return suffix
-          ? __agentOsPath().join(mapping.hostPath, ...suffix.split("/"))
-          : mapping.hostPath;
+        return {{
+          hostPath: suffix
+            ? __agentOsPath().join(mapping.hostPath, ...suffix.split("/"))
+            : mapping.hostPath,
+          readOnly: mapping.readOnly,
+        }};
       }}
 
       return null;
     }}
 
-    _resolveDescriptorPath(fd, pathPtr, pathLen) {{
+    _resolveHostPathForGuestPath(guestPath) {{
+      return this._resolveHostMappingForGuestPath(guestPath)?.hostPath ?? null;
+    }}
+
+    _rootRelativeTargetPrefersCwd(target) {{
+      const normalizedTarget = __agentOsPath().posix.normalize(target || ".");
+      if (normalizedTarget !== ".") {{
+        return false;
+      }}
+      return !this._rootRelativeTargetMatchesAbsoluteArg(target);
+    }}
+
+    _rootRelativeTargetMatchesAbsoluteArg(target) {{
+      const rootGuestPath = __agentOsPath().posix.resolve("/", target);
+      return this.args
+        .slice(1)
+        .some(
+          (arg) =>
+            typeof arg === "string" &&
+            arg.startsWith("/") &&
+            __agentOsPath().posix.normalize(arg) === rootGuestPath,
+        );
+    }}
+
+    _resolveRootRelativePath(target, preferCreateParent = false) {{
+      const rootGuestPath = __agentOsPath().posix.resolve("/", target);
+      const rootMapping = this._resolveHostMappingForGuestPath(rootGuestPath);
+      const rootHostPath = rootMapping?.hostPath ?? null;
+      const cwdGuestPath = this._currentGuestCwd();
+      if (cwdGuestPath !== "/") {{
+        const cwdGuestTarget = __agentOsPath().posix.resolve(cwdGuestPath, target);
+        const cwdMapping = this._resolveHostMappingForGuestPath(cwdGuestTarget);
+        const cwdHostTarget = cwdMapping?.hostPath ?? null;
+        if (
+          typeof cwdHostTarget === "string" &&
+          (
+            (preferCreateParent && !this._rootRelativeTargetMatchesAbsoluteArg(target)) ||
+            this._rootRelativeTargetPrefersCwd(target) ||
+            (
+              this._hostPathExists(cwdHostTarget) &&
+              !(typeof rootHostPath === "string" && this._hostPathExists(rootHostPath))
+            )
+          )
+        ) {{
+          return {{
+            guestPath: cwdGuestTarget,
+            hostPath: cwdHostTarget,
+            readOnly: cwdMapping?.readOnly === true,
+          }};
+        }}
+      }}
+      return {{
+        guestPath: rootGuestPath,
+        hostPath: rootHostPath,
+        readOnly: rootMapping?.readOnly === true,
+      }};
+    }}
+
+    _resolveDescriptorPath(fd, pathPtr, pathLen, options = {{}}) {{
       const entry = this._descriptorEntry(fd);
       if (!entry) {{
         return {{ error: __agentOsWasiErrnoBadf }};
       }}
-      const baseGuestPath = this._descriptorGuestPath(entry);
-      if (typeof baseGuestPath !== "string") {{
+      const target = this._readString(pathPtr, pathLen);
+      const base = this._descriptorPathBase(entry, target);
+      if (!base || typeof base.guestPath !== "string") {{
         return {{ error: __agentOsWasiErrnoBadf }};
       }}
-      const target = this._readString(pathPtr, pathLen);
       const guestPath = target.startsWith("/")
         ? __agentOsPath().posix.normalize(target)
-        : __agentOsPath().posix.resolve(baseGuestPath, target);
-      const hostPath = this._resolveHostPathForGuestPath(guestPath);
+        : __agentOsPath().posix.resolve(base.guestPath, target);
+      const mapped =
+        base.guestPath === "/" && !target.startsWith("/")
+          ? this._resolveRootRelativePath(
+              target,
+              options.preferCreateParent === true,
+            )
+          : {{
+              guestPath,
+              ...(
+                this._resolveHostMappingForGuestPath(guestPath) ??
+                {{ hostPath: null, readOnly: false }}
+              ),
+            }};
+      const hostPath = mapped.hostPath;
       if (typeof hostPath !== "string") {{
         return {{ error: __agentOsWasiErrnoNoent }};
       }}
       return {{
         error: __agentOsWasiErrnoSuccess,
-        guestPath,
+        guestPath: mapped.guestPath,
         hostPath,
+        readOnly: mapped.readOnly === true,
       }};
     }}
 
@@ -2493,6 +3059,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         const descriptor = Number(fd) >>> 0;
         const handle = this._externalFdHandle(descriptor);
         if (handle?.kind === "pipe-write" && handle.pipe) {{
+          if (bytes.length > 0 && !this._pipeHasReaders(handle.pipe)) {{
+            return __agentOsWasiErrnoPipe;
+          }}
           this._enqueuePipeBytes(handle.pipe, bytes);
           this._flushPipeConsumers(handle.pipe);
           return this._writeUint32(nwrittenPtr, bytes.length);
@@ -2501,6 +3070,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
           (handle?.kind === "passthrough" || handle?.kind === "host-passthrough") &&
           typeof handle.targetFd === "number"
         ) {{
+          if (handle.readOnly === true) {{
+            return __agentOsWasiErrnoRofs;
+          }}
           if (descriptor === 1 || descriptor === 2) {{
             const sidecarManagedProcess =
               typeof process?.env?.AGENT_OS_SANDBOX_ROOT === "string" &&
@@ -2521,6 +3093,22 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
             bytes.length,
             null,
           );
+          return this._writeUint32(nwrittenPtr, written);
+        }}
+        if (handle?.kind === "guest-file" && typeof handle.targetFd === "number") {{
+          const position = handle.append ? null : (handle.position ?? 0);
+          const written = __agentOsFs().writeSync(
+            handle.targetFd,
+            bytes,
+            0,
+            bytes.length,
+            position,
+          );
+          if (handle.append) {{
+            handle.position = Number(__agentOsFs().fstatSync(handle.targetFd).size ?? 0);
+          }} else {{
+            handle.position = (handle.position ?? 0) + written;
+          }}
           return this._writeUint32(nwrittenPtr, written);
         }}
         const entry = this.fdTable.get(descriptor);
@@ -2548,6 +3136,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
             ? Number(globalThis.__agentOsSyncRpc.callSync("__kernel_stdio_write", [2, bytes])) >>> 0
             : (process.stderr.write(bytes), bytes.length);
           return this._writeUint32(nwrittenPtr, written);
+        }}
+        if (entry.readOnly === true) {{
+          return __agentOsWasiErrnoRofs;
         }}
         if (entry.kind === "file") {{
           const position = typeof entry.offset === "number" ? entry.offset : null;
@@ -2578,6 +3169,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
           (handle?.kind === "passthrough" || handle?.kind === "host-passthrough") &&
           typeof handle.targetFd === "number"
         ) {{
+          if (handle.readOnly === true) {{
+            return __agentOsWasiErrnoRofs;
+          }}
           const written = __agentOsFs().writeSync(
             handle.targetFd,
             bytes,
@@ -2590,6 +3184,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         const entry = this.fdTable.get(descriptor);
         if (!entry || entry.kind !== "file") {{
           return __agentOsWasiErrnoBadf;
+        }}
+        if (entry.readOnly === true) {{
+          return __agentOsWasiErrnoRofs;
         }}
         const written = __agentOsFs().writeSync(
           entry.realFd,
@@ -2608,15 +3205,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
       try {{
         const descriptor = Number(fd) >>> 0;
         const explicitOffset = Number(offset) >>> 0;
-        const totalLength = (() => {{
-          const view = this._memoryView();
-          let length = 0;
-          for (let index = 0; index < (Number(iovsLen) >>> 0); index += 1) {{
-            const entryOffset = (Number(iovs) >>> 0) + index * 8;
-            length += view.getUint32(entryOffset + 4, true);
-          }}
-          return length >>> 0;
-        }})();
+        const totalLength = this._boundedIovLength(iovs, iovsLen);
         const buffer = Buffer.alloc(totalLength);
         const handle = this._externalFdHandle(descriptor);
         if (
@@ -2656,15 +3245,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         const descriptor = Number(fd) >>> 0;
         const handle = this._externalFdHandle(descriptor);
         if (handle?.kind === "pipe-read" && handle.pipe) {{
-          const totalLength = (() => {{
-            const view = this._memoryView();
-            let length = 0;
-            for (let index = 0; index < (Number(iovsLen) >>> 0); index += 1) {{
-              const entryOffset = (Number(iovs) >>> 0) + index * 8;
-              length += view.getUint32(entryOffset + 4, true);
-            }}
-            return length >>> 0;
-          }})();
+          const totalLength = this._boundedIovLength(iovs, iovsLen);
           while (handle.pipe.chunks.length === 0) {{
             if (handle.pipe.writeHandleCount === 0 && handle.pipe.producers.size === 0) {{
               return this._writeUint32(nreadPtr, 0);
@@ -2680,15 +3261,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
           return __agentOsWasiErrnoBadf;
         }}
         if (entry.kind === "stdin") {{
-          const totalLength = (() => {{
-            const view = this._memoryView();
-            let length = 0;
-            for (let index = 0; index < (Number(iovsLen) >>> 0); index += 1) {{
-              const entryOffset = (Number(iovs) >>> 0) + index * 8;
-              length += view.getUint32(entryOffset + 4, true);
-            }}
-            return length >>> 0;
-          }})();
+          const totalLength = this._boundedIovLength(iovs, iovsLen);
           const syncRpc =
             typeof globalThis?.__agentOsSyncRpc?.callSync === "function"
               ? globalThis.__agentOsSyncRpc
@@ -2752,15 +3325,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
           (handle?.kind === "passthrough" || handle?.kind === "host-passthrough") &&
           typeof handle.targetFd === "number"
         ) {{
-          const totalLength = (() => {{
-            const view = this._memoryView();
-            let length = 0;
-            for (let index = 0; index < (Number(iovsLen) >>> 0); index += 1) {{
-              const entryOffset = (Number(iovs) >>> 0) + index * 8;
-              length += view.getUint32(entryOffset + 4, true);
-            }}
-            return length >>> 0;
-          }})();
+          const totalLength = this._boundedIovLength(iovs, iovsLen);
           const buffer = Buffer.alloc(totalLength);
           const bytesRead = __agentOsFs().readSync(
             handle.targetFd,
@@ -2775,15 +3340,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         if (entry.kind !== "file") {{
           return __agentOsWasiErrnoBadf;
         }}
-        const totalLength = (() => {{
-          const view = this._memoryView();
-          let length = 0;
-          for (let index = 0; index < (Number(iovsLen) >>> 0); index += 1) {{
-            const entryOffset = (Number(iovs) >>> 0) + index * 8;
-            length += view.getUint32(entryOffset + 4, true);
-          }}
-          return length >>> 0;
-        }})();
+        const totalLength = this._boundedIovLength(iovs, iovsLen);
         const buffer = Buffer.alloc(totalLength);
         const position = typeof entry.offset === "number" ? entry.offset : null;
         const bytesRead = __agentOsFs().readSync(
@@ -2918,6 +3475,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         if (!entry || entry.kind !== "file" || typeof entry.realFd !== "number") {{
           return __agentOsWasiErrnoBadf;
         }}
+        if (entry.readOnly === true) {{
+          return __agentOsWasiErrnoRofs;
+        }}
         __agentOsFs().ftruncateSync(entry.realFd, Number(size));
         return __agentOsWasiErrnoSuccess;
       }} catch (error) {{
@@ -2981,7 +3541,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         if (!entry || entry.kind !== "preopen") {{
           return __agentOsWasiErrnoBadf;
         }}
-        const guestPath = this._descriptorGuestPath(entry);
+        const guestPath = this._descriptorPreopenName(entry);
         if (typeof guestPath !== "string") {{
           return __agentOsWasiErrnoBadf;
         }}
@@ -3001,7 +3561,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         if (!entry || entry.kind !== "preopen") {{
           return __agentOsWasiErrnoBadf;
         }}
-        const guestPath = this._descriptorGuestPath(entry);
+        const guestPath = this._descriptorPreopenName(entry);
         if (typeof guestPath !== "string") {{
           return __agentOsWasiErrnoBadf;
         }}
@@ -3018,7 +3578,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
     _fdReaddir(fd, bufPtr, bufLen, cookie, bufUsedPtr) {{
       try {{
         const entry = this._descriptorEntry(fd);
-        const fsPath = this._descriptorFsPath(entry);
+        const fsPath = this._descriptorDirectoryFsPath(entry);
         if (
           !entry ||
           (entry.kind !== "preopen" && entry.kind !== "directory") ||
@@ -3068,6 +3628,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         if (resolved.error !== __agentOsWasiErrnoSuccess) {{
           return resolved.error;
         }}
+        if (resolved.readOnly) {{
+          return __agentOsWasiErrnoRofs;
+        }}
         __agentOsFs().mkdirSync(resolved.hostPath);
         return __agentOsWasiErrnoSuccess;
       }} catch (error) {{
@@ -3085,6 +3648,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         if (destination.error !== __agentOsWasiErrnoSuccess) {{
           return destination.error;
         }}
+        if (source.readOnly || destination.readOnly) {{
+          return __agentOsWasiErrnoRofs;
+        }}
         __agentOsFs().linkSync(source.hostPath, destination.hostPath);
         return __agentOsWasiErrnoSuccess;
       }} catch (error) {{
@@ -3095,35 +3661,26 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
     _pathOpen(fd, _dirflags, pathPtr, pathLen, oflags, rightsBase, rightsInheriting, _fdflags, openedFdPtr) {{
       try {{
         const entry = this._descriptorEntry(fd);
-        const baseGuestPath = this._descriptorGuestPath(entry);
         if (
           !entry ||
           (entry.kind !== "preopen" && entry.kind !== "directory") ||
-          typeof entry.hostPath !== "string" ||
-          typeof baseGuestPath !== "string"
+          typeof entry.hostPath !== "string"
         ) {{
           return __agentOsWasiErrnoBadf;
         }}
-        const target = this._readString(pathPtr, pathLen);
-        const guestPath = target.startsWith("/")
-          ? __agentOsPath().posix.normalize(target)
-          : __agentOsPath().posix.resolve(baseGuestPath, target);
-        const baseHostPath = __agentOsPath().resolve(entry.hostPath);
-        const hostPath = __agentOsPath().resolve(baseHostPath, target);
-        const hostSuffix = __agentOsPath().relative(baseHostPath, hostPath);
-        if (
-          hostPath !== baseHostPath &&
-          (hostSuffix === ".." ||
-            hostSuffix.startsWith(`..${{__agentOsPath().sep}}`) ||
-            __agentOsPath().isAbsolute(hostSuffix))
-        ) {{
-          return __agentOsWasiErrnoNoent;
-        }}
         const requestedFlags = Number(oflags) >>> 0;
-        const openDirectory = (requestedFlags & __agentOsWasiOpenDirectory) !== 0;
         const createOrTruncate =
           (requestedFlags & __agentOsWasiOpenCreate) !== 0 ||
           (requestedFlags & __agentOsWasiOpenTruncate) !== 0;
+        const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen, {{
+          preferCreateParent: createOrTruncate,
+        }});
+        if (resolved.error !== __agentOsWasiErrnoSuccess) {{
+          return resolved.error;
+        }}
+        const guestPath = resolved.guestPath;
+        const hostPath = resolved.hostPath;
+        const openDirectory = (requestedFlags & __agentOsWasiOpenDirectory) !== 0;
         const allowedRightsBase = this._descriptorRightsBase(entry);
         const allowedRightsInheriting = this._descriptorRightsInheriting(entry);
         const requestedRightsBase = this._normalizeRights(rightsBase, allowedRightsInheriting);
@@ -3145,6 +3702,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
           !this._hasWriteRights(allowedRightsBase)
         ) {{
           return __agentOsWasiErrnoAcces;
+        }}
+        if (requestedWriteAccess && resolved.readOnly) {{
+          return __agentOsWasiErrnoRofs;
         }}
         const fsConstants = __agentOsFs().constants ?? {{}};
         let openFlags = requestedWriteAccess
@@ -3177,6 +3737,7 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
           kind: stats.isDirectory() ? "directory" : "file",
           guestPath,
           hostPath,
+          readOnly: resolved.readOnly === true,
           realFd,
           offset: 0,
           rightsBase: requestedRightsBase & allowedRightsInheriting,
@@ -3195,6 +3756,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         if (resolved.error !== __agentOsWasiErrnoSuccess) {{
           return resolved.error;
         }}
+        if (resolved.readOnly) {{
+          return __agentOsWasiErrnoRofs;
+        }}
         const target = this._readString(targetPtr, targetLen);
         __agentOsFs().symlinkSync(target, resolved.hostPath);
         return __agentOsWasiErrnoSuccess;
@@ -3208,6 +3772,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen);
         if (resolved.error !== __agentOsWasiErrnoSuccess) {{
           return resolved.error;
+        }}
+        if (resolved.readOnly) {{
+          return __agentOsWasiErrnoRofs;
         }}
         __agentOsFs().rmdirSync(resolved.hostPath);
         return __agentOsWasiErrnoSuccess;
@@ -3226,6 +3793,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         if (destination.error !== __agentOsWasiErrnoSuccess) {{
           return destination.error;
         }}
+        if (source.readOnly || destination.readOnly) {{
+          return __agentOsWasiErrnoRofs;
+        }}
         __agentOsFs().renameSync(source.hostPath, destination.hostPath);
         return __agentOsWasiErrnoSuccess;
       }} catch (error) {{
@@ -3238,6 +3808,9 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsWasiModule =
         const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen);
         if (resolved.error !== __agentOsWasiErrnoSuccess) {{
           return resolved.error;
+        }}
+        if (resolved.readOnly) {{
+          return __agentOsWasiErrnoRofs;
         }}
         __agentOsFs().unlinkSync(resolved.hostPath);
         return __agentOsWasiErrnoSuccess;
@@ -3623,6 +4196,11 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsSyncRpc === 
             throw new Error("Agent OS WASM child_process kill bridge is unavailable");
           }}
           return _childProcessKill.applySync(void 0, args);
+        case "process.kill":
+          if (typeof _processKill === "undefined") {{
+            throw new Error("Agent OS WASM process kill bridge is unavailable");
+          }}
+          return _processKill.applySync(void 0, args);
         case "child_process.write_stdin": {{
           if (typeof _childProcessStdinWrite === "undefined") {{
             throw new Error("Agent OS WASM child_process stdin bridge is unavailable");
@@ -3643,6 +4221,26 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsSyncRpc === 
             throw new Error("Agent OS WASM net.connect bridge is unavailable");
           }}
           return _netSocketConnectRaw.applySync(void 0, args);
+        case "net.reserve_tcp_port":
+          if (typeof _netReserveTcpPortRaw === "undefined") {{
+            throw new Error("Agent OS WASM net.reserve_tcp_port bridge is unavailable");
+          }}
+          return _netReserveTcpPortRaw.applySync(void 0, args);
+        case "net.release_tcp_port":
+          if (typeof _netReleaseTcpPortRaw === "undefined") {{
+            throw new Error("Agent OS WASM net.release_tcp_port bridge is unavailable");
+          }}
+          return _netReleaseTcpPortRaw.applySync(void 0, args);
+        case "net.listen":
+          if (typeof _netServerListenRaw === "undefined") {{
+            throw new Error("Agent OS WASM net.listen bridge is unavailable");
+          }}
+          return _netServerListenRaw.applySync(void 0, args);
+        case "net.server_accept":
+          if (typeof _netServerAcceptRaw === "undefined") {{
+            throw new Error("Agent OS WASM net.server_accept bridge is unavailable");
+          }}
+          return _netServerAcceptRaw.applySync(void 0, args);
         case "net.poll":
           if (typeof _netSocketPollRaw === "undefined") {{
             throw new Error("Agent OS WASM net.poll bridge is unavailable");
@@ -3663,6 +4261,79 @@ if (typeof globalThis !== "undefined" && typeof globalThis.__agentOsSyncRpc === 
             throw new Error("Agent OS WASM TLS-upgrade bridge is unavailable");
           }}
           return _netSocketUpgradeTlsRaw.applySync(void 0, args);
+        case "dgram.createSocket":
+          if (typeof _dgramSocketCreateRaw === "undefined") {{
+            throw new Error("Agent OS WASM dgram.createSocket bridge is unavailable");
+          }}
+          return _dgramSocketCreateRaw.applySync(void 0, args);
+        case "dgram.bind":
+          if (typeof _dgramSocketBindRaw === "undefined") {{
+            throw new Error("Agent OS WASM dgram.bind bridge is unavailable");
+          }}
+          return _dgramSocketBindRaw.applySync(void 0, args);
+        case "dgram.send": {{
+          if (typeof _dgramSocketSendRaw === "undefined") {{
+            throw new Error("Agent OS WASM dgram.send bridge is unavailable");
+          }}
+          const [socketId, chunk, options = {{}}] = args;
+          return _dgramSocketSendRaw.applySync(void 0, [
+            socketId,
+            __agentOsNormalizeBytes(chunk),
+            options,
+          ]);
+        }}
+        case "dgram.poll":
+          if (typeof _dgramSocketRecvRaw === "undefined") {{
+            throw new Error("Agent OS WASM dgram.poll bridge is unavailable");
+          }}
+          const event = _dgramSocketRecvRaw.applySync(void 0, args);
+          if (event && event.type === "message") {{
+            const data = __agentOsNormalizeBytes(event.data);
+            if (typeof Buffer !== "undefined" && Buffer.isBuffer(data)) {{
+              return {{
+                ...event,
+                data: {{ base64: data.toString("base64") }},
+              }};
+            }}
+          }}
+          if (
+            event &&
+            event.type === "message" &&
+            event.data &&
+            typeof event.data === "object" &&
+            typeof event.data.base64 === "string"
+          ) {{
+            return {{
+              ...event,
+              data: {{ base64: event.data.base64 }},
+            }};
+          }}
+          return event;
+        case "dgram.close":
+          if (typeof _dgramSocketCloseRaw === "undefined") {{
+            throw new Error("Agent OS WASM dgram.close bridge is unavailable");
+          }}
+          return _dgramSocketCloseRaw.applySync(void 0, args);
+        case "dgram.address":
+          if (typeof _dgramSocketAddressRaw === "undefined") {{
+            throw new Error("Agent OS WASM dgram.address bridge is unavailable");
+          }}
+          return _dgramSocketAddressRaw.applySync(void 0, args);
+        case "dgram.setBufferSize":
+          if (typeof _dgramSocketSetBufferSizeRaw === "undefined") {{
+            throw new Error("Agent OS WASM dgram.setBufferSize bridge is unavailable");
+          }}
+          return _dgramSocketSetBufferSizeRaw.applySync(void 0, args);
+        case "dgram.getBufferSize":
+          if (typeof _dgramSocketGetBufferSizeRaw === "undefined") {{
+            throw new Error("Agent OS WASM dgram.getBufferSize bridge is unavailable");
+          }}
+          return _dgramSocketGetBufferSizeRaw.applySync(void 0, args);
+        case "dns.lookup":
+          if (typeof _networkDnsLookupSyncRaw === "undefined") {{
+            throw new Error("Agent OS WASM dns.lookup bridge is unavailable");
+          }}
+          return _networkDnsLookupSyncRaw.applySync(void 0, args);
         case "process.signal_state": {{
           if (typeof _processSignalState === "undefined") {{
             throw new Error("Agent OS WASM signal-state bridge is unavailable");
@@ -3761,9 +4432,11 @@ fn prewarm_wasm_path(
         javascript_context_id,
         resolved_module,
         request,
-        frozen_time_ms,
-        true,
-        None,
+        WasmJavascriptExecutionOptions {
+            frozen_time_ms,
+            prewarm_only: true,
+            warmup_metrics: None,
+        },
     )
     .map_err(|error| match error {
         WasmExecutionError::Spawn(err) => WasmExecutionError::WarmupSpawn(err),
@@ -3795,8 +4468,12 @@ fn prewarm_wasm_path(
             .poll_event_blocking(poll_timeout)
             .map_err(map_javascript_error)?
         {
-            Some(JavascriptExecutionEvent::Stdout(chunk)) => stdout.extend(chunk),
-            Some(JavascriptExecutionEvent::Stderr(chunk)) => stderr.extend(chunk),
+            Some(JavascriptExecutionEvent::Stdout(chunk)) => {
+                append_wasm_captured_output(&mut stdout, &chunk, "stdout")?;
+            }
+            Some(JavascriptExecutionEvent::Stderr(chunk)) => {
+                append_wasm_captured_output(&mut stderr, &chunk, "stderr")?;
+            }
             Some(JavascriptExecutionEvent::Exited(exit_code)) => {
                 if exit_code != 0 {
                     return Err(WasmExecutionError::WarmupFailed {
@@ -4014,6 +4691,10 @@ fn wasm_guest_path_mappings(request: &StartWasmExecutionRequest) -> Vec<WasmGues
             Some(WasmGuestPathMapping {
                 guest_path: mapping.get("guestPath")?.as_str()?.to_owned(),
                 host_path: PathBuf::from(mapping.get("hostPath")?.as_str()?),
+                read_only: mapping
+                    .get("readOnly")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
         })
         .collect::<Vec<_>>();
@@ -4054,6 +4735,7 @@ fn push_wasm_guest_path_mapping(
     mappings.push(WasmGuestPathMapping {
         guest_path,
         host_path,
+        read_only: false,
     });
 }
 
@@ -4065,6 +4747,7 @@ fn encode_wasm_guest_path_mappings(mappings: &[WasmGuestPathMapping]) -> String 
                 json!({
                     "guestPath": mapping.guest_path,
                     "hostPath": mapping.host_path.to_string_lossy(),
+                    "readOnly": mapping.read_only,
                 })
             })
             .collect::<Vec<_>>(),
@@ -4287,7 +4970,7 @@ fn validate_module_limits(
     };
 
     let resolved_path = &resolved_module.resolved_path;
-    let metadata = fs::metadata(&resolved_path).map_err(|error| {
+    let metadata = fs::metadata(resolved_path).map_err(|error| {
         WasmExecutionError::InvalidModule(format!(
             "failed to stat {}: {error}",
             resolved_path.display()
@@ -4300,7 +4983,7 @@ fn validate_module_limits(
             MAX_WASM_MODULE_FILE_BYTES
         )));
     }
-    let bytes = fs::read(&resolved_path).map_err(|error| {
+    let bytes = fs::read(resolved_path).map_err(|error| {
         WasmExecutionError::InvalidModule(format!(
             "failed to read {}: {error}",
             resolved_path.display()
@@ -4556,11 +5239,15 @@ fn resolve_path_like_specifier(cwd: &Path, specifier: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        StartWasmExecutionRequest, WASM_MAX_FUEL_ENV, WASM_MAX_MEMORY_BYTES_ENV, WASM_PAGE_BYTES,
-        WASM_PREWARM_TIMEOUT_MS_ENV, WASM_SANDBOX_ROOT_ENV, WasmInternalSyncRpc,
-        WasmPermissionTier, build_wasm_runner_bootstrap, resolve_wasm_execution_timeout,
+        build_wasm_runner_bootstrap, open_wasm_guest_file, resolve_wasm_execution_timeout,
         resolve_wasm_prewarm_timeout, resolved_module_path, translate_wasm_guest_path,
-        wasm_guest_module_paths, wasm_memory_limit_pages, wasm_sandbox_root,
+        translate_wasm_host_symlink_target, wasm_guest_module_paths, wasm_host_path_is_read_only,
+        wasm_memory_limit_pages, wasm_mutation_touches_read_only_mapping,
+        wasm_read_only_filesystem_error, wasm_sandbox_root, wasm_sync_read_length,
+        wasm_sync_rpc_error_code, StartWasmExecutionRequest, Value, WasmExecutionError,
+        WasmInternalSyncRpc, WasmPermissionTier, WASM_CAPTURED_OUTPUT_LIMIT_BYTES,
+        WASM_MAX_FUEL_ENV, WASM_MAX_MEMORY_BYTES_ENV, WASM_PAGE_BYTES, WASM_PREWARM_TIMEOUT_MS_ENV,
+        WASM_SANDBOX_ROOT_ENV, WASM_SYNC_READ_LIMIT_BYTES,
     };
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
@@ -4621,6 +5308,73 @@ mod tests {
     }
 
     #[test]
+    fn wasm_captured_output_rejects_output_over_limit() {
+        let mut stdout = vec![b'x'; WASM_CAPTURED_OUTPUT_LIMIT_BYTES - 1];
+        super::append_wasm_captured_output(&mut stdout, b"y", "stdout").expect("fill to limit");
+        assert_eq!(stdout.len(), WASM_CAPTURED_OUTPUT_LIMIT_BYTES);
+
+        let error = super::append_wasm_captured_output(&mut stdout, b"z", "stdout")
+            .expect_err("captured output over limit should fail");
+        assert!(matches!(
+            error,
+            WasmExecutionError::OutputBufferExceeded {
+                stream: "stdout",
+                limit: WASM_CAPTURED_OUTPUT_LIMIT_BYTES,
+            }
+        ));
+    }
+
+    #[test]
+    fn wasm_sync_read_length_rejects_oversized_guest_lengths() {
+        assert_eq!(
+            wasm_sync_read_length(Some(WASM_SYNC_READ_LIMIT_BYTES as u64))
+                .expect("max read length should be accepted"),
+            WASM_SYNC_READ_LIMIT_BYTES
+        );
+
+        let error = wasm_sync_read_length(Some(WASM_SYNC_READ_LIMIT_BYTES as u64 + 1))
+            .expect_err("oversized read length should fail before allocation");
+        assert!(
+            matches!(error, WasmExecutionError::InvalidLimit(message) if message.contains("fs.readSync length"))
+        );
+    }
+
+    #[test]
+    fn wasm_bytes_arg_rejects_payloads_over_limit_before_decode() {
+        let mut payload = serde_json::Map::new();
+        payload.insert(
+            String::from("base64"),
+            Value::String(String::from("YWJjZA==")),
+        );
+
+        let error =
+            super::decode_wasm_bytes_arg(Some(&Value::Object(payload)), "fs.writeSync bytes", 3)
+                .expect_err("decoded bytes over limit should fail before allocation");
+
+        assert!(matches!(
+            error,
+            WasmExecutionError::OutputBufferExceeded {
+                stream: "fs.writeSync bytes",
+                limit: 3,
+            }
+        ));
+    }
+
+    #[test]
+    fn wasm_runner_bootstrap_caps_wasi_iov_lengths_before_allocation() {
+        let bootstrap = build_wasm_runner_bootstrap(&BTreeMap::new(), None);
+
+        assert!(bootstrap.contains(&format!(
+            "const __agentOsWasmSyncReadLimitBytes = {WASM_SYNC_READ_LIMIT_BYTES};"
+        )));
+        assert!(bootstrap.contains("_boundedIovLength(iovs, iovsLen)"));
+        assert!(bootstrap.contains("const totalLength = this._boundedIovLength(iovs, iovsLen);\n      const view = this._memoryView();"));
+        assert!(bootstrap.contains("return Buffer.concat(chunks, totalLength);"));
+        assert!(bootstrap.contains("const totalLength = this._boundedIovLength(iovs, iovsLen);"));
+        assert!(!bootstrap.contains("const totalLength = (() => {"));
+    }
+
+    #[test]
     fn wasm_guest_module_paths_include_mapped_guest_paths_for_host_specifiers() {
         let temp = tempdir().expect("create temp dir");
         let command_root = temp.path().join("commands");
@@ -4673,6 +5427,42 @@ mod tests {
     }
 
     #[test]
+    fn translate_wasm_host_symlink_target_returns_guest_path_for_mapped_targets() {
+        let temp = tempdir().expect("create temp dir");
+        let sandbox_root = temp.path().join("shadow-root");
+        let cwd = sandbox_root.join("home/user");
+        fs::create_dir_all(cwd.join("project")).expect("create host cwd");
+
+        let internal_sync_rpc = WasmInternalSyncRpc {
+            module_guest_paths: Vec::new(),
+            module_host_path: sandbox_root.join("module.wasm"),
+            guest_cwd: String::from("/home/user"),
+            host_cwd: cwd.clone(),
+            sandbox_root: Some(sandbox_root.clone()),
+            guest_path_mappings: vec![super::WasmGuestPathMapping {
+                guest_path: String::from("/"),
+                host_path: sandbox_root.clone(),
+                read_only: false,
+            }],
+            next_fd: 64,
+            open_files: Default::default(),
+            pending_events: VecDeque::new(),
+        };
+
+        assert_eq!(
+            translate_wasm_host_symlink_target(
+                &sandbox_root.join("tmp/sc/pdir/r.txt"),
+                &internal_sync_rpc
+            ),
+            Some(String::from("/tmp/sc/pdir/r.txt"))
+        );
+        assert_eq!(
+            translate_wasm_host_symlink_target(Path::new("relative-target"), &internal_sync_rpc),
+            None
+        );
+    }
+
+    #[test]
     fn translate_wasm_guest_path_recovers_root_collapsed_relative_paths_from_guest_cwd() {
         let temp = tempdir().expect("create temp dir");
         let sandbox_root = temp.path().join("shadow-root");
@@ -4690,6 +5480,7 @@ mod tests {
             guest_path_mappings: vec![super::WasmGuestPathMapping {
                 guest_path: String::from("/workspace"),
                 host_path: cwd.clone(),
+                read_only: false,
             }],
             next_fd: 64,
             open_files: Default::default(),
@@ -4708,6 +5499,7 @@ mod tests {
         let sandbox_root = temp.path().join("shadow-root");
         let cwd = temp.path().join("mounted-workspace");
         let mapped_root = temp.path().join("mounted-commands");
+        fs::create_dir_all(&sandbox_root).expect("create sandbox root");
         fs::create_dir_all(cwd.join("subdir")).expect("create cwd");
         fs::create_dir_all(&mapped_root).expect("create mapped root");
 
@@ -4721,10 +5513,12 @@ mod tests {
                 super::WasmGuestPathMapping {
                     guest_path: String::from("/workspace"),
                     host_path: cwd.clone(),
+                    read_only: false,
                 },
                 super::WasmGuestPathMapping {
                     guest_path: String::from("/__agentos/commands/0"),
                     host_path: mapped_root.clone(),
+                    read_only: false,
                 },
             ],
             next_fd: 64,
@@ -4763,6 +5557,152 @@ mod tests {
     }
 
     #[test]
+    fn translate_wasm_guest_path_rejects_symlink_escape_from_sandbox_root() {
+        let temp = tempdir().expect("create temp dir");
+        let sandbox_root = temp.path().join("shadow-root");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&sandbox_root).expect("create sandbox root");
+        fs::create_dir_all(&outside).expect("create outside root");
+        fs::write(outside.join("secret.txt"), b"host secret").expect("write outside file");
+        symlink(&outside, sandbox_root.join("escape")).expect("create escape symlink");
+
+        let internal_sync_rpc = WasmInternalSyncRpc {
+            module_guest_paths: Vec::new(),
+            module_host_path: sandbox_root.join("module.wasm"),
+            guest_cwd: String::from("/"),
+            host_cwd: sandbox_root.clone(),
+            sandbox_root: Some(sandbox_root.clone()),
+            guest_path_mappings: vec![super::WasmGuestPathMapping {
+                guest_path: String::from("/"),
+                host_path: sandbox_root,
+                read_only: false,
+            }],
+            next_fd: 64,
+            open_files: Default::default(),
+            pending_events: VecDeque::new(),
+        };
+
+        assert_eq!(
+            translate_wasm_guest_path("/escape/secret.txt", &internal_sync_rpc),
+            None
+        );
+        assert_eq!(
+            translate_wasm_guest_path("/escape/new.txt", &internal_sync_rpc),
+            None
+        );
+    }
+
+    #[test]
+    fn wasm_read_only_mapping_blocks_mutating_host_paths() {
+        let temp = tempdir().expect("create temp dir");
+        let sandbox_root = temp.path().join("shadow-root");
+        let readonly_root = temp.path().join("readonly");
+        fs::create_dir_all(&sandbox_root).expect("create sandbox root");
+        fs::create_dir_all(&readonly_root).expect("create readonly root");
+        fs::write(readonly_root.join("package.json"), b"{}").expect("write readonly file");
+
+        let internal_sync_rpc = WasmInternalSyncRpc {
+            module_guest_paths: Vec::new(),
+            module_host_path: sandbox_root.join("module.wasm"),
+            guest_cwd: String::from("/workspace"),
+            host_cwd: sandbox_root.clone(),
+            sandbox_root: Some(sandbox_root),
+            guest_path_mappings: vec![super::WasmGuestPathMapping {
+                guest_path: String::from("/node_modules"),
+                host_path: readonly_root.clone(),
+                read_only: true,
+            }],
+            next_fd: 64,
+            open_files: Default::default(),
+            pending_events: VecDeque::new(),
+        };
+
+        let host_path = translate_wasm_guest_path("/node_modules/package.json", &internal_sync_rpc)
+            .expect("read path should resolve");
+        assert_eq!(host_path, readonly_root.join("package.json"));
+        assert!(wasm_host_path_is_read_only(&host_path, &internal_sync_rpc));
+        assert!(wasm_host_path_is_read_only(
+            &readonly_root.join("new-package.json"),
+            &internal_sync_rpc
+        ));
+        assert_eq!(
+            wasm_sync_rpc_error_code(&wasm_read_only_filesystem_error("/node_modules")),
+            "EROFS"
+        );
+    }
+
+    #[test]
+    fn wasm_open_guest_file_errors_remain_sync_rpc_errors() {
+        let temp = tempdir().expect("create temp dir");
+        let missing_path = temp.path().join("missing.txt");
+
+        let error = open_wasm_guest_file(&missing_path, &Value::from(0))
+            .expect_err("missing file should return an open error");
+
+        assert_eq!(wasm_sync_rpc_error_code(&error), "ENOENT");
+    }
+
+    #[test]
+    fn wasm_hard_links_are_rejected_when_either_side_is_read_only() {
+        let temp = tempdir().expect("create temp dir");
+        let readonly_root = temp.path().join("readonly");
+        let writable_root = temp.path().join("writable");
+        fs::create_dir_all(&readonly_root).expect("create readonly root");
+        fs::create_dir_all(&writable_root).expect("create writable root");
+        let readonly_file = readonly_root.join("package.json");
+        let writable_file = writable_root.join("source.txt");
+        fs::write(&readonly_file, b"readonly").expect("write readonly source");
+        fs::write(&writable_file, b"writable").expect("write writable source");
+
+        let internal_sync_rpc = WasmInternalSyncRpc {
+            module_guest_paths: Vec::new(),
+            module_host_path: writable_root.join("module.wasm"),
+            guest_cwd: String::from("/workspace"),
+            host_cwd: writable_root.clone(),
+            sandbox_root: Some(writable_root.clone()),
+            guest_path_mappings: vec![
+                super::WasmGuestPathMapping {
+                    guest_path: String::from("/node_modules"),
+                    host_path: readonly_root.clone(),
+                    read_only: true,
+                },
+                super::WasmGuestPathMapping {
+                    guest_path: String::from("/workspace"),
+                    host_path: writable_root.clone(),
+                    read_only: false,
+                },
+            ],
+            next_fd: 64,
+            open_files: Default::default(),
+            pending_events: VecDeque::new(),
+        };
+
+        assert!(wasm_mutation_touches_read_only_mapping(
+            &readonly_file,
+            &writable_root.join("alias-from-readonly.json"),
+            &internal_sync_rpc
+        ));
+        assert!(wasm_mutation_touches_read_only_mapping(
+            &writable_file,
+            &readonly_root.join("alias-into-readonly.txt"),
+            &internal_sync_rpc
+        ));
+        assert!(!wasm_mutation_touches_read_only_mapping(
+            &writable_file,
+            &writable_root.join("alias.txt"),
+            &internal_sync_rpc
+        ));
+
+        let raw_alias = writable_root.join("raw-alias.json");
+        fs::hard_link(&readonly_file, &raw_alias).expect("host hard link would otherwise succeed");
+        fs::write(&raw_alias, b"mutated").expect("write through host hard link alias");
+        assert_eq!(
+            fs::read(&readonly_file).expect("read readonly source"),
+            b"mutated"
+        );
+    }
+
+    #[test]
     fn translate_wasm_guest_path_preserves_real_root_paths_before_guest_cwd_fallback() {
         let temp = tempdir().expect("create temp dir");
         let sandbox_root = temp.path().join("shadow-root");
@@ -4781,6 +5721,7 @@ mod tests {
             guest_path_mappings: vec![super::WasmGuestPathMapping {
                 guest_path: String::from("/workspace"),
                 host_path: cwd,
+                read_only: false,
             }],
             next_fd: 64,
             open_files: Default::default(),
@@ -4826,11 +5767,9 @@ mod tests {
             ]),
         ));
 
-        assert!(
-            mappings
-                .iter()
-                .any(|mapping| { mapping.guest_path == "/" && mapping.host_path == sandbox_root })
-        );
+        assert!(mappings
+            .iter()
+            .any(|mapping| { mapping.guest_path == "/" && mapping.host_path == sandbox_root }));
         assert!(mappings.iter().any(|mapping| {
             mapping.guest_path == "/home/user" && mapping.host_path == host_cwd
         }));
@@ -4842,6 +5781,65 @@ mod tests {
 
         assert!(bootstrap.contains("if (guestPath === \".\") {"));
         assert!(!bootstrap.contains("if (guestPath === \".\" || guestPath === \"/\") {"));
+    }
+
+    #[test]
+    fn wasm_runner_bootstrap_reports_dot_preopen_to_wasi() {
+        let bootstrap = build_wasm_runner_bootstrap(&BTreeMap::new(), None);
+
+        assert!(bootstrap.contains("_descriptorPreopenName(entry)"));
+        assert!(bootstrap.contains(
+            "if (guestPath === \".\") {\n        return this._descriptorGuestPath(entry);"
+        ));
+        assert!(bootstrap.contains("const guestPath = this._descriptorPreopenName(entry);"));
+    }
+
+    #[test]
+    fn wasm_runner_path_open_uses_guest_mapping_for_absolute_paths() {
+        let bootstrap = build_wasm_runner_bootstrap(&BTreeMap::new(), None);
+
+        assert!(bootstrap
+            .contains("const resolved = this._resolveDescriptorPath(fd, pathPtr, pathLen, {"));
+        assert!(
+            !bootstrap.contains("const hostPath = __agentOsPath().resolve(baseHostPath, target);")
+        );
+    }
+
+    #[test]
+    fn wasm_runner_root_preopen_relative_paths_preserve_cwd_fallback() {
+        let bootstrap = build_wasm_runner_bootstrap(&BTreeMap::new(), None);
+
+        assert!(bootstrap
+            .contains("const rootGuestPath = __agentOsPath().posix.resolve(\"/\", target);"));
+        assert!(bootstrap.contains(
+            "const cwdGuestTarget = __agentOsPath().posix.resolve(cwdGuestPath, target);"
+        ));
+        assert!(bootstrap.contains("_rootRelativeTargetPrefersCwd(target)"));
+        assert!(bootstrap.contains("_rootRelativeTargetMatchesAbsoluteArg(target)"));
+        assert!(bootstrap.contains("__agentOsPath().posix.normalize(arg) === rootGuestPath"));
+    }
+
+    #[test]
+    fn wasm_runner_readdir_uses_guest_preopen_path_in_sidecar() {
+        let bootstrap = build_wasm_runner_bootstrap(&BTreeMap::new(), None);
+
+        assert!(bootstrap.contains("const fsPath = this._descriptorDirectoryFsPath(entry);"));
+        assert!(
+            bootstrap.contains("(entry?.kind === \"preopen\" || entry?.kind === \"directory\")")
+        );
+    }
+
+    #[test]
+    fn wasm_runner_blocks_read_only_fd_write_paths() {
+        let bootstrap = build_wasm_runner_bootstrap(&BTreeMap::new(), None);
+
+        assert!(bootstrap.contains("readOnly: entry.readOnly === true,"));
+        assert!(bootstrap.contains(
+            "if (handle.readOnly === true) {\n            return __agentOsWasiErrnoRofs;\n          }"
+        ));
+        assert!(bootstrap.contains(
+            "if (entry.readOnly === true) {\n          return __agentOsWasiErrnoRofs;\n        }\n        const written = __agentOsFs().writeSync("
+        ));
     }
 
     #[test]

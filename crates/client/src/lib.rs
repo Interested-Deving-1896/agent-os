@@ -49,6 +49,9 @@ pub const SHELL_DISPOSE_TIMEOUT_MS: u64 = 5_000;
 /// VM lifecycle ready timeout during `create` (milliseconds).
 pub const VM_READY_TIMEOUT_MS: u64 = 10_000;
 
+/// Maximum scheduled cron jobs per VM.
+pub const CRON_JOB_LIMIT: usize = 1024;
+
 // ---------------------------------------------------------------------------
 // Public re-exports
 // ---------------------------------------------------------------------------
@@ -85,9 +88,9 @@ pub use shell::{ConnectTerminalOptions, OpenShellOptions, ShellHandle};
 
 pub use session::{
     AgentCapabilities, AgentInfo, AgentRegistryEntry, ConfigAllowedValue, CreateSessionOptions,
-    GetEventsOptions, McpServerConfig, PermissionDelivery, PermissionReply, PermissionRequest,
-    PromptCapabilities, PromptResult, SessionConfigOption, SessionId, SessionInfo, SessionInitData,
-    SessionMode, SessionModeState,
+    GetEventsOptions, McpServerConfig, PermissionReply, PermissionRequest, PromptCapabilities,
+    PromptResult, SessionConfigOption, SessionId, SessionInfo, SessionInitData, SessionMode,
+    SessionModeState,
 };
 
 pub use json_rpc::{

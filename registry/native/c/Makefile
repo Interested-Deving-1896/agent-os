@@ -57,7 +57,7 @@ endif
 
 # Compile flags
 WASM_CFLAGS  := --target=wasm32-wasip1 --sysroot=$(SYSROOT) -O2 -flto -I include/
-NATIVE_CFLAGS := -O0 -g -I include/
+NATIVE_CFLAGS := -O0 -g -D_LARGEFILE64_SOURCE -I include/
 
 # COMMANDS_DIR for install target (configurable, matches Rust binary output)
 COMMANDS_DIR ?= ../target/wasm32-wasip1/release/commands
@@ -66,7 +66,7 @@ COMMANDS_DIR ?= ../target/wasm32-wasip1/release/commands
 COMMANDS := zip unzip envsubst sqlite3 curl wget duckdb
 
 # Programs requiring patched sysroot (Tier 2+ custom host imports)
-PATCHED_PROGRAMS := isatty_test getpid_test getppid_test getppid_verify userinfo pipe_test dup_test spawn_child spawn_exit_code pipeline kill_child waitpid_return waitpid_edge syscall_coverage getpwuid_test signal_tests sigaction_behavior delayed_tcp_echo delayed_kill pipe_edge tcp_echo tcp_server udp_echo unix_socket signal_handler http_get dns_lookup sqlite3_cli curl wget
+PATCHED_PROGRAMS := isatty_test getpid_test getppid_test getppid_verify userinfo pipe_test dup_test spawn_child spawn_exit_code pipeline kill_child waitpid_return waitpid_edge syscall_coverage getpwuid_test signal_tests sigaction_self sigaction_behavior delayed_tcp_echo delayed_kill pipe_edge tcp_accept_spawn tcp_echo tcp_server udp_echo unix_socket signal_handler http_get dns_lookup sqlite3_cli curl wget
 
 # Discover all .c source files in programs/
 ALL_SOURCES := $(wildcard programs/*.c)
@@ -468,14 +468,9 @@ SQLITE_NATIVE  := $(SQLITE_COMMON)
 
 $(BUILD_DIR)/sqlite3_mem: programs/sqlite3_mem.c libs/sqlite3/sqlite3.c $(WASI_SDK_DIR)/bin/clang
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(WASM_CFLAGS) $(SQLITE_WASM) -Ilibs/sqlite3 -o $@.wasm \
+	$(CC) --target=wasm32-wasip1 --sysroot=$(SYSROOT) -Os -I include/ \
+	    $(SQLITE_WASM) -Ilibs/sqlite3 -Wl,--initial-memory=16777216 -o $@ \
 	    programs/sqlite3_mem.c libs/sqlite3/sqlite3.c
-	@if [ "$(HAS_WASM_OPT)" = "1" ]; then \
-		wasm-opt -O3 --strip-debug $@.wasm -o $@; \
-	else \
-		cp $@.wasm $@; \
-	fi
-	@rm -f $@.wasm
 
 $(NATIVE_DIR)/sqlite3_mem: programs/sqlite3_mem.c libs/sqlite3/sqlite3.c
 	@mkdir -p $(NATIVE_DIR)
@@ -516,7 +511,7 @@ $(BUILD_DIR)/zip: programs/zip.c $(ZLIB_SRCS) $(MINIZIP_SRCS) $(WASI_SDK_DIR)/bi
 
 $(NATIVE_DIR)/zip: programs/zip.c $(ZLIB_SRCS) $(MINIZIP_SRCS)
 	@mkdir -p $(NATIVE_DIR)
-	$(NATIVE_CC) $(NATIVE_CFLAGS) $(ZIP_INCLUDES) -o $@ programs/zip.c $(ZLIB_SRCS) $(MINIZIP_SRCS) -lz
+	$(NATIVE_CC) $(NATIVE_CFLAGS) $(ZIP_INCLUDES) -o $@ programs/zip.c $(ZLIB_SRCS) $(MINIZIP_SRCS)
 
 # unzip: links zlib + minizip (unzip side)
 MINIZIP_UNZIP_SRCS := libs/minizip/ioapi.c libs/minizip/unzip.c
@@ -533,7 +528,7 @@ $(BUILD_DIR)/unzip: programs/unzip.c $(ZLIB_SRCS) $(MINIZIP_UNZIP_SRCS) $(WASI_S
 
 $(NATIVE_DIR)/unzip: programs/unzip.c $(ZLIB_SRCS) $(MINIZIP_UNZIP_SRCS)
 	@mkdir -p $(NATIVE_DIR)
-	$(NATIVE_CC) $(NATIVE_CFLAGS) $(ZIP_INCLUDES) -o $@ programs/unzip.c $(ZLIB_SRCS) $(MINIZIP_UNZIP_SRCS) -lz
+	$(NATIVE_CC) $(NATIVE_CFLAGS) $(ZIP_INCLUDES) -o $@ programs/unzip.c $(ZLIB_SRCS) $(MINIZIP_UNZIP_SRCS)
 
 # curl_test: links libcurl (HTTP/HTTPS build for WASM via host_net + host_tls)
 CURL_SRCS := $(wildcard libs/curl/lib/*.c) $(wildcard libs/curl/lib/vauth/*.c) \

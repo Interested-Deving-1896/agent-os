@@ -1,7 +1,7 @@
 //! V8 isolate runtime manager backed by the embedded V8 runtime.
 
 use crate::v8_ipc::{self, BinaryFrame};
-use agent_os_v8_runtime::embedded_runtime::{spawn_embedded_runtime_ipc, EmbeddedRuntimeHandle};
+use agent_os_v8_runtime::embedded_runtime::{EmbeddedRuntimeHandle, spawn_embedded_runtime_ipc};
 use serde_json::Value;
 use std::io::{self, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -236,6 +236,7 @@ pub fn map_bridge_method(method: &str) -> (&str, bool) {
         "_processSignalState" => ("process.signal_state", false),
 
         // DNS operations
+        "_networkDnsLookupSyncRaw" => ("dns.lookup", false),
         "_networkDnsLookupRaw" => ("dns.lookup", false),
         "_networkDnsResolveRaw" => ("dns.resolve", false),
 
@@ -246,6 +247,7 @@ pub fn map_bridge_method(method: &str) -> (&str, bool) {
         "_resolveModule" | "_resolveModuleSync" => ("__resolve_module", false),
         "_loadFile" | "_loadFileSync" => ("fs.readFileSync", false),
         "_loadPolyfill" => ("__load_polyfill", false),
+        "_moduleFormat" => ("__module_format", false),
         "_batchResolveModules" => ("__batch_resolve_modules", false),
 
         // Crypto operations (handled by the sidecar or locally)
@@ -271,6 +273,7 @@ pub fn map_bridge_method(method: &str) -> (&str, bool) {
         "_cryptoDiffieHellmanGroup" => ("crypto.diffieHellmanGroup", false),
         "_cryptoDiffieHellmanSessionCreate" => ("crypto.diffieHellmanSessionCreate", false),
         "_cryptoDiffieHellmanSessionCall" => ("crypto.diffieHellmanSessionCall", false),
+        "_cryptoDiffieHellmanSessionDestroy" => ("crypto.diffieHellmanSessionDestroy", false),
         "_cryptoSubtle" => ("crypto.subtle", false),
 
         // Timer scheduling
@@ -327,6 +330,8 @@ pub fn map_bridge_method(method: &str) -> (&str, bool) {
         "_netSocketGetTlsClientHelloRaw" => ("net.socket_get_tls_client_hello", false),
         "_netSocketTlsQueryRaw" => ("net.socket_tls_query", false),
         "_tlsGetCiphersRaw" => ("tls.get_ciphers", false),
+        "_netReserveTcpPortRaw" => ("net.reserve_tcp_port", false),
+        "_netReleaseTcpPortRaw" => ("net.release_tcp_port", false),
         "_netServerListenRaw" => ("net.listen", false),
         "_netServerAcceptRaw" => ("net.server_accept", false),
         "_netServerCloseRaw" => ("net.server_close", false),
@@ -369,41 +374,6 @@ pub fn map_bridge_method(method: &str) -> (&str, bool) {
 
         // Pass through unknown methods
         _ => (method, false),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::map_bridge_method;
-
-    #[test]
-    fn audited_bridge_methods_map_to_named_handlers() {
-        for method in [
-            "_cryptoHashDigest",
-            "_cryptoSubtle",
-            "_networkHttp2ServerListenRaw",
-            "_networkHttp2SessionConnectRaw",
-            "_networkHttp2StreamRespondRaw",
-            "_upgradeSocketWriteRaw",
-            "_netSocketSetNoDelayRaw",
-            "_kernelStdioWriteRaw",
-            "_kernelPollRaw",
-            "_netSocketUpgradeTlsRaw",
-            "_tlsGetCiphersRaw",
-            "_dgramSocketAddressRaw",
-            "_dgramSocketSetBufferSizeRaw",
-        ] {
-            let (mapped, _) = map_bridge_method(method);
-            assert_ne!(mapped, method, "missing bridge-method mapping for {method}");
-        }
-    }
-
-    #[test]
-    fn http_request_bridge_shortcut_is_not_mapped() {
-        assert_eq!(
-            map_bridge_method("_networkHttpRequestRaw"),
-            ("_networkHttpRequestRaw", false)
-        );
     }
 }
 
@@ -524,9 +494,13 @@ pub fn base64_encode_pub(data: &[u8]) -> String {
     base64_encode(data)
 }
 
+pub fn base64_decode_pub(input: &str) -> Option<Vec<u8>> {
+    base64_decode(input).ok()
+}
+
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
@@ -580,4 +554,39 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
         }
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_bridge_method;
+
+    #[test]
+    fn audited_bridge_methods_map_to_named_handlers() {
+        for method in [
+            "_cryptoHashDigest",
+            "_cryptoSubtle",
+            "_networkHttp2ServerListenRaw",
+            "_networkHttp2SessionConnectRaw",
+            "_networkHttp2StreamRespondRaw",
+            "_upgradeSocketWriteRaw",
+            "_netSocketSetNoDelayRaw",
+            "_kernelStdioWriteRaw",
+            "_kernelPollRaw",
+            "_netSocketUpgradeTlsRaw",
+            "_tlsGetCiphersRaw",
+            "_dgramSocketAddressRaw",
+            "_dgramSocketSetBufferSizeRaw",
+        ] {
+            let (mapped, _) = map_bridge_method(method);
+            assert_ne!(mapped, method, "missing bridge-method mapping for {method}");
+        }
+    }
+
+    #[test]
+    fn http_request_bridge_shortcut_is_not_mapped() {
+        assert_eq!(
+            map_bridge_method("_networkHttpRequestRaw"),
+            ("_networkHttpRequestRaw", false)
+        );
+    }
 }

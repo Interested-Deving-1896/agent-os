@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 
+use openssl::sha::sha256;
+
 use crate::bridge::{external_refs, register_stub_bridge_fns};
 use crate::isolate::init_v8_platform;
 use crate::session::{ASYNC_BRIDGE_FNS, SYNC_BRIDGE_FNS};
@@ -10,6 +12,20 @@ use crate::session::{ASYNC_BRIDGE_FNS, SYNC_BRIDGE_FNS};
 /// Maximum allowed snapshot blob size (50MB).
 /// Prevents resource exhaustion from degenerate bridge code.
 const MAX_SNAPSHOT_BLOB_BYTES: usize = 50 * 1024 * 1024;
+const MAX_V8_BRIDGE_CODE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const V8_BRIDGE_CODE_LIMIT_ERROR_CODE: &str = "ERR_V8_BRIDGE_CODE_LIMIT";
+
+pub(crate) fn validate_bridge_code_size(bridge_code: &str) -> Result<(), String> {
+    if bridge_code.len() > MAX_V8_BRIDGE_CODE_BYTES {
+        return Err(format!(
+            "{V8_BRIDGE_CODE_LIMIT_ERROR_CODE}: bridge code too large for V8 bridge setup: {} bytes (max {})",
+            bridge_code.len(),
+            MAX_V8_BRIDGE_CODE_BYTES
+        ));
+    }
+
+    Ok(())
+}
 
 /// Create a V8 startup snapshot with a fully-initialized bridge context.
 ///
@@ -23,6 +39,8 @@ const MAX_SNAPSHOT_BLOB_BYTES: usize = 50 * 1024 * 1024;
 /// Returns an error if the bridge code fails to compile or the resulting
 /// snapshot exceeds MAX_SNAPSHOT_BLOB_BYTES.
 pub fn create_snapshot(bridge_code: &str) -> Result<v8::StartupData, String> {
+    validate_bridge_code_size(bridge_code)?;
+
     init_v8_platform();
 
     let mut isolate = v8::Isolate::snapshot_creator(Some(external_refs()), None);
@@ -166,7 +184,9 @@ where
     isolate
 }
 
-/// Thread-safe snapshot cache keyed by bridge code hash.
+type SnapshotCacheKey = [u8; 32];
+
+/// Thread-safe snapshot cache keyed by bridge code digest.
 ///
 /// Uses two-phase locking with per-key in-flight tracking so concurrent
 /// callers requesting different bridge code variants are not blocked by
@@ -179,13 +199,13 @@ pub struct SnapshotCache {
 
 struct CacheInner {
     entries: Vec<CacheEntry>,
-    /// Per-key in-flight tracking: callers for the same hash wait on the
+    /// Per-key in-flight tracking: callers for the same digest wait on the
     /// condvar instead of creating duplicate snapshots.
-    in_flight: HashMap<u64, Arc<InFlightEntry>>,
+    in_flight: HashMap<SnapshotCacheKey, Arc<InFlightEntry>>,
 }
 
 struct CacheEntry {
-    bridge_hash: u64,
+    key: SnapshotCacheKey,
     /// Snapshot blob bytes (copied from v8::StartupData).
     /// Stored as Vec<u8> rather than StartupData because StartupData
     /// contains raw pointers that are not Send/Sync.
@@ -216,14 +236,14 @@ impl SnapshotCache {
     /// inserts, never during snapshot creation. Per-key in-flight tracking
     /// prevents duplicate snapshot creation for the same bridge code.
     pub fn get_or_create(&self, bridge_code: &str) -> Result<Arc<Vec<u8>>, String> {
-        let hash = siphash(bridge_code);
+        let key = bridge_cache_key(bridge_code);
 
         // Phase 1: short lock — check cache, check in-flight, or claim creation
         let in_flight = {
             let mut inner = self.inner.lock().unwrap();
 
             // Cache hit — move to end (most recently used)
-            if let Some(pos) = inner.entries.iter().position(|e| e.bridge_hash == hash) {
+            if let Some(pos) = inner.entries.iter().position(|e| e.key == key) {
                 let entry = inner.entries.remove(pos);
                 let blob = Arc::clone(&entry.blob);
                 inner.entries.push(entry);
@@ -231,7 +251,7 @@ impl SnapshotCache {
             }
 
             // Another thread is already creating this snapshot — wait on it
-            if let Some(entry) = inner.in_flight.get(&hash) {
+            if let Some(entry) = inner.in_flight.get(&key) {
                 Some(Arc::clone(entry))
             } else {
                 // We're the creator — register in-flight and release the lock
@@ -239,7 +259,7 @@ impl SnapshotCache {
                     result: Mutex::new(None),
                     done: Condvar::new(),
                 });
-                inner.in_flight.insert(hash, Arc::clone(&entry));
+                inner.in_flight.insert(key, Arc::clone(&entry));
                 None
             }
         };
@@ -267,13 +287,13 @@ impl SnapshotCache {
                     inner.entries.remove(0);
                 }
                 inner.entries.push(CacheEntry {
-                    bridge_hash: hash,
+                    key,
                     blob: Arc::clone(arc),
                 });
             }
 
             // Publish result to waiters and remove in-flight entry
-            if let Some(entry) = inner.in_flight.remove(&hash) {
+            if let Some(entry) = inner.in_flight.remove(&key) {
                 let mut result = entry.result.lock().unwrap();
                 *result = Some(creation_result.clone());
                 entry.done.notify_all();
@@ -284,11 +304,53 @@ impl SnapshotCache {
     }
 }
 
-fn siphash(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut hasher);
-    hasher.finish()
+fn bridge_cache_key(bridge_code: &str) -> SnapshotCacheKey {
+    sha256(bridge_code.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_cache_key_uses_full_sha256_digest() {
+        assert_eq!(
+            bridge_cache_key("abc"),
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad,
+            ]
+        );
+    }
+
+    #[test]
+    fn create_snapshot_rejects_oversized_bridge_code_before_v8_creation() {
+        let bridge_code = " ".repeat(MAX_V8_BRIDGE_CODE_BYTES + 1);
+        let error = match create_snapshot(&bridge_code) {
+            Ok(_) => panic!("oversized bridge code should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains(V8_BRIDGE_CODE_LIMIT_ERROR_CODE));
+        assert!(error.contains("bridge code too large for V8 bridge setup"));
+        assert!(error.contains(&MAX_V8_BRIDGE_CODE_BYTES.to_string()));
+    }
+
+    #[test]
+    fn snapshot_cache_rejects_oversized_bridge_code_without_retaining_in_flight_state() {
+        let cache = SnapshotCache::new(1);
+        let bridge_code = " ".repeat(MAX_V8_BRIDGE_CODE_BYTES + 1);
+
+        for _ in 0..2 {
+            let error = match cache.get_or_create(&bridge_code) {
+                Ok(_) => panic!("oversized bridge code should be rejected"),
+                Err(error) => error,
+            };
+
+            assert!(error.contains(V8_BRIDGE_CODE_LIMIT_ERROR_CODE));
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -313,7 +375,7 @@ pub fn run_snapshot_consolidated_checks() {
     {
         let bridge_code = "(function() { globalThis.__bridge_init = true; })();";
         let blob = create_snapshot(bridge_code).expect("snapshot creation should succeed");
-        assert!(blob.len() > 0, "snapshot blob should be non-empty");
+        assert!(!blob.is_empty(), "snapshot blob should be non-empty");
     }
 
     // --- Part 2: Restored isolate executes JS correctly ---
@@ -553,7 +615,7 @@ pub fn run_snapshot_consolidated_checks() {
     // correctly dispatch to Rust bridge callbacks via external_refs().
     {
         use crate::bridge::{
-            register_async_bridge_fns, register_sync_bridge_fns, PendingPromises, SessionBuffers,
+            PendingPromises, SessionBuffers, register_async_bridge_fns, register_sync_bridge_fns,
         };
         use crate::host_call::BridgeCallContext;
         use std::cell::RefCell;
@@ -565,7 +627,7 @@ pub fn run_snapshot_consolidated_checks() {
         // Create minimal BridgeCallContext (sync call will fail but we
         // test that the FunctionTemplate dispatches without crash)
         let (event_tx, _event_rx) =
-            crossbeam_channel::unbounded::<crate::runtime_protocol::RuntimeEvent>();
+            crossbeam_channel::unbounded::<crate::session::RuntimeEventEnvelope>();
         let (_cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<crate::session::SessionCommand>();
         let call_id_router: crate::host_call::CallIdRouter =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -573,7 +635,7 @@ pub fn run_snapshot_consolidated_checks() {
         let receiver = crate::host_call::ReaderBridgeResponseReceiver::new(Box::new(
             std::io::Cursor::new(Vec::<u8>::new()),
         ));
-        let sender = crate::host_call::ChannelRuntimeEventSender::new(event_tx);
+        let sender = crate::host_call::ChannelRuntimeEventSender::new(event_tx, None);
         let bridge_ctx = BridgeCallContext::with_receiver(
             Box::new(sender),
             Box::new(receiver),
@@ -690,7 +752,7 @@ pub fn run_snapshot_consolidated_checks() {
             let iife_code = r#"
                     (function() {
                         // Verify bridge functions exist (like ivm-compat shim)
-                        var syncKeys = ['_log', '_error', '_resolveModule', '_loadFile',
+                        var syncKeys = ['_log', '_error', '_resolveModule', '_loadFile', '_moduleFormat',
                             '_cryptoRandomFill', '_fsReadFile', '_fsWriteFile',
                             '_childProcessSpawnStart', '_childProcessPoll', '_childProcessSpawnSync'];
                         var asyncKeys = ['_dynamicImport', '_scheduleTimer',
@@ -755,7 +817,10 @@ pub fn run_snapshot_consolidated_checks() {
             blob.is_some(),
             "snapshot creation should succeed with stub bridge functions"
         );
-        assert!(blob.unwrap().len() > 0, "snapshot blob should be non-empty");
+        assert!(
+            !blob.unwrap().is_empty(),
+            "snapshot blob should be non-empty"
+        );
     }
 
     // --- Part 15: create_snapshot() auto-registers stubs and injects defaults ---
@@ -767,7 +832,7 @@ pub fn run_snapshot_consolidated_checks() {
                 (function() {
                     // Verify all sync bridge functions are registered as stubs
                     var syncFns = ['_log', '_error', '_resolveModule', '_loadFile',
-                        '_loadPolyfill', '_cryptoRandomFill', '_cryptoRandomUUID',
+                        '_moduleFormat', '_loadPolyfill', '_cryptoRandomFill', '_cryptoRandomUUID',
                         '_fsReadFile', '_fsWriteFile', '_fsReadFileBinary',
                         '_fsWriteFileBinary', '_fsReadDir', '_fsMkdir', '_fsRmdir',
                         '_fsExists', '_fsStat', '_fsUnlink', '_fsRename', '_fsChmod',
@@ -818,7 +883,7 @@ pub fn run_snapshot_consolidated_checks() {
         let blob = create_snapshot(iife_code).expect(
             "create_snapshot should succeed with bridge code that checks stubs and defaults",
         );
-        assert!(blob.len() > 0, "snapshot blob should be non-empty");
+        assert!(!blob.is_empty(), "snapshot blob should be non-empty");
 
         // Verify the snapshot can be restored
         let mut isolate = create_isolate_from_snapshot(blob, None);
@@ -864,7 +929,7 @@ pub fn run_snapshot_consolidated_checks() {
             "#;
         let blob = create_snapshot(iife_code)
             .expect("create_snapshot should succeed with full bridge IIFE pattern");
-        assert!(blob.len() > 0);
+        assert!(!blob.is_empty());
 
         // Restore and verify default context has the bridge infrastructure
         let blob_bytes: Vec<u8> = blob.to_vec();
@@ -894,10 +959,10 @@ pub fn run_snapshot_consolidated_checks() {
         let result_str = result.to_rust_string_lossy(scope);
 
         assert_eq!(
-                result_str,
-                "_fs=true;_fs.readFile=true;myLog=true;require=true;console.log=true;console.error=true;__initialCwd=/;__part16_setup=true",
-                "restored context should have all bridge infrastructure from the IIFE"
-            );
+            result_str,
+            "_fs=true;_fs.readFile=true;myLog=true;require=true;console.log=true;console.error=true;__initialCwd=/;__part16_setup=true",
+            "restored context should have all bridge infrastructure from the IIFE"
+        );
     }
 
     // --- Part 17: SnapshotCache works with context-snapshot create_snapshot ---
@@ -930,7 +995,7 @@ pub fn run_snapshot_consolidated_checks() {
     // stubs, restore, replace stubs with real bridge functions, verify the
     // replaced functions dispatch to the real Rust callbacks.
     {
-        use crate::bridge::{replace_bridge_fns, PendingPromises, SessionBuffers};
+        use crate::bridge::{PendingPromises, SessionBuffers, replace_bridge_fns};
         use crate::host_call::BridgeCallContext;
         use std::cell::RefCell;
 
@@ -951,13 +1016,13 @@ pub fn run_snapshot_consolidated_checks() {
 
         // Create BridgeCallContext (sync calls will fail but we verify dispatch)
         let (event_tx, _event_rx) =
-            crossbeam_channel::unbounded::<crate::runtime_protocol::RuntimeEvent>();
+            crossbeam_channel::unbounded::<crate::session::RuntimeEventEnvelope>();
         let call_id_router: crate::host_call::CallIdRouter =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
         let receiver = crate::host_call::ReaderBridgeResponseReceiver::new(Box::new(
             std::io::Cursor::new(Vec::<u8>::new()),
         ));
-        let sender = crate::host_call::ChannelRuntimeEventSender::new(event_tx);
+        let sender = crate::host_call::ChannelRuntimeEventSender::new(event_tx, None);
         let bridge_ctx = BridgeCallContext::with_receiver(
             Box::new(sender),
             Box::new(receiver),
@@ -1003,10 +1068,10 @@ pub fn run_snapshot_consolidated_checks() {
         let script = v8::Script::compile(scope, check, None).unwrap();
         let result = script.run(scope).unwrap();
         assert_eq!(
-                result.to_rust_string_lossy(scope),
-                "__bridge_ready=true;_fs_exists=true;_fs.readFile_type=function;_log_type=function;_scheduleTimer_type=function",
-                "restored context should have bridge IIFE state + replaced functions"
-            );
+            result.to_rust_string_lossy(scope),
+            "__bridge_ready=true;_fs_exists=true;_fs.readFile_type=function;_log_type=function;_scheduleTimer_type=function",
+            "restored context should have bridge IIFE state + replaced functions"
+        );
     }
 
     // --- Part 19: _processConfig is overridable after restore ---
@@ -1045,7 +1110,8 @@ pub fn run_snapshot_consolidated_checks() {
         let payload_bytes = serialize_v8_value(scope, payload_val).expect("serialize payload");
 
         // Inject per-session globals (overrides snapshot defaults)
-        crate::execution::inject_globals_from_payload(scope, &payload_bytes);
+        crate::execution::inject_globals_from_payload(scope, &payload_bytes)
+            .expect("inject globals payload");
 
         // Verify _processConfig was overridden
         let check = v8::String::new(scope, "_processConfig.cwd").unwrap();
@@ -1168,7 +1234,7 @@ pub fn run_snapshot_consolidated_checks() {
                 let start = Instant::now();
                 match cache.get_or_create(&code) {
                     Ok(arc) => {
-                        assert!(arc.len() > 0);
+                        assert!(!arc.is_empty());
                     }
                     Err(e) => {
                         eprintln!("get_or_create failed: {}", e);

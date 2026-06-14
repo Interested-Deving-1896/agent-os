@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import type { KernelSpawnOptions } from "../src/runtime-compat.js";
 import type {
 	AuthenticatedSession,
 	CreatedVm,
@@ -75,5 +76,31 @@ describe("WASM command permission tiers", () => {
 			args: ["needle", "haystack.txt"],
 			cwd: "/workspace",
 		});
+	});
+
+	test("shell-mode spawn without a guest sh fails loudly", async () => {
+		fixtureRoot = mkdtempSync(join(tmpdir(), "agent-os-wasm-tiers-"));
+		const { client } = createMockClient();
+
+		proxy = new NativeSidecarKernelProxy({
+			client,
+			session: {
+				connectionId: "conn-1",
+				sessionId: "session-1",
+			} as AuthenticatedSession,
+			vm: { vmId: "vm-1" } as CreatedVm,
+			env: { HOME: "/workspace" },
+			cwd: "/workspace",
+			localMounts: [],
+			commandGuestPaths: new Map([["echo", "/__agentos/commands/000/echo"]]),
+		});
+
+		// Shell grammar belongs to the guest shell. Without a guest sh command the
+		// bridge must fail loudly instead of parsing or silently direct-spawning.
+		expect(() =>
+			proxy?.spawn("echo changed >> /tmp/write-only.txt", [], {
+				shell: true,
+			} as KernelSpawnOptions & { shell: boolean }),
+		).toThrow(/requires guest shell command 'sh'/);
 	});
 });

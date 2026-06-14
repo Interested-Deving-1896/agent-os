@@ -196,6 +196,7 @@ import {
 	type SoftwareRoot,
 } from "./packages.js";
 import { allowAll, createNodeHostNetworkAdapter } from "./runtime-compat.js";
+import { serializeLimitsForSidecar } from "./sidecar/limits.js";
 import { serializePermissionsForSidecar } from "./sidecar/permissions.js";
 import {
 	type AgentOsSidecarClient,
@@ -208,6 +209,7 @@ import {
 	type AuthenticatedSession,
 	type CreatedVm,
 	createAgentOsSidecarClient,
+	NATIVE_SIDECAR_FRAME_TIMEOUT_MS,
 	NativeSidecarKernelProxy,
 	NativeSidecarProcessClient,
 	type RootFilesystemEntry,
@@ -217,18 +219,6 @@ import {
 	type SidecarSessionState,
 	serializeRootFilesystemForSidecar,
 } from "./sidecar/rpc-client.js";
-
-const OS_INSTRUCTIONS_FIXTURE = fileURLToPath(
-	new URL("../fixtures/AGENTOS_SYSTEM_PROMPT.md", import.meta.url),
-);
-
-function buildOsInstructions(additional?: string): string {
-	const base = readFileSync(OS_INSTRUCTIONS_FIXTURE, "utf-8");
-	if (!additional) {
-		return base;
-	}
-	return `${base}\n${additional}`;
-}
 
 export interface AgentOsSharedSidecarOptions {
 	pool?: string;
@@ -389,6 +379,85 @@ export type MountConfig =
 	| NativeMountConfig
 	| OverlayMountConfig;
 
+/**
+ * Operator-tunable runtime limits for a VM. Every field is optional; unset fields fall back to
+ * built-in defaults that match the runtime's historical hardcoded constants, so behavior is
+ * unchanged unless a value is overridden. All values are JSON-serializable integers and are
+ * forwarded to the native sidecar as `CreateVmRequest.metadata` entries. Unknown, negative, or
+ * non-integer values throw at `AgentOs.create()` time.
+ */
+export interface AgentOsLimits {
+	/** Kernel resource limits (processes, FDs, sockets, filesystem bytes, WASM caps, etc.). */
+	resources?: {
+		cpuCount?: number;
+		maxProcesses?: number;
+		maxOpenFds?: number;
+		maxPipes?: number;
+		maxPtys?: number;
+		maxSockets?: number;
+		maxConnections?: number;
+		maxSocketBufferedBytes?: number;
+		maxSocketDatagramQueueLen?: number;
+		maxFilesystemBytes?: number;
+		maxInodeCount?: number;
+		maxBlockingReadMs?: number;
+		maxPreadBytes?: number;
+		maxFdWriteBytes?: number;
+		maxProcessArgvBytes?: number;
+		maxProcessEnvBytes?: number;
+		maxReaddirEntries?: number;
+		maxWasmFuel?: number;
+		maxWasmMemoryBytes?: number;
+		maxWasmStackBytes?: number;
+	};
+	/** HTTP body buffering limits. */
+	http?: {
+		/** Cap on `vm.fetch()` buffered response bodies. Must be <= the sidecar wire frame cap. */
+		maxFetchResponseBytes?: number;
+	};
+	/** Host-tool registration and invocation limits. */
+	tools?: {
+		defaultToolTimeoutMs?: number;
+		maxToolTimeoutMs?: number;
+		maxRegisteredToolkits?: number;
+		maxRegisteredToolsPerVm?: number;
+		maxToolsPerToolkit?: number;
+		maxToolSchemaBytes?: number;
+		maxToolExamplesPerTool?: number;
+		maxToolExampleInputBytes?: number;
+	};
+	/** Mount plugin manifest size limits. */
+	plugins?: {
+		maxPersistedManifestBytes?: number;
+		maxPersistedManifestFileBytes?: number;
+	};
+	/** ACP adapter buffering limits. */
+	acp?: {
+		maxReadLineBytes?: number;
+		stdoutBufferByteLimit?: number;
+	};
+	/** Guest JavaScript runtime buffering limits. */
+	jsRuntime?: {
+		v8HeapLimitMb?: number;
+		capturedOutputLimitBytes?: number;
+		stdinBufferLimitBytes?: number;
+		eventPayloadLimitBytes?: number;
+		v8IpcMaxFrameBytes?: number;
+	};
+	/** Guest Python runtime limits. */
+	python?: {
+		outputBufferMaxBytes?: number;
+		executionTimeoutMs?: number;
+		vfsRpcTimeoutMs?: number;
+	};
+	/** Guest WASM runtime limits. */
+	wasm?: {
+		maxModuleFileBytes?: number;
+		capturedOutputLimitBytes?: number;
+		syncReadLimitBytes?: number;
+	};
+}
+
 export interface AgentOsOptions {
 	/**
 	 * Software to install in the VM. Each entry provides agents, tools,
@@ -415,7 +484,7 @@ export interface AgentOsOptions {
 	rootFilesystem?: RootFilesystemConfig;
 	/** Filesystems to mount at boot time. */
 	mounts?: MountConfig[];
-	/** Additional instructions appended to the base OS instructions written to /etc/agentos/instructions.md. */
+	/** Additional instructions appended to the base OS system prompt injected at session start. */
 	additionalInstructions?: string;
 	/** Custom schedule driver for cron jobs. Defaults to TimerScheduleDriver. */
 	scheduleDriver?: ScheduleDriver;
@@ -431,6 +500,11 @@ export interface AgentOsOptions {
 	 * Pass an explicit sidecar handle to pin the VM to a caller-managed sidecar.
 	 */
 	sidecar?: AgentOsSidecarConfig;
+	/**
+	 * Operator-tunable runtime limits. Unset fields use built-in defaults that match the
+	 * runtime's historical constants, so omitting this leaves behavior unchanged.
+	 */
+	limits?: AgentOsLimits;
 }
 
 /** Configuration for a local MCP server (spawned as a child process). */
@@ -529,6 +603,19 @@ function toRecord(value: unknown): Record<string, unknown> {
 	return value && typeof value === "object" && !Array.isArray(value)
 		? (value as Record<string, unknown>)
 		: {};
+}
+
+function isLocalCancelledPromptResponse(
+	method: string,
+	response: JsonRpcResponse,
+): boolean {
+	const result = toRecord(response.result);
+	return (
+		method === "session/prompt" &&
+		response.id === null &&
+		response.error === undefined &&
+		result.stopReason === "cancelled"
+	);
 }
 
 const ACP_SESSION_EVENT_RETENTION_LIMIT = 1024;
@@ -1232,22 +1319,6 @@ async function bootstrapLiveBootstrapDirectories(
 	await client.bootstrapRootFilesystem(session, vm, entries);
 }
 
-function buildOsInstructionsBootstrapEntries(
-	additionalInstructions?: string,
-): FilesystemEntry[] {
-	return [
-		{
-			path: "/etc/agentos/instructions.md",
-			type: "file",
-			mode: "0644",
-			uid: 0,
-			gid: 0,
-			content: buildOsInstructions(additionalInstructions),
-			encoding: "utf8",
-		},
-	];
-}
-
 function toSnapshotModeString(
 	mode: number | undefined,
 	kind: RootFilesystemEntry["kind"],
@@ -1812,7 +1883,6 @@ export class AgentOs {
 					...NODE_RUNTIME_BOOTSTRAP_COMMANDS,
 					...toolBootstrapCommands,
 				],
-				buildOsInstructionsBootstrapEntries(options?.additionalInstructions),
 			);
 			let toolReference = "";
 			let rootBridge: NativeSidecarKernelProxy | null = null;
@@ -1853,7 +1923,7 @@ export class AgentOs {
 					cwd: REPO_ROOT,
 					command: ensureNativeSidecarBinary(),
 					args: [],
-					frameTimeoutMs: 60_000,
+					frameTimeoutMs: NATIVE_SIDECAR_FRAME_TIMEOUT_MS,
 				});
 				const session = await client.authenticateAndOpenSession();
 				const sidecarPermissions = serializePermissionsForSidecar(
@@ -1865,6 +1935,7 @@ export class AgentOs {
 						...Object.fromEntries(
 							Object.entries(env).map(([key, value]) => [`env.${key}`, value]),
 						),
+						...serializeLimitsForSidecar(options?.limits),
 					},
 					rootFilesystem: serializeRootFilesystemForSidecar(
 						options?.rootFilesystem,
@@ -2860,66 +2931,6 @@ export class AgentOs {
 		);
 	}
 
-	private _applyCodexConfigFallback(
-		session: AgentSessionEntry,
-		category: string,
-		value: string,
-	): JsonRpcResponse {
-		const option = session.configOptions.find(
-			(entry) => entry.category === category,
-		);
-		if (option) {
-			session.configOverrides.set(option.id, value);
-		}
-		session.configOverrides.set(category, value);
-		this._applySyntheticConfigOverrides(session);
-		this._recordSyntheticConfigUpdate(session);
-		return {
-			jsonrpc: "2.0",
-			id: null,
-			result: {
-				configOptions: session.configOptions,
-				via: "codex-config-fallback",
-			},
-		};
-	}
-
-	private _augmentPromptParams(
-		session: AgentSessionEntry,
-		params?: Record<string, unknown>,
-	): Record<string, unknown> | undefined {
-		if (session.agentType !== "codex") {
-			return params;
-		}
-
-		const model = session.configOptions.find(
-			(option) => option.category === "model",
-		)?.currentValue;
-		const thoughtLevel = session.configOptions.find(
-			(option) => option.category === "thought_level",
-		)?.currentValue;
-		if (!model && !thoughtLevel) {
-			return params;
-		}
-
-		const meta =
-			params?._meta &&
-			typeof params._meta === "object" &&
-			!Array.isArray(params._meta)
-				? { ...(params._meta as Record<string, unknown>) }
-				: {};
-		meta.agentOsCodexConfig = {
-			...(typeof model === "string" ? { model } : {}),
-			...(typeof thoughtLevel === "string"
-				? { thought_level: thoughtLevel }
-				: {}),
-		};
-		return {
-			...(params ?? {}),
-			_meta: meta,
-		};
-	}
-
 	private _handleSidecarEvent(
 		event: Parameters<NativeSidecarProcessClient["onEvent"]>[0] extends (
 			event: infer T,
@@ -2985,10 +2996,6 @@ export class AgentOs {
 		params?: Record<string, unknown>,
 	): Promise<JsonRpcResponse> {
 		const session = this._requireSession(sessionId);
-		const requestParams =
-			method === "session/prompt"
-				? this._augmentPromptParams(session, params)
-				: params;
 		const response = await new Promise<JsonRpcResponse>((resolve, reject) => {
 			const resolvers =
 				this._pendingSessionRequestResolvers.get(sessionId) ?? new Set();
@@ -3005,7 +3012,7 @@ export class AgentOs {
 				.sessionRequest(this._sidecarSession, this._sidecarVm, {
 					sessionId,
 					method,
-					params: requestParams,
+					params,
 				})
 				.then(resolve, reject)
 				.finally(() => {
@@ -3021,28 +3028,28 @@ export class AgentOs {
 				});
 		});
 		const liveSession = this._sessions.get(sessionId);
-		if (liveSession) {
+		if (liveSession && !isLocalCancelledPromptResponse(method, response)) {
 			await this._hydrateSessionState(liveSession).catch(() => {});
 		}
 		if (!response.error) {
 			if (
 				method === "session/set_mode" &&
-				typeof requestParams?.modeId === "string" &&
+				typeof params?.modeId === "string" &&
 				session.modes
 			) {
 				session.modes = {
 					...session.modes,
-					currentModeId: requestParams.modeId,
+					currentModeId: params.modeId,
 				};
 			}
 			if (
 				method === "session/set_config_option" &&
-				typeof requestParams?.configId === "string" &&
-				typeof requestParams?.value === "string"
+				typeof params?.configId === "string" &&
+				typeof params?.value === "string"
 			) {
-				const nextValue = requestParams.value;
+				const nextValue = params.value;
 				session.configOptions = session.configOptions.map((option) =>
-					option.id === requestParams.configId
+					option.id === params.configId
 						? { ...option, currentValue: nextValue }
 						: option,
 				);
@@ -3071,13 +3078,6 @@ export class AgentOs {
 				value,
 			},
 		);
-		if (
-			session.agentType === "codex" &&
-			response.error?.code === -32601 &&
-			toRecord(response.error.data).method === "session/set_config_option"
-		) {
-			return this._applyCodexConfigFallback(session, category, value);
-		}
 		return response;
 	}
 
@@ -3152,41 +3152,6 @@ export class AgentOs {
 		session.pendingPermissionReplies.clear();
 	}
 
-	private _tryForceCloseSessionProcess(sessionId: string): void {
-		const session = this._sessions.get(sessionId);
-		if (!session?.pid) {
-			return;
-		}
-		const sharedPidUsers = [...this._sessions.values()].filter(
-			(candidate) =>
-				candidate.sessionId !== sessionId && candidate.pid === session.pid,
-		);
-		if (sharedPidUsers.length > 0) {
-			return;
-		}
-		// Session processes live entirely inside the VM, so the only safe
-		// force-close is the sidecar `kill_process` RPC, which targets the guest
-		// process by its in-VM handle (`session.processId`).
-		//
-		// NEVER fall back to host `process.kill()` here. `session.pid` is a
-		// guest/kernel display PID, not a host PID. Passing it to the host signal
-		// API SIGKILLs whatever unrelated host process happens to share that
-		// number -- and a negative PID kills the entire host process *group* with
-		// that id. In practice that has killed the host tmux session, the test
-		// launcher, and even the user systemd manager. `close_agent_session`
-		// remains the authoritative teardown path if this RPC cannot run.
-		if (this.#kernel instanceof NativeSidecarKernelProxy && session.processId) {
-			void this._sidecarClient
-				.killProcess(
-					this._sidecarSession,
-					this._sidecarVm,
-					session.processId,
-					"SIGKILL",
-				)
-				.catch(() => {});
-		}
-	}
-
 	private async _closeSessionInternal(sessionId: string): Promise<void> {
 		const closing = this._sessionClosePromises.get(sessionId);
 		if (closing) {
@@ -3196,13 +3161,8 @@ export class AgentOs {
 			return;
 		}
 
-		const hasPendingRequests =
-			(this._pendingSessionRequestResolvers.get(sessionId)?.size ?? 0) > 0;
 		this._abortPendingSessionRequests(sessionId);
 		this._rejectPendingPermissionReplies(sessionId);
-		if (hasPendingRequests) {
-			this._tryForceCloseSessionProcess(sessionId);
-		}
 
 		this._requireSession(sessionId);
 		this._removeSession(sessionId);
@@ -3244,29 +3204,11 @@ export class AgentOs {
 			throw new Error(`Unknown agent type: ${agentType}`);
 		}
 
-		const toolReference = this._toolReference || undefined;
-		let extraArgs: string[] = [];
-		let extraEnv: Record<string, string> = {};
-		if (config.prepareInstructions) {
-			const cwd = options?.cwd ?? "/home/user";
-			const skipBase = options?.skipOsInstructions ?? false;
-			const hasToolRef = !!toolReference;
-			const hasAdditionalInstructions = !!options?.additionalInstructions;
-
-			if (!skipBase || hasToolRef || hasAdditionalInstructions) {
-				const prepared = await config.prepareInstructions(
-					this.#kernel,
-					cwd,
-					options?.additionalInstructions,
-					{ toolReference, skipBase },
-				);
-				if (prepared.args) extraArgs = prepared.args;
-				if (prepared.env) extraEnv = prepared.env;
-			}
-		}
-
-		const launchArgs = [...(config.launchArgs ?? []), ...extraArgs];
-		let launchEnv = { ...config.defaultEnv, ...extraEnv, ...options?.env };
+		// System-prompt assembly and injection (launch args / OPENCODE_CONTEXTPATHS) are owned by
+		// the sidecar at CreateSession. The host only forwards additionalInstructions /
+		// skipOsInstructions plus the agent's static launch args and env.
+		const launchArgs = [...(config.launchArgs ?? [])];
+		let launchEnv = { ...config.defaultEnv, ...options?.env };
 		const sessionCwd = options?.cwd ?? "/home/user";
 		const adapterEntrypoint = this._resolveAdapterBin(config.acpAdapter);
 		if (
@@ -3292,6 +3234,8 @@ export class AgentOs {
 				mcpServers: options?.mcpServers ?? [],
 				protocolVersion: ACP_PROTOCOL_VERSION,
 				clientCapabilities: defaultAcpClientCapabilities(),
+				additionalInstructions: options?.additionalInstructions,
+				skipOsInstructions: options?.skipOsInstructions ?? false,
 			},
 		);
 

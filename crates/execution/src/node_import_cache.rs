@@ -15,7 +15,7 @@ const NODE_IMPORT_CACHE_PATH_ENV: &str = "AGENT_OS_NODE_IMPORT_CACHE_PATH";
 const NODE_IMPORT_CACHE_LOADER_PATH_ENV: &str = "AGENT_OS_NODE_IMPORT_CACHE_LOADER_PATH";
 const NODE_IMPORT_CACHE_SCHEMA_VERSION: &str = "1";
 const NODE_IMPORT_CACHE_LOADER_VERSION: &str = "8";
-const NODE_IMPORT_CACHE_ASSET_VERSION: &str = "44";
+const NODE_IMPORT_CACHE_ASSET_VERSION: &str = "56";
 const NODE_IMPORT_CACHE_DIR_PREFIX: &str = "agent-os-node-import-cache";
 const DEFAULT_NODE_IMPORT_CACHE_MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 const PYODIDE_DIST_DIR: &str = "pyodide-dist";
@@ -120,6 +120,10 @@ const CONTROL_PIPE_FD = parseControlPipeFd(process.env.AGENT_OS_CONTROL_PIPE_FD)
 const SCHEMA_VERSION = '__NODE_IMPORT_CACHE_SCHEMA_VERSION__';
 const LOADER_VERSION = '__NODE_IMPORT_CACHE_LOADER_VERSION__';
 const ASSET_VERSION = '__NODE_IMPORT_CACHE_ASSET_VERSION__';
+const MAX_CACHE_RECORD_ENTRIES = 512;
+const MAX_CACHE_KEY_BYTES = 4096;
+const MAX_CACHE_VALUE_BYTES = 16 * 1024;
+const MAX_CACHE_STATE_BYTES = 4 * 1024 * 1024;
 const BUILTIN_PREFIX = '__AGENT_OS_BUILTIN_SPECIFIER_PREFIX__';
 const POLYFILL_PREFIX = '__AGENT_OS_POLYFILL_SPECIFIER_PREFIX__';
 const FS_ASSET_SPECIFIER = `${BUILTIN_PREFIX}fs`;
@@ -331,6 +335,10 @@ function loadCacheState() {
   }
 
   try {
+    const stat = fs.statSync(CACHE_PATH);
+    if (!stat.isFile() || stat.size > MAX_CACHE_STATE_BYTES) {
+      return emptyCacheState();
+    }
     const parsed = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8'));
     if (!isCompatibleCacheState(parsed)) {
       return emptyCacheState();
@@ -352,18 +360,33 @@ function flushCacheState() {
 
     let merged = cacheState;
     try {
-      const existing = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8'));
-      if (isCompatibleCacheState(existing)) {
-        merged = mergeCacheStates(normalizeCacheState(existing), cacheState);
+      const existingStat = fs.statSync(CACHE_PATH);
+      if (existingStat.isFile() && existingStat.size <= MAX_CACHE_STATE_BYTES) {
+        const existing = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8'));
+        if (isCompatibleCacheState(existing)) {
+          merged = mergeCacheStates(normalizeCacheState(existing), cacheState);
+        }
       }
     } catch {
       // Ignore missing or unreadable prior state and replace it with the in-memory view.
     }
 
+    merged = pruneCacheState(merged);
+    let serialized = JSON.stringify(merged);
+    if (byteLengthUtf8(serialized) > MAX_CACHE_STATE_BYTES) {
+      merged = pruneCacheState(merged, Math.floor(MAX_CACHE_RECORD_ENTRIES / 4));
+      serialized = JSON.stringify(merged);
+    }
+    if (byteLengthUtf8(serialized) > MAX_CACHE_STATE_BYTES) {
+      merged = emptyCacheState();
+      serialized = JSON.stringify(merged);
+    }
+
     const tempPath = `${CACHE_PATH}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify(merged));
+    fs.writeFileSync(tempPath, serialized);
     fs.renameSync(tempPath, CACHE_PATH);
     cacheState = merged;
+    pruneProjectedSourceFiles();
     dirty = false;
   } catch (error) {
     cacheWriteError = error instanceof Error ? error.message : String(error);
@@ -446,18 +469,18 @@ function isCompatibleCacheState(value) {
 }
 
 function normalizeCacheState(value) {
-  return {
+  return pruneCacheState({
     ...emptyCacheState(),
     ...value,
     resolutions: isRecord(value.resolutions) ? value.resolutions : {},
     packageTypes: isRecord(value.packageTypes) ? value.packageTypes : {},
     moduleFormats: isRecord(value.moduleFormats) ? value.moduleFormats : {},
     projectedSources: isRecord(value.projectedSources) ? value.projectedSources : {},
-  };
+  });
 }
 
 function mergeCacheStates(base, current) {
-  return {
+  return pruneCacheState({
     ...emptyCacheState(),
     resolutions: {
       ...base.resolutions,
@@ -475,7 +498,86 @@ function mergeCacheStates(base, current) {
       ...base.projectedSources,
       ...current.projectedSources,
     },
+  });
+}
+
+function pruneCacheState(state, maxEntries = MAX_CACHE_RECORD_ENTRIES) {
+  return {
+    ...emptyCacheState(),
+    ...state,
+    resolutions: pruneCacheRecord(state.resolutions, maxEntries),
+    packageTypes: pruneCacheRecord(state.packageTypes, maxEntries),
+    moduleFormats: pruneCacheRecord(state.moduleFormats, maxEntries),
+    projectedSources: pruneCacheRecord(state.projectedSources, maxEntries),
   };
+}
+
+function pruneCacheRecord(record, maxEntries) {
+  if (!isRecord(record)) {
+    return {};
+  }
+
+  const entries = [];
+  for (const [key, value] of Object.entries(record)) {
+    if (
+      byteLengthUtf8(key) <= MAX_CACHE_KEY_BYTES &&
+      cacheValueLength(value) <= MAX_CACHE_VALUE_BYTES
+    ) {
+      entries.push([key, value]);
+    }
+  }
+
+  return Object.fromEntries(entries.slice(-maxEntries));
+}
+
+function cacheValueLength(value) {
+  try {
+    return byteLengthUtf8(JSON.stringify(value));
+  } catch {
+    return MAX_CACHE_VALUE_BYTES + 1;
+  }
+}
+
+function byteLengthUtf8(value) {
+  return Buffer.byteLength(String(value), 'utf8');
+}
+
+function pruneProjectedSourceFiles() {
+  if (!PROJECTED_SOURCE_CACHE_ROOT) {
+    return;
+  }
+
+  const retained = new Set();
+  for (const entry of Object.values(cacheState.projectedSources)) {
+    if (
+      isRecord(entry) &&
+      typeof entry.cachedPath === 'string' &&
+      path.dirname(entry.cachedPath) === PROJECTED_SOURCE_CACHE_ROOT
+    ) {
+      retained.add(path.resolve(entry.cachedPath));
+    }
+  }
+
+  let entries;
+  try {
+    entries = fs.readdirSync(PROJECTED_SOURCE_CACHE_ROOT, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    const filePath = path.resolve(PROJECTED_SOURCE_CACHE_ROOT, entry.name);
+    if (!retained.has(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        // Best-effort cleanup. A failed unlink should not break module loading.
+      }
+    }
+  }
 }
 
 function loadProjectedPackageSource(url, filePath, format) {
@@ -2240,7 +2342,9 @@ function parseGuestPathMappings(value) {
           entry && typeof entry.hostPath === 'string'
             ? path.resolve(entry.hostPath)
             : null;
-        return guestPath && hostPath ? { guestPath, hostPath } : null;
+        return guestPath && hostPath
+          ? { guestPath, hostPath, readOnly: entry.readOnly === true }
+          : null;
       })
       .filter(Boolean)
       .sort((left, right) => right.guestPath.length - left.guestPath.length);
@@ -3052,6 +3156,21 @@ function toGuestBufferView(value, label) {
 }
 
 function decodeFsBytesPayload(value, label) {
+  const decodeByteArray = (bytes) => {
+    const denseBytes = Array.from(bytes);
+    if (denseBytes.length !== bytes.length) {
+      throw new TypeError(`Agent OS ${label} contains sparse byte values`);
+    }
+    if (
+      !denseBytes.every(
+        (byte) => typeof byte === 'number' && Number.isInteger(byte) && byte >= 0 && byte <= 255,
+      )
+    ) {
+      throw new TypeError(`Agent OS ${label} contains an invalid byte value`);
+    }
+    return Buffer.from(denseBytes);
+  };
+
   if (Buffer.isBuffer(value)) {
     return value;
   }
@@ -3061,13 +3180,52 @@ function decodeFsBytesPayload(value, label) {
   if (typeof value === 'string') {
     return Buffer.from(value);
   }
+  if (Array.isArray(value)) {
+    return decodeByteArray(value);
+  }
+  if (
+    value &&
+    typeof value === 'object' &&
+    Array.isArray(value.data)
+  ) {
+    return decodeByteArray(value.data);
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value);
+    if (
+      entries.length > 0 &&
+      entries.every(
+        ([key, byte]) =>
+          /^\d+$/.test(key) && typeof byte === 'number' && Number.isInteger(byte),
+      )
+    ) {
+      const bytes = [];
+      for (const [key, byte] of entries) {
+        const index = Number(key);
+        if (index < 0 || index >= entries.length || bytes[index] !== undefined) {
+          throw new TypeError(`Agent OS ${label} contains non-contiguous byte keys`);
+        }
+        bytes[index] = byte;
+      }
+      if (bytes.length !== entries.length || bytes.some((byte) => byte === undefined)) {
+        throw new TypeError(`Agent OS ${label} contains sparse byte keys`);
+      }
+      return decodeByteArray(bytes);
+    }
+  }
+  if (
+    value &&
+    typeof value === 'object' &&
+    typeof value.data === 'string'
+  ) {
+    return Buffer.from(value.data, 'base64');
+  }
 
   const base64Value =
     value &&
     typeof value === 'object' &&
-    value.__agentOsType === 'bytes' &&
-    typeof value.base64 === 'string'
-      ? value.base64
+    typeof (value.base64 ?? value.dataBase64) === 'string'
+      ? (value.base64 ?? value.dataBase64)
       : null;
   if (base64Value == null) {
     throw new TypeError(`Agent OS ${label} must be an encoded bytes payload`);
@@ -3148,6 +3306,52 @@ function invokeFsCallback(callback, error, ...results) {
   queueMicrotask(() => callback(error, ...results));
 }
 
+function readKernelStdinForFs(target, buffer, callback) {
+  if (target.length === 0) {
+    invokeFsCallback(callback, null, 0, buffer);
+    return;
+  }
+
+  let idleDelayMs = 1;
+  const attempt = () => {
+    requireFsSyncRpcBridge()
+      .call('__kernel_stdin_read', [target.length, 5])
+      .then(
+        (payload) => {
+          if (payload == null) {
+            const nextDelayMs = idleDelayMs;
+            idleDelayMs = Math.min(idleDelayMs * 2, 25);
+            setTimeout(attempt, nextDelayMs);
+            return;
+          }
+          if (payload && payload.done === true) {
+            invokeFsCallback(callback, null, 0, buffer);
+            return;
+          }
+          const dataBase64 =
+            payload &&
+            typeof payload === 'object' &&
+            typeof payload.dataBase64 === 'string'
+              ? payload.dataBase64
+              : '';
+          if (!dataBase64) {
+            const nextDelayMs = idleDelayMs;
+            idleDelayMs = Math.min(idleDelayMs * 2, 25);
+            setTimeout(attempt, nextDelayMs);
+            return;
+          }
+          idleDelayMs = 1;
+          const chunk = Buffer.from(dataBase64, 'base64');
+          const bytesRead = Math.min(target.length, chunk.byteLength);
+          chunk.copy(target.target, target.offset, 0, bytesRead);
+          invokeFsCallback(callback, null, bytesRead, buffer);
+        },
+        (error) => invokeFsCallback(callback, error),
+      );
+  };
+  attempt();
+}
+
 function createFsWatchUnavailableError(methodName) {
   const error = new Error(
     `Agent OS ${methodName} is unavailable because the kernel has no file-watching API`,
@@ -3214,10 +3418,16 @@ function createRpcBackedFsCallbacks(fromGuestDir = '/') {
 
       const done = requireFsCallback(callback, 'fs.read');
       const target = normalizeFsReadTarget(buffer, offset, length);
+      const normalizedFd = normalizeFsFd(fd);
+      const normalizedPosition = normalizeFsPosition(position);
+      if (normalizedFd === 0 && normalizedPosition == null) {
+        readKernelStdinForFs(target, buffer, done);
+        return;
+      }
       call('fs.read', [
-        normalizeFsFd(fd),
+        normalizedFd,
         target.length,
-        normalizeFsPosition(position),
+        normalizedPosition,
       ]).then(
         (payload) => {
           const chunk = decodeFsBytesPayload(payload, 'fs.read result');
@@ -3783,144 +3993,6 @@ function createRpcBackedChildProcessModule(fromGuestDir = '/') {
     }
     return { args, options, callback };
   };
-  const appendDoubleQuotedShellEscape = (current, character) => {
-    if (character === '"' || character === '\\' || character === '$' || character === '`') {
-      return current + character;
-    }
-    if (character === '\n') {
-      return current;
-    }
-    return current + '\\' + character;
-  };
-  const parseSimpleExecCommandWithRedirects = (command) => {
-    const tokens = [];
-    let current = '';
-    let quote = null;
-    let escaped = false;
-    const flushCurrent = () => {
-      if (current) {
-        tokens.push(current);
-        current = '';
-      }
-    };
-
-    for (let index = 0; index < command.length; index += 1) {
-      const character = command[index];
-      if (quote === null) {
-        if (escaped) {
-          current += character;
-          escaped = false;
-          continue;
-        }
-        if (character === '\\') {
-          escaped = true;
-          continue;
-        }
-        if (character === "'" || character === '"') {
-          quote = character;
-          continue;
-        }
-        if (/\s/.test(character)) {
-          flushCurrent();
-          continue;
-        }
-        if (character === '<') {
-          flushCurrent();
-          tokens.push('<');
-          continue;
-        }
-        if (character === '>') {
-          flushCurrent();
-          if (command[index + 1] === '>') {
-            tokens.push('>>');
-            index += 1;
-          } else {
-            tokens.push('>');
-          }
-          continue;
-        }
-        if ('|&;()$`*?[]{}~!'.includes(character)) {
-          return null;
-        }
-        current += character;
-        continue;
-      }
-
-      if (quote === "'") {
-        if (character === "'") {
-          quote = null;
-        } else {
-          current += character;
-        }
-        continue;
-      }
-
-      if (escaped) {
-        current = appendDoubleQuotedShellEscape(current, character);
-        escaped = false;
-        continue;
-      }
-      if (character === '\\') {
-        escaped = true;
-        continue;
-      }
-      if (character === '"') {
-        quote = null;
-        continue;
-      }
-      if (character === '$' || character === '`') {
-        return null;
-      }
-      current += character;
-    }
-
-    if (quote !== null || escaped) {
-      return null;
-    }
-    flushCurrent();
-    if (tokens.length === 0) {
-      return null;
-    }
-
-    let commandName;
-    const args = [];
-    let stdinPath;
-    let stdoutPath;
-    let appendStdout = false;
-    for (let index = 0; index < tokens.length; index += 1) {
-      const token = tokens[index];
-      if (token === '<' || token === '>' || token === '>>') {
-        const redirectPath = tokens[index + 1];
-        if (!redirectPath || redirectPath === '<' || redirectPath === '>' || redirectPath === '>>') {
-          return null;
-        }
-        if (token === '<') {
-          if (stdinPath !== undefined) {
-            return null;
-          }
-          stdinPath = redirectPath;
-        } else {
-          if (stdoutPath !== undefined) {
-            return null;
-          }
-          stdoutPath = redirectPath;
-          appendStdout = token === '>>';
-        }
-        index += 1;
-        continue;
-      }
-      if (!commandName) {
-        commandName = token;
-      } else {
-        args.push(token);
-      }
-    }
-    return commandName ? { command: commandName, args, stdinPath, stdoutPath, appendStdout } : null;
-  };
-  const resolveChildProcessRedirectPath = (cwd, targetPath) =>
-    targetPath.startsWith('/')
-      ? path.posix.normalize(targetPath)
-      : path.posix.normalize(path.posix.join(cwd, targetPath));
   const normalizeChildProcessSignal = (value) =>
     typeof value === 'string' && value.length > 0 ? value : 'SIGTERM';
   const normalizeChildProcessEncoding = (options) =>
@@ -4034,9 +4106,9 @@ function createRpcBackedChildProcessModule(fromGuestDir = '/') {
   const callKill = (childId, signal) =>
     bridge().callSync('child_process.kill', [childId, normalizeChildProcessSignal(signal)]);
   const callWriteStdin = (childId, chunk) =>
-    bridge().call('child_process.write_stdin', [childId, toGuestBufferView(chunk, 'stdin chunk')]);
+    bridge().callSync('child_process.write_stdin', [childId, toGuestBufferView(chunk, 'stdin chunk')]);
   const callCloseStdin = (childId) =>
-    bridge().call('child_process.close_stdin', [childId]);
+    bridge().callSync('child_process.close_stdin', [childId]);
   const encodeChildProcessOutput = (buffer, encoding) =>
     encoding ? buffer.toString(encoding) : buffer;
   const createChildProcessExecError = (subject, exitCode, signal, stdout, stderr) => {
@@ -4053,6 +4125,11 @@ function createRpcBackedChildProcessModule(fromGuestDir = '/') {
     if (typeof exitCode === 'number') {
       error.status = exitCode;
     }
+    return error;
+  };
+  const createSpawnSyncTimeoutError = (command) => {
+    const error = new Error(`spawnSync ${command} ETIMEDOUT`);
+    error.code = 'ETIMEDOUT';
     return error;
   };
   const createSpawnSyncResult = (pid, stdout, stderr, exitCode, signal, error, encoding) => {
@@ -4099,12 +4176,16 @@ function createRpcBackedChildProcessModule(fromGuestDir = '/') {
     const startedAt = Date.now();
     let exitCode = null;
     let signal = null;
+    let error = null;
     while (exitCode == null && signal == null) {
       if (
         normalizedOptions.timeout != null &&
         Date.now() - startedAt > normalizedOptions.timeout
       ) {
         callKill(child.childId, normalizedOptions.killSignal);
+        signal = normalizedOptions.killSignal;
+        error = createSpawnSyncTimeoutError(command);
+        break;
       }
 
       const event = callPoll(child.childId, RPC_POLL_WAIT_MS);
@@ -4131,7 +4212,7 @@ function createRpcBackedChildProcessModule(fromGuestDir = '/') {
       stderrBuffer,
       exitCode,
       signal,
-      null,
+      error,
       encoding,
     );
   };
@@ -4147,17 +4228,21 @@ function createRpcBackedChildProcessModule(fromGuestDir = '/') {
     }
 
     _write(chunk, encoding, callback) {
-      callWriteStdin(this.childId, chunk).then(
-        () => callback(),
-        (error) => callback(error),
-      );
+      try {
+        callWriteStdin(this.childId, chunk);
+        callback();
+      } catch (error) {
+        callback(error);
+      }
     }
 
     _final(callback) {
-      callCloseStdin(this.childId).then(
-        () => callback(),
-        (error) => callback(error),
-      );
+      try {
+        callCloseStdin(this.childId);
+        callback();
+      } catch (error) {
+        callback(error);
+      }
     }
   }
 
@@ -4419,55 +4504,6 @@ function createRpcBackedChildProcessModule(fromGuestDir = '/') {
       return child;
     },
     execSync(command, options) {
-      const redirect = parseSimpleExecCommandWithRedirects(String(command));
-      if (redirect?.stdoutPath) {
-        const normalizedOptions = normalizeChildProcessOptions(options, true);
-        const fs = createRpcBackedFsModule(normalizedOptions.cwd);
-        const stdoutPath = resolveChildProcessRedirectPath(
-          normalizedOptions.cwd,
-          redirect.stdoutPath,
-        );
-        const runOptions = {
-          ...options,
-          cwd: normalizedOptions.cwd,
-          input:
-            redirect.stdinPath !== undefined
-              ? fs.readFileSync(
-                  resolveChildProcessRedirectPath(normalizedOptions.cwd, redirect.stdinPath),
-                )
-              : options?.input,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        };
-        delete runOptions.encoding;
-        const result = runChildProcessSync(redirect.command, redirect.args, runOptions, false);
-        if (result.error) {
-          throw result.error;
-        }
-        if (result.status !== 0 || result.signal != null) {
-          throw createChildProcessExecError(
-            'child_process.execSync',
-            result.status,
-            result.signal,
-            result.stdout,
-            result.stderr,
-          );
-        }
-        const redirectedStdout = Buffer.isBuffer(result.stdout)
-          ? result.stdout
-          : Buffer.from(String(result.stdout));
-        if (redirect.appendStdout) {
-          let existing = Buffer.alloc(0);
-          try {
-            existing = Buffer.from(fs.readFileSync(stdoutPath));
-          } catch {
-            // Appending to a nonexistent file should create it.
-          }
-          fs.writeFileSync(stdoutPath, Buffer.concat([existing, redirectedStdout]));
-        } else {
-          fs.writeFileSync(stdoutPath, redirectedStdout);
-        }
-        return options?.encoding === 'buffer' || !options?.encoding ? Buffer.from('') : '';
-      }
       const result = runChildProcessSync(command, [], {
         ...options,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -8585,17 +8621,29 @@ const HOST_CWD =
 
 const WASI_ERRNO_SUCCESS = 0;
 const WASI_ERRNO_ACCES = 2;
+const WASI_ERRNO_AGAIN = 6;
 const WASI_ERRNO_BADF = 8;
 const WASI_ERRNO_CHILD = 10;
+const WASI_ERRNO_INVAL = 28;
+const WASI_ERRNO_PIPE = 64;
 const WASI_ERRNO_ROFS = 69;
+const WASI_ERRNO_SPIPE = 70;
 const WASI_ERRNO_SRCH = 71;
 const WASI_ERRNO_FAULT = 21;
 const WASI_RIGHT_FD_WRITE = 64n;
+const WASI_FILETYPE_UNKNOWN = 0;
+const WASI_FILETYPE_REGULAR_FILE = 4;
 const WASI_OFLAGS_CREAT = 1;
 const WASI_OFLAGS_DIRECTORY = 2;
 const WASI_OFLAGS_EXCL = 4;
 const WASI_OFLAGS_TRUNC = 8;
+const WASI_FDFLAGS_APPEND = 1;
+const WASI_WHENCE_SET = 0;
+const WASI_WHENCE_CUR = 1;
+const WASI_WHENCE_END = 2;
 const WASM_PAGE_BYTES = 65536;
+const DEFAULT_VIRTUAL_PID = 1;
+const DEFAULT_VIRTUAL_PPID = 0;
 const DEFAULT_VIRTUAL_UID = 0;
 const DEFAULT_VIRTUAL_GID = 0;
 const DEFAULT_VIRTUAL_OS_USER = 'root';
@@ -8624,6 +8672,10 @@ function isPathLike(specifier) {
 }
 
 function resolveModuleGuestPathToHostPath(guestPath) {
+  return resolveModuleGuestPathToHostMapping(guestPath)?.hostPath ?? null;
+}
+
+function resolveModuleGuestPathToHostMapping(guestPath) {
   if (typeof guestPath !== 'string') {
     return null;
   }
@@ -8632,7 +8684,10 @@ function resolveModuleGuestPathToHostPath(guestPath) {
   for (const mapping of GUEST_PATH_MAPPINGS) {
     if (mapping.guestPath === '/') {
       const suffix = normalized.replace(/^\/+/, '');
-      return suffix ? path.join(mapping.hostPath, suffix) : mapping.hostPath;
+      return {
+        hostPath: suffix ? path.join(mapping.hostPath, suffix) : mapping.hostPath,
+        readOnly: mapping.readOnly === true,
+      };
     }
 
     if (
@@ -8646,7 +8701,10 @@ function resolveModuleGuestPathToHostPath(guestPath) {
       normalized === mapping.guestPath
         ? ''
         : normalized.slice(mapping.guestPath.length + 1);
-    return suffix ? path.join(mapping.hostPath, ...suffix.split('/')) : mapping.hostPath;
+    return {
+      hostPath: suffix ? path.join(mapping.hostPath, ...suffix.split('/')) : mapping.hostPath,
+      readOnly: mapping.readOnly === true,
+    };
   }
 
   return null;
@@ -8684,7 +8742,9 @@ function parseGuestPathMappings(value) {
           entry && typeof entry.hostPath === 'string'
             ? path.resolve(entry.hostPath)
             : null;
-        return guestPath && hostPath ? { guestPath, hostPath } : null;
+        return guestPath && hostPath
+          ? { guestPath, hostPath, readOnly: entry.readOnly === true }
+          : null;
       })
       .filter(Boolean)
       .sort((left, right) => right.guestPath.length - left.guestPath.length);
@@ -8719,6 +8779,14 @@ const VIRTUAL_GID = parseVirtualProcessNumber(
   process.env.AGENT_OS_VIRTUAL_PROCESS_GID,
   DEFAULT_VIRTUAL_GID,
 );
+const VIRTUAL_PID = parseVirtualProcessNumber(
+  process.env.AGENT_OS_VIRTUAL_PROCESS_PID,
+  DEFAULT_VIRTUAL_PID,
+);
+const VIRTUAL_PPID = parseVirtualProcessNumber(
+  process.env.AGENT_OS_VIRTUAL_PROCESS_PPID,
+  DEFAULT_VIRTUAL_PPID,
+);
 const VIRTUAL_OS_USER = parseVirtualProcessString(
   process.env.AGENT_OS_VIRTUAL_OS_USER,
   DEFAULT_VIRTUAL_OS_USER,
@@ -8743,6 +8811,7 @@ const spawnedChildrenById = new Map();
 let nextSyntheticChildPid = 0x40000000;
 const syntheticFdEntries = new Map();
 const delegateManagedFdRefCounts = new Map();
+const closedPassthroughFds = new Set();
 globalThis.__agentOsWasiDelegateFdRefCount = (fd) =>
   delegateManagedFdRefCounts.get(Number(fd) >>> 0) ?? 0;
 const passthroughHandles = new Map([
@@ -8751,6 +8820,7 @@ const passthroughHandles = new Map([
   [2, { kind: 'passthrough', targetFd: 2, displayFd: 2, refCount: 0, open: true }],
 ]);
 const retainedSyntheticHandlesByDisplayFd = new Map();
+const retainedSpawnOutputHandlesByFd = new Map();
 let nextSyntheticFd = 64;
 let nextSyntheticPipeId = 1;
 const syntheticWaitArray = new Int32Array(new SharedArrayBuffer(4));
@@ -8870,13 +8940,54 @@ function buildPreopenRights() {
   }
 }
 
-function createPreopen(hostPath) {
-  const rights = buildPreopenRights();
+function createPreopen(hostPath, readOnly = false) {
+  const rights =
+    readOnly === true
+      ? {
+          rightsBase: READ_ONLY_PREOPEN_RIGHTS_BASE,
+          rightsInheriting: READ_ONLY_PREOPEN_RIGHTS_INHERITING,
+        }
+      : buildPreopenRights();
   return {
     hostPath,
+    readOnly: readOnly === true,
     rightsBase: rights.rightsBase,
     rightsInheriting: rights.rightsInheriting,
   };
+}
+
+function mappingContainsGuestPath(mapping, guestPath) {
+  if (!mapping || typeof mapping.guestPath !== 'string' || typeof guestPath !== 'string') {
+    return false;
+  }
+  const normalized = path.posix.normalize(guestPath);
+  return (
+    normalized === mapping.guestPath ||
+    mapping.guestPath === '/' ||
+    normalized.startsWith(`${mapping.guestPath}/`)
+  );
+}
+
+function mappingContainsHostPath(mapping, hostPath) {
+  if (!mapping || typeof mapping.hostPath !== 'string' || typeof hostPath !== 'string') {
+    return false;
+  }
+  const normalized = path.resolve(hostPath);
+  const root = path.resolve(mapping.hostPath);
+  return normalized === root || normalized.startsWith(`${root}${path.sep}`);
+}
+
+function readOnlyForCwd(guestCwd) {
+  for (const mapping of GUEST_PATH_MAPPINGS) {
+    if (
+      mapping?.readOnly === true &&
+      (mappingContainsGuestPath(mapping, guestCwd) ||
+        mappingContainsHostPath(mapping, HOST_CWD))
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function buildPreopens() {
@@ -8893,10 +9004,18 @@ function buildPreopens() {
           : typeof process.env.PWD === 'string' && process.env.PWD.startsWith('/')
             ? path.posix.normalize(process.env.PWD)
             : null;
-      const preopens = {
-        '.': createPreopen(HOST_CWD),
-      };
-      const seen = new Set(Object.keys(preopens));
+      const preopens = {};
+      const seen = new Set();
+      const cwdReadOnly = readOnlyForCwd(guestCwd);
+      preopens['.'] = createPreopen(HOST_CWD, cwdReadOnly);
+      seen.add('.');
+      const rootMapping = GUEST_PATH_MAPPINGS.find(
+        (mapping) => mapping && mapping.guestPath === '/',
+      );
+      if (rootMapping) {
+        preopens['/'] = createPreopen(rootMapping.hostPath, rootMapping.readOnly);
+        seen.add('/');
+      }
       for (const mapping of GUEST_PATH_MAPPINGS) {
         if (!mapping || typeof mapping.guestPath !== 'string' || typeof mapping.hostPath !== 'string') {
           continue;
@@ -8909,16 +9028,16 @@ function buildPreopens() {
         ) {
           continue;
         }
-        preopens[guestPath] = createPreopen(mapping.hostPath);
+        preopens[guestPath] = createPreopen(mapping.hostPath, mapping.readOnly);
         seen.add(guestPath);
       }
       const cwdMount = guestCwd || '/workspace';
       if (!seen.has(cwdMount)) {
-        preopens[cwdMount] = createPreopen(HOST_CWD);
+        preopens[cwdMount] = createPreopen(HOST_CWD, cwdReadOnly);
         seen.add(cwdMount);
       }
       if (cwdMount !== '/workspace' && !seen.has('/workspace')) {
-        preopens['/workspace'] = createPreopen(HOST_CWD);
+        preopens['/workspace'] = createPreopen(HOST_CWD, cwdReadOnly);
         seen.add('/workspace');
       }
       return preopens;
@@ -9086,11 +9205,15 @@ if (prewarmOnly) {
   process.exit(0);
 }
 
+const WASI_PREOPENS = buildPreopens();
+const WASI_PREOPEN_FD_BASE = 3;
+const WASI_PREOPEN_ENTRIES = Object.entries(WASI_PREOPENS);
+
 const wasi = new WASI({
   version: 'preview1',
   args: guestArgv,
   env: guestEnv,
-  preopens: buildPreopens(),
+  preopens: WASI_PREOPENS,
   returnOnExit: true,
 });
 
@@ -9189,6 +9312,14 @@ function hasWriteRights(rights) {
   }
 }
 
+function hasReadRights(rights) {
+  try {
+    return (BigInt(rights) & WASI_RIGHT_FD_READ) !== 0n;
+  } catch {
+    return true;
+  }
+}
+
 function hasMutationOpenFlags(oflags) {
   const normalized = Number(oflags) >>> 0;
   return (
@@ -9199,14 +9330,178 @@ function hasMutationOpenFlags(oflags) {
 }
 
 function denyReadOnlyMutation() {
-  return WASI_ERRNO_ACCES;
+  return WASI_ERRNO_ROFS;
+}
+
+function guestPathForPreopenKey(key) {
+  if (key === '.') {
+    return HOST_FS_GUEST_CWD;
+  }
+  return path.posix.normalize(key);
+}
+
+function resolvePathOpenGuestPath(fd, pathPtr, pathLen) {
+  const target = readGuestString(pathPtr, pathLen);
+  if (target.startsWith('/')) {
+    return path.posix.normalize(target);
+  }
+
+  const handle = lookupFdHandle(fd);
+  if (handle && typeof handle.guestPath === 'string') {
+    return path.posix.resolve(handle.guestPath, target);
+  }
+
+  const preopenIndex = (Number(fd) >>> 0) - WASI_PREOPEN_FD_BASE;
+  const preopen = WASI_PREOPEN_ENTRIES[preopenIndex];
+  if (preopen) {
+    return path.posix.resolve(guestPathForPreopenKey(preopen[0]), target);
+  }
+
+  return null;
+}
+
+function guestPathIsReadOnly(guestPath) {
+  return GUEST_PATH_MAPPINGS.some(
+    (mapping) => mapping?.readOnly === true && mappingContainsGuestPath(mapping, guestPath),
+  );
+}
+
+function resolvedGuestPathIsReadOnly(fd, pathPtr, pathLen) {
+  try {
+    const guestPath = resolvePathOpenGuestPath(fd, pathPtr, pathLen);
+    return typeof guestPath === 'string' && guestPathIsReadOnly(guestPath);
+  } catch {
+    return false;
+  }
+}
+
+function precreatePathOpenTarget(fd, pathPtr, pathLen, oflags) {
+  const normalizedOflags = Number(oflags) >>> 0;
+  if ((normalizedOflags & WASI_OFLAGS_CREAT) === 0) {
+    return null;
+  }
+
+  const guestPath = resolvePathOpenGuestPath(fd, pathPtr, pathLen);
+  if (typeof guestPath !== 'string') {
+    return null;
+  }
+
+  if (!fsModule.existsSync(guestPath)) {
+    fsModule.writeFileSync(guestPath, Buffer.alloc(0));
+  }
+  return guestPath;
+}
+
+function fsOpenFlagForPathOpen(oflags, rightsBase, fdflags) {
+  const normalizedOflags = Number(oflags) >>> 0;
+  const normalizedFdflags = Number(fdflags) >>> 0;
+  const wantsRead = hasReadRights(rightsBase);
+  const wantsWrite = hasWriteRights(rightsBase);
+  const wantsExclusive = (normalizedOflags & WASI_OFLAGS_EXCL) !== 0;
+  const wantsAppend = (normalizedFdflags & WASI_FDFLAGS_APPEND) !== 0;
+  const wantsTruncate = (normalizedOflags & WASI_OFLAGS_TRUNC) !== 0;
+
+  if (!wantsWrite) {
+    return 'r';
+  }
+
+  if (wantsAppend) {
+    if (wantsExclusive) {
+      return wantsRead ? 'ax+' : 'ax';
+    }
+    return wantsRead ? 'a+' : 'a';
+  }
+
+  if (wantsTruncate) {
+    if (wantsExclusive) {
+      return wantsRead ? 'wx+' : 'wx';
+    }
+    return wantsRead ? 'w+' : 'w';
+  }
+
+  return 'r+';
+}
+
+function allocateSyntheticFd() {
+  let fd = nextSyntheticFd;
+  while (
+    syntheticFdEntries.has(fd) ||
+    passthroughHandles.has(fd) ||
+    delegateManagedFdRefCounts.has(fd)
+  ) {
+    fd += 1;
+  }
+  nextSyntheticFd = fd + 1;
+  return fd;
+}
+
+function openGuestFileForPathOpen(fd, pathPtr, pathLen, oflags, rightsBase, fdflags, openedFdPtr) {
+  const normalizedOflags = Number(oflags) >>> 0;
+  const normalizedFdflags = Number(fdflags) >>> 0;
+  if ((normalizedOflags & WASI_OFLAGS_CREAT) === 0) {
+    return null;
+  }
+
+  const guestPath = resolvePathOpenGuestPath(fd, pathPtr, pathLen);
+  if (typeof guestPath !== 'string') {
+    return null;
+  }
+
+  const append = (normalizedFdflags & WASI_FDFLAGS_APPEND) !== 0;
+  const exclusive = (normalizedOflags & WASI_OFLAGS_EXCL) !== 0;
+  const truncate = (normalizedOflags & WASI_OFLAGS_TRUNC) !== 0;
+  if (!append && !exclusive && !truncate && !fsModule.existsSync(guestPath)) {
+    fsModule.writeFileSync(guestPath, Buffer.alloc(0));
+  }
+  const targetFd = fsModule.openSync(
+    guestPath,
+    fsOpenFlagForPathOpen(oflags, rightsBase, fdflags),
+    0o666,
+  );
+  const openedFd = allocateSyntheticFd();
+  syntheticFdEntries.set(openedFd, {
+    kind: 'guest-file',
+    targetFd,
+    displayFd: openedFd,
+    refCount: 1,
+    open: true,
+    guestPath,
+    position: append ? Number(fsModule.fstatSync(targetFd).size ?? 0) : 0,
+    append,
+  });
+  return writeGuestUint32(openedFdPtr, openedFd);
+}
+
+function retainPathOpenDelegateFd(openedFdPtr, guestPath) {
+  if (!(instanceMemory instanceof WebAssembly.Memory)) {
+    return WASI_ERRNO_SUCCESS;
+  }
+
+  try {
+    const openedFd = new DataView(instanceMemory.buffer).getUint32(Number(openedFdPtr), true);
+    retainDelegateFd(openedFd);
+    if (openedFd > 2 && !passthroughHandles.has(openedFd)) {
+      closedPassthroughFds.delete(openedFd);
+      passthroughHandles.set(openedFd, {
+        kind: 'passthrough',
+        targetFd: openedFd,
+        displayFd: openedFd,
+        refCount: 0,
+        open: true,
+        readOnly:
+          typeof guestPath === 'string' &&
+          resolveModuleGuestPathToHostMapping(guestPath)?.readOnly === true,
+        ...(typeof guestPath === 'string' ? { guestPath } : {}),
+      });
+    }
+    return WASI_ERRNO_SUCCESS;
+  } catch {
+    return WASI_ERRNO_FAULT;
+  }
 }
 
 function writeGuestUint32(ptr, value) {
   if (!(instanceMemory instanceof WebAssembly.Memory)) {
-    try {
-      process.stderr.write(`[agent-os-wasi] writeGuestUint32 no memory ptr=${Number(ptr)} value=${Number(value) >>> 0}\n`);
-    } catch {}
     return WASI_ERRNO_FAULT;
   }
 
@@ -9214,11 +9509,111 @@ function writeGuestUint32(ptr, value) {
     new DataView(instanceMemory.buffer).setUint32(Number(ptr), Number(value) >>> 0, true);
     return WASI_ERRNO_SUCCESS;
   } catch {
-    try {
-      process.stderr.write(`[agent-os-wasi] writeGuestUint32 fault ptr=${Number(ptr)} value=${Number(value) >>> 0} mem=${instanceMemory.buffer.byteLength}\n`);
-    } catch {}
     return WASI_ERRNO_FAULT;
   }
+}
+
+function readGuestUint32(ptr) {
+  if (!(instanceMemory instanceof WebAssembly.Memory)) {
+    throw new Error('WebAssembly memory is unavailable');
+  }
+  return new DataView(instanceMemory.buffer).getUint32(Number(ptr), true);
+}
+
+function writeGuestUint64(ptr, value) {
+  if (!(instanceMemory instanceof WebAssembly.Memory)) {
+    return WASI_ERRNO_FAULT;
+  }
+
+  try {
+    new DataView(instanceMemory.buffer).setBigUint64(Number(ptr), BigInt(value), true);
+    return WASI_ERRNO_SUCCESS;
+  } catch {
+    return WASI_ERRNO_FAULT;
+  }
+}
+
+function statTimestampNs(value) {
+  const numeric = Number(value);
+  return BigInt(Math.trunc((Number.isFinite(numeric) ? numeric : 0) * 1000000));
+}
+
+function writeGuestFilestat(ptr, stats, filetype = WASI_FILETYPE_REGULAR_FILE) {
+  if (!(instanceMemory instanceof WebAssembly.Memory)) {
+    return WASI_ERRNO_FAULT;
+  }
+
+  try {
+    const view = new DataView(instanceMemory.buffer);
+    const offset = Number(ptr) >>> 0;
+    view.setBigUint64(offset, 0n, true);
+    view.setBigUint64(offset + 8, BigInt(stats?.ino ?? 0), true);
+    view.setUint8(offset + 16, Number(filetype) >>> 0);
+    view.setBigUint64(offset + 24, BigInt(stats?.nlink ?? 1), true);
+    view.setBigUint64(offset + 32, BigInt(stats?.size ?? 0), true);
+    view.setBigUint64(offset + 40, statTimestampNs(stats?.atimeMs), true);
+    view.setBigUint64(offset + 48, statTimestampNs(stats?.mtimeMs), true);
+    view.setBigUint64(offset + 56, statTimestampNs(stats?.ctimeMs), true);
+    return WASI_ERRNO_SUCCESS;
+  } catch {
+    return WASI_ERRNO_FAULT;
+  }
+}
+
+function writeGuestFdstat(ptr, filetype, flags, rightsBase, rightsInheriting) {
+  if (!(instanceMemory instanceof WebAssembly.Memory)) {
+    return WASI_ERRNO_FAULT;
+  }
+
+  try {
+    const view = new DataView(instanceMemory.buffer);
+    const offset = Number(ptr) >>> 0;
+    view.setUint8(offset, Number(filetype) >>> 0);
+    view.setUint16(offset + 2, Number(flags) >>> 0, true);
+    view.setBigUint64(offset + 8, BigInt(rightsBase), true);
+    view.setBigUint64(offset + 16, BigInt(rightsInheriting), true);
+    return WASI_ERRNO_SUCCESS;
+  } catch {
+    return WASI_ERRNO_FAULT;
+  }
+}
+
+function mapSyntheticFsError(error) {
+  switch (error?.code) {
+    case 'EBADF':
+      return WASI_ERRNO_BADF;
+    case 'EACCES':
+    case 'EPERM':
+      return WASI_ERRNO_ACCES;
+    case 'EINVAL':
+      return WASI_ERRNO_INVAL;
+    case 'EROFS':
+      return WASI_ERRNO_ROFS;
+    default:
+      return WASI_ERRNO_FAULT;
+  }
+}
+
+function seekGuestFileHandle(handle, offset, whence) {
+  const numericWhence = Number(whence) >>> 0;
+  let base;
+  if (numericWhence === WASI_WHENCE_SET) {
+    base = 0n;
+  } else if (numericWhence === WASI_WHENCE_CUR) {
+    base = BigInt(handle.position ?? 0);
+  } else if (numericWhence === WASI_WHENCE_END) {
+    base = BigInt(Number(fsModule.fstatSync(handle.targetFd).size ?? 0));
+  } else {
+    return null;
+  }
+
+  const next = base + BigInt(offset);
+  if (next < 0n || next > BigInt(Number.MAX_SAFE_INTEGER)) {
+    return null;
+  }
+
+  handle.position = Number(next);
+  return next;
 }
 
 function createPipeHandle(kind, pipe, displayFd) {
@@ -9258,7 +9653,12 @@ function releaseDelegateFd(fd) {
 
 function lookupFdHandle(fd) {
   const numericFd = Number(fd) >>> 0;
-  return syntheticFdEntries.get(numericFd) ?? passthroughHandles.get(numericFd) ?? null;
+  return (
+    syntheticFdEntries.get(numericFd) ??
+    retainedSpawnOutputHandlesByFd.get(numericFd)?.handle ??
+    passthroughHandles.get(numericFd) ??
+    null
+  );
 }
 
 function lookupSyntheticHandleByDisplayFd(fd, expectedKind = null) {
@@ -9313,15 +9713,13 @@ function cloneFdHandle(fd) {
   return handle;
 }
 
-function wrapDelegateFdHandle(fd, displayFd = fd) {
-  retainDelegateFd(fd);
-  return {
-    kind: 'passthrough',
-    targetFd: Number(fd) >>> 0,
-    displayFd: Number(displayFd) >>> 0,
-    refCount: 1,
-    open: true,
-  };
+function passthroughHandleHasCanonicalMapping(handle) {
+  for (const current of passthroughHandles.values()) {
+    if (current === handle) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function releaseFdHandle(handle) {
@@ -9335,10 +9733,20 @@ function releaseFdHandle(handle) {
       handle.refCount === 0 &&
       handle.open &&
       handle.targetFd > 2 &&
+      !passthroughHandleHasCanonicalMapping(handle) &&
       releaseDelegateFd(handle.targetFd) &&
       typeof delegateManagedFdClose === 'function'
     ) {
       delegateManagedFdClose(handle.targetFd);
+    }
+    return;
+  }
+
+  if (handle.kind === 'guest-file') {
+    handle.refCount = Math.max(0, handle.refCount - 1);
+    if (handle.refCount === 0 && handle.open) {
+      handle.open = false;
+      fsModule.closeSync(handle.targetFd);
     }
     return;
   }
@@ -9382,6 +9790,25 @@ function closeSyntheticFd(fd) {
   return true;
 }
 
+function closePassthroughFd(fd) {
+  const numericFd = Number(fd) >>> 0;
+  const handle = passthroughHandles.get(numericFd);
+  if (!handle) {
+    return false;
+  }
+
+  passthroughHandles.delete(numericFd);
+  closedPassthroughFds.add(numericFd);
+  if ((handle.refCount ?? 0) === 0) {
+    releaseFdHandle(handle);
+  }
+  return true;
+}
+
+function rejectClosedPassthroughFd(fd) {
+  return closedPassthroughFds.has(Number(fd) >>> 0);
+}
+
 function collectInactivePipeHandles(pipe) {
   if (!pipe) {
     return;
@@ -9420,14 +9847,112 @@ function collectInactivePipeHandles(pipe) {
 }
 
 function resolveSpawnFd(fd) {
+  const numericFd = Number(fd) >>> 0;
   const handle = lookupFdHandle(fd);
   if (!handle) {
-    return Number(fd) >>> 0;
+    return numericFd;
   }
   if (handle.kind === 'passthrough') {
     return handle.targetFd >>> 0;
   }
+  if (handle.kind === 'guest-file') {
+    return numericFd;
+  }
   return handle.displayFd >>> 0;
+}
+
+function spawnStdinFdIsSyntheticPipe(fd) {
+  const handle =
+    lookupFdHandle(fd) ?? lookupSyntheticHandleByDisplayFd(fd, 'pipe-read');
+  return handle?.kind === 'pipe-read';
+}
+
+// Shell input redirects (`cmd < file`) reach proc_spawn as a plain file fd in
+// stdin_fd. The child cannot share that descriptor across the spawn boundary,
+// so the remaining file contents are materialized and written to the child's
+// stdin pipe, exactly like POSIX children reading an inherited file fd to EOF.
+// Returns null when the fd is not a readable file-backed handle so callers can
+// fail loudly instead of leaving the child hanging on an open stdin pipe.
+function readSpawnStdinRedirectBytes(fd) {
+  const numericFd = Number(fd) >>> 0;
+  const handle = lookupFdHandle(numericFd);
+  if (!handle) {
+    return null;
+  }
+
+  if (handle.kind === 'guest-file') {
+    const chunks = [];
+    let position = handle.position ?? 0;
+    for (;;) {
+      const buffer = Buffer.alloc(65536);
+      const bytesRead = fsModule.readSync(
+        handle.targetFd,
+        buffer,
+        0,
+        buffer.length,
+        position,
+      );
+      if (bytesRead <= 0) {
+        break;
+      }
+      chunks.push(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    handle.position = position;
+    return Buffer.concat(chunks);
+  }
+
+  if (handle.kind === 'passthrough' && typeof handle.guestPath === 'string') {
+    if (handle.guestPath === '/dev/null') {
+      return Buffer.alloc(0);
+    }
+    const stats = fsModule.statSync(handle.guestPath);
+    if (!stats.isFile()) {
+      return null;
+    }
+    return Buffer.from(fsModule.readFileSync(handle.guestPath));
+  }
+
+  return null;
+}
+
+function retainSpawnOutputHandle(fd) {
+  const numericFd = Number(fd) >>> 0;
+  if (numericFd <= 2) {
+    return null;
+  }
+
+  const retained = retainedSpawnOutputHandlesByFd.get(numericFd);
+  if (retained) {
+    retained.refCount += 1;
+    retained.handle.refCount += 1;
+    return { fd: numericFd, handle: retained.handle };
+  }
+
+  const handle = lookupFdHandle(numericFd);
+  if (handle?.kind !== 'guest-file') {
+    return null;
+  }
+
+  handle.refCount += 1;
+  retainedSpawnOutputHandlesByFd.set(numericFd, { handle, refCount: 1 });
+  return { fd: numericFd, handle };
+}
+
+function releaseSpawnOutputHandles(retainedHandles) {
+  for (const retained of retainedHandles ?? []) {
+    if (!retained || typeof retained.fd !== 'number' || !retained.handle) {
+      continue;
+    }
+    const retainedEntry = retainedSpawnOutputHandlesByFd.get(retained.fd);
+    if (retainedEntry?.handle === retained.handle) {
+      retainedEntry.refCount -= 1;
+      if (retainedEntry.refCount <= 0) {
+        retainedSpawnOutputHandlesByFd.delete(retained.fd);
+      }
+    }
+    releaseFdHandle(retained.handle);
+  }
 }
 
 function collectGuestIovBytes(iovs, iovsLen) {
@@ -9505,6 +10030,13 @@ function enqueuePipeBytes(pipe, bytes) {
     return;
   }
   pipe.chunks.push(chunk);
+}
+
+function pipeHasReaders(pipe) {
+  return (
+    (pipe?.readHandleCount ?? 0) > 0 ||
+    (pipe?.consumers?.size ?? 0) > 0
+  );
 }
 
 function unregisterPipeProducer(pipe, producerKey) {
@@ -9764,7 +10296,30 @@ function routeChunkToFd(fd, bytes) {
     return;
   }
 
+  if (handle.kind === 'guest-file') {
+    writeBytesToGuestFileHandle(handle, Buffer.from(bytes ?? []));
+    return;
+  }
+
   throw new Error(`bad file descriptor ${numericFd}`);
+}
+
+function writeBytesToGuestFileHandle(handle, bytes) {
+  const chunk = Buffer.from(bytes ?? []);
+  const position = handle.append ? null : (handle.position ?? 0);
+  const written = fsModule.writeSync(
+    handle.targetFd,
+    chunk,
+    0,
+    chunk.length,
+    position,
+  );
+  if (handle.append) {
+    handle.position = Number(fsModule.fstatSync(handle.targetFd).size ?? 0);
+  } else {
+    handle.position = (handle.position ?? 0) + written;
+  }
+  return written;
 }
 
 function routeChunkToDelegateFd(fd, bytes) {
@@ -9815,14 +10370,15 @@ function routeChunkToDelegateFd(fd, bytes) {
 function finalizeChildExit(record, exitCode, signal) {
   const status =
     signal == null
-      ? ((Number(exitCode ?? 1) & 0xff) << 8)
-      : (signalNumberFromName(signal) & 0x7f);
+      ? (Number(exitCode ?? 1) & 0xff)
+      : 128 + (signalNumberFromName(signal) & 0x7f);
   record.exitStatus = status;
   for (const fd of record.delegateRetainedFds ?? []) {
     if (releaseDelegateFd(fd) && typeof delegateManagedFdClose === 'function') {
       delegateManagedFdClose(fd);
     }
   }
+  releaseSpawnOutputHandles(record.retainedSpawnOutputHandles);
   unregisterChildPipeProducers(record);
   unregisterChildPipeConsumers(record);
   return status;
@@ -9868,11 +10424,16 @@ function resolveSyntheticGuestPath(value, fromGuestDir = '/') {
 }
 
 function resolveSyntheticHostPath(value, fromGuestDir = '/') {
+  const mapping = resolveSyntheticHostMapping(value, fromGuestDir);
+  return mapping?.hostPath ?? null;
+}
+
+function resolveSyntheticHostMapping(value, fromGuestDir = '/') {
   const guestPath = resolveSyntheticGuestPath(value, fromGuestDir);
   if (typeof guestPath !== 'string') {
     return null;
   }
-  return resolveModuleGuestPathToHostPath(guestPath);
+  return resolveModuleGuestPathToHostMapping(guestPath);
 }
 
 function maybeCreateSyntheticCommandResult(command, args, cwd) {
@@ -9889,11 +10450,16 @@ function maybeCreateSyntheticCommandResult(command, args, cwd) {
     const mode = Number.parseInt(modeArg, 8) >>> 0;
     try {
       for (const targetArg of args.slice(1)) {
-        const hostPath = resolveSyntheticHostPath(targetArg, cwd || '/');
-        if (typeof hostPath !== 'string') {
+        const mapping = resolveSyntheticHostMapping(targetArg, cwd || '/');
+        if (!mapping || typeof mapping.hostPath !== 'string') {
           throw new Error(`No such file or directory: ${targetArg}`);
         }
-        fsModule.chmodSync(hostPath, mode);
+        if (mapping.readOnly) {
+          const error = new Error(`Read-only file system: ${targetArg}`);
+          error.code = 'EROFS';
+          throw error;
+        }
+        fsModule.chmodSync(mapping.hostPath, mode);
       }
       return { exitCode: 0, stdout: '', stderr: '' };
     } catch (error) {
@@ -10017,6 +10583,13 @@ function processChildEvent(record, event) {
     return true;
   }
 
+  if (event.type === 'signal') {
+    dispatchWasmSignal(
+      typeof event.number === 'number' ? event.number : signalNumberFromName(event.signal),
+    );
+    return true;
+  }
+
   if (event.type === 'exit') {
     const exitCode =
       typeof event.exitCode === 'number' ? Math.trunc(event.exitCode) : null;
@@ -10059,6 +10632,8 @@ function pumpPipeProducers(pipe, waitMs) {
       continue;
     }
 
+    processed = pumpChildInputPipe(record, 0) || processed;
+
     const event = pollChildEvent(record, waitMs);
     if (!event) {
       continue;
@@ -10079,45 +10654,75 @@ function pumpChildInputPipe(record, waitMs) {
     });
     return false;
   }
-  const stdinReadyAt = Number(record?.stdinReadyAtMs) || 0;
-  if (stdinReadyAt > Date.now()) {
-    traceHostProcess('pump-child-input-deferred', {
+  if (record.pumpingInputPipe === true) {
+    return false;
+  }
+  record.pumpingInputPipe = true;
+  try {
+    const stdinReadyAt = Number(record?.stdinReadyAtMs) || 0;
+    if (stdinReadyAt > Date.now()) {
+      traceHostProcess('pump-child-input-deferred', {
+        childId: record?.childId ?? null,
+        waitMs: Number(waitMs) >>> 0,
+        stdinReadyAt,
+        now: Date.now(),
+        chunkCount: inputPipe.chunks.length,
+        writeHandleCount: inputPipe.writeHandleCount ?? null,
+        producerCount: inputPipe.producers?.size ?? null,
+      });
+      return false;
+    }
+
+    let progressed = false;
+    traceHostProcess('pump-child-input-begin', {
       childId: record?.childId ?? null,
       waitMs: Number(waitMs) >>> 0,
-      stdinReadyAt,
-      now: Date.now(),
       chunkCount: inputPipe.chunks.length,
       writeHandleCount: inputPipe.writeHandleCount ?? null,
       producerCount: inputPipe.producers?.size ?? null,
     });
-    return false;
-  }
+    if (inputPipe.chunks.length > 0) {
+      progressed = flushPipeConsumers(inputPipe) || progressed;
+    }
 
+    if (inputPipe.producers.size === 0 && (inputPipe.writeHandleCount ?? 0) === 0) {
+      return closePipeConsumers(inputPipe) || progressed;
+    }
+
+    const pumped = pumpPipeProducers(inputPipe, waitMs);
+    progressed = pumped || progressed;
+    if (inputPipe.chunks.length > 0) {
+      progressed = flushPipeConsumers(inputPipe) || progressed;
+    }
+    if (inputPipe.producers.size === 0 && (inputPipe.writeHandleCount ?? 0) === 0) {
+      progressed = closePipeConsumers(inputPipe) || progressed;
+    }
+
+    return progressed;
+  } finally {
+    record.pumpingInputPipe = false;
+  }
+}
+
+function pumpSpawnedChildren(waitMs) {
   let progressed = false;
-  traceHostProcess('pump-child-input-begin', {
-    childId: record?.childId ?? null,
-    waitMs: Number(waitMs) >>> 0,
-    chunkCount: inputPipe.chunks.length,
-    writeHandleCount: inputPipe.writeHandleCount ?? null,
-    producerCount: inputPipe.producers?.size ?? null,
-  });
-  if (inputPipe.chunks.length > 0) {
-    progressed = flushPipeConsumers(inputPipe) || progressed;
+  for (const record of Array.from(spawnedChildren.values())) {
+    if (!record || typeof record.exitStatus === 'number') {
+      continue;
+    }
+    try {
+      const event = pollChildEvent(record, waitMs);
+      if (event) {
+        processChildEvent(record, event);
+        progressed = true;
+      }
+      progressed = pumpChildInputPipe(record, 0) || progressed;
+    } catch (error) {
+      if (!isChildProcessGoneError(error)) {
+        throw error;
+      }
+    }
   }
-
-  if (inputPipe.producers.size === 0 && (inputPipe.writeHandleCount ?? 0) === 0) {
-    return closePipeConsumers(inputPipe) || progressed;
-  }
-
-  const pumped = pumpPipeProducers(inputPipe, waitMs);
-  progressed = pumped || progressed;
-  if (inputPipe.chunks.length > 0) {
-    progressed = flushPipeConsumers(inputPipe) || progressed;
-  }
-  if (inputPipe.producers.size === 0 && (inputPipe.writeHandleCount ?? 0) === 0) {
-    progressed = closePipeConsumers(inputPipe) || progressed;
-  }
-
   return progressed;
 }
 
@@ -10291,6 +10896,7 @@ function callSyncRpc(method, args = []) {
 
 const hostNetSockets = new Map();
 let nextHostNetSocketFd = 0x40000000;
+const HOST_NET_TIMEOUT_SENTINEL = '__secure_exec_net_timeout__';
 
 function getHostNetSocket(fd) {
   return hostNetSockets.get(Number(fd) >>> 0) ?? null;
@@ -10386,40 +10992,160 @@ function parseHostNetAddress(raw) {
   };
 }
 
-function signalNumberFromName(signal) {
-  switch (String(signal)) {
-    case 'SIGHUP':
-      return 1;
-    case 'SIGINT':
-      return 2;
-    case 'SIGKILL':
-      return 9;
-    case 'SIGTERM':
-      return 15;
-    default:
-      if (String(signal).startsWith('SIG')) {
-        const numeric = Number.parseInt(String(signal).slice(3), 10);
-        return Number.isInteger(numeric) ? numeric : 15;
-      }
-      return 15;
+function parseHostNetListenAddress(raw) {
+  const value = String(raw ?? '').trim();
+  if (!value) {
+    throw new Error('host_net listen address is required');
   }
+  if (value.startsWith('/')) {
+    return { path: value };
+  }
+  const address = parseHostNetAddress(value);
+  return { host: address.host, port: address.port };
+}
+
+function normalizeHostNetAddressInfo(address, port) {
+  const host = String(address ?? '');
+  const numericPort = Number(port);
+  if (!host || !Number.isInteger(numericPort) || numericPort < 0 || numericPort > 65535) {
+    return null;
+  }
+  return { address: host, port: numericPort };
+}
+
+function formatHostNetAddressInfo(info) {
+  const address = String(info?.address ?? '');
+  const port = Number(info?.port);
+  if (!address || !Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error('host_net socket address is incomplete');
+  }
+  return `${address}:${port}`;
+}
+
+const HOST_NET_AF_INET = 2;
+const HOST_NET_AF_INET6 = 10;
+const HOST_NET_SOCK_DGRAM = 5;
+const HOST_NET_SOCKET_TYPE_MASK = 0xf;
+const HOST_NET_SOL_SOCKET = 1;
+const HOST_NET_WASI_SOL_SOCKET = 0x7fffffff;
+const HOST_NET_SO_RCVTIMEO_64 = 20;
+const HOST_NET_SO_RCVTIMEO_32 = 66;
+const HOST_NET_TIMEVAL_BYTES = 16;
+
+function hostNetSocketBaseType(socket) {
+  return Number(socket?.sockType ?? 0) & HOST_NET_SOCKET_TYPE_MASK;
+}
+
+function hostNetSockoptKind(level, optname, optvalLen) {
+  const normalizedLevel = Number(level) >>> 0;
+  const normalizedOptname = Number(optname) >>> 0;
+  const normalizedOptvalLen = Number(optvalLen) >>> 0;
+  if (
+    normalizedLevel !== HOST_NET_SOL_SOCKET &&
+    normalizedLevel !== HOST_NET_WASI_SOL_SOCKET
+  ) {
+    return null;
+  }
+  if (normalizedOptvalLen !== HOST_NET_TIMEVAL_BYTES) {
+    return null;
+  }
+  if (
+    normalizedOptname === HOST_NET_SO_RCVTIMEO_64 ||
+    normalizedOptname === HOST_NET_SO_RCVTIMEO_32
+  ) {
+    return 'recv-timeout';
+  }
+  return null;
+}
+
+function parseHostNetTimevalMs(bytes) {
+  if (bytes.byteLength !== HOST_NET_TIMEVAL_BYTES) {
+    return null;
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const seconds = view.getBigInt64(0, true);
+  const microseconds = view.getBigInt64(8, true);
+  if (seconds < 0n || microseconds < 0n || microseconds > 999999n) {
+    return null;
+  }
+  if (seconds === 0n && microseconds === 0n) {
+    return null;
+  }
+  const milliseconds = seconds * 1000n + (microseconds + 999n) / 1000n;
+  if (milliseconds > BigInt(Number.MAX_SAFE_INTEGER)) {
+    return null;
+  }
+  return Number(milliseconds);
+}
+
+function ensureHostNetUdpSocket(socket) {
+  if (!socket || socket.closed || hostNetSocketBaseType(socket) !== HOST_NET_SOCK_DGRAM) {
+    return null;
+  }
+  if (socket.udpSocketId) {
+    return socket.udpSocketId;
+  }
+
+  const type = socket.domain === HOST_NET_AF_INET6 ? 'udp6' : 'udp4';
+  const result = callSyncRpc('dgram.createSocket', [{ type }]);
+  if (!result || typeof result.socketId !== 'string') {
+    throw new Error('host_net dgram socket creation failed');
+  }
+  socket.udpSocketId = result.socketId;
+  return socket.udpSocketId;
+}
+
+function signalNumberFromName(signal) {
+  const mapped = LINUX_SIGNAL_NAMES.indexOf(String(signal));
+  if (mapped > 0) {
+    return mapped;
+  }
+  if (String(signal).startsWith('SIG')) {
+    const numeric = Number.parseInt(String(signal).slice(3), 10);
+    return Number.isInteger(numeric) ? numeric : 15;
+  }
+  return 15;
 }
 
 function signalNameFromNumber(signal) {
   const numeric = Number(signal) >>> 0;
-  switch (numeric) {
-    case 1:
-      return 'SIGHUP';
-    case 2:
-      return 'SIGINT';
-    case 9:
-      return 'SIGKILL';
-    case 15:
-      return 'SIGTERM';
-    default:
-      return `SIG${numeric}`;
-  }
+  return LINUX_SIGNAL_NAMES[numeric] ?? `SIG${numeric}`;
 }
+
+const LINUX_SIGNAL_NAMES = [
+  null,
+  'SIGHUP',
+  'SIGINT',
+  'SIGQUIT',
+  'SIGILL',
+  'SIGTRAP',
+  'SIGABRT',
+  'SIGBUS',
+  'SIGFPE',
+  'SIGKILL',
+  'SIGUSR1',
+  'SIGSEGV',
+  'SIGUSR2',
+  'SIGPIPE',
+  'SIGALRM',
+  'SIGTERM',
+  null,
+  'SIGCHLD',
+  'SIGCONT',
+  'SIGSTOP',
+  'SIGTSTP',
+  'SIGTTIN',
+  'SIGTTOU',
+  'SIGURG',
+  'SIGXCPU',
+  'SIGXFSZ',
+  'SIGVTALRM',
+  'SIGPROF',
+  'SIGWINCH',
+  'SIGIO',
+  'SIGPWR',
+  'SIGSYS',
+];
 
 function writeGuestBytes(ptr, maxLen, bytes, actualLenPtr) {
   if (!(instanceMemory instanceof WebAssembly.Memory)) {
@@ -10449,7 +11175,14 @@ const hostNetImport = {
         domain: numericDomain,
         sockType: numericType,
         protocol: numericProtocol,
+        bindOptions: null,
+        localInfo: null,
+        localReservation: null,
+        remoteInfo: null,
+        serverId: null,
         socketId: null,
+        udpSocketId: null,
+        recvTimeoutMs: null,
         readChunks: [],
         readableEnded: false,
         closed: false,
@@ -10472,17 +11205,243 @@ const hostNetImport = {
         return WASI_ERRNO_FAULT;
       }
 
-      const result = callSyncRpc('net.connect', [{ host, port }]);
+      const request = { host, port };
+      if (socket.bindOptions?.host != null) {
+        request.localAddress = socket.bindOptions.host;
+      }
+      if (socket.bindOptions?.port != null) {
+        request.localPort = socket.bindOptions.port;
+      }
+      if (socket.localReservation != null) {
+        request.localReservation = socket.localReservation;
+      }
+
+      const result = callSyncRpc('net.connect', [request]);
       if (!result || typeof result.socketId !== 'string') {
         return WASI_ERRNO_FAULT;
       }
 
       socket.socketId = result.socketId;
+      socket.localInfo = normalizeHostNetAddressInfo(result.localAddress, result.localPort);
+      socket.localReservation = null;
+      socket.remoteInfo = normalizeHostNetAddressInfo(result.remoteAddress, result.remotePort);
       socket.readChunks.length = 0;
       socket.readableEnded = false;
       socket.closed = false;
       socket.lastError = null;
       return WASI_ERRNO_SUCCESS;
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+  },
+  net_getaddrinfo(hostPtr, hostLen, portPtr, portLen, family, retAddrPtr, retAddrLenPtr) {
+    try {
+      const hostname = readGuestString(hostPtr, hostLen);
+      const numericFamily = Number(family) >>> 0;
+      const lookupOptions = { hostname, all: true };
+      if (numericFamily === 4) {
+        lookupOptions.family = 4;
+      } else if (numericFamily === 6) {
+        lookupOptions.family = 6;
+      } else if (numericFamily !== 0) {
+        return WASI_ERRNO_INVAL;
+      }
+
+      const records = callSyncRpc('dns.lookup', [lookupOptions]);
+      if (!Array.isArray(records)) {
+        return WASI_ERRNO_FAULT;
+      }
+      const payload = records.map((record) => {
+        const family = Number(record?.family);
+        if (family !== 4 && family !== 6) {
+          throw new Error('host_net dns record family is unsupported');
+        }
+        return {
+          addr: String(record?.address ?? ''),
+          family,
+        };
+      });
+      const encoded = Buffer.from(JSON.stringify(payload), 'utf8');
+      return writeGuestBytes(
+        retAddrPtr,
+        readGuestUint32(retAddrLenPtr),
+        encoded,
+        retAddrLenPtr,
+      );
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+  },
+  net_bind(fd, addrPtr, addrLen) {
+    const socket = getHostNetSocket(fd);
+    if (!socket || socket.closed) {
+      return WASI_ERRNO_BADF;
+    }
+
+    try {
+      if (socket.localReservation != null) {
+        callSyncRpc('net.release_tcp_port', [socket.localReservation]);
+        socket.localReservation = null;
+      }
+
+      socket.bindOptions = parseHostNetListenAddress(readGuestString(addrPtr, addrLen));
+      if (hostNetSocketBaseType(socket) === HOST_NET_SOCK_DGRAM) {
+        if (socket.bindOptions.path != null) {
+          return WASI_ERRNO_FAULT;
+        }
+        const udpSocketId = ensureHostNetUdpSocket(socket);
+        if (!udpSocketId) {
+          return WASI_ERRNO_FAULT;
+        }
+        const result = callSyncRpc('dgram.bind', [
+          udpSocketId,
+          {
+            address: socket.bindOptions.host,
+            port: socket.bindOptions.port,
+          },
+        ]);
+        socket.localInfo = normalizeHostNetAddressInfo(result?.localAddress, result?.localPort);
+        return socket.localInfo ? WASI_ERRNO_SUCCESS : WASI_ERRNO_FAULT;
+      }
+
+      if (socket.bindOptions.path == null) {
+        const reservation = callSyncRpc('net.reserve_tcp_port', [socket.bindOptions]);
+        if (
+          !reservation ||
+          typeof reservation.reservationId !== 'string' ||
+          !Number.isInteger(Number(reservation.localPort))
+        ) {
+          return WASI_ERRNO_FAULT;
+        }
+        socket.localReservation = reservation.reservationId;
+        socket.bindOptions = {
+          ...socket.bindOptions,
+          host: reservation.localAddress ?? socket.bindOptions.host,
+          port: Number(reservation.localPort),
+        };
+        socket.localInfo = normalizeHostNetAddressInfo(
+          socket.bindOptions.host ?? '127.0.0.1',
+          socket.bindOptions.port,
+        );
+      } else {
+        socket.localInfo = null;
+      }
+      return WASI_ERRNO_SUCCESS;
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+  },
+  net_listen(fd, backlog) {
+    const socket = getHostNetSocket(fd);
+    if (!socket || socket.closed) {
+      return WASI_ERRNO_BADF;
+    }
+    if (socket.serverId || !socket.bindOptions) {
+      return WASI_ERRNO_FAULT;
+    }
+
+    try {
+      const request = {
+        ...socket.bindOptions,
+        backlog: Math.max(0, Number(backlog) >>> 0),
+      };
+      if (socket.localReservation != null) {
+        request.localReservation = socket.localReservation;
+      }
+
+      const result = callSyncRpc('net.listen', [request]);
+      if (!result || typeof result.serverId !== 'string') {
+        return WASI_ERRNO_FAULT;
+      }
+      socket.serverId = result.serverId;
+      socket.localReservation = null;
+      socket.localInfo = normalizeHostNetAddressInfo(result.localAddress, result.localPort);
+      return WASI_ERRNO_SUCCESS;
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+  },
+  net_accept(fd, retFdPtr, retAddrPtr, retAddrLenPtr) {
+    const socket = getHostNetSocket(fd);
+    if (!socket?.serverId || socket.closed) {
+      return WASI_ERRNO_BADF;
+    }
+
+    try {
+      let result = null;
+      while (true) {
+        result = callSyncRpc('net.server_accept', [socket.serverId]);
+        if (result && result !== HOST_NET_TIMEOUT_SENTINEL) {
+          break;
+        }
+        pumpSpawnedChildren(10);
+      }
+      if (typeof result === 'string') {
+        result = JSON.parse(result);
+      }
+      if (!result || typeof result.socketId !== 'string') {
+        return WASI_ERRNO_FAULT;
+      }
+
+      const acceptedFd = nextHostNetSocketFd++;
+      hostNetSockets.set(acceptedFd, {
+        domain: socket.domain,
+        sockType: socket.sockType,
+        protocol: socket.protocol,
+        bindOptions: null,
+        localInfo: normalizeHostNetAddressInfo(result.info?.localAddress, result.info?.localPort),
+        localReservation: null,
+        remoteInfo: normalizeHostNetAddressInfo(result.info?.remoteAddress, result.info?.remotePort),
+        serverId: null,
+        socketId: result.socketId,
+        udpSocketId: null,
+        recvTimeoutMs: socket.recvTimeoutMs,
+        readChunks: [],
+        readableEnded: false,
+        closed: false,
+        lastError: null,
+      });
+
+      const address = Buffer.from(formatHostNetAddressInfo({
+        address: result.info?.remoteAddress,
+        port: result.info?.remotePort,
+      }), 'utf8');
+      if (writeGuestUint32(retFdPtr, acceptedFd) !== WASI_ERRNO_SUCCESS) {
+        return WASI_ERRNO_FAULT;
+      }
+      return writeGuestBytes(retAddrPtr, readGuestUint32(retAddrLenPtr), address, retAddrLenPtr);
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+  },
+  net_getsockname(fd, addrPtr, addrLenPtr) {
+    const socket = getHostNetSocket(fd);
+    if (!socket || socket.closed) {
+      return WASI_ERRNO_BADF;
+    }
+    if (!socket.localInfo) {
+      return WASI_ERRNO_INVAL;
+    }
+
+    try {
+      const address = Buffer.from(formatHostNetAddressInfo(socket.localInfo), 'utf8');
+      return writeGuestBytes(addrPtr, readGuestUint32(addrLenPtr), address, addrLenPtr);
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+  },
+  net_getpeername(fd, addrPtr, addrLenPtr) {
+    const socket = getHostNetSocket(fd);
+    if (!socket || socket.closed) {
+      return WASI_ERRNO_BADF;
+    }
+    if (!socket.remoteInfo) {
+      return WASI_ERRNO_INVAL;
+    }
+
+    try {
+      const address = Buffer.from(formatHostNetAddressInfo(socket.remoteInfo), 'utf8');
+      return writeGuestBytes(addrPtr, readGuestUint32(addrLenPtr), address, addrLenPtr);
     } catch {
       return WASI_ERRNO_FAULT;
     }
@@ -10515,6 +11474,8 @@ const hostNetImport = {
         // Non-zero recv flags are currently ignored in the WASM host_net shim.
       }
 
+      const deadline =
+        socket.recvTimeoutMs == null ? null : Date.now() + Math.max(0, socket.recvTimeoutMs);
       while (true) {
         const queued = dequeueHostNetBytes(socket, bufLen);
         if (queued.length > 0) {
@@ -10529,11 +11490,146 @@ const hostNetImport = {
           return writeGuestUint32(retReceivedPtr, 0);
         }
 
-        pollHostNetSocket(socket, 50);
+        const pollWaitMs =
+          deadline == null ? 50 : Math.max(0, Math.min(50, deadline - Date.now()));
+        if (deadline != null && pollWaitMs === 0) {
+          return WASI_ERRNO_AGAIN;
+        }
+        pollHostNetSocket(socket, pollWaitMs);
+        if (deadline != null && Date.now() >= deadline) {
+          return WASI_ERRNO_AGAIN;
+        }
       }
     } catch {
       return WASI_ERRNO_FAULT;
     }
+  },
+  net_sendto(fd, bufPtr, bufLen, flags, addrPtr, addrLen, retSentPtr) {
+    const socket = getHostNetSocket(fd);
+    if (!socket || socket.closed) {
+      return WASI_ERRNO_BADF;
+    }
+
+    try {
+      if ((Number(flags) >>> 0) !== 0) {
+        return WASI_ERRNO_INVAL;
+      }
+      const udpSocketId = ensureHostNetUdpSocket(socket);
+      if (!udpSocketId) {
+        return WASI_ERRNO_FAULT;
+      }
+
+      const { host, port } = parseHostNetAddress(readGuestString(addrPtr, addrLen));
+      const chunk = readGuestBytes(bufPtr, bufLen);
+      const result = callSyncRpc('dgram.send', [
+        udpSocketId,
+        chunk,
+        { address: host, port },
+      ]);
+      socket.localInfo = normalizeHostNetAddressInfo(result?.localAddress, result?.localPort);
+      const written = Number(result?.bytes) >>> 0;
+      return writeGuestUint32(retSentPtr, written);
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+  },
+  net_recvfrom(fd, bufPtr, bufLen, flags, retReceivedPtr, retAddrPtr, retAddrLenPtr) {
+    const socket = getHostNetSocket(fd);
+    if (!socket || socket.closed) {
+      return WASI_ERRNO_BADF;
+    }
+
+    try {
+      if ((Number(flags) >>> 0) !== 0) {
+        return WASI_ERRNO_INVAL;
+      }
+      const udpSocketId = ensureHostNetUdpSocket(socket);
+      if (!udpSocketId) {
+        return WASI_ERRNO_FAULT;
+      }
+
+      const deadline =
+        socket.recvTimeoutMs == null ? null : Date.now() + Math.max(0, socket.recvTimeoutMs);
+      while (true) {
+        const pollWaitMs =
+          deadline == null ? 50 : Math.max(0, Math.min(50, deadline - Date.now()));
+        if (deadline != null && pollWaitMs === 0) {
+          return WASI_ERRNO_AGAIN;
+        }
+        const event = callSyncRpc('dgram.poll', [udpSocketId, pollWaitMs]);
+        if (!event) {
+          if (deadline != null && Date.now() >= deadline) {
+            return WASI_ERRNO_AGAIN;
+          }
+          continue;
+        }
+        if (event.type === 'error') {
+          return WASI_ERRNO_FAULT;
+        }
+        if (event.type !== 'message') {
+          continue;
+        }
+
+        let bytes;
+        if (event.data && typeof event.data === 'object' && typeof event.data.base64 === 'string') {
+          bytes = Buffer.from(event.data.base64, 'base64');
+        } else {
+          try {
+            bytes = decodeFsBytesPayload(event.data, 'host_net recvfrom data');
+          } catch {
+            return WASI_ERRNO_FAULT;
+          }
+        }
+        const dataResult = writeGuestBytes(bufPtr, bufLen, bytes, retReceivedPtr);
+        if (dataResult !== WASI_ERRNO_SUCCESS) {
+          return dataResult;
+        }
+        if (!event.remoteAddress || !Number.isInteger(Number(event.remotePort))) {
+          return WASI_ERRNO_BADF;
+        }
+        let address;
+        try {
+          address = Buffer.from(formatHostNetAddressInfo({
+            address: event.remoteAddress,
+            port: event.remotePort,
+          }), 'utf8');
+        } catch {
+          return WASI_ERRNO_INVAL;
+        }
+        let addressCapacity;
+        try {
+          addressCapacity = readGuestUint32(retAddrLenPtr);
+        } catch {
+          return WASI_ERRNO_FAULT;
+        }
+        const addressResult = writeGuestBytes(retAddrPtr, addressCapacity, address, retAddrLenPtr);
+        return addressResult;
+      }
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+  },
+  net_setsockopt(fd, level, optname, optvalPtr, optvalLen) {
+    const socket = getHostNetSocket(fd);
+    if (!socket || socket.closed) {
+      return WASI_ERRNO_BADF;
+    }
+    const sockoptKind = hostNetSockoptKind(level, optname, optvalLen);
+    if (sockoptKind == null) {
+      return WASI_ERRNO_INVAL;
+    }
+    try {
+      const timeoutMs = parseHostNetTimevalMs(readGuestBytes(optvalPtr, optvalLen));
+      if (timeoutMs == null && readGuestBytes(optvalPtr, optvalLen).some((byte) => byte !== 0)) {
+        return WASI_ERRNO_INVAL;
+      }
+      if (sockoptKind === 'recv-timeout') {
+        socket.recvTimeoutMs = timeoutMs;
+      }
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+    return WASI_ERRNO_SUCCESS;
   },
   net_close(fd) {
     const numericFd = Number(fd) >>> 0;
@@ -10543,12 +11639,16 @@ const hostNetImport = {
     }
 
     hostNetSockets.delete(numericFd);
-    if (!socket.socketId || socket.closed) {
-      return WASI_ERRNO_SUCCESS;
-    }
-
     try {
-      callSyncRpc('net.destroy', [socket.socketId]);
+      if (socket.localReservation != null) {
+        callSyncRpc('net.release_tcp_port', [socket.localReservation]);
+      }
+      if (socket.socketId && !socket.closed) {
+        callSyncRpc('net.destroy', [socket.socketId]);
+      }
+      if (socket.udpSocketId) {
+        callSyncRpc('dgram.close', [socket.udpSocketId]);
+      }
       return WASI_ERRNO_SUCCESS;
     } catch {
       return WASI_ERRNO_FAULT;
@@ -10562,9 +11662,13 @@ const hostNetImport = {
 
     try {
       const servername = readGuestString(hostnamePtr, hostnameLen);
+      const tlsOptions = { servername };
+      if (guestEnv.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
+        tlsOptions.rejectUnauthorized = false;
+      }
       callSyncRpc('net.socket_upgrade_tls', [
         socket.socketId,
-        JSON.stringify({ servername }),
+        JSON.stringify(tlsOptions),
       ]);
       return WASI_ERRNO_SUCCESS;
     } catch {
@@ -10632,6 +11736,21 @@ const hostProcessImport = {
               stdoutTarget,
               stderrTarget,
             });
+            let stdinRedirectBytes = null;
+            if (
+              stdinTarget > 2 &&
+              stdinTarget !== 0xffffffff &&
+              !spawnStdinFdIsSyntheticPipe(stdinTarget)
+            ) {
+              stdinRedirectBytes = readSpawnStdinRedirectBytes(stdinTarget);
+              if (stdinRedirectBytes == null) {
+                traceHostProcess('proc-spawn-stdin-redirect-unreadable', {
+                  command,
+                  stdinFd: stdinTarget,
+                });
+                return WASI_ERRNO_FAULT;
+              }
+            }
             const result = callSyncRpc('child_process.spawn', [
               {
                 command,
@@ -10669,6 +11788,10 @@ const hostProcessImport = {
             const stdinPipe = registerPipeConsumer(stdinTarget, result.childId, 'stdin');
             const stdoutPipe = registerPipeProducer(stdoutTarget, result.childId, 'stdout');
             const stderrPipe = registerPipeProducer(stderrTarget, result.childId, 'stderr');
+            const retainedSpawnOutputHandles = [stdoutTarget, stderrTarget]
+              .filter((fd, index, values) => values.indexOf(fd) === index)
+              .map((fd) => retainSpawnOutputHandle(fd))
+              .filter(Boolean);
             const delegateRetainedFds = [stdinTarget, stdoutTarget, stderrTarget].filter(
               (fd, index, values) =>
                 fd > 2 &&
@@ -10689,6 +11812,7 @@ const hostProcessImport = {
               stderrPipe,
               stdinReadyAtMs: Date.now() + 100,
               delegateRetainedFds,
+              retainedSpawnOutputHandles,
               exitStatus: null,
       };
             spawnedChildren.set(pid, record);
@@ -10698,6 +11822,15 @@ const hostProcessImport = {
               childId: result.childId,
               pid,
             });
+            if (stdinRedirectBytes != null) {
+              if (stdinRedirectBytes.length > 0) {
+                callSyncRpc('child_process.write_stdin', [
+                  result.childId,
+                  stdinRedirectBytes,
+                ]);
+              }
+              callSyncRpc('child_process.close_stdin', [result.childId]);
+            }
             consumeSpawnOutputFd(stdoutFd);
             consumeSpawnOutputFd(stderrFd);
             return writeGuestUint32(retPidPtr, pid);
@@ -10775,6 +11908,11 @@ const hostProcessImport = {
                 continue;
               }
 
+              if (event.type === 'signal') {
+                processChildEvent(record, event);
+                continue;
+              }
+
               if (event.type === 'exit') {
                 processChildEvent(record, event);
                 if (writeGuestUint32(retStatusPtr, record.exitStatus ?? 1) !== WASI_ERRNO_SUCCESS) {
@@ -10801,15 +11939,33 @@ const hostProcessImport = {
           if (permissionTier !== 'full') {
             return WASI_ERRNO_SRCH;
           }
-          const record = spawnedChildren.get(Number(pid) >>> 0);
-          if (!record) {
-            return WASI_ERRNO_SRCH;
-          }
+          const targetPid = Number(pid) >>> 0;
+          const signalName = signalNameFromNumber(signal);
 
           try {
-            callSyncRpc('child_process.kill', [record.childId, signalNameFromNumber(signal)]);
+            if (targetPid === VIRTUAL_PID) {
+              callSyncRpc('process.kill', [VIRTUAL_PID, signalName]);
+              if (
+                Number(signal) > 0 &&
+                typeof instance?.exports?.__wasi_signal_trampoline === 'function'
+              ) {
+                instance.exports.__wasi_signal_trampoline(Number(signal) | 0);
+              }
+              return WASI_ERRNO_SUCCESS;
+            }
+
+            const record = spawnedChildren.get(targetPid);
+            if (record) {
+              callSyncRpc('child_process.kill', [record.childId, signalName]);
+              return WASI_ERRNO_SUCCESS;
+            }
+
+            callSyncRpc('process.kill', [targetPid, signalName]);
             return WASI_ERRNO_SUCCESS;
-          } catch {
+          } catch (error) {
+            if (error?.code === 'ESRCH') {
+              return WASI_ERRNO_SRCH;
+            }
             return WASI_ERRNO_FAULT;
           }
         },
@@ -10843,8 +11999,24 @@ const hostProcessImport = {
         },
         fd_dup(fd, retNewFdPtr) {
           try {
-            const duplicatedFd = nextSyntheticFd++;
-            const handle = cloneFdHandle(fd) ?? wrapDelegateFdHandle(fd, duplicatedFd);
+            const handle = cloneFdHandle(fd);
+            if (!handle) {
+              return WASI_ERRNO_BADF;
+            }
+            let duplicatedFd = 0;
+            while (
+              duplicatedFd <= 2 &&
+              (
+                syntheticFdEntries.has(duplicatedFd) ||
+                passthroughHandles.has(duplicatedFd) ||
+                delegateManagedFdRefCounts.has(duplicatedFd)
+              )
+            ) {
+              duplicatedFd += 1;
+            }
+            if (duplicatedFd > 2) {
+              duplicatedFd = nextSyntheticFd++;
+            }
             syntheticFdEntries.set(duplicatedFd, handle);
             traceHostProcess('fd-dup', {
               fd: Number(fd) >>> 0,
@@ -10860,35 +12032,38 @@ const hostProcessImport = {
         },
         fd_dup2(oldFd, newFd) {
           try {
+            const sourceFd = Number(oldFd) >>> 0;
             const targetFd = Number(newFd) >>> 0;
-            const sourceHandle = cloneFdHandle(oldFd) ?? wrapDelegateFdHandle(oldFd, targetFd);
-
-            const sourceIsSamePassthrough =
-              sourceHandle.kind === 'passthrough' && sourceHandle.targetFd === targetFd;
-
-            traceHostProcess('fd-dup2-begin', {
-              oldFd: Number(oldFd) >>> 0,
-              newFd: targetFd,
-              sourceKind: sourceHandle.kind,
-              sourceTargetFd: sourceHandle.targetFd ?? null,
-              sourceDisplayFd: sourceHandle.displayFd ?? null,
-              sourceIsSamePassthrough,
-              existingKind: syntheticFdEntries.get(targetFd)?.kind ?? passthroughHandles.get(targetFd)?.kind ?? null,
-            });
-            closeSyntheticFd(targetFd);
-
-            if (sourceIsSamePassthrough) {
-              releaseFdHandle(sourceHandle);
-              traceHostProcess('fd-dup2-same-passthrough', {
-                oldFd: Number(oldFd) >>> 0,
+            if (sourceFd === targetFd) {
+              if (!lookupFdHandle(sourceFd)) {
+                return WASI_ERRNO_BADF;
+              }
+              traceHostProcess('fd-dup2-same-fd', {
+                oldFd: sourceFd,
                 newFd: targetFd,
               });
               return WASI_ERRNO_SUCCESS;
             }
 
+            const sourceHandle = cloneFdHandle(sourceFd);
+            if (!sourceHandle) {
+              return WASI_ERRNO_BADF;
+            }
+
+            traceHostProcess('fd-dup2-begin', {
+              oldFd: sourceFd,
+              newFd: targetFd,
+              sourceKind: sourceHandle.kind,
+              sourceTargetFd: sourceHandle.targetFd ?? null,
+              sourceDisplayFd: sourceHandle.displayFd ?? null,
+              existingKind: syntheticFdEntries.get(targetFd)?.kind ?? passthroughHandles.get(targetFd)?.kind ?? null,
+            });
+
+            closeSyntheticFd(targetFd);
+            closePassthroughFd(targetFd);
             syntheticFdEntries.set(targetFd, sourceHandle);
             traceHostProcess('fd-dup2-installed', {
-              oldFd: Number(oldFd) >>> 0,
+              oldFd: sourceFd,
               newFd: targetFd,
               sourceKind: sourceHandle.kind,
             });
@@ -10908,6 +12083,11 @@ const hostProcessImport = {
               return WASI_ERRNO_INVAL;
             }
 
+            const handle = cloneFdHandle(sourceFd);
+            if (!handle) {
+              return WASI_ERRNO_BADF;
+            }
+
             let duplicatedFd = minimumFdNumber >>> 0;
             while (
               syntheticFdEntries.has(duplicatedFd) ||
@@ -10918,8 +12098,6 @@ const hostProcessImport = {
             }
             nextSyntheticFd = Math.max(nextSyntheticFd, duplicatedFd + 1);
 
-            const handle =
-              cloneFdHandle(sourceFd) ?? wrapDelegateFdHandle(sourceFd, duplicatedFd);
             syntheticFdEntries.set(duplicatedFd, handle);
             traceHostProcess('fd-dup-min', {
               fd: sourceFd >>> 0,
@@ -11007,17 +12185,39 @@ const HOST_FS_GUEST_CWD =
     ? path.posix.normalize(guestEnv.PWD)
     : '/';
 
+for (let index = 0; index < WASI_PREOPEN_ENTRIES.length; index += 1) {
+  const fd = WASI_PREOPEN_FD_BASE + index;
+  const [guestPath, preopenSpec] = WASI_PREOPEN_ENTRIES[index];
+  if (!passthroughHandles.has(fd)) {
+    retainDelegateFd(fd);
+    closedPassthroughFds.delete(fd);
+    passthroughHandles.set(fd, {
+      kind: 'passthrough',
+      targetFd: fd,
+      displayFd: fd,
+      refCount: 0,
+      open: true,
+      guestPath: guestPathForPreopenKey(guestPath),
+      readOnly: preopenSpec?.readOnly === true,
+    });
+  }
+}
+
 function hostFsModeFromStat(stat) {
   const mode = Number(stat?.mode);
   return Number.isInteger(mode) && mode > 0 ? mode >>> 0 : 0;
 }
 
 function resolveHostFsPath(value, fromGuestDir = HOST_FS_GUEST_CWD) {
+  return resolveHostFsMapping(value, fromGuestDir)?.hostPath ?? null;
+}
+
+function resolveHostFsMapping(value, fromGuestDir = HOST_FS_GUEST_CWD) {
   const guestPath = resolveSyntheticGuestPath(value, fromGuestDir);
   if (typeof guestPath !== 'string') {
     return null;
   }
-  return resolveModuleGuestPathToHostPath(guestPath);
+  return resolveModuleGuestPathToHostMapping(guestPath);
 }
 
 const hostFsImport = {
@@ -11067,16 +12267,19 @@ const hostFsImport = {
   chmod(pathPtr, pathLen, mode) {
     try {
       const target = readGuestString(pathPtr, pathLen);
-      const hostPath = resolveHostFsPath(target);
-      if (typeof hostPath !== 'string') {
+      const mapping = resolveHostFsMapping(target);
+      if (!mapping || typeof mapping.hostPath !== 'string') {
+        return 1;
+      }
+      if (mapping.readOnly) {
         return 1;
       }
       traceHostProcess('host-fs-chmod', {
         target,
-        hostPath,
+        hostPath: mapping.hostPath,
         mode: Number(mode) >>> 0,
       });
-      fsModule.chmodSync(hostPath, Number(mode) >>> 0);
+      fsModule.chmodSync(mapping.hostPath, Number(mode) >>> 0);
       return 0;
     } catch {
       traceHostProcess('host-fs-chmod-fault', {});
@@ -11144,8 +12347,46 @@ if (delegatePathOpen) {
       return denyReadOnlyMutation();
     }
 
-    const result = delegatePathOpen(
-      fd,
+    const passthroughDirHandle = lookupFdHandle(fd);
+    if (passthroughDirHandle && passthroughDirHandle.kind !== 'passthrough') {
+      return WASI_ERRNO_BADF;
+    }
+    if (!passthroughDirHandle && rejectClosedPassthroughFd(fd)) {
+      return WASI_ERRNO_BADF;
+    }
+
+    const delegateDirFd =
+      passthroughDirHandle?.kind === 'passthrough'
+        ? passthroughDirHandle.targetFd
+        : fd;
+    const guestPath = resolvePathOpenGuestPath(fd, pathPtr, pathLen);
+    if (
+      guestPathIsReadOnly(guestPath) &&
+      (hasMutationOpenFlags(oflags) || hasWriteRights(rightsBase))
+    ) {
+      return denyReadOnlyMutation();
+    }
+    if ((Number(oflags) & WASI_OFLAGS_CREAT) !== 0) {
+      try {
+        const syntheticResult = openGuestFileForPathOpen(
+          fd,
+          pathPtr,
+          pathLen,
+          oflags,
+          rightsBase,
+          fdflags,
+          openedFdPtr,
+        );
+        if (syntheticResult != null) {
+          return syntheticResult;
+        }
+      } catch {
+        return WASI_ERRNO_FAULT;
+      }
+    }
+
+    let result = delegatePathOpen(
+      delegateDirFd,
       dirflags,
       pathPtr,
       pathLen,
@@ -11155,26 +12396,87 @@ if (delegatePathOpen) {
       fdflags,
       openedFdPtr,
     );
-    if (result === WASI_ERRNO_SUCCESS && instanceMemory instanceof WebAssembly.Memory) {
+
+    if (result !== WASI_ERRNO_SUCCESS && (Number(oflags) & WASI_OFLAGS_CREAT) !== 0) {
       try {
-        const openedFd = new DataView(instanceMemory.buffer).getUint32(Number(openedFdPtr), true);
-        retainDelegateFd(openedFd);
-        if (openedFd > 2 && !passthroughHandles.has(openedFd)) {
-          passthroughHandles.set(openedFd, {
-            kind: 'passthrough',
-            targetFd: openedFd,
-            displayFd: openedFd,
-            refCount: 0,
-            open: true,
-          });
+        precreatePathOpenTarget(fd, pathPtr, pathLen, oflags);
+        result = delegatePathOpen(
+          delegateDirFd,
+          dirflags,
+          pathPtr,
+          pathLen,
+          oflags,
+          rightsBase,
+          rightsInheriting,
+          fdflags,
+          openedFdPtr,
+        );
+        if (result !== WASI_ERRNO_SUCCESS) {
+          const fallbackResult = openGuestFileForPathOpen(
+            fd,
+            pathPtr,
+            pathLen,
+            oflags,
+            rightsBase,
+            fdflags,
+            openedFdPtr,
+          );
+          if (fallbackResult != null) {
+            return fallbackResult;
+          }
         }
       } catch {
         return WASI_ERRNO_FAULT;
       }
     }
+
+    if (result === WASI_ERRNO_SUCCESS) {
+      return retainPathOpenDelegateFd(openedFdPtr, guestPath);
+    }
     return result;
   };
 }
+
+function wrapReadOnlyPathMutation(name, shouldDeny) {
+  const delegate = typeof wasiImport[name] === 'function' ? wasiImport[name].bind(wasiImport) : null;
+  if (!delegate) {
+    return;
+  }
+  wasiImport[name] = (...args) => {
+    if (shouldDeny(...args)) {
+      return denyReadOnlyMutation();
+    }
+    return delegate(...args);
+  };
+}
+
+wrapReadOnlyPathMutation('path_create_directory', (fd, pathPtr, pathLen) =>
+  resolvedGuestPathIsReadOnly(fd, pathPtr, pathLen),
+);
+wrapReadOnlyPathMutation('path_filestat_set_times', (fd, _flags, pathPtr, pathLen) =>
+  resolvedGuestPathIsReadOnly(fd, pathPtr, pathLen),
+);
+wrapReadOnlyPathMutation(
+  'path_link',
+  (oldFd, _oldFlags, oldPathPtr, oldPathLen, newFd, newPathPtr, newPathLen) =>
+    resolvedGuestPathIsReadOnly(oldFd, oldPathPtr, oldPathLen) ||
+    resolvedGuestPathIsReadOnly(newFd, newPathPtr, newPathLen),
+);
+wrapReadOnlyPathMutation('path_remove_directory', (fd, pathPtr, pathLen) =>
+  resolvedGuestPathIsReadOnly(fd, pathPtr, pathLen),
+);
+wrapReadOnlyPathMutation(
+  'path_rename',
+  (oldFd, oldPathPtr, oldPathLen, newFd, newPathPtr, newPathLen) =>
+    resolvedGuestPathIsReadOnly(oldFd, oldPathPtr, oldPathLen) ||
+    resolvedGuestPathIsReadOnly(newFd, newPathPtr, newPathLen),
+);
+wrapReadOnlyPathMutation('path_symlink', (_oldPathPtr, _oldPathLen, fd, newPathPtr, newPathLen) =>
+  resolvedGuestPathIsReadOnly(fd, newPathPtr, newPathLen),
+);
+wrapReadOnlyPathMutation('path_unlink_file', (fd, pathPtr, pathLen) =>
+  resolvedGuestPathIsReadOnly(fd, pathPtr, pathLen),
+);
 
 if (isWorkspaceReadOnly()) {
 
@@ -11222,9 +12524,45 @@ const delegateManagedFdWrite =
   typeof wasiImport.fd_write === 'function'
     ? wasiImport.fd_write.bind(wasiImport)
     : null;
+const delegateManagedFdPwrite =
+  typeof wasiImport.fd_pwrite === 'function'
+    ? wasiImport.fd_pwrite.bind(wasiImport)
+    : null;
+const delegateManagedFdSeek =
+  typeof wasiImport.fd_seek === 'function'
+    ? wasiImport.fd_seek.bind(wasiImport)
+    : null;
+const delegateManagedFdTell =
+  typeof wasiImport.fd_tell === 'function'
+    ? wasiImport.fd_tell.bind(wasiImport)
+    : null;
+const delegateManagedFdFdstatGet =
+  typeof wasiImport.fd_fdstat_get === 'function'
+    ? wasiImport.fd_fdstat_get.bind(wasiImport)
+    : null;
+const delegateManagedFdFdstatSetFlags =
+  typeof wasiImport.fd_fdstat_set_flags === 'function'
+    ? wasiImport.fd_fdstat_set_flags.bind(wasiImport)
+    : null;
+const delegateManagedFdFilestatGet =
+  typeof wasiImport.fd_filestat_get === 'function'
+    ? wasiImport.fd_filestat_get.bind(wasiImport)
+    : null;
+const delegateManagedFdFilestatSetSize =
+  typeof wasiImport.fd_filestat_set_size === 'function'
+    ? wasiImport.fd_filestat_set_size.bind(wasiImport)
+    : null;
 const delegateManagedFdClose =
   typeof wasiImport.fd_close === 'function'
     ? wasiImport.fd_close.bind(wasiImport)
+    : null;
+const delegateManagedFdPrestatGet =
+  typeof wasiImport.fd_prestat_get === 'function'
+    ? wasiImport.fd_prestat_get.bind(wasiImport)
+    : null;
+const delegateManagedFdPrestatDirName =
+  typeof wasiImport.fd_prestat_dir_name === 'function'
+    ? wasiImport.fd_prestat_dir_name.bind(wasiImport)
     : null;
 const delegateManagedPollOneoff =
   typeof wasiImport.poll_oneoff === 'function'
@@ -11273,7 +12611,42 @@ wasiImport.fd_read = (fd, iovs, iovsLen, nreadPtr) => {
     }
   }
 
-  if (numericFd === 0) {
+  if (handle?.kind === 'guest-file') {
+    try {
+      const requestedLength = (() => {
+        if (!(instanceMemory instanceof WebAssembly.Memory)) {
+          return 0;
+        }
+        const view = new DataView(instanceMemory.buffer);
+        let total = 0;
+        for (let index = 0; index < (Number(iovsLen) >>> 0); index += 1) {
+          const entryOffset = (Number(iovs) >>> 0) + index * 8;
+          total += view.getUint32(entryOffset + 4, true);
+        }
+        return total >>> 0;
+      })();
+      const buffer = Buffer.alloc(requestedLength);
+      const bytesRead = fsModule.readSync(
+        handle.targetFd,
+        buffer,
+        0,
+        requestedLength,
+        handle.position ?? 0,
+      );
+      handle.position = (handle.position ?? 0) + bytesRead;
+      const written = writeBytesToGuestIovs(iovs, iovsLen, buffer.subarray(0, bytesRead));
+      return writeGuestUint32(nreadPtr, written);
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+  }
+
+  if (
+    numericFd === 0 &&
+    handle?.kind === 'passthrough' &&
+    handle.targetFd === 0 &&
+    passthroughHandles.get(0) === handle
+  ) {
     const sidecarManagedProcess =
       typeof process?.env?.AGENT_OS_SANDBOX_ROOT === 'string' &&
       process.env.AGENT_OS_SANDBOX_ROOT.length > 0;
@@ -11303,10 +12676,18 @@ wasiImport.fd_read = (fd, iovs, iovsLen, nreadPtr) => {
     }
   }
 
+  if (!handle && numericFd <= 2) {
+    return WASI_ERRNO_BADF;
+  }
+
   if (handle?.kind === 'passthrough') {
     return delegateManagedFdRead
       ? delegateManagedFdRead(handle.targetFd, iovs, iovsLen, nreadPtr)
       : WASI_ERRNO_BADF;
+  }
+
+  if (rejectClosedPassthroughFd(numericFd)) {
+    return WASI_ERRNO_BADF;
   }
 
   return delegateManagedFdRead
@@ -11316,10 +12697,43 @@ wasiImport.fd_read = (fd, iovs, iovsLen, nreadPtr) => {
 
 wasiImport.fd_pread = (fd, iovs, iovsLen, offset, nreadPtr) => {
   const handle = lookupFdHandle(fd);
+  if (handle?.kind === 'guest-file') {
+    try {
+      const requestedLength = (() => {
+        if (!(instanceMemory instanceof WebAssembly.Memory)) {
+          return 0;
+        }
+        const view = new DataView(instanceMemory.buffer);
+        let total = 0;
+        for (let index = 0; index < (Number(iovsLen) >>> 0); index += 1) {
+          const entryOffset = (Number(iovs) >>> 0) + index * 8;
+          total += view.getUint32(entryOffset + 4, true);
+        }
+        return total >>> 0;
+      })();
+      const buffer = Buffer.alloc(requestedLength);
+      const bytesRead = fsModule.readSync(
+        handle.targetFd,
+        buffer,
+        0,
+        requestedLength,
+        Number(offset),
+      );
+      const written = writeBytesToGuestIovs(iovs, iovsLen, buffer.subarray(0, bytesRead));
+      return writeGuestUint32(nreadPtr, written);
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+  }
+
   if (handle?.kind === 'passthrough') {
     return delegateFdPread
       ? delegateFdPread(handle.targetFd, iovs, iovsLen, offset, nreadPtr)
       : WASI_ERRNO_BADF;
+  }
+
+  if (rejectClosedPassthroughFd(fd)) {
+    return WASI_ERRNO_BADF;
   }
 
   return delegateFdPread
@@ -11327,13 +12741,283 @@ wasiImport.fd_pread = (fd, iovs, iovsLen, offset, nreadPtr) => {
     : WASI_ERRNO_BADF;
 };
 
+wasiImport.fd_pwrite = (fd, iovs, iovsLen, offset, nwrittenPtr) => {
+  const handle = lookupFdHandle(fd);
+  if (handle?.kind === 'guest-file') {
+    try {
+      const bytes = collectGuestIovBytes(iovs, iovsLen);
+      const written = fsModule.writeSync(
+        handle.targetFd,
+        bytes,
+        0,
+        bytes.length,
+        Number(offset),
+      );
+      return writeGuestUint32(nwrittenPtr, written);
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+  }
+
+  if (handle?.kind === 'passthrough') {
+    if (handle.readOnly === true) {
+      return WASI_ERRNO_ROFS;
+    }
+    return delegateManagedFdPwrite
+      ? delegateManagedFdPwrite(handle.targetFd, iovs, iovsLen, offset, nwrittenPtr)
+      : WASI_ERRNO_BADF;
+  }
+
+  if (rejectClosedPassthroughFd(fd)) {
+    return WASI_ERRNO_BADF;
+  }
+
+  return delegateManagedFdPwrite
+    ? delegateManagedFdPwrite(fd, iovs, iovsLen, offset, nwrittenPtr)
+    : WASI_ERRNO_BADF;
+};
+
 wasiImport.fd_sync = (fd) => {
   const handle = lookupFdHandle(fd);
+  if (handle?.kind === 'guest-file') {
+    return WASI_ERRNO_SUCCESS;
+  }
+
   if (handle?.kind === 'passthrough') {
     return delegateFdSync ? delegateFdSync(handle.targetFd) : WASI_ERRNO_SUCCESS;
   }
 
+  if (rejectClosedPassthroughFd(fd)) {
+    return WASI_ERRNO_BADF;
+  }
+
   return delegateFdSync ? delegateFdSync(fd) : WASI_ERRNO_SUCCESS;
+};
+
+wasiImport.fd_seek = (fd, offset, whence, newOffsetPtr) => {
+  const handle = lookupFdHandle(fd);
+  if (handle?.kind === 'guest-file') {
+    try {
+      const next = seekGuestFileHandle(handle, offset, whence);
+      if (next == null) {
+        return WASI_ERRNO_INVAL;
+      }
+      return writeGuestUint64(newOffsetPtr, next);
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+  }
+
+  if (handle && handle.kind !== 'passthrough') {
+    return WASI_ERRNO_SPIPE;
+  }
+
+  if (handle?.kind === 'passthrough') {
+    return delegateManagedFdSeek
+      ? delegateManagedFdSeek(handle.targetFd, offset, whence, newOffsetPtr)
+      : WASI_ERRNO_BADF;
+  }
+
+  if (rejectClosedPassthroughFd(fd)) {
+    return WASI_ERRNO_BADF;
+  }
+
+  return delegateManagedFdSeek
+    ? delegateManagedFdSeek(fd, offset, whence, newOffsetPtr)
+    : WASI_ERRNO_BADF;
+};
+
+wasiImport.fd_tell = (fd, offsetPtr) => {
+  const handle = lookupFdHandle(fd);
+  if (handle?.kind === 'guest-file') {
+    return writeGuestUint64(offsetPtr, BigInt(handle.position ?? 0));
+  }
+
+  if (handle && handle.kind !== 'passthrough') {
+    return WASI_ERRNO_SPIPE;
+  }
+
+  if (handle?.kind === 'passthrough') {
+    return delegateManagedFdTell
+      ? delegateManagedFdTell(handle.targetFd, offsetPtr)
+      : WASI_ERRNO_BADF;
+  }
+
+  if (rejectClosedPassthroughFd(fd)) {
+    return WASI_ERRNO_BADF;
+  }
+
+  return delegateManagedFdTell
+    ? delegateManagedFdTell(fd, offsetPtr)
+    : WASI_ERRNO_BADF;
+};
+
+wasiImport.fd_fdstat_get = (fd, statPtr) => {
+  const handle = lookupFdHandle(fd);
+  if (handle?.kind === 'pipe-read') {
+    return writeGuestFdstat(
+      statPtr,
+      WASI_FILETYPE_UNKNOWN,
+      0,
+      WASI_RIGHT_FD_READ |
+        WASI_RIGHT_FD_FDSTAT_SET_FLAGS |
+        WASI_RIGHT_FD_FILESTAT_GET |
+        WASI_RIGHT_POLL_FD_READWRITE,
+      0n,
+    );
+  }
+
+  if (handle?.kind === 'pipe-write') {
+    return writeGuestFdstat(
+      statPtr,
+      WASI_FILETYPE_UNKNOWN,
+      0,
+      WASI_RIGHT_FD_WRITE |
+        WASI_RIGHT_FD_FDSTAT_SET_FLAGS |
+        WASI_RIGHT_FD_FILESTAT_GET |
+        WASI_RIGHT_POLL_FD_READWRITE,
+      0n,
+    );
+  }
+
+  if (handle && handle.kind !== 'passthrough') {
+    return WASI_ERRNO_BADF;
+  }
+
+  if (handle?.kind === 'passthrough') {
+    return delegateManagedFdFdstatGet
+      ? delegateManagedFdFdstatGet(handle.targetFd, statPtr)
+      : WASI_ERRNO_BADF;
+  }
+
+  if (rejectClosedPassthroughFd(fd)) {
+    return WASI_ERRNO_BADF;
+  }
+
+  return delegateManagedFdFdstatGet
+    ? delegateManagedFdFdstatGet(fd, statPtr)
+    : WASI_ERRNO_BADF;
+};
+
+wasiImport.fd_fdstat_set_flags = (fd, flags) => {
+  const handle = lookupFdHandle(fd);
+  if (handle && handle.kind !== 'passthrough') {
+    return WASI_ERRNO_BADF;
+  }
+
+  if (handle?.kind === 'passthrough') {
+    return delegateManagedFdFdstatSetFlags
+      ? delegateManagedFdFdstatSetFlags(handle.targetFd, flags)
+      : WASI_ERRNO_BADF;
+  }
+
+  if (rejectClosedPassthroughFd(fd)) {
+    return WASI_ERRNO_BADF;
+  }
+
+  return delegateManagedFdFdstatSetFlags
+    ? delegateManagedFdFdstatSetFlags(fd, flags)
+    : WASI_ERRNO_BADF;
+};
+
+wasiImport.fd_filestat_get = (fd, statPtr) => {
+  const handle = lookupFdHandle(fd);
+  if (handle?.kind === 'guest-file') {
+    try {
+      return writeGuestFilestat(statPtr, fsModule.fstatSync(handle.targetFd));
+    } catch (error) {
+      return mapSyntheticFsError(error);
+    }
+  }
+
+  if (handle?.kind === 'passthrough') {
+    return delegateManagedFdFilestatGet
+      ? delegateManagedFdFilestatGet(handle.targetFd, statPtr)
+      : WASI_ERRNO_BADF;
+  }
+
+  if (rejectClosedPassthroughFd(fd)) {
+    return WASI_ERRNO_BADF;
+  }
+
+  return delegateManagedFdFilestatGet
+    ? delegateManagedFdFilestatGet(fd, statPtr)
+    : WASI_ERRNO_BADF;
+};
+
+wasiImport.fd_filestat_set_size = (fd, size) => {
+  const handle = lookupFdHandle(fd);
+  if (handle?.kind === 'guest-file') {
+    try {
+      const nextSize = Number(size);
+      fsModule.ftruncateSync(handle.targetFd, nextSize);
+      if ((handle.position ?? 0) > nextSize) {
+        handle.position = nextSize;
+      }
+      return WASI_ERRNO_SUCCESS;
+    } catch (error) {
+      return mapSyntheticFsError(error);
+    }
+  }
+
+  if (handle?.kind === 'passthrough') {
+    if (handle.readOnly === true) {
+      return WASI_ERRNO_ROFS;
+    }
+    return delegateManagedFdFilestatSetSize
+      ? delegateManagedFdFilestatSetSize(handle.targetFd, size)
+      : WASI_ERRNO_BADF;
+  }
+
+  if (rejectClosedPassthroughFd(fd)) {
+    return WASI_ERRNO_BADF;
+  }
+
+  return delegateManagedFdFilestatSetSize
+    ? delegateManagedFdFilestatSetSize(fd, size)
+    : WASI_ERRNO_BADF;
+};
+
+wasiImport.fd_prestat_get = (fd, prestatPtr) => {
+  const handle = lookupFdHandle(fd);
+  if (handle && handle.kind !== 'passthrough') {
+    return WASI_ERRNO_BADF;
+  }
+
+  if (handle?.kind === 'passthrough') {
+    return delegateManagedFdPrestatGet
+      ? delegateManagedFdPrestatGet(handle.targetFd, prestatPtr)
+      : WASI_ERRNO_BADF;
+  }
+
+  if (rejectClosedPassthroughFd(fd)) {
+    return WASI_ERRNO_BADF;
+  }
+
+  return delegateManagedFdPrestatGet
+    ? delegateManagedFdPrestatGet(fd, prestatPtr)
+    : WASI_ERRNO_BADF;
+};
+
+wasiImport.fd_prestat_dir_name = (fd, pathPtr, pathLen) => {
+  const handle = lookupFdHandle(fd);
+  if (handle && handle.kind !== 'passthrough') {
+    return WASI_ERRNO_BADF;
+  }
+
+  if (handle?.kind === 'passthrough') {
+    return delegateManagedFdPrestatDirName
+      ? delegateManagedFdPrestatDirName(handle.targetFd, pathPtr, pathLen)
+      : WASI_ERRNO_BADF;
+  }
+
+  if (rejectClosedPassthroughFd(fd)) {
+    return WASI_ERRNO_BADF;
+  }
+
+  return delegateManagedFdPrestatDirName
+    ? delegateManagedFdPrestatDirName(fd, pathPtr, pathLen)
+    : WASI_ERRNO_BADF;
 };
 
 wasiImport.fd_write = (fd, iovs, iovsLen, nwrittenPtr) => {
@@ -11342,6 +13026,9 @@ wasiImport.fd_write = (fd, iovs, iovsLen, nwrittenPtr) => {
   if (handle?.kind === 'pipe-write') {
     try {
       const bytes = collectGuestIovBytes(iovs, iovsLen);
+      if (bytes.length > 0 && !pipeHasReaders(handle.pipe)) {
+        return WASI_ERRNO_PIPE;
+      }
       enqueuePipeBytes(handle.pipe, bytes);
       flushPipeConsumers(handle.pipe);
       return writeGuestUint32(nwrittenPtr, bytes.length);
@@ -11350,10 +13037,27 @@ wasiImport.fd_write = (fd, iovs, iovsLen, nwrittenPtr) => {
     }
   }
 
+  if (handle?.kind === 'guest-file') {
+    try {
+      const bytes = collectGuestIovBytes(iovs, iovsLen);
+      const written = writeBytesToGuestFileHandle(handle, bytes);
+      return writeGuestUint32(nwrittenPtr, written);
+    } catch {
+      return WASI_ERRNO_FAULT;
+    }
+  }
+
   if (handle?.kind === 'passthrough') {
+    if (handle.readOnly === true) {
+      return WASI_ERRNO_ROFS;
+    }
     return delegateManagedFdWrite
       ? delegateManagedFdWrite(handle.targetFd, iovs, iovsLen, nwrittenPtr)
       : WASI_ERRNO_BADF;
+  }
+
+  if (!handle && numericFd <= 2) {
+    return WASI_ERRNO_BADF;
   }
 
   if (numericFd === 1 || numericFd === 2) {
@@ -11373,6 +13077,10 @@ wasiImport.fd_write = (fd, iovs, iovsLen, nwrittenPtr) => {
     } catch {
       return WASI_ERRNO_FAULT;
     }
+  }
+
+  if (rejectClosedPassthroughFd(fd)) {
+    return WASI_ERRNO_BADF;
   }
 
   return delegateManagedFdWrite
@@ -11397,7 +13105,16 @@ wasiImport.fd_close = (fd) => {
       fd: Number(fd) >>> 0,
       targetFd: handle.targetFd ?? null,
     });
+    closePassthroughFd(fd);
     return WASI_ERRNO_SUCCESS;
+  }
+
+  if (!handle && Number(fd) >>> 0 <= 2) {
+    return WASI_ERRNO_BADF;
+  }
+
+  if (rejectClosedPassthroughFd(fd)) {
+    return WASI_ERRNO_BADF;
   }
 
   if (delegateManagedFdRefCounts.has(Number(fd) >>> 0)) {
@@ -11461,6 +13178,17 @@ wasiImport.poll_oneoff = (inPtr, outPtr, nsubscriptions, neventsPtr) => {
 
     const fd = view.getUint32(base + 16, true);
     const handle = lookupFdHandle(fd);
+    if (!handle && rejectClosedPassthroughFd(fd)) {
+      hasSyntheticSubscription = true;
+      subscriptions.push({
+        kind: tag === 1 ? 'fd_read' : 'fd_write',
+        fd,
+        handle,
+        userdata,
+        error: WASI_ERRNO_BADF,
+      });
+      continue;
+    }
     if (handle && handle.kind !== 'passthrough') {
       hasSyntheticSubscription = true;
     } else if (handle?.kind === 'passthrough') {
@@ -11566,6 +13294,17 @@ wasiImport.poll_oneoff = (inPtr, outPtr, nsubscriptions, neventsPtr) => {
 
   while (readyEvents.length === 0) {
     for (const subscription of subscriptions) {
+      if (subscription.error != null) {
+        readyEvents.push({
+          userdata: subscription.userdata,
+          error: subscription.error,
+          type: subscription.kind === 'fd_read' ? 1 : 2,
+          nbytes: 0,
+          flags: 0,
+        });
+        continue;
+      }
+
       if (subscription.kind === 'fd_read' && subscription.handle?.kind === 'pipe-read') {
         const pipe = subscription.handle.pipe;
         if (pipe.chunks.length > 0 || (pipe.writeHandleCount === 0 && pipe.producers.size === 0)) {
@@ -11672,6 +13411,28 @@ const instance = new WebAssembly.Instance(module, {
 if (instance.exports.memory instanceof WebAssembly.Memory) {
   instanceMemory = instance.exports.memory;
 }
+
+function dispatchWasmSignal(signal) {
+  const numeric = Number(signal) | 0;
+  if (
+    numeric > 0 &&
+    typeof instance?.exports?.__wasi_signal_trampoline === 'function'
+  ) {
+    instance.exports.__wasi_signal_trampoline(numeric);
+  }
+}
+
+Object.defineProperty(globalThis, '__agentOsWasmSignalDispatch', {
+  configurable: true,
+  writable: true,
+  value: (_eventType, payload) => {
+    const signal =
+      typeof payload?.number === 'number'
+        ? payload.number
+        : signalNumberFromName(payload?.signal);
+    dispatchWasmSignal(signal);
+  },
+});
 
 if (typeof instance.exports._start === 'function') {
   // The `RuntimeError: unreachable` reports that used to point at
@@ -12263,10 +14024,6 @@ fn render_patched_pyodide_mjs() -> String {
             r#"async function fe(e){if(e.startsWith("file://")&&(e=e.slice(7)),e.includes("://")){let t=await(await fetch(e)).text();await import(`data:text/javascript;base64,${$e(t)}`);return}await import(e.startsWith("/")?e:$.pathToFileURL(e).href)}o(fe,"nodeLoadScript");"#,
         )
         .replace(
-            r#"function ce(e,t){return e.startsWith("file://")&&(e=e.slice(7)),e.includes("://")?{response:fetch(e)}:{binary:L.readFile(e).then(n=>new Uint8Array(n.buffer,n.byteOffset,n.byteLength))}}o(ce,"node_getBinaryResponse");"#,
-            r#"function ce(e,t){return e.startsWith("file://")&&(e=e.slice(7)),e.includes("://")?{response:fetch(e)}:{binary:L.readFile(e).then(n=>new Uint8Array(n.buffer,n.byteOffset,n.byteLength))}}o(ce,"node_getBinaryResponse");"#,
-        )
-        .replace(
             r#"function Ne(e){if(typeof WasmOffsetConverter<"u")return;let{binary:t,response:n}=R(e+"pyodide.asm.wasm"),i=K();return function(s,r){return async function(){s.sentinel=await i;try{let a;if(n){a=await WebAssembly.instantiateStreaming(n,s);}else{let l=await t;a=await WebAssembly.instantiate(l,s);}let{instance:l,module:c}=a;r(l,c);}catch(a){console.warn("wasm instantiation failed!"),console.warn(a)}}(),{}}}o(Ne,"getInstantiateWasmFunc");"#,
             r#"function Ne(e){if(typeof WasmOffsetConverter<"u")return;let{binary:t,response:n}=R(e+"pyodide.asm.wasm"),i=K();return function(s,r){return async function(){s.sentinel=await i;try{let a;if(n){a=await WebAssembly.instantiateStreaming(n,s);}else{let l=await t;a=await WebAssembly.instantiate(l,s);}let{instance:l,module:c}=a;r(l,c);}catch(a){console.warn("wasm instantiation failed!"),console.warn(a);throw a}}(),{}}}o(Ne,"getInstantiateWasmFunc");"#,
         )
@@ -12297,6 +14054,7 @@ fn render_builtin_asset_source(asset: &BuiltinAsset) -> String {
         "https" => render_https_builtin_asset_source(asset.init_counter_key),
         "tls" => render_tls_builtin_asset_source(asset.init_counter_key),
         "os" => render_os_builtin_asset_source(asset.init_counter_key),
+        "util" => render_util_builtin_asset_source(asset.init_counter_key),
         "v8" => render_v8_builtin_asset_source(asset.init_counter_key),
         "vm" => render_vm_builtin_asset_source(asset.init_counter_key),
         "worker-threads" => render_worker_threads_builtin_asset_source(asset.init_counter_key),
@@ -12321,6 +14079,21 @@ const builtin = namespace.default ?? namespace;\n\n\
 export const __agentOsInitCount = initCount;\n\
 export default builtin;\n\
 export * from {module_specifier};\n"
+    )
+}
+
+fn render_util_builtin_asset_source(init_counter_key: &str) -> String {
+    let init_counter_key = format!("{init_counter_key:?}");
+
+    format!(
+        "import * as namespace from \"node:util\";\n\n\
+const initCount = (globalThis[{init_counter_key}] ?? 0) + 1;\n\
+globalThis[{init_counter_key}] = initCount;\n\
+const builtin = namespace.default ?? namespace;\n\n\
+export const __agentOsInitCount = initCount;\n\
+export default builtin;\n\
+export const formatWithOptions = builtin.formatWithOptions;\n\
+export * from \"node:util\";\n"
     )
 }
 
@@ -12631,33 +14404,120 @@ fn render_diagnostics_channel_builtin_asset_source(init_counter_key: &str) -> St
     let init_counter_key = format!("{init_counter_key:?}");
 
     format!(
-        "const initCount = (globalThis[{init_counter_key}] ?? 0) + 1;\n\
-globalThis[{init_counter_key}] = initCount;\n\
-\n\
-function channel(name = '') {{\n\
-  const channelName = String(name);\n\
-  return {{\n\
-    name: channelName,\n\
-    hasSubscribers: false,\n\
-    publish() {{}},\n\
-    subscribe() {{}},\n\
-    unsubscribe() {{}},\n\
-  }};\n\
-}}\n\
-\n\
-function hasSubscribers() {{\n\
-  return false;\n\
-}}\n\
-\n\
-function subscribe() {{}}\n\
-\n\
-function unsubscribe() {{}}\n\
-\n\
-const mod = {{ channel, hasSubscribers, subscribe, unsubscribe }};\n\
-\n\
-export const __agentOsInitCount = initCount;\n\
-export default mod;\n\
-export {{ channel, hasSubscribers, subscribe, unsubscribe }};\n"
+        r#"const initCount = (globalThis[{init_counter_key}] ?? 0) + 1;
+globalThis[{init_counter_key}] = initCount;
+
+class Channel {{
+  constructor(name = '') {{
+    this.name = String(name);
+    this._subscribers = new Set();
+  }}
+
+  get hasSubscribers() {{
+    return this._subscribers.size > 0;
+  }}
+
+  publish(message) {{
+    for (const subscriber of Array.from(this._subscribers)) {{
+      subscriber(message, this.name);
+    }}
+  }}
+
+  subscribe(subscriber) {{
+    if (typeof subscriber === 'function') {{
+      this._subscribers.add(subscriber);
+    }}
+  }}
+
+  unsubscribe(subscriber) {{
+    return this._subscribers.delete(subscriber);
+  }}
+
+  runStores(context, callback, thisArg, ...args) {{
+    if (typeof callback !== 'function') {{
+      return callback;
+    }}
+    return callback.apply(thisArg, args);
+  }}
+}}
+
+const channelCache = new Map();
+
+function channel(name = '') {{
+  const channelName = String(name);
+  let existing = channelCache.get(channelName);
+  if (!existing) {{
+    existing = new Channel(channelName);
+    channelCache.set(channelName, existing);
+  }}
+  return existing;
+}}
+
+function hasSubscribers(name = '') {{
+  return channel(name).hasSubscribers;
+}}
+
+function subscribe(name = '', subscriber) {{
+  return channel(name).subscribe(subscriber);
+}}
+
+function unsubscribe(name = '', subscriber) {{
+  return channel(name).unsubscribe(subscriber);
+}}
+
+function tracingChannel(name = '') {{
+  const channelName = String(name);
+  const tracing = {{
+    start: channel(`tracing:${{channelName}}:start`),
+    end: channel(`tracing:${{channelName}}:end`),
+    asyncStart: channel(`tracing:${{channelName}}:asyncStart`),
+    asyncEnd: channel(`tracing:${{channelName}}:asyncEnd`),
+    error: channel(`tracing:${{channelName}}:error`),
+    subscribe() {{}},
+    unsubscribe() {{
+      return true;
+    }},
+    traceSync(fn, context, thisArg, ...args) {{
+      if (typeof fn !== 'function') {{
+        return fn;
+      }}
+      return fn.apply(thisArg, args);
+    }},
+    tracePromise(fn, context, thisArg, ...args) {{
+      if (typeof fn !== 'function') {{
+        return Promise.resolve(fn);
+      }}
+      return Promise.resolve(fn.apply(thisArg, args));
+    }},
+    traceCallback(fn, position, context, thisArg, ...args) {{
+      if (typeof fn !== 'function') {{
+        return fn;
+      }}
+      return fn.apply(thisArg, args);
+    }},
+  }};
+  Object.defineProperty(tracing, 'hasSubscribers', {{
+    get() {{
+      return (
+        tracing.start.hasSubscribers ||
+        tracing.end.hasSubscribers ||
+        tracing.asyncStart.hasSubscribers ||
+        tracing.asyncEnd.hasSubscribers ||
+        tracing.error.hasSubscribers
+      );
+    }},
+    enumerable: false,
+    configurable: true,
+  }});
+  return tracing;
+}}
+
+const mod = {{ Channel, channel, hasSubscribers, subscribe, tracingChannel, unsubscribe }};
+
+export const __agentOsInitCount = initCount;
+export default mod;
+export {{ Channel, channel, hasSubscribers, subscribe, tracingChannel, unsubscribe }};
+"#
     )
 }
 
@@ -13089,7 +14949,9 @@ fn write_file_if_changed(path: &Path, contents: &str) -> Result<(), io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NodeImportCache, NODE_IMPORT_CACHE_TEST_MATERIALIZE_DELAY_MS};
+    use super::{
+        NodeImportCache, NODE_IMPORT_CACHE_TEST_MATERIALIZE_DELAY_MS, NODE_WASM_RUNNER_SOURCE,
+    };
     use crate::host_node::node_binary;
     use serde_json::Value;
     use std::collections::BTreeSet;
@@ -13858,6 +15720,205 @@ export async function loadPyodide(options) {
     }
 
     #[test]
+    fn materialized_loader_prunes_persisted_resolution_cache_state() {
+        assert_node_available();
+
+        let temp_root = tempdir().expect("create node import cache temp root");
+        let workspace = tempdir().expect("create loader test workspace");
+        let import_cache = NodeImportCache::new_in(temp_root.path().to_path_buf());
+        import_cache
+            .ensure_materialized()
+            .expect("materialize node import cache");
+
+        let driver_path = workspace.path().join("drive-loader-cache.mjs");
+        write_fixture(
+            &driver_path,
+            r#"
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const [loaderPath, workspaceRoot] = process.argv.slice(2);
+const loader = await import(`${pathToFileURL(loaderPath).href}?case=${process.pid}-${Date.now()}`);
+const parentURL = pathToFileURL(path.join(workspaceRoot, 'entry.mjs')).href;
+
+for (let index = 0; index < 600; index += 1) {
+  const specifier = `pkg-${index}`;
+  const resolvedPath = path.join(workspaceRoot, 'node_modules', specifier, 'index.mjs');
+  await loader.resolve(specifier, { parentURL }, async () => ({
+    url: pathToFileURL(resolvedPath).href,
+    format: 'module',
+  }));
+}
+"#,
+        );
+
+        let output = Command::new(node_binary())
+            .arg(&driver_path)
+            .arg(&import_cache.loader_path)
+            .arg(workspace.path())
+            .env("AGENT_OS_NODE_IMPORT_CACHE_PATH", import_cache.cache_path())
+            .env(
+                "AGENT_OS_NODE_IMPORT_CACHE_ASSET_ROOT",
+                import_cache.asset_root(),
+            )
+            .output()
+            .expect("run loader cache driver");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+
+        let state: Value = serde_json::from_str(
+            &fs::read_to_string(import_cache.cache_path()).expect("read cache state"),
+        )
+        .expect("parse cache state");
+        let resolutions = state["resolutions"]
+            .as_object()
+            .expect("resolution cache object");
+
+        assert_eq!(resolutions.len(), 512);
+        assert!(
+            resolutions.keys().any(|key| key.contains("pkg-599")),
+            "newest resolution should be retained"
+        );
+        assert!(
+            !resolutions.keys().any(|key| key.contains("pkg-0\"")),
+            "oldest resolution should be pruned"
+        );
+    }
+
+    #[test]
+    fn materialized_loader_ignores_oversized_state_during_flush_merge() {
+        assert_node_available();
+
+        let temp_root = tempdir().expect("create node import cache temp root");
+        let workspace = tempdir().expect("create loader test workspace");
+        let import_cache = NodeImportCache::new_in(temp_root.path().to_path_buf());
+        import_cache
+            .ensure_materialized()
+            .expect("materialize node import cache");
+        fs::create_dir_all(import_cache.cache_path().parent().expect("cache parent"))
+            .expect("create cache parent");
+        fs::write(import_cache.cache_path(), vec![b' '; 5 * 1024 * 1024])
+            .expect("seed oversized cache state");
+
+        let driver_path = workspace.path().join("drive-oversized-state.mjs");
+        write_fixture(
+            &driver_path,
+            r#"
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const [loaderPath, workspaceRoot] = process.argv.slice(2);
+const loader = await import(`${pathToFileURL(loaderPath).href}?case=oversized-${process.pid}-${Date.now()}`);
+const parentURL = pathToFileURL(path.join(workspaceRoot, 'entry.mjs')).href;
+await loader.resolve('pkg-fresh', { parentURL }, async () => ({
+  url: pathToFileURL(path.join(workspaceRoot, 'node_modules/pkg-fresh/index.mjs')).href,
+  format: 'module',
+}));
+"#,
+        );
+
+        let output = Command::new(node_binary())
+            .arg(&driver_path)
+            .arg(&import_cache.loader_path)
+            .arg(workspace.path())
+            .env("AGENT_OS_NODE_IMPORT_CACHE_PATH", import_cache.cache_path())
+            .env(
+                "AGENT_OS_NODE_IMPORT_CACHE_ASSET_ROOT",
+                import_cache.asset_root(),
+            )
+            .output()
+            .expect("run oversized state driver");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+
+        let state_contents =
+            fs::read_to_string(import_cache.cache_path()).expect("read rewritten cache state");
+        assert!(
+            state_contents.len() < 4 * 1024 * 1024,
+            "cache state should be rewritten below the hard limit"
+        );
+        let state: Value = serde_json::from_str(&state_contents).expect("parse cache state");
+        assert_eq!(
+            state["resolutions"]
+                .as_object()
+                .expect("resolution cache object")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn materialized_loader_prunes_unreferenced_projected_source_files() {
+        assert_node_available();
+
+        let temp_root = tempdir().expect("create node import cache temp root");
+        let workspace = tempdir().expect("create loader test workspace");
+        let import_cache = NodeImportCache::new_in(temp_root.path().to_path_buf());
+        import_cache
+            .ensure_materialized()
+            .expect("materialize node import cache");
+        let node_modules = workspace.path().join("node_modules");
+        fs::create_dir_all(&node_modules).expect("create node_modules");
+        for index in 0..520 {
+            let package_dir = node_modules.join(format!("pkg-{index}"));
+            fs::create_dir_all(&package_dir).expect("create package dir");
+            fs::write(
+                package_dir.join("index.mjs"),
+                format!("import fs from 'node:fs';\nexport const value = {index};\n"),
+            )
+            .expect("write package source");
+        }
+
+        let driver_path = workspace.path().join("drive-projected-source-cache.mjs");
+        write_fixture(
+            &driver_path,
+            r#"
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const [loaderPath, workspaceRoot] = process.argv.slice(2);
+const loader = await import(`${pathToFileURL(loaderPath).href}?case=projected-${process.pid}-${Date.now()}`);
+
+for (let index = 0; index < 520; index += 1) {
+  const filePath = path.join(workspaceRoot, 'node_modules', `pkg-${index}`, 'index.mjs');
+  await loader.load(pathToFileURL(filePath).href, { format: 'module' }, async () => {
+    throw new Error('nextLoad should not run for projected package sources');
+  });
+}
+"#,
+        );
+
+        let guest_path_mappings = format!(
+            r#"[{{"guestPath":"/root/node_modules","hostPath":"{}"}}]"#,
+            node_modules.display()
+        );
+        let output = Command::new(node_binary())
+            .arg(&driver_path)
+            .arg(&import_cache.loader_path)
+            .arg(workspace.path())
+            .env("AGENT_OS_NODE_IMPORT_CACHE_PATH", import_cache.cache_path())
+            .env(
+                "AGENT_OS_NODE_IMPORT_CACHE_ASSET_ROOT",
+                import_cache.asset_root(),
+            )
+            .env("AGENT_OS_GUEST_PATH_MAPPINGS", guest_path_mappings)
+            .output()
+            .expect("run projected source cache driver");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+
+        let projected_source_root = import_cache
+            .cache_path()
+            .parent()
+            .expect("cache parent")
+            .join("projected-sources");
+        let cached_file_count = fs::read_dir(&projected_source_root)
+            .expect("read projected source cache")
+            .count();
+        assert_eq!(cached_file_count, 512);
+    }
+
+    #[test]
     fn ensure_materialized_writes_denied_builtin_assets_for_hardened_modules() {
         let import_cache = NodeImportCache::default();
         import_cache
@@ -13940,7 +16001,8 @@ export async function loadPyodide(options) {
         assert!(async_hooks_asset.contains("class AsyncLocalStorage"));
         assert!(async_hooks_asset.contains("function createHook()"));
         assert!(diagnostics_asset.contains("function channel(name = '')"));
-        assert!(diagnostics_asset.contains("function hasSubscribers()"));
+        assert!(diagnostics_asset.contains("class Channel"));
+        assert!(diagnostics_asset.contains("function tracingChannel(name = '')"));
     }
 
     #[test]
@@ -14049,6 +16111,40 @@ export async function loadPyodide(options) {
         assert!(dns_promises_asset.contains("__agentOsBuiltinDns.promises"));
         assert!(dns_promises_asset.contains("export const Resolver = mod.Resolver"));
         assert!(dns_promises_asset.contains("export const resolve4 = mod.resolve4"));
+    }
+
+    #[test]
+    fn wasm_runner_preopens_dot_before_root() {
+        let dot_index = NODE_WASM_RUNNER_SOURCE
+            .find("preopens['.'] = createPreopen(HOST_CWD, cwdReadOnly);")
+            .expect("runner should preopen the current directory");
+        let root_index = NODE_WASM_RUNNER_SOURCE
+            .find("preopens['/'] = createPreopen(rootMapping.hostPath, rootMapping.readOnly);")
+            .expect("runner should preopen the guest root");
+
+        assert!(dot_index < root_index);
+    }
+
+    #[test]
+    fn wasm_runner_preserves_read_only_mappings_in_preopens() {
+        assert!(NODE_WASM_RUNNER_SOURCE
+            .contains("? { guestPath, hostPath, readOnly: entry.readOnly === true }"));
+        assert!(NODE_WASM_RUNNER_SOURCE.contains("readOnly: readOnly === true,"));
+        assert!(NODE_WASM_RUNNER_SOURCE.contains("resolveModuleGuestPathToHostMapping"));
+        assert!(NODE_WASM_RUNNER_SOURCE.contains("rightsBase: READ_ONLY_PREOPEN_RIGHTS_BASE,"));
+        assert!(NODE_WASM_RUNNER_SOURCE
+            .contains("preopens[guestPath] = createPreopen(mapping.hostPath, mapping.readOnly);"));
+        assert!(NODE_WASM_RUNNER_SOURCE.contains("const cwdReadOnly = readOnlyForCwd(guestCwd);"));
+        assert!(NODE_WASM_RUNNER_SOURCE
+            .contains("preopens['.'] = createPreopen(HOST_CWD, cwdReadOnly);"));
+        assert!(
+            NODE_WASM_RUNNER_SOURCE.contains("if (mapping.readOnly) {\n        return 1;\n      }")
+        );
+        assert!(NODE_WASM_RUNNER_SOURCE.contains("readOnly: preopenSpec?.readOnly === true,"));
+        assert!(NODE_WASM_RUNNER_SOURCE
+            .contains("resolveModuleGuestPathToHostMapping(guestPath)?.readOnly === true"));
+        assert!(NODE_WASM_RUNNER_SOURCE
+            .contains("if (handle.readOnly === true) {\n      return WASI_ERRNO_ROFS;\n    }"));
     }
 
     #[test]

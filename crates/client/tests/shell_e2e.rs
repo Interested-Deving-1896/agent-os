@@ -1,9 +1,8 @@
 //! Shell / PTY e2e against a real `agent-os-sidecar`.
 //!
-//! `open_shell` spawns a PTY-backed `sh` (a WASM command) which is NOT checked into git, so this
-//! suite is self-gating: it first probes a trivial `exec` of the shell command and, if it cannot be
-//! resolved, treats that as "WASM shell not present" and skips. The suite still compiles and passes
-//! as a skip in that environment.
+//! `open_shell` spawns a PTY-backed `sh` (a WASM command). This suite fails fast by default when
+//! that command is unavailable; set `AGENT_OS_CLIENT_ALLOW_E2E_SKIPS=1` only for local skip-only
+//! runs.
 //!
 //! When the shell IS available the suite asserts the real TS contract: open returns a synthetic
 //! `shell-N` id (NOT a pid), `on_shell_data` carries stdout, `write_shell` reaches the shell,
@@ -16,11 +15,10 @@ use futures::StreamExt;
 
 #[tokio::test]
 async fn shell_surface_open_write_data_resize_close() {
-    if !common::sidecar_available() {
-        eprintln!("skipping shell_surface_open_write_data_resize_close: sidecar binary not built");
+    if !common::require_sidecar("shell_surface_open_write_data_resize_close") {
         return;
     }
-    let os = common::new_vm().await;
+    let os = common::new_vm_with_wasm_commands().await;
 
     // --- Runtime-independent ShellNotFound contract (no WASM needed) ------------------------------
     // Every shell operation on an unknown id returns ShellNotFound, asserted against the real sidecar
@@ -33,24 +31,29 @@ async fn shell_surface_open_write_data_resize_close() {
         "write_shell(unknown) must return ShellNotFound"
     );
     assert!(
-        matches!(os.resize_shell("shell-missing", 80, 24), Err(ClientError::ShellNotFound(_))),
+        matches!(
+            os.resize_shell("shell-missing", 80, 24),
+            Err(ClientError::ShellNotFound(_))
+        ),
         "resize_shell(unknown) must return ShellNotFound"
     );
     assert!(
-        matches!(os.close_shell("shell-missing"), Err(ClientError::ShellNotFound(_))),
+        matches!(
+            os.close_shell("shell-missing"),
+            Err(ClientError::ShellNotFound(_))
+        ),
         "close_shell(unknown) must return ShellNotFound"
     );
     assert!(
-        matches!(os.on_shell_data("shell-missing"), Err(ClientError::ShellNotFound(_))),
+        matches!(
+            os.on_shell_data("shell-missing"),
+            Err(ClientError::ShellNotFound(_))
+        ),
         "on_shell_data(unknown) must return ShellNotFound"
     );
 
-    if !common::wasm_commands_available(&os).await {
-        eprintln!(
-            "skipping shell PTY assertions: WASM PTY shell (sh) not present in this environment \
-             (ShellNotFound contract above still executed)"
-        );
-        os.shutdown().await.expect("shutdown");
+    if !common::require_wasm_commands(&os, "shell_surface_open_write_data_resize_close").await {
+        os.shutdown().await.expect("shutdown after local skip");
         return;
     }
 

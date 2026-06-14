@@ -8,7 +8,6 @@
 //! only and become `Arc<dyn ...>` trait objects; they cannot cross the wire and are gated exactly as
 //! the actor layer gates them.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -153,7 +152,9 @@ pub struct SoftwareInput {
 /// error string. Stays host-side (never crosses to the guest); the guest invokes it by name via the
 /// sidecar tool-invocation callback channel.
 pub type ToolCallback = Arc<
-    dyn Fn(serde_json::Value) -> futures::future::BoxFuture<'static, Result<serde_json::Value, String>>
+    dyn Fn(
+            serde_json::Value,
+        ) -> futures::future::BoxFuture<'static, Result<serde_json::Value, String>>
         + Send
         + Sync,
 >;
@@ -191,7 +192,11 @@ pub struct Permissions {
     pub fs: Option<FsPermissions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<PatternPermissions>,
-    #[serde(default, rename = "childProcess", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "childProcess",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub child_process: Option<PatternPermissions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process: Option<PatternPermissions>,
@@ -375,8 +380,7 @@ pub enum AgentOsSidecarConfig {
 /// Mirrors the TS `ScheduleEntry.callback: () => void | Promise<void>`. The cron manager passes a
 /// closure that runs one job execution; the driver awaits it (and, for the default driver, reschedules
 /// the next cron fire afterwards).
-pub type ScheduleCallback =
-    Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+pub type ScheduleCallback = Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// A schedule entry handed to a [`ScheduleDriver`]. Mirrors TS `ScheduleEntry`
 /// (`cron/schedule-driver.ts`).
@@ -458,9 +462,7 @@ impl TimerScheduleDriver {
             }
         };
 
-        let delay = (next - now)
-            .to_std()
-            .unwrap_or(std::time::Duration::ZERO);
+        let delay = (next - now).to_std().unwrap_or(std::time::Duration::ZERO);
 
         tokio::spawn(async move {
             tokio::select! {
@@ -509,9 +511,4 @@ impl ScheduleDriver for TimerScheduleDriver {
         self.timers.scan(|_, cancel| cancel.cancel());
         self.timers.clear();
     }
-}
-
-/// Metadata helpers reused when building sidecar requests.
-pub(crate) fn empty_metadata() -> BTreeMap<String, String> {
-    BTreeMap::new()
 }

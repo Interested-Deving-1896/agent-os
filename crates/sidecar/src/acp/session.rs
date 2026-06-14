@@ -1,8 +1,8 @@
-use crate::acp::compat::{
-    derive_config_options, synthetic_config_update, synthetic_mode_update,
-    PendingPermissionRequest, SeenInboundRequestIds, RECENT_ACTIVITY_LIMIT,
-};
 use crate::acp::AcpTimeoutDiagnostics;
+use crate::acp::compat::{
+    PendingPermissionRequests, RECENT_ACTIVITY_LIMIT, SeenInboundRequestIds, derive_config_options,
+    synthetic_config_update, synthetic_mode_update,
+};
 use crate::acp::{JsonRpcError, JsonRpcId, JsonRpcNotification};
 use crate::protocol::{SequencedNotification, SessionCreatedResponse, SessionStateResponse};
 use serde::Serialize;
@@ -212,6 +212,7 @@ pub(crate) struct SequencedEvent {
 }
 
 pub(crate) const ACP_SESSION_EVENT_RETENTION_LIMIT: usize = 1024;
+pub(crate) const ACP_STDOUT_BUFFER_BYTE_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct AcpSessionState {
@@ -221,6 +222,7 @@ pub(crate) struct AcpSessionState {
     pub(crate) process_id: String,
     pub(crate) pid: Option<u32>,
     pub(crate) stdout_buffer: String,
+    pub(crate) stdout_buffer_truncated: bool,
     pub(crate) next_request_id: i64,
     pub(crate) next_sequence_number: u64,
     pub(crate) events: VecDeque<SequencedEvent>,
@@ -229,7 +231,7 @@ pub(crate) struct AcpSessionState {
     pub(crate) agent_capabilities: Option<Value>,
     pub(crate) agent_info: Option<Value>,
     pub(crate) recent_activity: VecDeque<String>,
-    pub(crate) pending_permission_requests: BTreeMap<String, PendingPermissionRequest>,
+    pub(crate) pending_permission_requests: PendingPermissionRequests,
     pub(crate) seen_inbound_request_ids: SeenInboundRequestIds,
     pub(crate) terminals: BTreeMap<String, AcpTerminalState>,
     pub(crate) next_terminal_id: u64,
@@ -277,6 +279,7 @@ impl AcpSessionState {
             process_id,
             pid,
             stdout_buffer: String::new(),
+            stdout_buffer_truncated: false,
             // The sidecar already used request ids 1 and 2 on this ACP
             // connection for initialize and session/new before the session
             // state is created. Continue from 3 so later session RPCs never
@@ -292,7 +295,7 @@ impl AcpSessionState {
             agent_capabilities: init_result.get("agentCapabilities").cloned(),
             agent_info: init_result.get("agentInfo").cloned(),
             recent_activity: VecDeque::with_capacity(RECENT_ACTIVITY_LIMIT),
-            pending_permission_requests: BTreeMap::new(),
+            pending_permission_requests: PendingPermissionRequests::default(),
             seen_inbound_request_ids: SeenInboundRequestIds::default(),
             terminals: BTreeMap::new(),
             next_terminal_id: 1,
@@ -313,7 +316,7 @@ impl AcpSessionState {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn state_response(&self) -> Result<SessionStateResponse, AcpSessionStateError> {
         self.state_response_with_additional_events(std::iter::empty())
     }
@@ -606,6 +609,19 @@ impl AcpSessionState {
         }
         self.termination_requested.then_some(true)
     }
+}
+
+pub(crate) fn trim_acp_stdout_buffer(buffer: &mut String) -> bool {
+    if buffer.len() <= ACP_STDOUT_BUFFER_BYTE_LIMIT {
+        return false;
+    }
+
+    let mut remove_len = buffer.len() - ACP_STDOUT_BUFFER_BYTE_LIMIT;
+    while !buffer.is_char_boundary(remove_len) {
+        remove_len += 1;
+    }
+    buffer.drain(..remove_len);
+    true
 }
 
 fn serialize_sequenced_notification<T: Serialize>(

@@ -9,21 +9,20 @@ use hickory_resolver::proto::op::{Message, Query};
 use hickory_resolver::proto::rr::domain::Name;
 use hickory_resolver::proto::rr::rdata::{A, AAAA, CAA, CNAME, MX, NAPTR, NS, PTR, SOA, SRV, TXT};
 use hickory_resolver::proto::rr::{RData, Record, RecordType};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use std::time::{Duration, Instant};
 use support::{
-    assert_node_available, authenticate, collect_process_output,
-    collect_process_output_with_timeout, dispose_vm_and_close_session, execute, new_sidecar,
+    assert_node_available, authenticate, dispose_vm_and_close_session, execute, new_sidecar,
     open_session, temp_dir, write_fixture,
 };
 
@@ -37,6 +36,7 @@ const ALLOWED_NODE_BUILTINS: &[&str] = &[
     "events",
     "fs",
     "module",
+    "os",
     "path",
     "perf_hooks",
     "punycode",
@@ -65,6 +65,8 @@ const BUILTIN_CONFORMANCE_CASES: &[&str] = &[
     "extended_builtin_polyfills",
 ];
 
+const PROBE_OUTPUT_BYTE_LIMIT: usize = 1024 * 1024;
+
 fn run_host_probe(cwd: &Path, entrypoint: &Path) -> Value {
     run_host_probe_with_env(cwd, entrypoint, &[])
 }
@@ -76,17 +78,53 @@ fn run_host_probe_with_env(cwd: &Path, entrypoint: &Path, env: &[(&str, &str)]) 
         command.env(key, value);
     }
 
-    let output = command.output().expect("run host node probe");
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn host node probe");
+    let stdout = child.stdout.take().expect("host probe stdout pipe");
+    let stderr = child.stderr.take().expect("host probe stderr pipe");
+    let stdout_reader = thread::spawn(move || read_probe_pipe(stdout, "stdout"));
+    let stderr_reader = thread::spawn(move || read_probe_pipe(stderr, "stderr"));
+    let status = child.wait().expect("wait host node probe");
+    let stdout = stdout_reader
+        .join()
+        .expect("join host probe stdout reader")
+        .expect("read bounded host probe stdout");
+    let stderr = stderr_reader
+        .join()
+        .expect("join host probe stderr reader")
+        .expect("read bounded host probe stderr");
 
     assert!(
-        output.status.success(),
+        status.success(),
         "host probe failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        status.code(),
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
     );
 
-    serde_json::from_slice(&output.stdout).expect("parse host probe JSON")
+    serde_json::from_slice(&stdout).expect("parse host probe JSON")
+}
+
+fn read_probe_pipe(mut pipe: impl Read, channel: &str) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = pipe
+            .read(&mut chunk)
+            .map_err(|err| format!("read host probe {channel}: {err}"))?;
+        if read == 0 {
+            return Ok(output);
+        }
+        if output.len().saturating_add(read) > PROBE_OUTPUT_BYTE_LIMIT {
+            return Err(format!(
+                "host probe exceeded {PROBE_OUTPUT_BYTE_LIMIT} bytes on {channel}"
+            ));
+        }
+        output.extend_from_slice(&chunk[..read]);
+    }
 }
 
 fn run_guest_probe(case_name: &str, cwd: &Path, entrypoint: &Path) -> Value {
@@ -100,6 +138,7 @@ fn run_guest_probe(case_name: &str, cwd: &Path, entrypoint: &Path) -> Value {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_vm_with_metadata_and_permissions(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
     request_id: i64,
@@ -131,6 +170,89 @@ fn create_vm_with_metadata_and_permissions(
         ResponsePayload::VmCreated(response) => response.vm_id,
         other => panic!("unexpected vm create response: {other:?}"),
     }
+}
+
+fn collect_builtin_process_output(
+    sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
+    connection_id: &str,
+    session_id: &str,
+    vm_id: &str,
+    process_id: &str,
+) -> (String, String, i32) {
+    collect_builtin_process_output_with_timeout(
+        sidecar,
+        connection_id,
+        session_id,
+        vm_id,
+        process_id,
+        Duration::from_secs(10),
+    )
+}
+
+fn collect_builtin_process_output_with_timeout(
+    sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
+    connection_id: &str,
+    session_id: &str,
+    vm_id: &str,
+    process_id: &str,
+    timeout: Duration,
+) -> (String, String, i32) {
+    let ownership = OwnershipScope::session(connection_id, session_id);
+    let deadline = Instant::now() + timeout;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut exit = None;
+
+    loop {
+        let event = sidecar
+            .poll_event_blocking(&ownership, Duration::from_millis(100))
+            .expect("poll builtin conformance event");
+        if let Some(event) = event {
+            assert_eq!(
+                event.ownership,
+                OwnershipScope::vm(connection_id, session_id, vm_id)
+            );
+
+            match event.payload {
+                EventPayload::ProcessOutput(ProcessOutputEvent {
+                    process_id: event_process_id,
+                    channel,
+                    chunk,
+                }) if event_process_id == process_id => match channel {
+                    StreamChannel::Stdout => {
+                        append_probe_output(&mut stdout, &chunk, &process_id, "stdout")
+                    }
+                    StreamChannel::Stderr => {
+                        append_probe_output(&mut stderr, &chunk, &process_id, "stderr")
+                    }
+                },
+                EventPayload::ProcessExited(exited) if exited.process_id == process_id => {
+                    exit = Some((exited.exit_code, Instant::now()));
+                }
+                _ => {}
+            }
+        }
+
+        if let Some((exit_code, seen_at)) = exit {
+            if Instant::now().duration_since(seen_at) >= Duration::from_millis(200) {
+                return (stdout, stderr, exit_code);
+            }
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for builtin conformance process {process_id}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+fn append_probe_output(buffer: &mut String, chunk: &[u8], process_id: &str, channel: &str) {
+    let text = String::from_utf8_lossy(chunk);
+    assert!(
+        buffer.len().saturating_add(text.len()) <= PROBE_OUTPUT_BYTE_LIMIT,
+        "builtin conformance process {process_id} exceeded {PROBE_OUTPUT_BYTE_LIMIT} bytes on {channel}"
+    );
+    buffer.push_str(&text);
 }
 
 fn run_guest_probe_with_config(
@@ -173,7 +295,7 @@ fn run_guest_probe_with_config(
         Vec::new(),
     );
 
-    let (stdout, stderr, exit_code) = collect_process_output(
+    let (stdout, stderr, exit_code) = collect_builtin_process_output(
         &mut sidecar,
         &connection_id,
         &session_id,
@@ -194,6 +316,7 @@ fn run_guest_probe_with_config(
     serde_json::from_str(stdout.trim()).expect("parse guest probe JSON")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_guest_probe_in_existing_session(
     sidecar: &mut agent_os_sidecar::NativeSidecar<support::RecordingBridge>,
     request_id_base: i64,
@@ -236,7 +359,7 @@ fn run_guest_probe_in_existing_session(
     );
 
     let (stdout, stderr, exit_code) =
-        collect_process_output(sidecar, connection_id, session_id, &vm_id, &process_id);
+        collect_builtin_process_output(sidecar, connection_id, session_id, &vm_id, &process_id);
 
     sidecar
         .dispose_vm_internal_blocking(connection_id, session_id, &vm_id, DisposeReason::Requested)
@@ -306,7 +429,7 @@ fn write_process_stdin(
             OwnershipScope::vm(connection_id, session_id, vm_id),
             RequestPayload::WriteStdin(WriteStdinRequest {
                 process_id: process_id.to_owned(),
-                chunk: chunk.to_owned(),
+                chunk: chunk.as_bytes().to_vec(),
             }),
         ))
         .expect("write builtin conformance stdin");
@@ -702,7 +825,7 @@ agent.destroy();
         &entrypoint,
         Vec::new(),
     );
-    let (stdout, stderr, exit_code) = collect_process_output(
+    let (stdout, stderr, exit_code) = collect_builtin_process_output(
         &mut sidecar,
         &connection_id,
         &session_id,
@@ -1254,8 +1377,12 @@ console.log(JSON.stringify({ callbackAnswer, promiseAnswer }));
                     channel,
                     chunk,
                 }) if process_id == "proc-readline-question" => match channel {
-                    StreamChannel::Stdout => stdout.push_str(&chunk),
-                    StreamChannel::Stderr => stderr.push_str(&chunk),
+                    StreamChannel::Stdout => {
+                        append_probe_output(&mut stdout, &chunk, &process_id, "stdout")
+                    }
+                    StreamChannel::Stderr => {
+                        append_probe_output(&mut stderr, &chunk, &process_id, "stderr")
+                    }
                 },
                 EventPayload::ProcessExited(exited)
                     if exited.process_id == "proc-readline-question" =>
@@ -1732,7 +1859,7 @@ console.log(JSON.stringify({
             (String::from("resource.cpu_count"), String::from("2")),
             (
                 String::from("resource.max_wasm_memory_bytes"),
-                String::from((64_u64 * 1024 * 1024).to_string()),
+                (64_u64 * 1024 * 1024).to_string(),
             ),
         ]),
     );
@@ -1748,7 +1875,7 @@ console.log(JSON.stringify({
             (String::from("resource.cpu_count"), String::from("5")),
             (
                 String::from("resource.max_wasm_memory_bytes"),
-                String::from((256_u64 * 1024 * 1024).to_string()),
+                (256_u64 * 1024 * 1024).to_string(),
             ),
         ]),
     );
@@ -2045,8 +2172,26 @@ fn console_conformance_matches_host_node() {
         "console",
         r#"
 import * as consoleModule from "node:console";
+import { Writable } from "node:stream";
 const consoleInstance = new consoleModule.Console(process.stdout, process.stderr);
 const task = consoleModule.createTask("demo-task");
+const detachedChunks = [];
+const detachedErrors = [];
+const createSink = (target) =>
+  new Writable({
+    write(chunk, _encoding, callback) {
+      target.push(String(chunk));
+      callback();
+    },
+  });
+const detachedConsole = new consoleModule.Console(
+  createSink(detachedChunks),
+  createSink(detachedErrors),
+);
+const detachedLog = detachedConsole.log;
+const detachedError = detachedConsole.error;
+detachedLog("detached-log");
+detachedError("detached-error");
 
 console.log(JSON.stringify({
   types: {
@@ -2081,6 +2226,8 @@ console.log(JSON.stringify({
     trace: typeof consoleInstance.trace,
     warn: typeof consoleInstance.warn,
   },
+  detachedOutput: detachedChunks.join(""),
+  detachedErrorOutput: detachedErrors.join(""),
 }));
 "#,
     );
@@ -2185,53 +2332,71 @@ console.log(JSON.stringify({
     );
 }
 
-fn child_process_fork_emits_error_async_impl() {
-    let cwd = temp_dir("builtin-child-process-fork-async-error");
+fn child_process_fork_supports_basic_ipc_impl() {
+    let cwd = temp_dir("builtin-child-process-fork-ipc");
     let entrypoint = cwd.join("entry.mjs");
+    let worker = cwd.join("worker.mjs");
+    write_fixture(
+        &worker,
+        r#"
+process.send({
+  type: "ready",
+  connected: process.connected,
+  argv: process.argv.slice(-1),
+});
+
+process.on("message", (message) => {
+  process.send({
+    type: "pong",
+    value: message.value + 1,
+    connected: process.connected,
+  });
+  process.exit(0);
+});
+"#,
+    );
     write_fixture(
         &entrypoint,
         r#"
 import childProcess from "node:child_process";
+import { Buffer } from "node:buffer";
 
-let child = null;
-let syncThrow = null;
+const child = childProcess.fork("./worker.mjs", ["worker-arg"]);
+const stdout = [];
+const messages = [];
+const errors = [];
+let sendReturn = null;
 
-try {
-  child = childProcess.fork("./worker.mjs");
-} catch (error) {
-  syncThrow = {
-    name: error?.name ?? null,
-    message: error?.message ?? null,
-  };
-}
+child.stdout.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
+child.on("error", (error) => errors.push({
+  name: error?.name ?? null,
+  message: error?.message ?? null,
+  code: error?.code ?? null,
+}));
+child.on("message", (message) => {
+  messages.push(message);
+  if (message.type === "ready") {
+    sendReturn = child.send({ type: "ping", value: 41 });
+  }
+});
 
-let errorEvent = null;
-let receivedBeforeAwait = null;
-
-if (child) {
-  child.on("error", (error) => {
-    errorEvent = {
-      name: error?.name ?? null,
-      message: error?.message ?? null,
-    };
-  });
-  receivedBeforeAwait = errorEvent !== null;
-  await Promise.resolve();
-}
+const exit = await new Promise((resolve) => {
+  child.on("close", (code, signal) => resolve({ code, signal }));
+});
 
 console.log(JSON.stringify({
-  returnedChild: child !== null,
-  hasOn: typeof child?.on === "function",
-  hasStdout: child?.stdout != null,
-  syncThrow,
-  receivedBeforeAwait,
-  errorEvent,
+  connectedAfterFork: child.connected,
+  sendReturn,
+  messages,
+  errors,
+  stdoutBase64: Buffer.concat(stdout).toString("base64"),
+  exit,
 }));
 "#,
     );
 
     let guest = run_guest_probe_with_config(
-        "child-process-fork-async-error",
+        "child-process-fork-ipc",
         &cwd,
         &entrypoint,
         BTreeMap::new(),
@@ -2239,22 +2404,40 @@ console.log(JSON.stringify({
         &["child_process"],
     );
 
-    assert_eq!(guest["returnedChild"], Value::Bool(true));
-    assert_eq!(guest["hasOn"], Value::Bool(true));
-    assert_eq!(guest["hasStdout"], Value::Bool(true));
-    assert_eq!(guest["syncThrow"], Value::Null);
-    assert_eq!(guest["receivedBeforeAwait"], Value::Bool(false));
+    let pretty_guest = serde_json::to_string_pretty(&guest).expect("pretty guest JSON");
     assert_eq!(
-        guest["errorEvent"]["message"],
-        Value::String(String::from(
-            "child_process.fork is not supported in sandbox"
-        ))
+        guest["sendReturn"],
+        Value::Bool(true),
+        "guest result:\n{pretty_guest}"
     );
+    assert_eq!(
+        guest["errors"],
+        Value::Array(Vec::new()),
+        "guest result:\n{pretty_guest}"
+    );
+    assert_eq!(guest["stdoutBase64"], Value::String(String::new()));
+    assert_eq!(guest["exit"]["code"], Value::from(0));
+    assert_eq!(guest["exit"]["signal"], Value::Null);
+    assert_eq!(
+        guest["messages"][0]["type"],
+        Value::String(String::from("ready"))
+    );
+    assert_eq!(guest["messages"][0]["connected"], Value::Bool(true));
+    assert_eq!(
+        guest["messages"][0]["argv"][0],
+        Value::String(String::from("worker-arg"))
+    );
+    assert_eq!(
+        guest["messages"][1]["type"],
+        Value::String(String::from("pong"))
+    );
+    assert_eq!(guest["messages"][1]["value"], Value::from(42));
+    assert_eq!(guest["messages"][1]["connected"], Value::Bool(true));
 }
 
 #[test]
-fn child_process_fork_emits_error_async() {
-    run_isolated_builtin_conformance_test("child-process-fork-async-error");
+fn child_process_fork_supports_basic_ipc() {
+    run_isolated_builtin_conformance_test("child-process-fork-ipc");
 }
 
 fn child_process_exec_preserves_spawn_error_codes_impl() {
@@ -2588,9 +2771,17 @@ import crypto from "node:crypto";
 
 const random = crypto.randomBytes(16);
 const uuid = crypto.randomUUID();
+const ciphers = crypto.getCiphers();
+const curves = crypto.getCurves();
 
 console.log(JSON.stringify({
   hashesIncludeSha256: crypto.getHashes().includes("sha256"),
+  ciphersIncludeAes256Cbc: ciphers.includes("aes-256-cbc"),
+  ciphersIncludeAes256Gcm: ciphers.includes("aes-256-gcm"),
+  ciphersSorted: ciphers.join(",") === [...ciphers].sort().join(","),
+  curvesIncludePrime256v1: curves.includes("prime256v1"),
+  curvesIncludeSecp384r1: curves.includes("secp384r1"),
+  curvesSorted: curves.join(",") === [...curves].sort().join(","),
   sha256: crypto.createHash("sha256").update("agent-os").digest("hex"),
   hmacSha256: crypto.createHmac("sha256", "shared-secret").update("agent-os").digest("hex"),
   randomBytesLength: random.length,
@@ -3442,10 +3633,12 @@ process.exit(0);
     assert_eq!(result["os"]["platform"], "linux");
     assert_eq!(result["os"]["arch"], "x64");
     assert_eq!(result["os"]["type"], "Linux");
-    assert!(result["os"]["homedir"]
-        .as_str()
-        .expect("os.homedir string")
-        .starts_with('/'));
+    assert!(
+        result["os"]["homedir"]
+            .as_str()
+            .expect("os.homedir string")
+            .starts_with('/')
+    );
     assert_eq!(result["os"]["tmpdir"], "/tmp");
     assert_eq!(result["os"]["userInfoHomedir"], result["os"]["homedir"]);
     assert_eq!(result["os"]["eol"], "\n");
@@ -3454,10 +3647,12 @@ process.exit(0);
     assert_eq!(result["os"]["totalmem"], 1_073_741_824u64);
     assert_eq!(result["os"]["freemem"], 536_870_912u64);
     assert_eq!(result["os"]["hasSignals"], true);
-    assert!(result["os"]["networkInterfaceKeys"]
-        .as_array()
-        .expect("network interfaces array")
-        .is_empty());
+    assert!(
+        result["os"]["networkInterfaceKeys"]
+            .as_array()
+            .expect("network interfaces array")
+            .is_empty()
+    );
     assert_eq!(result["perf"]["hasNow"], true);
     assert_eq!(result["perf"]["hasObserver"], true);
     assert_eq!(result["perf"]["measureDurationFinite"], true);
@@ -3629,7 +3824,7 @@ console.log(JSON.stringify({ hasRefAfterUnref: timer.hasRef() }));
         Vec::new(),
     );
 
-    let (stdout, stderr, exit_code) = collect_process_output_with_timeout(
+    let (stdout, stderr, exit_code) = collect_builtin_process_output_with_timeout(
         &mut sidecar,
         &connection_id,
         &session_id,
@@ -3717,7 +3912,7 @@ fn __builtin_conformance_extra_test_runner() {
     match test_name.as_str() {
         "http-request-keepalive" => http_request_custom_agent_reuses_keepalive_socket_impl(),
         "http-request-denied" => http_request_denied_egress_returns_permission_error_impl(),
-        "child-process-fork-async-error" => child_process_fork_emits_error_async_impl(),
+        "child-process-fork-ipc" => child_process_fork_supports_basic_ipc_impl(),
         "http-socket-writes" => http_socket_writes_do_not_silently_drop_data_impl(),
         "buffer-concat-truncation" => buffer_concat_truncation_matches_host_node_impl(),
         "mkdtemp-sync-collision-safe" => mkdtemp_sync_collision_safe_matches_host_node_impl(),
