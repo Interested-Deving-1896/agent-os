@@ -354,10 +354,6 @@ export interface BindingTree {
 
 export type BindingFunction = (...args: unknown[]) => unknown;
 
-export interface ModuleAccessOptions {
-	cwd?: string;
-}
-
 export interface NodeDriverOptions {
 	filesystem?: VirtualFileSystem;
 	networkAdapter?: NetworkAdapter;
@@ -365,7 +361,6 @@ export interface NodeDriverOptions {
 	permissions?: Permissions;
 	processConfig?: ProcessConfig;
 	osConfig?: OSConfig;
-	moduleAccess?: ModuleAccessOptions;
 }
 
 export interface DefaultNetworkAdapterOptions {
@@ -377,11 +372,8 @@ export interface NodeRuntimeOptions {
 	runtimeDriverFactory?: NodeRuntimeDriverFactory;
 	permissions?: Partial<Permissions>;
 	memoryLimit?: number;
-	moduleAccessPaths?: string[];
 	bindings?: BindingTree;
 	loopbackExemptPorts?: number[];
-	moduleAccessCwd?: string;
-	packageRoots?: Array<{ hostPath: string; vmPath: string }>;
 }
 
 export type NodeRuntimeDriverFactoryOptions = Record<string, never>;

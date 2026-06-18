@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import claude from "@rivet-dev/agent-os-claude";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import opencode from "@rivet-dev/agent-os-opencode";
 import pi from "@rivet-dev/agent-os-pi";
 import piCli from "@rivet-dev/agent-os-pi-cli";
@@ -98,7 +99,7 @@ async function inspectLaunch(
 	software: SoftwareInput[],
 ): Promise<LaunchProbe> {
 	const vm = await AgentOs.create({
-		moduleAccessCwd: MODULE_ACCESS_CWD,
+		mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 		software,
 	});
 	let sessionId: string | undefined;

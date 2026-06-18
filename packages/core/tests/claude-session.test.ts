@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import type { Fixture, LLMock, ToolCall } from "@copilotkit/llmock";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import claude from "@rivet-dev/agent-os-claude";
 import {
 	afterAll,
@@ -164,7 +165,7 @@ describe("full createSession('claude')", () => {
 	beforeEach(async () => {
 		vm = await AgentOs.create({
 			loopbackExemptPorts: [mockPort],
-			moduleAccessCwd: MODULE_ACCESS_CWD,
+			mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 			software: [claude, ...REGISTRY_SOFTWARE],
 		});
 	});
@@ -239,7 +240,7 @@ describe("full createSession('claude')", () => {
 		const promptMockPort = Number(new URL(promptMockUrl).port);
 		const promptVm = await AgentOs.create({
 			loopbackExemptPorts: [promptMockPort],
-			moduleAccessCwd: MODULE_ACCESS_CWD,
+			mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 			software: [claude, ...REGISTRY_SOFTWARE],
 		});
 		let sessionId: string | undefined;
@@ -308,7 +309,7 @@ describe("full createSession('claude')", () => {
 		const promptMockPort = Number(new URL(promptMockUrl).port);
 		const promptVm = await AgentOs.create({
 			loopbackExemptPorts: [promptMockPort],
-			moduleAccessCwd: MODULE_ACCESS_CWD,
+			mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 			software: [claude, ...REGISTRY_SOFTWARE],
 		});
 		let sessionId: string | undefined;
@@ -385,7 +386,7 @@ describe("full createSession('claude')", () => {
 		const promptMockPort = Number(new URL(promptMockUrl).port);
 		const promptVm = await AgentOs.create({
 			loopbackExemptPorts: [promptMockPort],
-			moduleAccessCwd: MODULE_ACCESS_CWD,
+			mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 			software: [claude, ...REGISTRY_SOFTWARE],
 		});
 		let sessionId: string | undefined;

@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import pi from "@rivet-dev/agent-os-pi";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import { describe, expect, test } from "vitest";
 import { AgentOs } from "../src/agent-os.js";
 import {
@@ -31,7 +32,7 @@ function requestIncludesExtensionMarker(req: unknown): boolean {
 async function createPiVm(mockUrl: string): Promise<AgentOs> {
 	return AgentOs.create({
 		loopbackExemptPorts: [Number(new URL(mockUrl).port)],
-		moduleAccessCwd: MODULE_ACCESS_CWD,
+		mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 		software: [pi],
 	});
 }

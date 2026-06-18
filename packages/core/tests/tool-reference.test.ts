@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import { z } from "zod";
 import { AgentOs, hostTool, toolKit } from "../src/index.js";
 
@@ -71,7 +72,7 @@ describe("tool reference registration", () => {
 
 	beforeEach(async () => {
 		vm = await AgentOs.create({
-			moduleAccessCwd: MODULE_ACCESS_CWD,
+			mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 			toolKits: [mathToolKit],
 		});
 	});

@@ -1,5 +1,6 @@
 import { createServer } from "node:https";
 import { resolve } from "node:path";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, test } from "vitest";
 import { WebSocketServer } from "ws";
@@ -143,7 +144,7 @@ describe("guest websocket over wss", () => {
 		try {
 			const port = (server.address() as AddressInfo).port;
 			vm = await AgentOs.create({
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				loopbackExemptPorts: [port],
 				permissions: {
 					fs: "allow",

@@ -1,5 +1,6 @@
 import common from "@agent-os-pkgs/common";
 import git from "@agent-os-pkgs/git";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { AgentOs } from "../src/index.js";
@@ -65,7 +66,7 @@ describe("git quickstart integration", () => {
 
 		beforeEach(async () => {
 			vm = await AgentOs.create({
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				permissions: GIT_QUICKSTART_PERMISSIONS,
 				software: [COMMON_SOFTWARE, GIT_PACKAGE],
 			});

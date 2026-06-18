@@ -1143,7 +1143,7 @@ describe("native sidecar process client", () => {
 		}
 	}, 60_000);
 
-	test("exercises moduleAccessCwd and layer RPCs against the real sidecar binary", async () => {
+	test("exercises a /root/node_modules host_dir mount and layer RPCs against the real sidecar binary", async () => {
 		const fixtureRoot = mkdtempSync(join(tmpdir(), "agent-os-native-sidecar-"));
 		cleanupPaths.push(fixtureRoot);
 		ensureSidecarBinaryReady();
@@ -1174,7 +1174,19 @@ describe("native sidecar process client", () => {
 			);
 
 			await client.configureVm(session, vm, {
-				moduleAccessCwd: join(REPO_ROOT, "packages/core"),
+				mounts: [
+					{
+						guestPath: "/root/node_modules",
+						readOnly: true,
+						plugin: {
+							id: "host_dir",
+							config: JSON.stringify({
+								hostPath: join(REPO_ROOT, "packages/core", "node_modules"),
+								readOnly: true,
+							}),
+						},
+					},
+				],
 			});
 
 			const modulePackage = JSON.parse(

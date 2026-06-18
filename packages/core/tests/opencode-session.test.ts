@@ -4,6 +4,7 @@ import {
 	type ServerResponse,
 } from "node:http";
 import { resolve } from "node:path";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import type { Fixture, ToolCall } from "@copilotkit/llmock";
 import opencode from "@rivet-dev/agent-os-opencode";
 import { describe, expect, test } from "vitest";
@@ -204,7 +205,7 @@ async function startChatCompletionsMock(
 async function createOpenCodeVm(mockUrl: string): Promise<AgentOs> {
 	return AgentOs.create({
 		loopbackExemptPorts: [Number(new URL(mockUrl).port)],
-		moduleAccessCwd: MODULE_ACCESS_CWD,
+		mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 		software: [opencode, ...REGISTRY_SOFTWARE],
 	});
 }

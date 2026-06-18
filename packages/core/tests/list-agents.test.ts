@@ -41,8 +41,9 @@ describe("listAgents()", () => {
 	});
 
 	test("installed is false when adapter package is missing", async () => {
-		// Create a VM with moduleAccessCwd pointing to a directory without node_modules
-		const vm2 = await AgentOs.create({ moduleAccessCwd: "/tmp" });
+		// Create a VM with no /root/node_modules mount, so no adapter packages
+		// are resolvable and every agent must report installed: false.
+		const vm2 = await AgentOs.create({});
 		try {
 			const agents = vm2.listAgents();
 			// No packages installed in /tmp

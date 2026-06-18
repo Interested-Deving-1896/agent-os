@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import type { Fixture, ToolCall } from "@copilotkit/llmock";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import claude from "@rivet-dev/agent-os-claude";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { AgentOs } from "../src/index.js";
@@ -100,7 +101,7 @@ describe("filesystem operations", () => {
 		await vm.dispose();
 		vm = await AgentOs.create({
 			loopbackExemptPorts: [mockPort],
-			moduleAccessCwd: MODULE_ACCESS_CWD,
+			mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 			permissions: ALLOW_ALL_VM_PERMISSIONS,
 			software: [claude, ...REGISTRY_SOFTWARE],
 		});

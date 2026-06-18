@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import { AgentOs } from "../src/index.js";
 
 /**
@@ -45,7 +46,7 @@ describe("Claude Code SDK investigation", () => {
 
 	beforeEach(async () => {
 		vm = await AgentOs.create({
-			moduleAccessCwd: MODULE_ACCESS_CWD,
+			mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 		});
 	}, 60_000);
 
@@ -56,7 +57,7 @@ describe("Claude Code SDK investigation", () => {
 		vm = undefined;
 	}, 60_000);
 
-	test("claude-code package is mounted in VM via ModuleAccessFileSystem", async () => {
+	test("claude-code package is mounted in VM via the /root/node_modules mount", async () => {
 		const script = `
 const fs = require("fs");
 const pkgPath = "/root/node_modules/@anthropic-ai/claude-code/package.json";
@@ -132,11 +133,11 @@ if (exists) {
 
 test("vendor ripgrep binary is projected and fails deterministically if executed in the VM", async () => {
 		// Claude Code bundles native ripgrep (ELF) for code search.
-		// The binary file is accessible via the ModuleAccessFileSystem overlay,
+		// The binary file is accessible via the /root/node_modules mount,
 		// but projected native binaries are not executable guest-side.
 		// Production Claude sessions still force Agent OS ripgrep via env.
 		// Note: .node native addons (audio-capture) are blocked by the
-		// overlay itself (ERR_MODULE_ACCESS_NATIVE_ADDON).
+		// module loader itself (ERR_MODULE_ACCESS_NATIVE_ADDON).
 		const script = `
 const fs = require("fs");
 const childProcess = require("child_process");

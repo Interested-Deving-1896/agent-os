@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import type { Fixture, ToolCall } from "@copilotkit/llmock";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import common from "@agent-os-pkgs/common";
 import piCli from "@rivet-dev/agent-os-pi-cli";
 import { describe, expect, test } from "vitest";
@@ -48,7 +49,7 @@ function createToolFixtures(
 async function createPiCliVm(mockUrl: string): Promise<AgentOs> {
 	return AgentOs.create({
 		loopbackExemptPorts: [Number(new URL(mockUrl).port)],
-		moduleAccessCwd: MODULE_ACCESS_CWD,
+		mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 		software: hasRegistryCommands ? [common, piCli] : [piCli],
 	});
 }

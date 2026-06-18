@@ -3,6 +3,7 @@ import {
 	InvalidScheduleError,
 	PastScheduleError,
 	isAcpTimeoutErrorData,
+	nodeModulesMount,
 	type AcpTimeoutErrorData,
 	type AgentOsLimits,
 	type ExecOptions,
@@ -12,6 +13,7 @@ import {
 	type KernelExecResult,
 	type KernelSpawnOptions,
 	type MountConfigJsonPrimitive,
+	type NodeModulesMountConfig,
 	type OpenShellOptions,
 	type PromptCapabilities,
 	type PromptResult,
@@ -30,6 +32,7 @@ describe("root public API exports", () => {
 		void (null as KernelExecResult | null);
 		void (null as KernelSpawnOptions | null);
 		void (null as MountConfigJsonPrimitive | null);
+		void (null as NodeModulesMountConfig | null);
 		void (null as OpenShellOptions | null);
 		void (null as PromptCapabilities | null);
 		void (null as PromptResult | null);
@@ -37,6 +40,21 @@ describe("root public API exports", () => {
 		void (null as TimingMitigation | null);
 
 		expect(true).toBe(true);
+	});
+
+	test("re-exports nodeModulesMount helper from the root entrypoint", () => {
+		const mount = nodeModulesMount("/host/project/node_modules");
+		expect(mount.path).toBe("/root/node_modules");
+		expect(mount.readOnly).toBe(true);
+		expect(mount.plugin.id).toBe("host_dir");
+		expect(mount.plugin.config.hostPath).toBe("/host/project/node_modules");
+		expect(mount.plugin.config.readOnly).toBe(true);
+
+		const writable = nodeModulesMount("/host/project/node_modules", {
+			readOnly: false,
+		});
+		expect(writable.readOnly).toBe(false);
+		expect(writable.plugin.config.readOnly).toBe(false);
 	});
 
 	test("re-exports ACP timeout diagnostics helper from the root entrypoint", () => {

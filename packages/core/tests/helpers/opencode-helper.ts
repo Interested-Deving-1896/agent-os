@@ -31,9 +31,9 @@ async function mkdirpVm(vm: AgentOs, targetPath: string): Promise<void> {
 	}
 }
 
-export function resolveOpenCodeAdapterBinPath(moduleAccessCwd: string): string {
+export function resolveOpenCodeAdapterBinPath(hostProjectDir: string): string {
 	const hostPkgJson = join(
-		moduleAccessCwd,
+		hostProjectDir,
 		"node_modules/@rivet-dev/agent-os-opencode/package.json",
 	);
 	const pkg = JSON.parse(readFileSync(hostPkgJson, "utf-8"));

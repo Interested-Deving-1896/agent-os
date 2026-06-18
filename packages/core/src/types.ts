@@ -55,6 +55,7 @@ export type {
 export type {
 	HostDirBackendOptions,
 	HostDirMountPluginConfig,
+	NodeModulesMountConfig,
 } from "./host-dir-mount.js";
 export type { HostTool, ToolExample, ToolKit } from "./host-tools.js";
 export type {

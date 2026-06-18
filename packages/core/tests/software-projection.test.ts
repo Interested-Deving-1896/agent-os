@@ -30,7 +30,6 @@ describe("software projection on the sidecar path", () => {
 
 	test("preserves projected package roots without cwd node_modules", async () => {
 		vm = await AgentOs.create({
-			moduleAccessCwd: "/tmp",
 			software: [pi],
 		});
 
@@ -70,7 +69,6 @@ describe("software projection on the sidecar path", () => {
 
 	test("keeps projected package roots read-only on the sidecar path", async () => {
 		vm = await AgentOs.create({
-			moduleAccessCwd: "/tmp",
 			software: [pi],
 		});
 
@@ -108,7 +106,6 @@ describe("software projection on the sidecar path", () => {
 
 	test("preserves registry meta-package command injection on the sidecar path", async () => {
 			vm = await AgentOs.create({
-				moduleAccessCwd: "/tmp",
 				software: [common],
 			});
 

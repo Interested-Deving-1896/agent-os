@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { describe, expect, test } from "vitest";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import { AgentOs } from "../src/agent-os.js";
 import type { SoftwareInput } from "../src/packages.js";
 
@@ -157,7 +158,7 @@ function useMockAdapterBin(vm: AgentOs, scriptPath: string): () => void {
 
 async function createMockAgentVm(software: SoftwareInput[]): Promise<AgentOs> {
 	return AgentOs.create({
-		moduleAccessCwd: MODULE_ACCESS_CWD,
+		mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 		software,
 	});
 }

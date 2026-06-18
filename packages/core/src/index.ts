@@ -8,7 +8,7 @@ export {
 	PastScheduleError,
 	TimerScheduleDriver,
 } from "./cron/index.js";
-export { createHostDirBackend } from "./host-dir-mount.js";
+export { createHostDirBackend, nodeModulesMount } from "./host-dir-mount.js";
 export {
 	hostTool,
 	MAX_TOOL_DESCRIPTION_LENGTH,

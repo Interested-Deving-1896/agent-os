@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import { AgentOs } from "../src/index.js";
 
 const MODULE_ACCESS_CWD = resolve(import.meta.dirname, "..");
@@ -9,7 +10,7 @@ describe("OpenCode VM package", () => {
 
 	beforeEach(async () => {
 		vm = await AgentOs.create({
-			moduleAccessCwd: MODULE_ACCESS_CWD,
+			mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 		});
 	});
 

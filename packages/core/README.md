@@ -142,7 +142,7 @@ await vm.dispose();
 ### Exported Types
 
 **VM & Options**
-- `AgentOsOptions` — VM creation options (commandDirs, loopbackExemptPorts, moduleAccessCwd, mounts, additionalInstructions)
+- `AgentOsOptions` — VM creation options (commandDirs, loopbackExemptPorts, mounts, additionalInstructions). Use `nodeModulesMount(...)` in `mounts` to expose a host `node_modules` tree at `/root/node_modules`.
 - `AgentOsSidecarConfig` — shared-pool or explicit-handle sidecar selection for VM creation
 - `AgentOsSharedSidecarOptions` — shared sidecar pool selection
 - `AgentOsCreateSidecarOptions` — explicit sidecar handle creation options

@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { AgentOs } from "../src/agent-os.js";
@@ -97,8 +98,8 @@ describe("createSession OS instructions integration", () => {
 			os.tmpdir() + "/agentos-os-instructions-",
 		);
 		vm = await AgentOs.create({
-			moduleAccessCwd: MODULE_ACCESS_CWD,
 			mounts: [
+				...moduleAccessMounts(MODULE_ACCESS_CWD),
 				{
 					path: "/home/user",
 					plugin: createHostDirBackend({

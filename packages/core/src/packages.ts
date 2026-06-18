@@ -150,7 +150,7 @@ export interface SoftwareContext {
 	resolvePackage(packageName: string): string;
 }
 
-/** Host-to-VM path mapping for ModuleAccessFileSystem. */
+/** Host-to-VM path mapping for a software package's `/root/node_modules/<pkg>` mount. */
 export interface SoftwareRoot {
 	hostPath: string;
 	vmPath: string;
@@ -306,7 +306,7 @@ export interface ProcessedSoftware {
 	commandPackages: CommandPackageMetadata[];
 	/** Per-command permission tiers propagated into the WasmVM runtime. */
 	commandPermissions: Record<string, PermissionTier>;
-	/** Host-to-VM path mappings for ModuleAccessFileSystem. */
+	/** Host-to-VM path mappings for software-package `/root/node_modules/<pkg>` mounts. */
 	softwareRoots: SoftwareRoot[];
 	/** Agent configs registered by agent software. */
 	agentConfigs: Map<string, AgentConfig>;

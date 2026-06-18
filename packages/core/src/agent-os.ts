@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import {
+	dirname,
 	join,
 	posix as posixPath,
 	resolve as resolveHostPath,
@@ -472,12 +473,6 @@ export interface AgentOsOptions {
 	 * Defaults to the hardened builtin set used by the native sidecar bridge.
 	 */
 	allowedNodeBuiltins?: string[];
-	/**
-	 * Host-side CWD for module access resolution. Sets the directory whose
-	 * node_modules are projected into the VM at /root/node_modules/.
-	 * Defaults to process.cwd().
-	 */
-	moduleAccessCwd?: string;
 	/** Root filesystem configuration. Defaults to an overlay with the bundled base snapshot as its deepest lower. */
 	rootFilesystem?: RootFilesystemConfig;
 	/** Filesystems to mount at boot time. */
@@ -1545,7 +1540,6 @@ async function resolveCompatLocalMounts(
 
 function collectSidecarMountPlan(options: {
 	mounts?: MountConfig[];
-	moduleAccessCwd: string;
 	softwareRoots: SoftwareRoot[];
 	commandDirs: string[];
 	shimDir: string | null;
@@ -1596,17 +1590,6 @@ function collectSidecarMountPlan(options: {
 			continue;
 		}
 		pushMount(mount);
-	}
-
-	const moduleNodeModules = resolveHostPath(
-		join(options.moduleAccessCwd, "node_modules"),
-	);
-	if (existsSync(moduleNodeModules)) {
-		hostPathMappings.push({
-			vmPath: "/root/node_modules",
-			hostPath: moduleNodeModules,
-			readOnly: true,
-		});
 	}
 
 	for (const root of options.softwareRoots) {
@@ -2395,7 +2378,6 @@ export class AgentOs {
 	private _shellCounter = 0;
 	private _acpTerminals = new Map<string, AcpTerminalEntry>();
 	private _acpTerminalCounter = 0;
-	private _moduleAccessCwd: string;
 	private _softwareRoots: SoftwareRoot[];
 	private _softwareAgentConfigs: Map<string, AgentConfig>;
 	private _cronManager!: CronManager;
@@ -2414,7 +2396,6 @@ export class AgentOs {
 	private constructor(
 		kernel: Kernel,
 		sidecar: AgentOsSidecar,
-		moduleAccessCwd: string,
 		softwareRoots: SoftwareRoot[],
 		softwareAgentConfigs: Map<string, AgentConfig>,
 		hostMounts: HostMountInfo[],
@@ -2426,7 +2407,6 @@ export class AgentOs {
 	) {
 		this.#kernel = kernel;
 		this.sidecar = sidecar;
-		this._moduleAccessCwd = moduleAccessCwd;
 		this._softwareRoots = softwareRoots;
 		this._softwareAgentConfigs = softwareAgentConfigs;
 		this._hostMounts = hostMounts;
@@ -2460,7 +2440,6 @@ export class AgentOs {
 
 	static async create(options?: AgentOsOptions): Promise<AgentOs> {
 		const processed = processSoftware(options?.software ?? []);
-		const moduleAccessCwd = options?.moduleAccessCwd ?? process.cwd();
 		const localMounts = await resolveCompatLocalMounts(options?.mounts);
 		const toolKits = options?.toolKits;
 		if (toolKits && toolKits.length > 0) {
@@ -2510,7 +2489,6 @@ export class AgentOs {
 				const { sidecarMounts, hostMounts, hostPathMappings } =
 					collectSidecarMountPlan({
 						mounts: options?.mounts,
-						moduleAccessCwd,
 						softwareRoots: processed.softwareRoots,
 						commandDirs: preparedCommandDirs.commandDirs,
 						shimDir: toolShimDir,
@@ -2551,7 +2529,6 @@ export class AgentOs {
 				await client.configureVm(session, nativeVm, {
 					mounts: sidecarMounts,
 					permissions: sidecarPermissions,
-					moduleAccessCwd,
 					commandPermissions: processed.commandPermissions,
 					allowedNodeBuiltins: options?.allowedNodeBuiltins,
 					loopbackExemptPorts: options?.loopbackExemptPorts,
@@ -2650,7 +2627,6 @@ export class AgentOs {
 			const vm = new AgentOs(
 				vmAdmin.kernel,
 				sidecar,
-				moduleAccessCwd,
 				processed.softwareRoots,
 				processed.agentConfigs,
 				vmAdmin.hostMounts,
@@ -3279,7 +3255,8 @@ export class AgentOs {
 
 				let installed = false;
 				try {
-					// Check package roots first, then CWD-based node_modules.
+					// Check software roots first, then the host dir behind the
+					// `/root/node_modules` mount.
 					const vmPrefix = `/root/node_modules/${config.acpAdapter}`;
 					let hostPkgJsonPath: string | null = null;
 					for (const root of this._softwareRoots) {
@@ -3289,10 +3266,16 @@ export class AgentOs {
 						}
 					}
 					if (!hostPkgJsonPath) {
-						hostPkgJsonPath = join(
-							resolvePackageDir(this._moduleAccessCwd, config.acpAdapter),
-							"package.json",
-						);
+						const nodeModulesRoot = this._nodeModulesHostRoot();
+						if (nodeModulesRoot) {
+							hostPkgJsonPath = join(
+								resolvePackageDir(nodeModulesRoot, config.acpAdapter),
+								"package.json",
+							);
+						}
+					}
+					if (!hostPkgJsonPath) {
+						throw new Error("no package source");
 					}
 					readFileSync(hostPkgJsonPath);
 					installed = true;
@@ -3863,11 +3846,28 @@ export class AgentOs {
 
 	/**
 	 * Resolve the VM bin entry point of an ACP adapter package.
-	 * Reads from the host filesystem since kernel.readFile() does NOT see
-	 * the ModuleAccessFileSystem overlay.
+	 * Reads from the host filesystem since kernel.readFile() resolves through
+	 * mounts; adapter package.json is read directly off the host dir backing
+	 * the relevant mount.
 	 */
 	private _resolveAdapterBin(adapterPackage: string): string {
 		return this._resolvePackageBin(adapterPackage);
+	}
+
+	/**
+	 * Parent of the host directory backing the `/root/node_modules` mount, if
+	 * the caller supplied one (e.g. via `nodeModulesMount(...)`). Used as the
+	 * `resolvePackageDir` start dir for adapter/agent package resolution when no
+	 * software root matches. `nodeModulesMount` mounts `<dir>/node_modules`, so
+	 * the start dir is `<dir>` (one level above the node_modules tree).
+	 */
+	private _nodeModulesHostRoot(): string | null {
+		for (const mount of this._hostMounts) {
+			if (mount.vmPath === "/root/node_modules") {
+				return dirname(mount.hostPath);
+			}
+		}
+		return null;
 	}
 
 	private _resolvePackageBin(packageName: string, binName?: string): string {
@@ -3879,10 +3879,18 @@ export class AgentOs {
 				break;
 			}
 		}
-		// Fall back to CWD-based node_modules.
+		// Fall back to the host dir behind the `/root/node_modules` mount.
 		if (!hostPkgJsonPath) {
+			const nodeModulesRoot = this._nodeModulesHostRoot();
+			if (!nodeModulesRoot) {
+				throw new Error(
+					`Cannot resolve package "${packageName}": no software root provides it and ` +
+						`no /root/node_modules mount was supplied. Pass ` +
+						`mounts: [nodeModulesMount("<host>/node_modules")] to AgentOs.create().`,
+				);
+			}
 			hostPkgJsonPath = join(
-				resolvePackageDir(this._moduleAccessCwd, packageName),
+				resolvePackageDir(nodeModulesRoot, packageName),
 				"package.json",
 			);
 		}

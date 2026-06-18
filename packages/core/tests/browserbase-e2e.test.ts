@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import { AgentOs, type Permissions } from "../src/index.js";
 
 const MODULE_ACCESS_CWD = resolve(import.meta.dirname, "..");
@@ -223,7 +224,7 @@ describe("Browserbase e2e", () => {
 			};
 
 			vm = await AgentOs.create({
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				permissions: BROWSERBASE_PERMISSIONS,
 			});
 			await vm.writeFile("/tmp/browserbase-e2e.mjs", GUEST_SCRIPT);

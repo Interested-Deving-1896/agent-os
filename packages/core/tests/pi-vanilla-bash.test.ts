@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import type { Fixture, ToolCall } from "@copilotkit/llmock";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import common from "@agent-os-pkgs/common";
 import pi from "@rivet-dev/agent-os-pi";
 import { describe, expect, test } from "vitest";
@@ -58,7 +59,7 @@ function bashToolCall(args: Record<string, unknown>): ToolCall {
 async function createPiVm(mockUrl: string): Promise<AgentOs> {
 	return AgentOs.create({
 		loopbackExemptPorts: [Number(new URL(mockUrl).port)],
-		moduleAccessCwd: MODULE_ACCESS_CWD,
+		mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 		software: [common, pi],
 	});
 }

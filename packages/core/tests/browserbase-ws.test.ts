@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import { AgentOs, type Permissions } from "../src/index.js";
 
 const MODULE_ACCESS_CWD = resolve(import.meta.dirname, "..");
@@ -900,7 +901,7 @@ describe("Browserbase websocket smoke test", () => {
 		"opens a Browserbase CDP websocket and completes one command",
 		async () => {
 			vm = await AgentOs.create({
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				permissions: BROWSERBASE_PERMISSIONS,
 			});
 			await vm.writeFile("/tmp/browserbase-ws-test.mjs", GUEST_SCRIPT);
@@ -945,7 +946,7 @@ describe("Browserbase websocket smoke test", () => {
 		"initializes the browse cli daemon and lists pages in remote mode",
 		async () => {
 			vm = await AgentOs.create({
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				permissions: BROWSERBASE_PERMISSIONS,
 			});
 			await vm.writeFile("/tmp/browserbase-cli-pages-test.mjs", CLI_PAGES_SCRIPT);
@@ -983,7 +984,7 @@ describe("Browserbase websocket smoke test", () => {
 		"attaches to a Browserbase page target and reads its frame tree over raw CDP",
 		async () => {
 			vm = await AgentOs.create({
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				permissions: BROWSERBASE_PERMISSIONS,
 			});
 			await vm.writeFile("/tmp/browserbase-target-test.mjs", CDP_TARGET_SCRIPT);
@@ -1015,7 +1016,7 @@ describe("Browserbase websocket smoke test", () => {
 		"initializes Stagehand directly in Browserbase mode",
 		async () => {
 			vm = await AgentOs.create({
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				permissions: BROWSERBASE_PERMISSIONS,
 			});
 			await vm.writeFile(
@@ -1054,7 +1055,7 @@ describe("Browserbase websocket smoke test", () => {
 		"creates and debugs a Browserbase session through the Browserbase SDK",
 		async () => {
 			vm = await AgentOs.create({
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				permissions: BROWSERBASE_PERMISSIONS,
 			});
 			await vm.writeFile("/tmp/browserbase-sdk-test.mjs", BROWSERBASE_SDK_SCRIPT);
@@ -1108,7 +1109,7 @@ describe("Browserbase websocket smoke test", () => {
 		"creates and debugs a Browserbase session through node:https",
 		async () => {
 			vm = await AgentOs.create({
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				permissions: BROWSERBASE_PERMISSIONS,
 			});
 			await vm.writeFile(
@@ -1161,7 +1162,7 @@ describe("Browserbase websocket smoke test", () => {
 		"completes the top-level target pre-resume bootstrap sequence over raw CDP",
 		async () => {
 			vm = await AgentOs.create({
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				permissions: BROWSERBASE_PERMISSIONS,
 			});
 			await vm.writeFile("/tmp/browserbase-bootstrap-test.mjs", CDP_BOOTSTRAP_SCRIPT);

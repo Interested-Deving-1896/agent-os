@@ -5,6 +5,7 @@ import {
 	type ServerResponse,
 } from "node:http";
 import { readlink, readdir } from "node:fs/promises";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import { resolve } from "node:path";
 import claude from "@rivet-dev/agent-os-claude";
 import opencode from "@rivet-dev/agent-os-opencode";
@@ -61,7 +62,7 @@ const PI_AGENTS: SessionCleanupAgent[] = [
 		createVm: async (mockUrl) =>
 			AgentOs.create({
 				loopbackExemptPorts: [Number(new URL(mockUrl).port)],
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				software: [pi],
 			}),
 		createSession: async (vm, mockUrl) => {
@@ -87,7 +88,7 @@ const PI_AGENTS: SessionCleanupAgent[] = [
 		createVm: async (mockUrl) =>
 			AgentOs.create({
 				loopbackExemptPorts: [Number(new URL(mockUrl).port)],
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				software: [piCli],
 			}),
 		createSession: async (vm, mockUrl) => {
@@ -116,7 +117,7 @@ const REGISTRY_AGENTS: SessionCleanupAgent[] = [
 		createVm: async (mockUrl) =>
 			AgentOs.create({
 				loopbackExemptPorts: [Number(new URL(mockUrl).port)],
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				software: [claude, ...REGISTRY_SOFTWARE],
 			}),
 		createSession: async (vm, mockUrl) =>
@@ -137,7 +138,7 @@ const REGISTRY_AGENTS: SessionCleanupAgent[] = [
 		createVm: async (mockUrl) =>
 			AgentOs.create({
 				loopbackExemptPorts: [Number(new URL(mockUrl).port)],
-				moduleAccessCwd: MODULE_ACCESS_CWD,
+				mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 				software: [opencode, ...REGISTRY_SOFTWARE],
 			}),
 		createSession: async (vm, mockUrl) => {

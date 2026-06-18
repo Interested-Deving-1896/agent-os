@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import codex from "@rivet-dev/agent-os-codex-agent";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import { afterEach, describe, expect, test } from "vitest";
 import { AgentOs } from "../src/agent-os.js";
 import { REGISTRY_SOFTWARE } from "./helpers/registry-commands.js";
@@ -18,7 +19,7 @@ describe("Codex agent availability", () => {
 
 	test("codex package provides commands without registering a runnable ACP agent", async () => {
 		const vm = await AgentOs.create({
-			moduleAccessCwd: MODULE_ACCESS_CWD,
+			mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 			software: [codex, ...REGISTRY_SOFTWARE],
 		});
 		cleanups.add(async () => {

@@ -8,8 +8,8 @@ export interface AgentConfig {
 	/**
 	 * Absolute host path to the software package directory that registered this
 	 * agent config. Package-provided agent adapters should resolve their nested
-	 * dependencies relative to this directory before falling back to the caller's
-	 * moduleAccessCwd.
+	 * dependencies relative to this directory before falling back to the host dir
+	 * behind the caller-supplied `/root/node_modules` mount.
 	 */
 	declaringPackageDir?: string;
 	/** Additional CLI args prepended when launching the ACP adapter. */

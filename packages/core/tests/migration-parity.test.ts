@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage } from "node:http";
 import { resolve } from "node:path";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import common from "@agent-os-pkgs/common";
 import { afterEach, describe, expect, test } from "vitest";
 import { z } from "zod";
@@ -380,7 +381,7 @@ describe("native sidecar migration parity gate", () => {
 
 	test("covers session lifecycle and agent prompt flow on the Rust sidecar path", async () => {
 		const vm = await AgentOs.create({
-			moduleAccessCwd: MODULE_ACCESS_CWD,
+			mounts: moduleAccessMounts(MODULE_ACCESS_CWD),
 			software: [SYNTHETIC_AGENT],
 			permissions: {
 				fs: "allow",
