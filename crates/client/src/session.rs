@@ -15,14 +15,14 @@ use std::sync::atomic::Ordering;
 use anyhow::Result;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use agent_os_protocol::ACP_EXTENSION_NAMESPACE;
 use agent_os_protocol::generated::v1::{
     AcpCloseSessionRequest, AcpCreateSessionRequest, AcpGetSessionStateRequest, AcpRequest,
     AcpResponse, AcpRuntimeKind, AcpSessionCreatedResponse, AcpSessionRequest,
     AcpSessionStateResponse,
 };
+use agent_os_protocol::ACP_EXTENSION_NAMESPACE;
 use secure_exec_client::wire;
 
 use crate::agent_os::{AgentOs, SessionEntry};

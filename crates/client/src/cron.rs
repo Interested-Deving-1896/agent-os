@@ -12,8 +12,8 @@
 //!
 //! Cron fields are interpreted in the host LOCAL timezone, matching croner's default behavior.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, Timelike, Utc, Weekday};
 use scc::HashMap as SccHashMap;
@@ -1218,12 +1218,12 @@ fn register_cron_job(
 #[cfg(test)]
 mod tests {
     use super::{
-        CronAction, CronJobState, CronManager, CronOverlap, ScheduleDriver, ScheduleEntry,
-        ScheduleHandle, ensure_cron_capacity, register_cron_job,
+        ensure_cron_capacity, register_cron_job, CronAction, CronJobState, CronManager,
+        CronOverlap, ScheduleDriver, ScheduleEntry, ScheduleHandle,
     };
     use crate::CRON_JOB_LIMIT;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     #[derive(Default)]
     struct RecordingScheduleDriver {

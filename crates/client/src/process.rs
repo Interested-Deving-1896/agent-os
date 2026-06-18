@@ -1195,8 +1195,8 @@ fn epoch_ms_now() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        EXEC_OUTPUT_CAPTURE_LIMIT_BYTES, append_exec_output, exited_pids_to_prune,
-        prune_string_f64_map,
+        append_exec_output, exited_pids_to_prune, prune_string_f64_map,
+        EXEC_OUTPUT_CAPTURE_LIMIT_BYTES,
     };
     use scc::HashMap as SccHashMap;
 

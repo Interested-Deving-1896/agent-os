@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use bytes::Bytes;
 use serde::Deserialize;
 
@@ -250,9 +250,9 @@ fn base64_decoded_upper_bound(encoded_len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        VM_FETCH_BUFFER_LIMIT_BYTES, base64_decoded_upper_bound,
-        ensure_fetch_base64_body_within_limit, ensure_fetch_component_within_limit,
-        ensure_fetch_request_payload_within_limit,
+        base64_decoded_upper_bound, ensure_fetch_base64_body_within_limit,
+        ensure_fetch_component_within_limit, ensure_fetch_request_payload_within_limit,
+        VM_FETCH_BUFFER_LIMIT_BYTES,
     };
 
     #[test]

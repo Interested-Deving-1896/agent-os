@@ -32,12 +32,30 @@ struct Case {
 }
 
 const CASES: &[Case] = &[
-    Case { name: "pnpm-isolated", expect: Expect::StoreSymlink("node_modules/.pnpm/") },
-    Case { name: "bun", expect: Expect::StoreSymlink("node_modules/.bun/") },
-    Case { name: "yarn-pnpm", expect: Expect::StoreSymlink("node_modules/.store/") },
-    Case { name: "yarn-pnp", expect: Expect::PlugNPlay },
-    Case { name: "npm", expect: Expect::Flat },
-    Case { name: "yarn-nm", expect: Expect::Flat },
+    Case {
+        name: "pnpm-isolated",
+        expect: Expect::StoreSymlink("node_modules/.pnpm/"),
+    },
+    Case {
+        name: "bun",
+        expect: Expect::StoreSymlink("node_modules/.bun/"),
+    },
+    Case {
+        name: "yarn-pnpm",
+        expect: Expect::StoreSymlink("node_modules/.store/"),
+    },
+    Case {
+        name: "yarn-pnp",
+        expect: Expect::PlugNPlay,
+    },
+    Case {
+        name: "npm",
+        expect: Expect::Flat,
+    },
+    Case {
+        name: "yarn-nm",
+        expect: Expect::Flat,
+    },
 ];
 
 #[test]
@@ -62,10 +80,16 @@ fn package_manager_layouts_carry_expected_store_signatures() {
         match case.expect {
             Expect::StoreSymlink(marker) => {
                 let target = std::fs::read_link(&is_odd).unwrap_or_else(|e| {
-                    panic!("[{}] app/node_modules/is-odd should be a symlink: {e}", case.name)
+                    panic!(
+                        "[{}] app/node_modules/is-odd should be a symlink: {e}",
+                        case.name
+                    )
                 });
                 let target = target.to_string_lossy();
-                eprintln!("[{}] is-odd -> {target}  (expect store marker {marker:?})", case.name);
+                eprintln!(
+                    "[{}] is-odd -> {target}  (expect store marker {marker:?})",
+                    case.name
+                );
                 assert!(
                     target.contains(marker),
                     "[{}] symlink target {target:?} should contain store marker {marker:?}",
@@ -74,26 +98,53 @@ fn package_manager_layouts_carry_expected_store_signatures() {
             }
             Expect::PlugNPlay => {
                 eprintln!("[{}] expect .pnp.cjs + no node_modules", case.name);
-                assert!(layout.join(".pnp.cjs").exists(), "[{}] expected .pnp.cjs", case.name);
-                assert!(!app_nm.exists(), "[{}] PnP should have no app/node_modules", case.name);
+                assert!(
+                    layout.join(".pnp.cjs").exists(),
+                    "[{}] expected .pnp.cjs",
+                    case.name
+                );
+                assert!(
+                    !app_nm.exists(),
+                    "[{}] PnP should have no app/node_modules",
+                    case.name
+                );
             }
             Expect::Flat => {
                 eprintln!("[{}] expect flat (hoisted to root, no store)", case.name);
                 // Direct dep resolves to a real dir at the workspace root, no store.
                 let root_isodd = layout.join("node_modules/is-odd");
-                assert!(root_isodd.exists(), "[{}] expected hoisted node_modules/is-odd", case.name);
                 assert!(
-                    !root_isodd.symlink_metadata().unwrap().file_type().is_symlink(),
+                    root_isodd.exists(),
+                    "[{}] expected hoisted node_modules/is-odd",
+                    case.name
+                );
+                assert!(
+                    !root_isodd
+                        .symlink_metadata()
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
                     "[{}] flat layout's is-odd should be a real dir, not a symlink",
                     case.name
                 );
-                for store in ["node_modules/.pnpm", "node_modules/.bun", "node_modules/.store"] {
-                    assert!(!layout.join(store).exists(), "[{}] flat layout must not have {store}", case.name);
+                for store in [
+                    "node_modules/.pnpm",
+                    "node_modules/.bun",
+                    "node_modules/.store",
+                ] {
+                    assert!(
+                        !layout.join(store).exists(),
+                        "[{}] flat layout must not have {store}",
+                        case.name
+                    );
                 }
             }
         }
     }
 
-    assert!(checked > 0, "no layouts found under PM_LAYOUTS_DIR — generate them first");
+    assert!(
+        checked > 0,
+        "no layouts found under PM_LAYOUTS_DIR — generate them first"
+    );
     eprintln!("\nvalidated {checked} package-manager layouts");
 }

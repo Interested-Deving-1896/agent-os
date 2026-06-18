@@ -7,10 +7,10 @@
 
 mod common;
 
-use agent_os_client::ClientError;
 use agent_os_client::fs::{
     BatchWriteEntry, DeleteOptions, DirEntryType, FileContent, MkdirOptions,
 };
+use agent_os_client::ClientError;
 
 #[tokio::test]
 async fn base_layer_exposes_default_files() {

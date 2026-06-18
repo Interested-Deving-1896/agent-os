@@ -3,8 +3,8 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use agent_os_client::AgentOs;
 use agent_os_client::config::{AgentOsConfig, MountConfig, MountPlugin};
+use agent_os_client::AgentOs;
 use uuid::Uuid;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

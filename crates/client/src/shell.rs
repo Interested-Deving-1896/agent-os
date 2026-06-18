@@ -28,7 +28,7 @@ use secure_exec_client::wire::{self, EventPayload, StreamChannel};
 
 use crate::agent_os::{AcpTerminalEntry, AgentOs, ShellEntry};
 use crate::error::ClientError;
-use crate::process::{OutputCallback, ProcessStatus, StdinInput, install_output_callback};
+use crate::process::{install_output_callback, OutputCallback, ProcessStatus, StdinInput};
 use crate::stream::ByteStream;
 
 /// Channel capacity for a shell's data / stderr broadcasts.

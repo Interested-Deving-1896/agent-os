@@ -45,12 +45,19 @@ async fn exec_command_line_paths() {
         .exec("echo a && echo b", ExecOptions::default())
         .await
         .expect("exec && chain");
-    assert_eq!(chain.exit_code, 0, "chain exit (stderr: {:?})", chain.stderr);
+    assert_eq!(
+        chain.exit_code, 0,
+        "chain exit (stderr: {:?})",
+        chain.stderr
+    );
     assert_eq!(chain.stdout, "a\nb\n", "chain stdout");
 
     // Shell path: a redirect writes a file the VM can read back.
     let redirect = os
-        .exec("echo redirected > /tmp/exec_redirect.txt", ExecOptions::default())
+        .exec(
+            "echo redirected > /tmp/exec_redirect.txt",
+            ExecOptions::default(),
+        )
         .await
         .expect("exec redirect");
     assert_eq!(

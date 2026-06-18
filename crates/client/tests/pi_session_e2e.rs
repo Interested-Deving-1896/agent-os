@@ -162,7 +162,10 @@ async fn pi_session_create_prompt_close() {
         )
         .await
         .expect("create_session(\"pi\") must succeed against a built Pi tree");
-    assert!(!session.session_id.is_empty(), "session id must be non-empty");
+    assert!(
+        !session.session_id.is_empty(),
+        "session id must be non-empty"
+    );
     assert!(
         os.list_sessions()
             .iter()

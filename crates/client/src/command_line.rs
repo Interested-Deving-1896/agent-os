@@ -123,7 +123,13 @@ mod tests {
     /// Shell metacharacters route the whole line through `sh -c` as a single argv element.
     #[test]
     fn shell_syntax_wraps_in_sh_c() {
-        for line in ["echo a && echo b", "echo hi > /tmp/x", "echo 'a b'", "ls *.txt", "a | b"] {
+        for line in [
+            "echo a && echo b",
+            "echo hi > /tmp/x",
+            "echo 'a b'",
+            "ls *.txt",
+            "a | b",
+        ] {
             let (command, args) = resolve_exec_command(line).unwrap();
             assert_eq!(command, "sh", "line {line:?} should use sh -c");
             assert_eq!(args, vec!["-c".to_string(), line.to_string()]);
