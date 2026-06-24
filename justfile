@@ -10,13 +10,24 @@ preview-publish REF:
 secure-exec-local:
 	node scripts/secure-exec-dep.mjs local
 
-# Pin secure-exec to a published version. The @secure-exec/* npm packages and the
-# secure-exec-* crates are always the same version, so this sets both and switches
-# to pinned mode.
+# Switch deps back to pinned (published) mode without changing the pinned versions.
+secure-exec-pinned:
+	node scripts/secure-exec-dep.mjs pinned
+
+# Show the current dep mode + the pinned npm/crate versions.
+secure-exec-status:
+	node scripts/secure-exec-dep.mjs status
+
+# Pin secure-exec to a published version and switch to pinned mode.
+#   Release <v>  -> @secure-exec/* npm AND secure-exec-* crates both pin to <v>
+#                   (a release publishes npm + crates together).
+#   Preview <v>  -> @secure-exec/* npm pin to the 0.0.0-<branch>.<sha> tag; the
+#                   crate version is left at the last crates.io release because
+#                   crates.io has no preview track. CI's `prepare-build` clones
+#                   secure-exec at <sha> and builds the crates from that clone.
 secure-exec-set-version VERSION:
 	node scripts/secure-exec-dep.mjs pinned
-	node scripts/secure-exec-dep.mjs set-secure-exec-version "{{ VERSION }}"
-	node scripts/secure-exec-dep.mjs set-crate-version "{{ VERSION }}"
+	node scripts/secure-exec-dep.mjs pin-secure-exec "{{ VERSION }}"
 
 # Pin the @agentos-software/* software packages (separate version track).
 agentos-pkgs-set-version VERSION:

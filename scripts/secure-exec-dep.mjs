@@ -19,10 +19,24 @@
 // Bump the whole workspace to a new secure-exec version with ONE command:
 //   node scripts/secure-exec-dep.mjs set-version <version>
 //
+// PREVIEW CRATE BUILDS (`prepare-build`):
+//   npm has dist-tags, so a secure-exec *preview* publishes `@secure-exec/*` to
+//   npm under a branch tag (version `0.0.0-<branch>.<sha>`). crates.io has NO
+//   such non-prod track, so secure-exec only publishes CRATES on real rc /
+//   releases (its publish workflow skips crates.io for previews). The agent-os
+//   sidecar is a Rust binary that embeds the secure-exec crates, so to build it
+//   against an unreleased (preview) secure-exec we CLONE secure-exec at the
+//   pinned commit (the `<sha>` encoded in the npm preview version) and build
+//   cargo in `local` (path-dep) mode against that clone. Release pins resolve
+//   crates straight from crates.io and need no clone. CI runs `prepare-build`
+//   before every `cargo build`; it is a no-op for release pins.
+//
 // Commands:
 //   node scripts/secure-exec-dep.mjs pinned
 //   node scripts/secure-exec-dep.mjs local
 //   node scripts/secure-exec-dep.mjs set-version <version>
+//   node scripts/secure-exec-dep.mjs prepare-build   # CI: clone+local for previews, no-op for releases
+//   node scripts/secure-exec-dep.mjs secure-exec-sha # print the pinned preview sha ("" for releases)
 //   node scripts/secure-exec-dep.mjs status
 //
 // After switching modes or versions, run `pnpm install` (and a cargo build) so
@@ -31,6 +45,7 @@
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -252,6 +267,85 @@ function rewriteCargo(mode, setVersion) {
 }
 
 // ---------------------------------------------------------------------------
+// preview crate builds: clone secure-exec at the pinned sha
+// ---------------------------------------------------------------------------
+// secure-exec is a PUBLIC GitHub repo, so cloning needs no token. The clone
+// target is always the sibling ../secure-exec (SECURE_EXEC_REL) so the cargo
+// path deps written by `local` mode resolve unchanged.
+const SECURE_EXEC_GIT_URL =
+	process.env.SECURE_EXEC_GIT_URL ||
+	`https://github.com/${process.env.SECURE_EXEC_REPO || "rivet-dev/secure-exec"}.git`;
+
+// The pinned @secure-exec/core version from the catalog is the source of truth
+// for which secure-exec the workspace consumes.
+function pinnedSecureExecVersion() {
+	const v = readVersions()["@secure-exec/core"];
+	if (!v) {
+		throw new Error(
+			"no @secure-exec/core pin found in the pnpm-workspace.yaml catalog",
+		);
+	}
+	return v;
+}
+
+// Preview versions are `0.0.0-<branch>.<sha>` (secure-exec scripts/publish
+// lib/context.ts: `${PREVIEW_BASE_VERSION}-${branch}.${GITHUB_SHA.slice(0,7)}`).
+// Return the trailing commit sha for previews; null for real releases.
+function previewSha(version) {
+	const m = /^0\.0\.0-.+\.([0-9a-f]{7,40})$/.exec(version);
+	return m ? m[1] : null;
+}
+
+function git(args, opts = {}) {
+	return execFileSync("git", args, { stdio: "inherit", ...opts });
+}
+
+// `git fetch` wants a FULL 40-char sha (GitHub advertises full-sha wants, not
+// abbreviations), but the preview version only carries the 7-char short sha.
+// Resolve it via the commits API. A token (GITHUB_TOKEN) is optional and only
+// raises the anonymous rate limit.
+async function resolveFullSha(sha) {
+	if (/^[0-9a-f]{40}$/.test(sha)) return sha;
+	const repo = process.env.SECURE_EXEC_REPO || "rivet-dev/secure-exec";
+	const headers = { "User-Agent": "agentos-secure-exec-dep", Accept: "application/vnd.github+json" };
+	const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+	if (token) headers.Authorization = `Bearer ${token}`;
+	const res = await fetch(`https://api.github.com/repos/${repo}/commits/${sha}`, { headers });
+	if (!res.ok) {
+		throw new Error(`could not resolve secure-exec sha ${sha}: GitHub API HTTP ${res.status}`);
+	}
+	const full = (await res.json()).sha;
+	if (!full) throw new Error(`GitHub API returned no sha for ${sha}`);
+	return full;
+}
+
+async function cloneSecureExecAtSha(sha) {
+	const abs = path.resolve(ROOT, SECURE_EXEC_REL);
+	const full = await resolveFullSha(sha);
+	if (!existsSync(path.join(abs, ".git"))) {
+		git(["init", "-q", abs]);
+		git(["-C", abs, "remote", "add", "origin", SECURE_EXEC_GIT_URL]);
+	}
+	git(["-C", abs, "fetch", "--depth", "1", "origin", full]);
+	git(["-C", abs, "checkout", "-q", full]);
+	return abs;
+}
+
+// secure-exec crates share ONE workspace version (kept in sync with npm). The
+// crate version is the real semver in source — NOT the `0.0.0-...` npm preview
+// string — read from the cloned root Cargo.toml `[workspace.package]`.
+function readCloneCrateVersion(dir) {
+	const cargo = readFileSync(path.join(dir, "Cargo.toml"), "utf8");
+	const m = /\[workspace\.package\][\s\S]*?\bversion\s*=\s*"([^"]+)"/.exec(cargo);
+	if (!m) {
+		throw new Error(
+			`could not read [workspace.package] version from ${dir}/Cargo.toml`,
+		);
+	}
+	return m[1];
+}
+
+// ---------------------------------------------------------------------------
 // commands
 // ---------------------------------------------------------------------------
 function npmMode() {
@@ -342,6 +436,65 @@ switch (cmd) {
 		console.log(`secure-exec crate version requirement set to ${arg}.`);
 		break;
 	}
+	case "pin-secure-exec": {
+		// Pin secure-exec to <v>, correct for BOTH preview and release pins:
+		//  - npm @secure-exec/* always pin to <v> (a preview branch tag or a
+		//    real release version both resolve from the npm registry).
+		//  - crates: npm and crates only share a version on a REAL release (they
+		//    publish together). For a preview, <v> is `0.0.0-<branch>.<sha>` which
+		//    is NOT a crate version — crates.io has no preview track — so the crate
+		//    version requirement is left untouched (stays pinned to the last
+		//    crates.io release) and `prepare-build` clones at <sha> to build them.
+		if (!arg) {
+			console.error("usage: pin-secure-exec <version>");
+			process.exit(1);
+		}
+		writeCatalog(arg, "secure-exec");
+		const sha = previewSha(arg);
+		if (sha) {
+			console.log(
+				`@secure-exec/* npm pinned to preview ${arg}; crate version left as-is ` +
+					`(crates build from a clone at ${sha} via prepare-build — crates.io has no preview track).`,
+			);
+		} else {
+			rewriteCargo(cargoMode(), arg);
+			console.log(`@secure-exec/* npm + secure-exec-* crate version pinned to release ${arg}.`);
+		}
+		break;
+	}
+	case "secure-exec-sha": {
+		// Print the pinned preview sha (empty for release pins). Lets CI gate
+		// steps / cache keys on whether a preview clone is needed.
+		console.log(previewSha(pinnedSecureExecVersion()) || "");
+		break;
+	}
+	case "prepare-build": {
+		// CI step run before every `cargo build`. For a preview pin, clone
+		// secure-exec at the pinned sha and switch cargo to local path deps; for
+		// a release pin this is a no-op and cargo resolves crates from crates.io.
+		const version = pinnedSecureExecVersion();
+		const sha = previewSha(version);
+		if (!sha) {
+			console.log(
+				`secure-exec ${version} is a release pin; cargo resolves crates from crates.io (no clone).`,
+			);
+			break;
+		}
+		console.log(
+			`secure-exec ${version} is a preview; cloning ${SECURE_EXEC_GIT_URL} @ ${sha} -> ${SECURE_EXEC_REL}`,
+		);
+		const abs = await cloneSecureExecAtSha(sha);
+		// The v8-runtime build.rs needs the secure-exec workspace's node deps
+		// (packages/build-tools/node_modules) or it panics — install them.
+		console.log("installing cloned secure-exec workspace deps (for the v8-runtime build)...");
+		execFileSync("pnpm", ["install", "--frozen-lockfile"], { cwd: abs, stdio: "inherit" });
+		const crateVer = readCloneCrateVersion(abs);
+		rewriteCargo("local", crateVer);
+		console.log(
+			`cargo -> LOCAL path deps against cloned secure-exec @ ${sha} (crate version ${crateVer}).`,
+		);
+		break;
+	}
 	case "status": {
 		const versions = readVersions();
 		console.log(`mode: ${currentMode()}`);
@@ -351,7 +504,7 @@ switch (cmd) {
 	}
 	default:
 		console.error(
-			"usage: secure-exec-dep.mjs <pinned|local|status|set-version <v>|set-secure-exec-version <v>|set-agentos-pkgs-version <v>|set-crate-version <v>>",
+			"usage: secure-exec-dep.mjs <pinned|local|status|set-version <v>|pin-secure-exec <v>|set-secure-exec-version <v>|set-agentos-pkgs-version <v>|set-crate-version <v>|prepare-build|secure-exec-sha>",
 		);
 		process.exit(1);
 }

@@ -38,5 +38,17 @@ run "memory-pi-session" \
 run "memory-claude-session" \
   --expose-gc scripts/benchmarks/memory.bench.ts --workload=claude-session --count=3
 
+# Session-creation VM-tax benchmark (deterministic, llmock-backed).
+# Compares the agentOS VM path vs the bare-node pi-SDK equivalent and gates the
+# deterministic metrics against scripts/benchmarks/baseline.json.
+# Set BENCH_GATE=1 to fail the run on a regression (CI); set BENCH_UPDATE_BASELINE=1
+# to refresh the committed baseline (do this on a clean checkout, review in PR).
+echo "" >&2
+echo "=== Running session ===" >&2
+pnpm exec tsx scripts/benchmarks/session.bench.ts --iterations=5 \
+  ${BENCH_GATE:+--gate} ${BENCH_UPDATE_BASELINE:+--update-baseline} \
+  1> "$RESULTS_DIR/session.json" \
+  2> >(tee "$RESULTS_DIR/session.log" >&2)
+
 echo "" >&2
 echo "=== Done. Results in $RESULTS_DIR ===" >&2

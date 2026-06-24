@@ -211,6 +211,7 @@ import {
 import {
 	type CommandPackageMetadata,
 	processSoftware,
+	resolveAgentSnapshotBundle,
 	resolvePackageDir,
 	type SoftwareInput,
 	type SoftwareRoot,
@@ -2741,6 +2742,9 @@ export class AgentOs {
 				? (options.software ?? [])
 				: [commonSoftware, ...(options?.software ?? [])];
 		const processed = processSoftware(software);
+		// Agent-SDK snapshot bundle (loaded once per sidecar into the V8 startup
+		// snapshot, reused across sessions) for any snapshot-enabled agent.
+		const snapshotUserlandCode = resolveAgentSnapshotBundle(software);
 		const localMounts = await resolveCompatLocalMounts(options?.mounts);
 		const toolKits = options?.toolKits;
 		if (toolKits && toolKits.length > 0) {
@@ -2835,12 +2839,18 @@ export class AgentOs {
 					// module resolution keep their engine defaults (full Node
 					// emulation), matching the prior behavior where Agent OS only
 					// constrained the builtin allow-list.
-					...(options?.allowedNodeBuiltins !== undefined
+					...(options?.allowedNodeBuiltins !== undefined ||
+					snapshotUserlandCode !== undefined
 						? {
 								jsRuntime: {
 									platform: "node" as const,
 									moduleResolution: "node" as const,
-									allowedBuiltins: options.allowedNodeBuiltins,
+									...(options?.allowedNodeBuiltins !== undefined
+										? { allowedBuiltins: options.allowedNodeBuiltins }
+										: {}),
+									...(snapshotUserlandCode !== undefined
+										? { snapshotUserlandCode }
+										: {}),
 								},
 							}
 						: {}),

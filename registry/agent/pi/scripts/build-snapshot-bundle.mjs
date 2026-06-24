@@ -1,7 +1,7 @@
 /**
  * Builds the Pi SDK snapshot bundle (Step 2a).
  *
- * Bundles src/snapshot-entry.ts into a single IIFE at dist/pi-sdk-snapshot.js that
+ * Bundles src/snapshot-entry.ts into a single IIFE at dist/sdk-snapshot.js that
  * evaluates the SDK graph and publishes it on globalThis.__PI_SDK_RUNTIME__. node:
  * builtins stay external (provided by the V8 runtime's bridge polyfills, already in
  * the snapshot heap); heavy provider SDKs reached only via dynamic import() stay
@@ -39,7 +39,7 @@ const { build } = await import(pathToFileURL(esbuildPath).href);
 // Entry/outfile are overridable (PI_SNAPSHOT_ENTRY / PI_SNAPSHOT_OUTFILE) for
 // bisection/testing; default to the committed entry + artifact.
 const entryPoint = process.env.PI_SNAPSHOT_ENTRY || join(pkgRoot, "src", "snapshot-entry.ts");
-const outfile = process.env.PI_SNAPSHOT_OUTFILE || join(pkgRoot, "dist", "pi-sdk-snapshot.js");
+const outfile = process.env.PI_SNAPSHOT_OUTFILE || join(pkgRoot, "dist", "sdk-snapshot.js");
 
 // Provider SDKs the pi-ai layer pulls only via dynamic import(); keep them lazy.
 const lazyExternals = [
@@ -137,18 +137,27 @@ const snapshotSafePlugin = {
 		// at top level, leaving pending promises. Convert to synchronous require()
 		// (grabs the polyfill module reference only — no I/O, no pending promise),
 		// preserving the feature post-restore.
+		const ENV_API_KEYS_EAGER_IMPORTS = 3;
 		b.onLoad({ filter: /\/pi-ai\/dist\/env-api-keys\.js$/ }, (a) => {
 			let src = readFileSync(a.path, "utf8");
-			const before = src;
-			src = src.replace(
-				/dynamicImport\((NODE_\w+_SPECIFIER)\)\.then\(\(m\)\s*=>\s*\{\s*(_\w+)\s*=\s*m\.(\w+);\s*\}\);/g,
-				(_m, spec, lhs, prop) => `try { ${lhs} = require(${spec}).${prop}; } catch {}`,
-			);
-			if (src === before) {
+			const re =
+				/dynamicImport\((NODE_\w+_SPECIFIER)\)\.then\(\(m\)\s*=>\s*\{\s*(_\w+)\s*=\s*m\.(\w+);\s*\}\);/g;
+			// Count matches BEFORE replacing: a `src === before` check only catches a
+			// total shape change. If upstream adds a 4th eager import (or drops one),
+			// the regex would silently transform a subset and leave a pending-promise
+			// hazard at module-init — re-breaking snapshot-safety with no build error.
+			// Assert the exact expected count so any drift fails the build loudly.
+			const matchCount = (src.match(re) || []).length;
+			if (matchCount !== ENV_API_KEYS_EAGER_IMPORTS) {
 				throw new Error(
-					"snapshot-safe: env-api-keys.js eager dynamicImport shape changed; update the transform",
+					`snapshot-safe: env-api-keys.js eager dynamicImport shape changed ` +
+						`(found ${matchCount}, expected ${ENV_API_KEYS_EAGER_IMPORTS}); update the transform`,
 				);
 			}
+			src = src.replace(
+				re,
+				(_m, spec, lhs, prop) => `try { ${lhs} = require(${spec}).${prop}; } catch {}`,
+			);
 			return { contents: src, loader: "js" };
 		});
 		// pi-tui/dist/utils.js creates a module-level `new Intl.Segmenter(...)` — an
@@ -213,5 +222,5 @@ writeFileSync(`${outfile}.sha256`, `${sha256}\n`);
 
 const inputs = Object.keys(result.metafile.inputs).length;
 console.log(
-	`\npi-sdk-snapshot.js: ${(bytes.length / 1024).toFixed(0)} KiB · ${inputs} modules inlined · sha256 ${sha256.slice(0, 12)}…`,
+	`\nsdk-snapshot.js: ${(bytes.length / 1024).toFixed(0)} KiB · ${inputs} modules inlined · sha256 ${sha256.slice(0, 12)}…`,
 );

@@ -24,6 +24,11 @@ RUN rustup toolchain install stable --profile minimal && \
 RUN corepack enable && \
     pnpm install --frozen-lockfile
 
+# crates.io has no preview track: a secure-exec preview pin builds the crates
+# from a clone at the pinned commit (../secure-exec == /secure-exec here);
+# a release pin is a no-op and resolves crates from crates.io.
+RUN node scripts/secure-exec-dep.mjs prepare-build
+
 RUN tu=$(echo "$TARGET" | tr 'a-z-' 'A-Z_') && \
     tl=$(echo "$TARGET" | tr - _) && \
     export BINDGEN_EXTRA_CLANG_ARGS_${tl}="--sysroot=$SDK -isystem $SDK/usr/include" && \

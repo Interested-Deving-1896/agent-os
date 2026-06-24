@@ -39,10 +39,44 @@ import {
 	existsSync,
 	readFileSync,
 	readdirSync,
+	writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { PassThrough } from "node:stream";
+
+// ── Phase tracing (opt-in via PI_TRACE_FILE) ────────────────────────
+// Emits Chrome-trace ("X") events for newSession sub-phases so the otherwise
+// opaque ACP `session/new` span can be broken down and compared against the
+// bare-node equivalent. The file is written in the guest VFS and read by the
+// host (e.g. the benchmark) via vm.readFile.
+function startPhaseTrace() {
+	const spans: { name: string; ts: number; dur: number }[] = [];
+	const t0 = Date.now();
+	return {
+		async span<T>(name: string, fn: () => Promise<T> | T): Promise<T> {
+			const start = Date.now();
+			try {
+				return await fn();
+			} finally {
+				spans.push({ name, ts: (start - t0) * 1000, dur: (Date.now() - start) * 1000 });
+			}
+		},
+		flush(extra: Record<string, unknown> = {}) {
+			const file = process.env.PI_TRACE_FILE;
+			if (!file) return;
+			const events = [
+				{ name: "newSession", cat: "pi", ph: "X", pid: 1, tid: 1, ts: 0, dur: (Date.now() - t0) * 1000, args: extra },
+				...spans.map((s) => ({ name: s.name, cat: "pi", ph: "X", pid: 1, tid: 1, ts: s.ts, dur: s.dur })),
+			];
+			try {
+				writeFileSync(file, JSON.stringify(events));
+			} catch {
+				/* tracing is best-effort */
+			}
+		},
+	};
+}
 
 const PI_SDK_PACKAGE = "@mariozechner/pi-coding-agent";
 const MODULE_ACCESS_NODE_MODULES = "/root/node_modules";
@@ -590,8 +624,37 @@ function findProjectedPackageRoot(packageName: string): string {
 	return directRoot;
 }
 
+// When the agent SDK has been evaluated into the V8 startup snapshot (built once
+// per sidecar), its runtime API is already present on this global — published by
+// the snapshot build-entry (snapshot-entry.ts). Reading it skips the per-session
+// dynamic-import + evaluate of the whole SDK graph entirely.
+const PI_SDK_RUNTIME_GLOBAL = "__PI_SDK_RUNTIME__";
+
+function readSnapshotRuntime(): PiSdkRuntime | undefined {
+	const candidate = (globalThis as Record<string, unknown>)[
+		PI_SDK_RUNTIME_GLOBAL
+	];
+	if (
+		candidate &&
+		typeof candidate === "object" &&
+		typeof (candidate as PiSdkRuntime).createAgentSession === "function"
+	) {
+		return candidate as PiSdkRuntime;
+	}
+	return undefined;
+}
+
 async function loadPiSdkRuntime(): Promise<PiSdkRuntime> {
 	if (!piSdkRuntimePromise) {
+		// Snapshot fast path: the SDK runtime is already on the global (evaluated
+		// into the snapshot at sidecar startup). No I/O, no module resolution.
+		const snapshotRuntime = readSnapshotRuntime();
+		if (snapshotRuntime) {
+			piSdkRuntimePromise = Promise.resolve(snapshotRuntime);
+			return piSdkRuntimePromise;
+		}
+		// Fallback: load the SDK from the guest VFS via dynamic import (the path
+		// used when no snapshot is present, e.g. a cold/unsupported runtime).
 		piSdkRuntimePromise = (async () => {
 			const packageRoot = findProjectedPackageRoot(PI_SDK_PACKAGE);
 			const agentCoreRoot = findProjectedPackageRoot("@mariozechner/pi-agent-core");
@@ -744,6 +807,7 @@ class PiSdkAgent implements Agent {
 	async newSession(
 		params: NewSessionRequest,
 	): Promise<NewSessionResponse> {
+		const __trace = startPhaseTrace();
 		this.cwd = params.cwd;
 		process.chdir(params.cwd);
 		const agentDir = join(process.env.HOME || "/home/agentos", ".pi", "agent");
@@ -752,21 +816,29 @@ class PiSdkAgent implements Agent {
 			SessionManager,
 			SettingsManager,
 			createCodingTools,
-		} = await loadPiSdkRuntime();
+		} = await __trace.span("loadPiSdkRuntime", () => loadPiSdkRuntime());
 		const { extensionFactories, errors: extensionLoadErrors } =
-			await loadDiscoveredExtensionFactories(params.cwd, agentDir);
-		const resourceLoader = new DefaultResourceLoader({
-			cwd: params.cwd,
-			agentDir,
-			...(extensionFactories.length > 0
-				? {
+			await __trace.span("loadExtensions", () =>
+				loadDiscoveredExtensionFactories(params.cwd, agentDir),
+			);
+		// Step 3: when no workspace extensions were discovered (the common case),
+		// skip DefaultResourceLoader entirely — it eagerly loads skills/themes/
+		// prompts/agentsFiles (~250ms) the headless ACP adapter doesn't use. The
+		// MinimalResourceLoader's reload() is a no-op. Only the full loader (with its
+		// extension runtime) is constructed when extensions are actually present.
+		const resourceLoader: MinimalResourceLoaderLike =
+			extensionFactories.length > 0
+				? new DefaultResourceLoader({
+						cwd: params.cwd,
+						agentDir,
 						noExtensions: true,
 						extensionFactories,
-					}
-				: {}),
-			...(appendSystemPrompt ? { appendSystemPrompt } : {}),
-		});
-		await resourceLoader.reload();
+						...(appendSystemPrompt ? { appendSystemPrompt } : {}),
+					})
+				: new MinimalResourceLoader({
+						...(appendSystemPrompt ? { appendSystemPrompt } : {}),
+					});
+		await __trace.span("resourceLoader.reload", () => resourceLoader.reload());
 		for (const { path, error } of extensionLoadErrors) {
 			console.warn(`[pi-sdk-acp] Failed to load extension ${path}: ${error}`);
 		}
@@ -775,21 +847,24 @@ class PiSdkAgent implements Agent {
 			agentDir,
 		);
 
-		const { session } = await createAgentSession({
-			cwd: params.cwd,
-			sessionManager: SessionManager.inMemory(params.cwd),
-			resourceLoader,
-			tools: this.wrapTools(
-				createCodingTools(params.cwd, {
-					read: {
-						autoResizeImages: settingsManager.getImageAutoResize(),
-					},
-					bash: {
-						commandPrefix: settingsManager.getShellCommandPrefix(),
-					},
-				}),
-			),
-		});
+		const { session } = await __trace.span("createAgentSession", () =>
+			createAgentSession({
+				cwd: params.cwd,
+				sessionManager: SessionManager.inMemory(params.cwd),
+				resourceLoader,
+				tools: this.wrapTools(
+					createCodingTools(params.cwd, {
+						read: {
+							autoResizeImages: settingsManager.getImageAutoResize(),
+						},
+						bash: {
+							commandPrefix: settingsManager.getShellCommandPrefix(),
+						},
+					}),
+				),
+			}),
+		);
+		__trace.flush();
 
 		this.session = session;
 		this.sessionId = session.sessionId;

@@ -112,6 +112,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-rusty-v8-
       - run: pnpm install --frozen-lockfile
+      # crates.io has no preview track, so a preview pin builds the sidecar
+      # against secure-exec cloned at the pinned commit (no-op for releases).
+      - name: Prepare secure-exec crates
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/secure-exec-dep.mjs prepare-build
       - name: Build sidecar binary
         id: build
         run: |
@@ -174,6 +180,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-rusty-v8-
       - run: pnpm install --frozen-lockfile
+      # crates.io has no preview track, so a preview pin builds the plugin
+      # against secure-exec cloned at the pinned commit (no-op for releases).
+      - name: Prepare secure-exec crates
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/secure-exec-dep.mjs prepare-build
       - name: Build plugin cdylib
         id: build
         run: |

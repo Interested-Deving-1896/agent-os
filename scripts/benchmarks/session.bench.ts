@@ -1,0 +1,488 @@
+/**
+ * Session-creation "VM tax" benchmark (JS layer, llmock, deterministic).
+ *
+ * Measures the cost of getting a pi agent ready across lanes and reports how much
+ * of it is the agentOS VM vs the inherent Node.js pi-SDK work:
+ *
+ *   lane `vm`        — AgentOs.create() (vmCreate) + createSession("pi") (sessionCreate)
+ *   lane `bare-node` — the SAME pi-SDK session construction on host node, no VM
+ *                      (sessionCreate = load pi SDK + createAgentSession)
+ *
+ *   derived.vmTaxMs    = vm.sessionCreate.p50 − bareNode.sessionCreate.p50
+ *   derived.vmTaxRatio = vm.sessionCreate.p50 / bareNode.sessionCreate.p50
+ *
+ * All LLM traffic goes to a local llmock, so vmCreate/sessionCreate are
+ * deterministic and gate-able. Prompt latency is intentionally NOT measured here
+ * (it's LLM-bound; it belongs in a separate informational real-API suite).
+ *
+ * Usage:
+ *   pnpm exec tsx scripts/benchmarks/session.bench.ts [--iterations=N] [--warmup=N]
+ *                 [--lanes=vm,bare-node] [--gate] [--update-baseline]
+ *
+ *   --gate             exit non-zero if a gated metric regresses vs baseline.json
+ *   --update-baseline  overwrite baseline.json with this run (review the diff in a PR)
+ */
+
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { performance } from "node:perf_hooks";
+import { AgentOs } from "@rivet-dev/agentos-core";
+import { LLMock } from "@copilotkit/llmock";
+import {
+	type BenchResult,
+	type GateRule,
+	type PhaseStats,
+	collectMetadata,
+	evaluateGate,
+	loadBaseline,
+	printDeltaTable,
+	round,
+	stats,
+	writeBaseline,
+} from "./baseline.js";
+
+// ── args ─────────────────────────────────────────────────────────────
+const argv = process.argv.slice(2);
+const arg = (k: string, d: string) =>
+	argv.find((a) => a.startsWith(`--${k}=`))?.split("=")[1] ?? d;
+const flag = (k: string) => argv.includes(`--${k}`);
+
+const ITERATIONS = Number.parseInt(arg("iterations", "5"), 10);
+const WARMUP = Number.parseInt(arg("warmup", "1"), 10);
+const LANES = arg("lanes", "vm,bare-node").split(",");
+const GATE = flag("gate");
+const UPDATE_BASELINE = flag("update-baseline");
+const TRACE = flag("trace");
+
+// ── gate rules: p50 of deterministic metrics + the hardware-independent ratio ──
+const GATE_RULES: GateRule[] = [
+	// noiseFloor keeps tiny/fast metrics from flaking on sub-ms jitter.
+	{ path: "vm.vmCreate.p50", tolerance: 0.15, noiseFloor: 10, label: "vm.vmCreate p50" },
+	{ path: "vm.sessionCreate.p50", tolerance: 0.12, noiseFloor: 40, label: "vm.sessionCreate p50" },
+	{ path: "derived.vmTaxRatio", tolerance: 0.15, noiseFloor: 0.1, label: "VM-tax ratio (vm/bare)" },
+];
+
+// ── shared llmock ────────────────────────────────────────────────────
+let llmock: LLMock | undefined;
+let llmockUrl = "";
+let llmockPort = 0;
+async function ensureLlmock() {
+	if (llmock) return { url: llmockUrl, port: llmockPort };
+	llmock = new LLMock({ port: 0, logLevel: "silent" });
+	llmock.addFixtures([
+		{ match: { predicate: () => true }, response: { content: "Hello from llmock" } },
+	]);
+	llmockUrl = await llmock.start();
+	llmockPort = Number(new URL(llmockUrl).port);
+	return { url: llmockUrl, port: llmockPort };
+}
+
+// ── workload resolution (robust to repo layout) ──────────────────────
+
+async function loadPiSoftware(): Promise<unknown> {
+	// Preferred: the published/installed software package. Variable specifier so
+	// this typechecks even when the package isn't installed in the dev workspace.
+	const piPkg = "@agentos-software/pi";
+	try {
+		return (await import(piPkg)).default;
+	} catch {
+		// Fallback: the in-repo registry workspace build.
+		const local = join(import.meta.dirname, "../../registry/agent/pi/dist/index.js");
+		if (existsSync(local)) return (await import(local)).default;
+		throw new Error(
+			"Could not resolve the pi software package (@agentos-software/pi or registry/agent/pi/dist). Build it first.",
+		);
+	}
+}
+
+const PI_SDK_PKG = "@mariozechner/pi-coding-agent";
+
+/** Locate the installed pi-coding-agent package root on the host, or null. */
+function findPiSdkRoot(): string | null {
+	const reqs = [
+		createRequire(join(import.meta.dirname, "../../package.json")),
+		createRequire(join(import.meta.dirname, "../../registry/agent/pi/package.json")),
+	];
+	for (const req of reqs) {
+		for (const base of req.resolve.paths(PI_SDK_PKG) ?? []) {
+			const root = join(base, PI_SDK_PKG);
+			if (existsSync(join(root, "package.json"))) return root;
+		}
+		try {
+			// pnpm symlink layout: resolve the entry, then walk up to the pkg root.
+			let dir = dirname(req.resolve(PI_SDK_PKG));
+			for (let i = 0; i < 10; i++) {
+				const pj = join(dir, "package.json");
+				if (
+					existsSync(pj) &&
+					JSON.parse(readFileSync(pj, "utf8")).name === PI_SDK_PKG
+				) {
+					return dir;
+				}
+				const parent = dirname(dir);
+				if (parent === dir) break;
+				dir = parent;
+			}
+		} catch {
+			/* not resolvable via this require context */
+		}
+	}
+	return null;
+}
+
+/**
+ * Resolve the pi SDK package root, or throw (hard error) if it isn't installed —
+ * the Node.js-equivalent baseline must actually run, not silently vanish.
+ */
+function resolvePiSdkRootOrThrow(): string {
+	const root = findPiSdkRoot();
+	if (!root) {
+		throw new Error(
+			`bare-node lane: ${PI_SDK_PKG} is not installed/resolvable on the host. ` +
+				"Run `pnpm install` (it's a devDependency), or pass --lanes=vm to skip this lane.",
+		);
+	}
+	return root;
+}
+
+/**
+ * The bare-node session-creation script, run in a FRESH node process per sample
+ * so each pays the full cold SDK load (the VM lane reloads the SDK in a fresh V8
+ * isolate every session, so this is the apples-to-apples "Node.js equivalent").
+ * Mirrors registry/agent/pi/src/adapter.ts `newSession`, with no VM. It times the
+ * SDK load + session construction internally and prints `__MS__=<ms>`.
+ */
+function bareNodeScript(root: string): string {
+	return `
+import { performance } from "node:perf_hooks";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+const root = ${JSON.stringify(root)};
+const phases = [];
+const t0 = performance.now();
+async function span(name, fn) {
+  const s = performance.now();
+  try { return await fn(); }
+  finally { phases.push({ name, cat: "pi", ph: "X", pid: 1, tid: 1, ts: (s - t0) * 1000, dur: (performance.now() - s) * 1000 }); }
+}
+const [sdk, settings, resource, session] = await span("loadPiSdkRuntime", () => Promise.all([
+  import(join(root, "dist/core/sdk.js")),
+  import(join(root, "dist/core/settings-manager.js")),
+  import(join(root, "dist/core/resource-loader.js")),
+  import(join(root, "dist/core/session-manager.js")),
+]));
+if (typeof sdk.createAgentSession !== "function") {
+  console.error("pi SDK API changed: createAgentSession missing");
+  process.exit(2);
+}
+const cwd = tmpdir();
+const agentDir = join(homedir(), ".pi", "agent");
+const settingsManager = settings.SettingsManager.create(cwd, agentDir);
+const resourceLoader = new resource.DefaultResourceLoader({ cwd, agentDir });
+await span("resourceLoader.reload", () => resourceLoader.reload());
+await span("createAgentSession", () => sdk.createAgentSession({
+  cwd, agentDir,
+  sessionManager: session.SessionManager.inMemory(cwd),
+  resourceLoader, settingsManager,
+  tools: sdk.createCodingTools(cwd, {}),
+  customTools: sdk.createCodingTools(cwd, {}),
+}));
+const total = performance.now() - t0;
+console.log("__MS__=" + total);
+console.log("__TRACE__=" + JSON.stringify([{ name: "newSession", cat: "pi", ph: "X", pid: 1, tid: 1, ts: 0, dur: total * 1000 }, ...phases]));
+process.exit(0);
+`;
+}
+
+type TraceEvent = {
+	name: string;
+	ph: string;
+	ts: number;
+	dur: number;
+	pid: number;
+	tid: number;
+	cat?: string;
+};
+
+function runBareNode(
+	root: string,
+	llmockUrlArg: string,
+): Promise<{ ms: number; trace: TraceEvent[] }> {
+	return new Promise((res, rej) => {
+		const child = spawn(
+			process.execPath,
+			["--input-type=module", "-e", bareNodeScript(root)],
+			{
+				env: {
+					...process.env,
+					ANTHROPIC_BASE_URL: llmockUrlArg,
+					ANTHROPIC_API_KEY: "bench-key",
+				},
+				stdio: ["ignore", "pipe", "pipe"],
+			},
+		);
+		let out = "";
+		let err = "";
+		child.stdout.on("data", (d) => {
+			out += d;
+		});
+		child.stderr.on("data", (d) => {
+			err += d;
+		});
+		child.on("error", rej);
+		child.on("exit", (code) => {
+			if (code !== 0) {
+				rej(
+					new Error(
+						`bare-node subprocess exited ${code}: ${(err || out).slice(-400)}`,
+					),
+				);
+				return;
+			}
+			const m = out.match(/__MS__=([\d.]+)/);
+			if (!m) {
+				rej(new Error(`bare-node subprocess produced no timing: ${out.slice(-200)}`));
+				return;
+			}
+			const tm = out.match(/__TRACE__=(.+)/);
+			res({ ms: Number(m[1]), trace: tm ? JSON.parse(tm[1]) : [] });
+		});
+	});
+}
+
+async function bareNodeLaneSample(
+	root: string,
+	llmockUrlArg: string,
+): Promise<Sample> {
+	const { ms } = await runBareNode(root, llmockUrlArg);
+	return { sessionCreate: ms };
+}
+
+// ── lanes ────────────────────────────────────────────────────────────
+type Sample = Record<string, number>;
+
+async function vmLaneSample(software: unknown): Promise<Sample> {
+	const { port, url } = await ensureLlmock();
+	let t = performance.now();
+	const vm = await AgentOs.create({
+		software: [software] as never,
+		loopbackExemptPorts: [port],
+	});
+	const vmCreate = performance.now() - t;
+	t = performance.now();
+	const { sessionId } = await vm.createSession("pi", {
+		env: { ANTHROPIC_API_KEY: "bench-key", ANTHROPIC_BASE_URL: url },
+	});
+	const sessionCreate = performance.now() - t;
+	vm.closeSession(sessionId);
+	await vm.dispose();
+	return { vmCreate, sessionCreate };
+}
+
+async function runLane(
+	name: string,
+	sampleFn: () => Promise<Sample>,
+): Promise<Record<string, PhaseStats>> {
+	const collected: Record<string, number[]> = {};
+	for (let i = 0; i < ITERATIONS + WARMUP; i++) {
+		const warm = i < WARMUP;
+		const sample = await sampleFn();
+		if (warm) continue;
+		for (const [k, v] of Object.entries(sample)) {
+			(collected[k] ??= []).push(v);
+		}
+		const line = Object.entries(sample)
+			.map(([k, v]) => `${k}=${v.toFixed(0)}`)
+			.join(" ");
+		console.error(`[${name}] iter ${i - WARMUP}: ${line} ms`);
+	}
+	const out: Record<string, PhaseStats> = {};
+	for (const [k, v] of Object.entries(collected)) out[k] = stats(v);
+	return out;
+}
+
+// ── main ─────────────────────────────────────────────────────────────
+// ── trace mode ───────────────────────────────────────────────────────
+const RESULTS_DIR = join(import.meta.dirname, "results");
+
+/** One vm createSession with adapter phase tracing on; returns the spans. */
+async function vmLaneTrace(software: unknown): Promise<TraceEvent[]> {
+	const { port, url } = await ensureLlmock();
+	const vm = await AgentOs.create({
+		software: [software] as never,
+		loopbackExemptPorts: [port],
+	});
+	const tracePath = "/home/agentos/pi-trace.json";
+	const { sessionId } = await vm.createSession("pi", {
+		env: {
+			ANTHROPIC_API_KEY: "bench-key",
+			ANTHROPIC_BASE_URL: url,
+			PI_TRACE_FILE: tracePath,
+		},
+	});
+	let spans: TraceEvent[] = [];
+	try {
+		spans = JSON.parse(new TextDecoder().decode(await vm.readFile(tracePath)));
+	} catch (e) {
+		console.error(`  (no adapter trace: ${(e as Error).message})`);
+	}
+	vm.closeSession(sessionId);
+	await vm.dispose();
+	return spans;
+}
+
+function phaseMap(spans: TraceEvent[]): Map<string, number> {
+	const m = new Map<string, number>();
+	for (const s of spans) m.set(s.name, Math.round(s.dur / 1000)); // µs -> ms
+	return m;
+}
+
+async function traceMode() {
+	const out: Record<string, TraceEvent[]> = {};
+
+	console.error("=== trace: vm lane (adapter newSession phases) ===");
+	out.vm = await vmLaneTrace(await loadPiSoftware());
+
+	console.error("=== trace: bare-node lane (host pi-SDK phases) ===");
+	const { trace } = await runBareNode(
+		resolvePiSdkRootOrThrow(),
+		(await ensureLlmock()).url,
+	);
+	out["bare-node"] = trace;
+
+	// Write Chrome-trace / Perfetto JSON per lane (openable at ui.perfetto.dev),
+	// and a merged trace with the lanes on separate tracks for side-by-side view.
+	const tag = (evs: TraceEvent[], tid: number, prefix: string) =>
+		evs.map((e) => ({ ...e, tid, name: `${prefix}${e.name}` }));
+	writeFileSync(
+		join(RESULTS_DIR, "trace-vm.json"),
+		JSON.stringify({ traceEvents: out.vm }, null, 2),
+	);
+	writeFileSync(
+		join(RESULTS_DIR, "trace-bare-node.json"),
+		JSON.stringify({ traceEvents: out["bare-node"] }, null, 2),
+	);
+	writeFileSync(
+		join(RESULTS_DIR, "trace-merged.json"),
+		JSON.stringify(
+			{
+				traceEvents: [
+					...tag(out.vm, 1, "vm:"),
+					...tag(out["bare-node"], 2, "bare:"),
+				],
+			},
+			null,
+			2,
+		),
+	);
+
+	// Per-phase comparison table (the "difference with nodejs perf").
+	const vmP = phaseMap(out.vm);
+	const bareP = phaseMap(out["bare-node"]);
+	const names = [...new Set([...vmP.keys(), ...bareP.keys()])].filter(
+		(n) => n !== "newSession",
+	);
+	const headers = ["phase", "vm (ms)", "bare-node (ms)", "VM tax (ms)", "×"];
+	const rows = names.map((n) => {
+		const v = vmP.get(n);
+		const b = bareP.get(n);
+		const tax = v !== undefined && b !== undefined ? v - b : undefined;
+		const x = v !== undefined && b ? round(v / b, 1) : undefined;
+		return [n, v ?? "—", b ?? "—", tax ?? "—", x ?? "—"];
+	});
+	rows.push([
+		"TOTAL (newSession)",
+		vmP.get("newSession") ?? "—",
+		bareP.get("newSession") ?? "—",
+		(vmP.get("newSession") ?? 0) - (bareP.get("newSession") ?? 0) || "—",
+		bareP.get("newSession")
+			? round((vmP.get("newSession") ?? 0) / (bareP.get("newSession") ?? 1), 1)
+			: "—",
+	]);
+	const widths = headers.map((h, i) =>
+		Math.max(h.length, ...rows.map((r) => String(r[i]).length)),
+	);
+	const fmt = (r: (string | number)[]) =>
+		r.map((c, i) => String(c).padStart(widths[i])).join(" | ");
+	console.error("");
+	console.error(fmt(headers));
+	console.error(widths.map((w) => "-".repeat(w)).join("-+-"));
+	for (const r of rows) console.error(fmt(r));
+	console.error(
+		`\nTraces written to ${RESULTS_DIR}/trace-{vm,bare-node,merged}.json — open at https://ui.perfetto.dev`,
+	);
+	if (llmock) await llmock.stop();
+}
+
+async function main() {
+	if (TRACE) {
+		await traceMode();
+		return;
+	}
+	const lanes: BenchResult["lanes"] = {};
+
+	if (LANES.includes("vm")) {
+		const software = await loadPiSoftware();
+		console.error("\n=== lane: vm (AgentOs + createSession) ===");
+		lanes.vm = await runLane("vm", () => vmLaneSample(software));
+	}
+
+	if (LANES.includes("bare-node")) {
+		console.error("\n=== lane: bare-node (host pi-SDK, fresh process, no VM) ===");
+		// Hard error if the SDK isn't installed — the Node.js-equivalent baseline
+		// must actually run, not silently vanish from the comparison.
+		const root = resolvePiSdkRootOrThrow();
+		const { url } = await ensureLlmock();
+		lanes["bare-node"] = await runLane("bare-node", () =>
+			bareNodeLaneSample(root, url),
+		);
+	}
+
+	// derived VM tax
+	const derived: Record<string, number> = {};
+	const vmSess = lanes.vm?.sessionCreate?.p50;
+	const bareSess = lanes["bare-node"]?.sessionCreate?.p50;
+	if (vmSess !== undefined && bareSess !== undefined && bareSess > 0) {
+		derived.vmTaxMs = Math.round(vmSess - bareSess);
+		derived.vmTaxRatio = Math.round((vmSess / bareSess) * 100) / 100;
+	}
+
+	const result: BenchResult = {
+		benchmark: "session",
+		...collectMetadata({ iterations: ITERATIONS, warmup: WARMUP, llmock: true }),
+		lanes,
+		derived,
+	};
+
+	// emit result JSON to stdout (run-benchmarks.sh redirects to results/)
+	console.log(JSON.stringify(result, null, 2));
+
+	// delta vs baseline
+	const baseline = loadBaseline();
+	const outcomes = evaluateGate(result, baseline, GATE_RULES);
+	console.error("\n── delta vs baseline ──");
+	if (!baseline) console.error("(no baseline.json yet — run with --update-baseline to create one)");
+	printDeltaTable(outcomes);
+
+	if (UPDATE_BASELINE) {
+		writeBaseline(result);
+		console.error(`baseline.json updated (${result.gitSha}${result.gitDirty ? "-dirty" : ""}).`);
+	}
+
+	if (llmock) await llmock.stop();
+
+	const regressions = outcomes.filter((o) => o.regressed);
+	if (GATE && baseline && regressions.length > 0) {
+		console.error(`\n❌ ${regressions.length} metric(s) regressed beyond budget.`);
+		process.exit(1);
+	}
+	console.error(GATE ? "\n✓ within budget." : "\n(run with --gate to enforce thresholds)");
+}
+
+main().catch((e) => {
+	console.error(e);
+	process.exit(1);
+});

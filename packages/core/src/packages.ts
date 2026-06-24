@@ -309,6 +309,30 @@ export function defineSoftware<T extends AnySoftwareDescriptor>(desc: T): T {
 	return desc;
 }
 
+/**
+ * Resolve the agent-SDK snapshot bundle (an esbuild IIFE at
+ * `<packageDir>/dist/sdk-snapshot.js`) for the first snapshot-enabled agent in
+ * the software set. Returns its source so it can be evaluated once into the
+ * per-sidecar V8 startup snapshot (`jsRuntime.snapshotUserlandCode`) and reused
+ * across sessions. Returns `undefined` when no agent opts in (`agent.snapshot`)
+ * or the bundle is absent — the runtime then keeps the per-session import path.
+ */
+export function resolveAgentSnapshotBundle(
+	software: SoftwareInput[],
+): string | undefined {
+	const descriptors: AnySoftwareDescriptor[] = software.flat();
+	for (const desc of descriptors) {
+		if (desc.type !== "agent") continue;
+		const agent = desc as AgentSoftwareDescriptor;
+		if (!agent.agent.snapshot) continue;
+		const bundlePath = join(agent.packageDir, "dist", "sdk-snapshot.js");
+		if (existsSync(bundlePath)) {
+			return readFileSync(bundlePath, "utf-8");
+		}
+	}
+	return undefined;
+}
+
 // ── Software Processing ──────────────────────────────────────────────
 
 /** Result of processing all software descriptors at boot time. */

@@ -182,6 +182,7 @@ impl AcpExtension {
         mut ctx: ExtensionContext<'_>,
         request: AcpCreateSessionRequest,
     ) -> AcpHandlerOutput {
+        let __t0 = Instant::now();
         let process_id = self.allocate_process_id("acp-agent");
         let mut args = request.args.clone();
         let mut env = hash_to_btree(request.env.clone());
@@ -195,6 +196,7 @@ impl AcpExtension {
         {
             return AcpHandlerOutput::response(Err(error));
         }
+        tracing::info!(target: "agentos_sidecar::perf", phase = "prompt_injection", elapsed_ms = __t0.elapsed().as_millis() as u64, "create_session phase");
 
         let started = match ctx
             .spawn_process_wire(ExecuteRequest {
@@ -212,10 +214,12 @@ impl AcpExtension {
             Ok(started) => started,
             Err(error) => return AcpHandlerOutput::response(Err(error)),
         };
+        tracing::info!(target: "agentos_sidecar::perf", phase = "spawn_process", elapsed_ms = __t0.elapsed().as_millis() as u64, "create_session phase");
 
         let bootstrap = self
             .create_session_inner(&mut ctx, &request, &process_id)
             .await;
+        tracing::info!(target: "agentos_sidecar::perf", phase = "session_inner_done", elapsed_ms = __t0.elapsed().as_millis() as u64, "create_session phase");
         if bootstrap.is_err() {
             kill_process_best_effort(&mut ctx, &process_id).await;
         }
@@ -288,6 +292,7 @@ impl AcpExtension {
         request: &AcpCreateSessionRequest,
         process_id: &str,
     ) -> Result<CreateSessionBootstrap, SidecarError> {
+        let __ti = Instant::now();
         let mut stdout = String::new();
         let mut notifications = Vec::new();
         let client_capabilities =
@@ -317,6 +322,7 @@ impl AcpExtension {
         notifications.extend(initialize_response.notifications);
         let init_result = response_result(initialize_response.response, "ACP initialize")?;
         validate_initialize_result(&init_result, request.protocol_version)?;
+        tracing::info!(target: "agentos_sidecar::perf", phase = "acp_initialize", elapsed_ms = __ti.elapsed().as_millis() as u64, "create_session_inner phase");
 
         let session_new = json!({
             "jsonrpc": "2.0",
@@ -341,6 +347,7 @@ impl AcpExtension {
         notifications.extend(session_response.notifications);
         let session_result = response_result(session_response.response, "ACP session/new")?;
         let session_id = session_id_from_session_result(&session_result, process_id);
+        tracing::info!(target: "agentos_sidecar::perf", phase = "acp_session_new", elapsed_ms = __ti.elapsed().as_millis() as u64, "create_session_inner phase");
 
         let mut config_options = init_result
             .get("configOptions")
