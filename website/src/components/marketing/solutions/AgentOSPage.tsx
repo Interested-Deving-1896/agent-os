@@ -1686,7 +1686,7 @@ const TechnologyAndBenchmarks = () => (
 							<h3 className='text-lg font-medium text-ink'>WebAssembly + V8 Isolates</h3>
 						</div>
 						<p className='text-sm leading-relaxed text-ink-soft'>
-							High-performance virtualization without specialized infrastructure. The same battle-hardened isolation technology that powers Google Chrome and Cloudflare Workers.
+							High-performance virtualization without specialized infrastructure. The same battle-hardened isolation technology that powers Google Chrome.
 						</p>
 					</div>
 					<div className={`group relative overflow-hidden p-6 ${CARD_SURFACE}`}>
@@ -1728,8 +1728,6 @@ const DEPLOY_TARGETS = [
 	{ label: 'Rivet Compute', href: 'https://rivet.dev/docs/deploy/rivet-compute' },
 	{ label: 'Vercel', href: 'https://rivet.dev/docs/deploy/vercel' },
 	{ label: 'Railway', href: 'https://rivet.dev/docs/deploy/railway' },
-	{ label: 'Cloudflare', href: 'https://rivet.dev/docs/deploy/cloudflare' },
-	{ label: 'Supabase', href: 'https://rivet.dev/docs/deploy/supabase' },
 	{ label: 'Kubernetes', href: 'https://rivet.dev/docs/deploy/kubernetes' },
 	{ label: 'AWS', href: 'https://rivet.dev/docs/deploy/aws-ecs' },
 	{ label: 'Google Cloud', href: 'https://rivet.dev/docs/deploy/gcp-cloud-run' },
