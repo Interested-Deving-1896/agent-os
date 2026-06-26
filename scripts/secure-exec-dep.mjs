@@ -50,7 +50,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const SECURE_EXEC_REL = "../secure-exec"; // sibling checkout, per CLAUDE.md
+const SECURE_EXEC_REL = process.env.SECURE_EXEC_REL || "../secure-exec"; // sibling checkout by default, per CLAUDE.md
 
 // Swappable @secure-exec/* packages -> their path under the secure-exec repo.
 const SWAPPABLE_SCOPED = {
@@ -387,7 +387,7 @@ function npmMode() {
 }
 function cargoMode() {
 	const cargo = readFileSync(path.join(ROOT, "Cargo.toml"), "utf8");
-	return /path\s*=\s*"\.\.\/secure-exec\/crates\//.test(cargo) ? "local" : "pinned";
+	return /path\s*=\s*"[^"]*secure-exec[^"]*\/crates\//.test(cargo) ? "local" : "pinned";
 }
 function currentMode() {
 	return npmMode() === cargoMode() ? npmMode() : `hybrid(npm=${npmMode()},cargo=${cargoMode()})`;
