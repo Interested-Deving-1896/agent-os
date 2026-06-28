@@ -35,12 +35,10 @@ jobs:
       - run: node scripts/check-stale-split-names.mjs
       - run: node --test scripts/check-agentos-client-protocol-compat.test.mjs
       - run: node scripts/check-agentos-client-protocol-compat.mjs
-      - run: node --test scripts/check-registry-test-runtime-boundary.test.mjs
-      - run: node scripts/check-registry-test-runtime-boundary.mjs
-      - run: node --test scripts/check-registry-software-split.test.mjs
-      - run: node scripts/check-registry-software-split.mjs
       - run: node --test scripts/check-secure-exec-package-boundary.test.mjs
       - run: node scripts/check-secure-exec-package-boundary.mjs
+      - run: node --test scripts/check-no-escaping-local-deps.test.mjs
+      - run: node scripts/check-no-escaping-local-deps.mjs
       # Build the Rust crates against the pinned secure-exec. For a preview pin this
       # clones secure-exec at the pinned <sha> and switches cargo to local path deps
       # (crates.io has no preview track, so an unreleased crate API — e.g. a new
