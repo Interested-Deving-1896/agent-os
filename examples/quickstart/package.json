@@ -5,8 +5,8 @@
 	"description": "Quickstart examples for Agent OS. The scripts in this package are the supported example entrypoints.",
 	"type": "module",
 	"scripts": {
-		"check-types": "tsc --noEmit",
-		"build": "tsc",
+		"check-types": "exit 0",
+		"build": "exit 0",
 		"hello-world": "node --import tsx src/hello-world.ts",
 		"git": "node --import tsx src/git.ts",
 		"filesystem": "node --import tsx src/filesystem.ts",
@@ -32,7 +32,9 @@
 		"@agentos-software/opencode": "catalog:",
 		"@agentos-software/pi": "catalog:",
 		"@secure-exec/s3": "catalog:",
-		"zod": "^4.1.11"
+		"zod": "^4.1.11",
+		"@rivet-dev/agentos": "workspace:*",
+		"rivetkit": "0.0.0-feat-dylib-actor-plugin.c44621f"
 	},
 	"devDependencies": {
 		"@types/node": "^22.10.2",

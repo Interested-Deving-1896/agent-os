@@ -12,8 +12,18 @@ packages:
   - packages/shell
   - packages/sidecar-binary
   - examples/*
+  # Nested example packages (e.g. examples/quickstart/hello-world) so every
+  # embeddable example is a workspace member that `turbo check-types` covers.
+  - examples/*/*
   - scripts/publish
   - website
+  # Local docs theme consumed as a workspace member (symlinked from ~/docs-theme
+  # via vendor-theme/*) so React hoists to ONE copy across website + theme —
+  # otherwise the file:/link: cross-repo dep duplicates React and docs islands
+  # don't hydrate in `astro dev`. Source of truth stays ~/docs-theme.
+  - website/vendor/theme
+  - website/vendor/theme/vendor/components
+  - website/vendor/theme/vendor/icons
 
 ignoredBuiltDependencies:
   - '@clerk/shared'
@@ -59,9 +69,9 @@ catalog:
   '@agentos-software/unzip': 0.3.0-rc.2
   '@agentos-software/yq': 0.3.0-rc.2
   '@agentos-software/zip': 0.3.0-rc.2
-  '@secure-exec/core': 0.0.0-fix-ci-boundary-fixture-and-local-dep-guard.4a04f91
-  '@secure-exec/google-drive': 0.0.0-fix-ci-boundary-fixture-and-local-dep-guard.4a04f91
+  '@secure-exec/core': 0.0.0-repin-se139.178d1d0
+  '@secure-exec/google-drive': 0.0.0-repin-se139.178d1d0
   '@secure-exec/nodejs': 0.2.1
-  '@secure-exec/s3': 0.0.0-fix-ci-boundary-fixture-and-local-dep-guard.4a04f91
-  '@secure-exec/sandbox': 0.0.0-fix-ci-boundary-fixture-and-local-dep-guard.4a04f91
+  '@secure-exec/s3': 0.0.0-repin-se139.178d1d0
+  '@secure-exec/sandbox': 0.0.0-repin-se139.178d1d0
 # <<< secure-exec catalog <<<
