@@ -204,6 +204,16 @@ run "sync-bridge-floor-phases" \
     --sync-rpc-latency \
     --bridge-phases
 
+# Large-args sync bridge lane. Same no-op bridge RPC, but with a 64KiB payload so
+# the per-call argument-buffer clone (bridge.rs:1978) is material. This is the
+# standing regression guard for the args-serialization buffer reuse.
+run "sync-bridge-floor-bigargs" \
+  scripts/benchmarks/sync-bridge-floor.bench.ts \
+    --iterations="${BENCH_SYNC_BRIDGE_BIGARGS_ITERATIONS:-10}" \
+    --warmup="${BENCH_SYNC_BRIDGE_BIGARGS_WARMUP:-2}" \
+    --call-counts="${BENCH_SYNC_BRIDGE_BIGARGS_CALL_COUNTS:-1,8,32}" \
+    --payload-bytes="${BENCH_SYNC_BRIDGE_BIGARGS_PAYLOAD_BYTES:-65536}"
+
 # Focused DNS lookup floor. Splits the broad dns rows into warm, repeated,
 # concurrent, and fresh-process lookup shapes.
 run "dns-lookup-floor" \
