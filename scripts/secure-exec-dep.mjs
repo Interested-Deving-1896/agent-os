@@ -50,11 +50,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const SECURE_EXEC_REL = "../secure-exec"; // sibling checkout, per CLAUDE.md
+// Sibling checkout, per CLAUDE.md. Overridable via SECURE_EXEC_LOCAL_PATH (a path
+// relative to the repo root) for local-only dev against a non-default secure-exec
+// working copy — e.g. the converged browser/wasm branch in ../secure-exec-convwasi.
+// NEVER push the resulting local path:/link: deps; this only affects `local` mode.
+const SECURE_EXEC_REL = process.env.SECURE_EXEC_LOCAL_PATH ?? "../secure-exec";
 
 // Swappable @secure-exec/* packages -> their path under the secure-exec repo.
 const SWAPPABLE_SCOPED = {
 	"@secure-exec/core": "packages/core",
+	"@secure-exec/browser": "packages/browser",
 	"@secure-exec/s3": "registry/file-system/s3",
 	"@secure-exec/google-drive": "registry/file-system/google-drive",
 	"@secure-exec/sandbox": "registry/tool/sandbox",
@@ -91,9 +96,8 @@ const CRATES = {
 // Seed versions (heterogeneous today; `set-version` unifies them after a publish).
 const SEED_VERSIONS = {
 	"@secure-exec/core": "0.2.1",
+	"@secure-exec/browser": "0.2.1",
 	"@secure-exec/nodejs": "0.2.1",
-	"@secure-exec/s3": "0.2.0-rc.3",
-	"@secure-exec/google-drive": "0.2.0-rc.3",
 	"@secure-exec/sandbox": "0.2.0-rc.3",
 };
 const SEED_SOFTWARE_VERSION = "0.0.260331072558";
@@ -234,7 +238,7 @@ function versionFor(name, pinned) {
 // Which managed group a catalog package belongs to. secure-exec (the runtime)
 // and the @agentos-software/* registry packages publish on independent cadences, so
 // versions are set per scope.
-//   "secure-exec"   -> @secure-exec/* swappable scope (core, s3, google-drive, sandbox)
+//   "secure-exec"   -> @secure-exec/* swappable scope (core, sandbox)
 //   "agentos-pkgs" -> @agentos-software/* registry packages
 //   "registry-only" -> published-only deps pinned independently (e.g. @secure-exec/nodejs)
 function catalogScope(name) {
@@ -387,7 +391,10 @@ function npmMode() {
 }
 function cargoMode() {
 	const cargo = readFileSync(path.join(ROOT, "Cargo.toml"), "utf8");
-	return /path\s*=\s*"\.\.\/secure-exec\/crates\//.test(cargo) ? "local" : "pinned";
+	// Honor the configured (possibly env-overridden) local path so status reports
+	// honestly when pointed at e.g. ../secure-exec-convwasi.
+	const rel = SECURE_EXEC_REL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return new RegExp(`path\\s*=\\s*"${rel}/crates/`).test(cargo) ? "local" : "pinned";
 }
 function currentMode() {
 	return npmMode() === cargoMode() ? npmMode() : `hybrid(npm=${npmMode()},cargo=${cargoMode()})`;
@@ -439,8 +446,8 @@ switch (cmd) {
 			console.error("usage: set-secure-exec-version <version>");
 			process.exit(1);
 		}
-		// Bump only the @secure-exec/* runtime scope (core, s3, google-drive,
-		// sandbox). The cargo crate version is independent — manage it with
+		// Bump only the @secure-exec/* runtime scope (core, sandbox). The cargo
+		// crate version is independent — manage it with
 		// `set-crate-version` when the sibling crates rebase.
 		writeCatalog(arg, "secure-exec");
 		console.log(`@secure-exec/* npm versions pinned to ${arg} (catalog).`);
