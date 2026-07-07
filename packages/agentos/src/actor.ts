@@ -16,9 +16,9 @@ import common from "@agentos-software/common";
 import { OPT_AGENTOS_ROOT } from "@rivet-dev/agentos-core";
 import { getSidecarPath } from "@rivet-dev/agentos-sidecar";
 import {
-	actor,
 	type ActorDefinition,
 	type ActorFactoryHandle,
+	actor,
 	type CoreRuntime,
 	type DatabaseProvider,
 	type NapiNativePluginOptions,
@@ -30,8 +30,8 @@ import {
 	agentOsActorConfigSchema,
 	nativeAgentOsOptionsSchema,
 } from "./config.js";
+import type { AgentOsActions } from "./generated/actor-actions.generated.js";
 import { getPluginPath } from "./plugin-binary.js";
-import type { AgentOsActions } from "./actor-actions.js";
 import type { AgentOsActorState, AgentOsActorVars } from "./types.js";
 
 /**
@@ -229,6 +229,7 @@ function serializeSidecar(input: unknown): { pool?: string } | undefined {
 
 function buildNativeFactoryBuilder<TConnParams>(
 	parsed: AgentOsActorConfig<TConnParams>,
+	actorOptions: Record<string, unknown>,
 ): (runtime: CoreRuntime) => ActorFactoryHandle {
 	return (runtime) => {
 		if (runtime.kind !== "napi") {
@@ -247,6 +248,9 @@ function buildNativeFactoryBuilder<TConnParams>(
 			pluginPath: getPluginPath(),
 			// Opaque config envelope the plugin parses (config.rs::AgentOsConfigJson).
 			configJson: buildConfigJson(parsed),
+			// RivetKit's native-plugin bridge owns the runtime ActorConfig for
+			// cdylib actors, so forward the merged per-actor lifecycle options too.
+			actorOptions,
 			// Resolve the prebuilt sidecar binary from the npm package so the plugin
 			// spawns the bundled binary rather than relying on `agentos-sidecar`
 			// being on PATH.
@@ -260,6 +264,7 @@ function buildNativeFactoryBuilder<TConnParams>(
 			// native-plugin actors.)
 			inspectorTabs: AGENTOS_INSPECTOR_CONFIG.tabs,
 		} as NapiNativePluginOptions & {
+			actorOptions?: Record<string, unknown>;
 			inspectorTabs: typeof AGENTOS_INSPECTOR_CONFIG.tabs;
 		};
 		return runtime.createNativePluginFactory(options);
@@ -269,10 +274,10 @@ function buildNativeFactoryBuilder<TConnParams>(
 /**
  * Type alias for the `agentOS(...)` return type. Events are not typed at the TS
  * surface because the Rust plugin owns the broadcast set, but the ACTIONS are
- * typed via {@link AgentOsActions} — a TS mirror of the Rust dispatch in
- * `crates/agentos-actor-plugin/src/actions/mod.rs`. That is what gives
- * `createClient<typeof registry>()` a fully-typed handle (e.g. `handle.exec()`
- * returns `ExecResult`, not `unknown`). Keep the two in sync.
+ * typed via {@link AgentOsActions} — generated from the Rust dispatch contract
+ * table in `crates/agentos-actor-plugin/src/actions/contract_surface.rs`.
+ * That is what gives `createClient<typeof registry>()` a fully-typed handle
+ * (e.g. `handle.exec()` returns `ExecResult`, not `unknown`).
  */
 export type AgentOsActorDefinition<TConnParams> = ActorDefinition<
 	AgentOsActorState,
@@ -344,14 +349,39 @@ const INSPECTOR_TABS_ASSET_DIR = join(
 // dashboard shows only the agent-os tabs.
 const AGENTOS_INSPECTOR_CONFIG = {
 	tabs: [
-		{ id: "transcript", label: "Transcript", source: INSPECTOR_TABS_ASSET_DIR, icon: "comments" },
-		{ id: "filesystem", label: "Filesystem", source: INSPECTOR_TABS_ASSET_DIR, icon: "folder-tree" },
-		{ id: "processes", label: "Processes", source: INSPECTOR_TABS_ASSET_DIR, icon: "microchip" },
-		{ id: "software", label: "Software", source: INSPECTOR_TABS_ASSET_DIR, icon: "box-archive" },
-		{ id: "mounts", label: "Mounts", source: INSPECTOR_TABS_ASSET_DIR, icon: "hard-drive" },
-		...(["workflow", "database", "state", "queue", "connections", "console"].map(
+		{
+			id: "transcript",
+			label: "Transcript",
+			source: INSPECTOR_TABS_ASSET_DIR,
+			icon: "comments",
+		},
+		{
+			id: "filesystem",
+			label: "Filesystem",
+			source: INSPECTOR_TABS_ASSET_DIR,
+			icon: "folder-tree",
+		},
+		{
+			id: "processes",
+			label: "Processes",
+			source: INSPECTOR_TABS_ASSET_DIR,
+			icon: "microchip",
+		},
+		{
+			id: "software",
+			label: "Software",
+			source: INSPECTOR_TABS_ASSET_DIR,
+			icon: "box-archive",
+		},
+		{
+			id: "mounts",
+			label: "Mounts",
+			source: INSPECTOR_TABS_ASSET_DIR,
+			icon: "hard-drive",
+		},
+		...["workflow", "database", "state", "queue", "connections", "console"].map(
 			(id) => ({ id, hidden: true as const }),
-		)),
+		),
 	],
 };
 
@@ -384,6 +414,9 @@ export function createAgentOS<TConnParams = undefined>(
 	} as Parameters<
 		typeof actor
 	>[0]) as unknown as AgentOsActorDefinition<TConnParams>;
-	definition.nativeFactoryBuilder = buildNativeFactoryBuilder(parsed);
+	definition.nativeFactoryBuilder = buildNativeFactoryBuilder(
+		parsed,
+		actorOptions,
+	);
 	return definition;
 }

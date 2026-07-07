@@ -10,6 +10,7 @@
 //! verbatim copies of the rivetkit-agent-os helpers; `session`/`preview` swap
 //! rivetkit's `Ctx` for [`HostCtx`] (durable storage via `db_*`).
 
+mod contract_surface;
 pub(crate) mod cron;
 pub(crate) mod filesystem;
 pub(crate) mod network;
@@ -122,8 +123,7 @@ fn decode_args_impl<T: DeserializeOwned>(args: &[u8]) -> Result<T> {
         .context("decode action args from cbor")?;
     let value = revive_undefined_envelopes(value);
     let mut normalized = Vec::new();
-    ciborium::into_writer(&value, &mut normalized)
-        .context("re-encode revived action args")?;
+    ciborium::into_writer(&value, &mut normalized).context("re-encode revived action args")?;
     abi::codec::decode_positional(&normalized)
 }
 
@@ -186,7 +186,7 @@ fn reply_ok_encoded(host: &HostCtx, token: u64, encoded: Result<Vec<u8>>) {
 }
 
 pub(crate) fn encode_event_arg<T: Serialize>(payload: &T) -> Result<Vec<u8>> {
-    abi::codec::encode_json_compat_to_vec(&(payload,)).map_err(Into::into)
+    abi::codec::encode_json_compat_to_vec(&(payload,))
 }
 
 /// Reply failure with the error message (matches `ActionCall::err`).
@@ -212,311 +212,10 @@ pub mod contract {
 
     use super::{cron, filesystem, network, preview, process, session, shell};
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ReplyShape {
-        Unit,
-        String,
-        Bool,
-        Number,
-        Uint8Array,
-        Array,
-        NullableArray,
-        Object(&'static [&'static str]),
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    pub struct ActionContract {
-        pub name: &'static str,
-        pub reply_shape: ReplyShape,
-        pub ts_signature: &'static str,
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    pub struct EventContract {
-        pub name: &'static str,
-        pub payload_shape: ReplyShape,
-        pub ts_signature: &'static str,
-    }
-
-    pub const ACTION_CONTRACTS: &[ActionContract] = &[
-        ActionContract {
-            name: "readFile",
-            reply_shape: ReplyShape::Uint8Array,
-            ts_signature: "readFile: (c: Ctx, path: string) => Promise<Uint8Array>;",
-        },
-        ActionContract {
-            name: "writeFile",
-            reply_shape: ReplyShape::Unit,
-            ts_signature:
-                "writeFile: (c: Ctx, path: string, content: string | Uint8Array) => Promise<void>;",
-        },
-        ActionContract {
-            name: "stat",
-            reply_shape: ReplyShape::Object(&["atimeMs", "birthtimeMs", "blocks", "ctimeMs", "dev", "gid", "ino", "isDirectory", "isSymbolicLink", "mode", "mtimeMs", "nlink", "rdev", "size", "uid"]),
-            ts_signature: "stat: (c: Ctx, path: string) => Promise<VirtualStat>;",
-        },
-        ActionContract {
-            name: "mkdir",
-            reply_shape: ReplyShape::Unit,
-            ts_signature: "mkdir: (c: Ctx, path: string) => Promise<void>;",
-        },
-        ActionContract {
-            name: "readdir",
-            reply_shape: ReplyShape::Array,
-            ts_signature: "readdir: (c: Ctx, path: string) => Promise<string[]>;",
-        },
-        ActionContract {
-            name: "readdirEntries",
-            reply_shape: ReplyShape::NullableArray,
-            ts_signature:
-                "readdirEntries: (c: Ctx, path: string) => Promise<ReaddirEntry[] | null>;",
-        },
-        ActionContract {
-            name: "exists",
-            reply_shape: ReplyShape::Bool,
-            ts_signature: "exists: (c: Ctx, path: string) => Promise<boolean>;",
-        },
-        ActionContract {
-            name: "move",
-            reply_shape: ReplyShape::Unit,
-            ts_signature: "move: (c: Ctx, from: string, to: string) => Promise<void>;",
-        },
-        ActionContract {
-            name: "deleteFile",
-            reply_shape: ReplyShape::Unit,
-            ts_signature:
-                "deleteFile: (c: Ctx, path: string, options?: { recursive?: boolean }) => Promise<void>;",
-        },
-        ActionContract {
-            name: "writeFiles",
-            reply_shape: ReplyShape::Array,
-            ts_signature:
-                "writeFiles: ( c: Ctx, entries: { path: string; content: string | Uint8Array }[], ) => Promise<WriteFileResult[]>;",
-        },
-        ActionContract {
-            name: "readFiles",
-            reply_shape: ReplyShape::Array,
-            ts_signature: "readFiles: (c: Ctx, paths: string[]) => Promise<ReadFileResult[]>;",
-        },
-        ActionContract {
-            name: "readdirRecursive",
-            reply_shape: ReplyShape::Array,
-            ts_signature: "readdirRecursive: (c: Ctx, path: string) => Promise<DirEntry[]>;",
-        },
-        ActionContract {
-            name: "exec",
-            reply_shape: ReplyShape::Object(&["exitCode", "stderr", "stdout"]),
-            ts_signature: "exec: ( c: Ctx, command: string, options?: ExecActionOptions, ) => Promise<ExecResult>;",
-        },
-        ActionContract {
-            name: "spawn",
-            reply_shape: ReplyShape::Object(&["pid"]),
-            ts_signature: "spawn: ( c: Ctx, command: string, args: string[], options?: SpawnActionOptions, ) => Promise<SpawnedProcess>;",
-        },
-        ActionContract {
-            name: "waitProcess",
-            reply_shape: ReplyShape::Number,
-            ts_signature: "waitProcess: (c: Ctx, pid: number) => Promise<number>;",
-        },
-        ActionContract {
-            name: "killProcess",
-            reply_shape: ReplyShape::Unit,
-            ts_signature: "killProcess: (c: Ctx, pid: number) => Promise<void>;",
-        },
-        ActionContract {
-            name: "stopProcess",
-            reply_shape: ReplyShape::Unit,
-            ts_signature: "stopProcess: (c: Ctx, pid: number) => Promise<void>;",
-        },
-        ActionContract {
-            name: "listProcesses",
-            reply_shape: ReplyShape::Array,
-            ts_signature: "listProcesses: (c: Ctx) => Promise<SpawnedProcessInfo[]>;",
-        },
-        ActionContract {
-            name: "allProcesses",
-            reply_shape: ReplyShape::Array,
-            ts_signature: "allProcesses: (c: Ctx) => Promise<ProcessInfo[]>;",
-        },
-        ActionContract {
-            name: "processTree",
-            reply_shape: ReplyShape::Array,
-            ts_signature: "processTree: (c: Ctx) => Promise<ProcessTreeNode[]>;",
-        },
-        ActionContract {
-            name: "getProcess",
-            reply_shape: ReplyShape::Object(&["args", "command", "exitCode", "pid", "running", "startedAt"]),
-            ts_signature: "getProcess: (c: Ctx, pid: number) => Promise<SpawnedProcessInfo>;",
-        },
-        ActionContract {
-            name: "writeProcessStdin",
-            reply_shape: ReplyShape::Unit,
-            ts_signature:
-                "writeProcessStdin: (c: Ctx, pid: number, data: string | Uint8Array) => Promise<void>;",
-        },
-        ActionContract {
-            name: "closeProcessStdin",
-            reply_shape: ReplyShape::Unit,
-            ts_signature: "closeProcessStdin: (c: Ctx, pid: number) => Promise<void>;",
-        },
-        ActionContract {
-            name: "openShell",
-            reply_shape: ReplyShape::Object(&["shellId"]),
-            ts_signature: "openShell: (c: Ctx, options?: OpenShellActionOptions) => Promise<OpenShellResult>;",
-        },
-        ActionContract {
-            name: "writeShell",
-            reply_shape: ReplyShape::Unit,
-            ts_signature: "writeShell: (c: Ctx, shellId: string, data: string | Uint8Array) => Promise<void>;",
-        },
-        ActionContract {
-            name: "resizeShell",
-            reply_shape: ReplyShape::Unit,
-            ts_signature: "resizeShell: (c: Ctx, shellId: string, cols: number, rows: number) => Promise<void>;",
-        },
-        ActionContract {
-            name: "closeShell",
-            reply_shape: ReplyShape::Unit,
-            ts_signature: "closeShell: (c: Ctx, shellId: string) => Promise<void>;",
-        },
-        ActionContract {
-            name: "waitShell",
-            reply_shape: ReplyShape::Number,
-            ts_signature: "waitShell: (c: Ctx, shellId: string) => Promise<number>;",
-        },
-        ActionContract {
-            name: "vmFetch",
-            reply_shape: ReplyShape::Object(&["body", "headers", "status", "statusText"]),
-            ts_signature: "vmFetch: ( c: Ctx, port: number, url: string, options?: VmFetchOptions, ) => Promise<VmFetchResponse>;",
-        },
-        ActionContract {
-            name: "scheduleCron",
-            reply_shape: ReplyShape::Object(&["id"]),
-            ts_signature: "scheduleCron: (c: Ctx, options: SerializableCronJobOptions) => Promise<ScheduledCronJob>;",
-        },
-        ActionContract {
-            name: "listCronJobs",
-            reply_shape: ReplyShape::Array,
-            ts_signature: "listCronJobs: (c: Ctx) => Promise<SerializableCronJobInfo[]>;",
-        },
-        ActionContract {
-            name: "cancelCronJob",
-            reply_shape: ReplyShape::Unit,
-            ts_signature: "cancelCronJob: (c: Ctx, id: string) => Promise<void>;",
-        },
-        ActionContract {
-            name: "createSession",
-            reply_shape: ReplyShape::String,
-            ts_signature:
-                "createSession: (c: Ctx, agentType: string, options?: CreateSessionOptions) => Promise<string>;",
-        },
-        ActionContract {
-            name: "sendPrompt",
-            reply_shape: ReplyShape::Object(&["response", "text"]),
-            ts_signature: "sendPrompt: (c: Ctx, sessionId: string, text: string) => Promise<PromptResult>;",
-        },
-        ActionContract {
-            name: "closeSession",
-            reply_shape: ReplyShape::Unit,
-            ts_signature: "closeSession: (c: Ctx, sessionId: string) => Promise<void>;",
-        },
-        ActionContract {
-            name: "listPersistedSessions",
-            reply_shape: ReplyShape::Array,
-            ts_signature: "listPersistedSessions: (c: Ctx) => Promise<PersistedSessionRecord[]>;",
-        },
-        ActionContract {
-            name: "getSessionEvents",
-            reply_shape: ReplyShape::Array,
-            ts_signature:
-                "getSessionEvents: (c: Ctx, sessionId: string) => Promise<PersistedSessionEvent[]>;",
-        },
-        ActionContract {
-            name: "respondPermission",
-            reply_shape: ReplyShape::Unit,
-            ts_signature:
-                "respondPermission: ( c: Ctx, sessionId: string, permissionId: string, reply: PermissionReply, ) => Promise<void>;",
-        },
-        ActionContract {
-            name: "createSignedPreviewUrl",
-            reply_shape: ReplyShape::Object(&["expiresAt", "path", "port", "token"]),
-            ts_signature:
-                "createSignedPreviewUrl: (c: Ctx, port: number, ttlSeconds: number) => Promise<SignedPreviewUrl>;",
-        },
-        ActionContract {
-            name: "expireSignedPreviewUrl",
-            reply_shape: ReplyShape::Unit,
-            ts_signature: "expireSignedPreviewUrl: (c: Ctx, token: string) => Promise<void>;",
-        },
-        ActionContract {
-            name: "listMounts",
-            reply_shape: ReplyShape::Array,
-            ts_signature: "listMounts: (c: Ctx) => Promise<MountInfo[]>;",
-        },
-        ActionContract {
-            name: "listSoftware",
-            reply_shape: ReplyShape::Array,
-            ts_signature: "listSoftware: (c: Ctx) => Promise<SoftwareInfo[]>;",
-        },
-    ];
-
-    pub const EVENT_CONTRACTS: &[EventContract] = &[
-        EventContract {
-            name: "sessionEvent",
-            payload_shape: ReplyShape::Object(&["event", "sessionId"]),
-            ts_signature: "sessionEvent: SessionEventPayload;",
-        },
-        EventContract {
-            name: "permissionRequest",
-            payload_shape: ReplyShape::Object(&["request", "sessionId"]),
-            ts_signature: "permissionRequest: PermissionRequestPayload;",
-        },
-        EventContract {
-            name: "agentCrashed",
-            payload_shape: ReplyShape::Object(&["event", "sessionId"]),
-            ts_signature: "agentCrashed: AgentCrashedPayload;",
-        },
-        EventContract {
-            name: "vmBooted",
-            payload_shape: ReplyShape::Object(&[]),
-            ts_signature: "vmBooted: VmBootedPayload;",
-        },
-        EventContract {
-            name: "vmShutdown",
-            payload_shape: ReplyShape::Object(&["reason"]),
-            ts_signature: "vmShutdown: VmShutdownPayload;",
-        },
-        EventContract {
-            name: "processOutput",
-            payload_shape: ReplyShape::Object(&["data", "pid", "stream"]),
-            ts_signature: "processOutput: ProcessOutputPayload;",
-        },
-        EventContract {
-            name: "processExit",
-            payload_shape: ReplyShape::Object(&["exitCode", "pid"]),
-            ts_signature: "processExit: ProcessExitPayload;",
-        },
-        EventContract {
-            name: "shellData",
-            payload_shape: ReplyShape::Object(&["data", "shellId"]),
-            ts_signature: "shellData: ShellDataPayload;",
-        },
-        EventContract {
-            name: "shellStderr",
-            payload_shape: ReplyShape::Object(&["data", "shellId"]),
-            ts_signature: "shellStderr: ShellDataPayload;",
-        },
-        EventContract {
-            name: "shellExit",
-            payload_shape: ReplyShape::Object(&["exitCode", "shellId"]),
-            ts_signature: "shellExit: ShellExitPayload;",
-        },
-        EventContract {
-            name: "cronEvent",
-            payload_shape: ReplyShape::Object(&["event"]),
-            ts_signature: "cronEvent: CronEventPayload;",
-        },
-    ];
+    pub use super::contract_surface::{
+        render_actor_actions_ts, ActionContract, EventContract, ReplyShape, ACTION_CONTRACTS,
+        EVENT_CONTRACTS, GENERATED_ACTOR_ACTIONS_PATH,
+    };
 
     pub fn decode_action_args(name: &str, args: &[u8]) -> Result<()> {
         match name {
@@ -661,6 +360,93 @@ pub mod contract {
         variants
             .into_iter()
             .map(|value| abi::codec::encode_positional(&value))
+            .collect()
+    }
+
+    pub fn encoded_invalid_client_arg_variants(name: &str) -> Result<Vec<(&'static str, Vec<u8>)>> {
+        let variants = match name {
+            "readFile"
+            | "stat"
+            | "mkdir"
+            | "readdir"
+            | "readdirEntries"
+            | "exists"
+            | "readdirRecursive"
+            | "closeShell"
+            | "waitShell"
+            | "cancelCronJob"
+            | "closeSession"
+            | "getSessionEvents"
+            | "expireSignedPreviewUrl" => {
+                vec![("path/id must be a string", json!([42]))]
+            }
+            "writeFile" | "writeShell" => {
+                vec![(
+                    "content must be string or Uint8Array",
+                    json!(["/workspace/file.txt", { "bad": true }]),
+                )]
+            }
+            "move" => vec![(
+                "destination must be a string",
+                json!(["/workspace/a.txt", 42]),
+            )],
+            "deleteFile" => vec![(
+                "recursive option must be boolean",
+                json!(["/workspace/file.txt", { "recursive": "yes" }]),
+            )],
+            "writeFiles" => vec![(
+                "entry path must be a string",
+                json!([[{ "path": 42, "content": "a" }]]),
+            )],
+            "readFiles" => vec![("paths must be strings", json!([[42]]))],
+            "exec" => vec![(
+                "env option values must be strings",
+                json!(["echo hello", { "env": { "A": 42 } }]),
+            )],
+            "spawn" => vec![("args must be strings", json!(["node", [42]]))],
+            "waitProcess" | "killProcess" | "stopProcess" | "getProcess" | "closeProcessStdin" => {
+                vec![("pid must be a number", json!(["42"]))]
+            }
+            "listProcesses"
+            | "allProcesses"
+            | "processTree"
+            | "listCronJobs"
+            | "listPersistedSessions"
+            | "listMounts"
+            | "listSoftware" => vec![(
+                "zero-arg action must not accept extras",
+                json!(["unexpected"]),
+            )],
+            "writeProcessStdin" => {
+                vec![(
+                    "stdin content must be string or Uint8Array",
+                    json!([42, { "bad": true }]),
+                )]
+            }
+            "openShell" => vec![("cols option must be numeric", json!([{ "cols": "wide" }]))],
+            "resizeShell" => vec![("cols must be numeric", json!(["shell-1", "80", 24]))],
+            "vmFetch" => vec![("port must be numeric", json!(["3000", "http://127.0.0.1/"]))],
+            "scheduleCron" => vec![(
+                "cron job requires a schedule/action shape",
+                json!([{ "id": "job-1" }]),
+            )],
+            "createSession" => vec![("agent type must be a string", json!([42]))],
+            "sendPrompt" => vec![(
+                "prompt must be a string",
+                json!(["session-1", { "text": "hello" }]),
+            )],
+            "respondPermission" => vec![(
+                "permission response must be a string",
+                json!(["session-1", "permission-1", 42]),
+            )],
+            "createSignedPreviewUrl" => vec![("ttl must be numeric", json!([3000, "60"]))],
+            other => return Err(anyhow!("unknown action {other}")),
+        };
+        variants
+            .into_iter()
+            .map(|(case, value)| {
+                abi::codec::encode_positional(&value).map(|encoded| (case, encoded))
+            })
             .collect()
     }
 
@@ -884,11 +670,11 @@ pub mod contract {
 /// ephemeral session-resume state.
 ///
 /// ⚠️ SOURCE OF TRUTH / KEEP IN SYNC ⚠️
-/// This match statement is mirrored one-to-one by the TypeScript
-/// `AgentOsActions` interface in `packages/agentos/src/actor-actions.ts`, which
-/// types the `createClient<typeof registry>()` handle. Every `"name" =>` arm
-/// below must have a corresponding method there with matching positional args
-/// and serialized return type. Update both in the same change.
+/// This match statement is mirrored one-to-one by `contract_surface.rs`, which
+/// generates the TypeScript `AgentOsActions` surface used to type
+/// `createClient<typeof registry>()`. Every `"name" =>` arm below must have a
+/// corresponding contract row with matching positional args and serialized
+/// return type. Update both in the same change.
 pub(crate) async fn dispatch(
     host: &HostCtx,
     vm: &AgentOs,
