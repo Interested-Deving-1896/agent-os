@@ -22,7 +22,8 @@ Usage: build-curl-upstream.sh \
   --zstd-include <dir> \
   --zstd-libdir <dir> \
   --ca-bundle <path> \
-  --output <output>
+  --output <output> \
+  [--install-prefix <dir>]
 EOF
 }
 
@@ -45,9 +46,11 @@ ZSTD_INCLUDE=""
 ZSTD_LIBDIR=""
 CA_BUNDLE=""
 OUTPUT=""
+INSTALL_PREFIX=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --install-prefix) INSTALL_PREFIX="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
     --tag) TAG="$2"; shift 2 ;;
     --url) URL="$2"; shift 2 ;;
@@ -142,50 +145,6 @@ cp -a "$ZSTD_LIBDIR/libzstd.a" "$DEPS/lib/"
 
 pushd "$SRC_DIR" >/dev/null
 
-echo "Patching WASI-incompatible signal/setjmp includes..."
-python3 - <<'PY'
-from pathlib import Path
-
-replacements = {
-    "lib/hostip.h": [
-        (
-            '#include <setjmp.h>\n',
-            '#ifndef __wasi__\n#include <setjmp.h>\n#endif\n',
-        ),
-    ],
-    "lib/hostip.c": [
-        (
-            '#include <setjmp.h>\n#include <signal.h>\n',
-            '#ifndef __wasi__\n#include <setjmp.h>\n#include <signal.h>\n#endif\n',
-        ),
-    ],
-    "lib/transfer.c": [
-        (
-            '#include <signal.h>\n',
-            '#ifndef __wasi__\n#include <signal.h>\n#endif\n',
-        ),
-    ],
-    "src/tool_main.c": [
-        (
-            '#include <signal.h>\n',
-            '#ifndef __wasi__\n#include <signal.h>\n#endif\n',
-        ),
-    ],
-}
-
-for rel_path, edits in replacements.items():
-    path = Path(rel_path)
-    updated = path.read_text()
-    for old, new in edits:
-        text = updated
-        if new in text:
-            continue
-        if old not in text:
-            raise SystemExit(f"Expected to patch {rel_path}, but no replacement matched")
-        updated = text.replace(old, new)
-    path.write_text(updated)
-PY
-
 echo "Configuring upstream curl for wasm32-wasip1 (in-guest mbedTLS + zlib/brotli/zstd)..."
 # mbedTLS 3.x removed the legacy havege RNG, so curl's configure runs its
 # "mbedtls_ssl_init in -lmbedtls" link probe — which needs the three archives
@@ -216,6 +175,33 @@ make -C lib libcurl.la
 
 echo "Building upstream curl tool..."
 make -C src curl
+
+# Reusable libcurl artifact: install the overlaid, mbedTLS-linked libcurl into a
+# prefix (headers + libcurl.a) so git can link it in-process. Same overlay and
+# configure as above, so git's git-remote-http gets the identical TLS backend.
+if [[ -n "$INSTALL_PREFIX" ]]; then
+  echo "Installing libcurl to $INSTALL_PREFIX ..."
+  rm -rf "$INSTALL_PREFIX"
+  mkdir -p "$INSTALL_PREFIX/include/curl" "$INSTALL_PREFIX/lib/pkgconfig"
+  make -C lib install prefix="$INSTALL_PREFIX" >/dev/null 2>&1 || true
+  make -C include install prefix="$INSTALL_PREFIX" >/dev/null 2>&1 || true
+  # Guarantee headers + the static archive land regardless of libtool install
+  # quirks under a cross toolchain.
+  cp -a include/curl/*.h "$INSTALL_PREFIX/include/curl/" 2>/dev/null || true
+  if [[ -f lib/.libs/libcurl.a && ! -f "$INSTALL_PREFIX/lib/libcurl.a" ]]; then
+    cp -a lib/.libs/libcurl.a "$INSTALL_PREFIX/lib/libcurl.a"
+  fi
+  cp -a libcurl.pc "$INSTALL_PREFIX/lib/pkgconfig/" 2>/dev/null || true
+  if [[ ! -f "$INSTALL_PREFIX/lib/libcurl.a" ]]; then
+    echo "libcurl.a missing after install into $INSTALL_PREFIX" >&2
+    exit 1
+  fi
+  if [[ ! -f "$INSTALL_PREFIX/include/curl/curl.h" ]]; then
+    echo "curl/curl.h missing after install into $INSTALL_PREFIX" >&2
+    exit 1
+  fi
+  echo "Installed libcurl artifact ($(wc -c < "$INSTALL_PREFIX/lib/libcurl.a") bytes) at $INSTALL_PREFIX"
+fi
 
 BIN=""
 for candidate in "src/.libs/curl" "src/curl" "src/curl.wasm"; do
