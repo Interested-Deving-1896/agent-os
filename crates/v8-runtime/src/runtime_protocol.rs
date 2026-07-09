@@ -21,6 +21,12 @@ pub enum RuntimeCommand {
     DestroySession {
         session_id: String,
     },
+    PauseSession {
+        session_id: String,
+    },
+    ResumeSession {
+        session_id: String,
+    },
     WarmSnapshot {
         bridge_code: String,
         userland_code: String,

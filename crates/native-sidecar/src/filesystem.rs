@@ -16,8 +16,9 @@ use crate::service::{
     log_stale_process_event, normalize_host_path, normalize_path, path_is_within_root,
 };
 use crate::state::{
-    ActiveExecutionEvent, ActiveProcess, BridgeError, SidecarKernel, VmState,
-    EXECUTION_DRIVER_NAME, EXECUTION_SANDBOX_ROOT_ENV, PYTHON_VFS_RPC_GUEST_ROOT,
+    ActiveExecutionEvent, ActiveProcess, BridgeError, ShadowNodeType, ShadowSyncInventoryEntry,
+    SidecarKernel, VmState, EXECUTION_DRIVER_NAME, EXECUTION_SANDBOX_ROOT_ENV,
+    PYTHON_VFS_RPC_GUEST_ROOT,
 };
 use crate::{DispatchResult, NativeSidecar, NativeSidecarBridge, SidecarError};
 
@@ -515,21 +516,26 @@ fn mirror_guest_filesystem_shadow_after_call(
             )
             .map_err(|error| SidecarError::InvalidState(error.to_string()))?;
             mirror_guest_file_write_to_shadow(vm, &payload.path, &bytes)?;
+            refresh_shadow_inventory_path(vm, &payload.path)?;
         }
         GuestFilesystemOperation::Pwrite => {
             // A positional write only carries the changed region; mirror the
             // full post-write file from the kernel so the shadow stays faithful.
             let bytes = vm.kernel.read_file(&payload.path).map_err(kernel_error)?;
             mirror_guest_file_write_to_shadow(vm, &payload.path, &bytes)?;
+            refresh_shadow_inventory_path(vm, &payload.path)?;
         }
         GuestFilesystemOperation::CreateDir | GuestFilesystemOperation::Mkdir => {
             mirror_guest_directory_write_to_shadow(vm, &payload.path)?;
+            refresh_shadow_inventory_path(vm, &payload.path)?;
         }
         GuestFilesystemOperation::RemoveFile | GuestFilesystemOperation::RemoveDir => {
             remove_guest_shadow_path(vm, &payload.path)?;
+            forget_shadow_inventory_path(vm, &payload.path);
         }
         GuestFilesystemOperation::Remove => {
             remove_guest_shadow_path(vm, &payload.path)?;
+            forget_shadow_inventory_path(vm, &payload.path);
         }
         GuestFilesystemOperation::Copy => {
             let destination = payload.destination_path.as_deref().ok_or_else(|| {
@@ -539,6 +545,7 @@ fn mirror_guest_filesystem_shadow_after_call(
             })?;
             remove_guest_shadow_path(vm, destination)?;
             mirror_guest_subtree_to_shadow(vm, destination)?;
+            refresh_shadow_inventory_path(vm, destination)?;
         }
         GuestFilesystemOperation::Move => {
             let destination = payload.destination_path.as_deref().ok_or_else(|| {
@@ -549,6 +556,8 @@ fn mirror_guest_filesystem_shadow_after_call(
             remove_guest_shadow_path(vm, &payload.path)?;
             remove_guest_shadow_path(vm, destination)?;
             mirror_guest_subtree_to_shadow(vm, destination)?;
+            forget_shadow_inventory_path(vm, &payload.path);
+            refresh_shadow_inventory_path(vm, destination)?;
         }
         GuestFilesystemOperation::Rename => {
             let destination = payload.destination_path.as_deref().ok_or_else(|| {
@@ -557,6 +566,8 @@ fn mirror_guest_filesystem_shadow_after_call(
                 ))
             })?;
             rename_guest_shadow_path(vm, &payload.path, destination)?;
+            forget_shadow_inventory_path(vm, &payload.path);
+            refresh_shadow_inventory_path(vm, destination)?;
         }
         GuestFilesystemOperation::Symlink => {
             let target = payload.target.as_deref().ok_or_else(|| {
@@ -565,6 +576,7 @@ fn mirror_guest_filesystem_shadow_after_call(
                 ))
             })?;
             mirror_guest_symlink_to_shadow(vm, &payload.path, target)?;
+            refresh_shadow_inventory_path(vm, &payload.path)?;
         }
         GuestFilesystemOperation::Link => {
             let destination = payload.destination_path.as_deref().ok_or_else(|| {
@@ -573,12 +585,15 @@ fn mirror_guest_filesystem_shadow_after_call(
                 ))
             })?;
             mirror_guest_link_to_shadow(vm, &payload.path, destination)?;
+            refresh_shadow_inventory_path(vm, &payload.path)?;
+            refresh_shadow_inventory_path(vm, destination)?;
         }
         GuestFilesystemOperation::Chmod => {
             let mode = payload.mode.ok_or_else(|| {
                 SidecarError::InvalidState(String::from("guest filesystem chmod requires a mode"))
             })?;
             mirror_guest_chmod_to_shadow(vm, &payload.path, mode)?;
+            refresh_shadow_inventory_node(vm, &payload.path)?;
         }
         GuestFilesystemOperation::Utimes => {
             let atime_ms = payload.atime_ms.ok_or_else(|| {
@@ -598,12 +613,14 @@ fn mirror_guest_filesystem_shadow_after_call(
                 VirtualUtimeSpec::Set(VirtualTimeSpec::from_millis(mtime_ms)),
                 true,
             )?;
+            refresh_shadow_inventory_node(vm, &payload.path)?;
         }
         GuestFilesystemOperation::Truncate => {
             let len = payload.len.ok_or_else(|| {
                 SidecarError::InvalidState(String::from("guest filesystem truncate requires len"))
             })?;
             mirror_guest_truncate_to_shadow(vm, &payload.path, len)?;
+            refresh_shadow_inventory_node(vm, &payload.path)?;
         }
         GuestFilesystemOperation::ReadFile
         | GuestFilesystemOperation::Pread
@@ -617,6 +634,120 @@ fn mirror_guest_filesystem_shadow_after_call(
         | GuestFilesystemOperation::Chown => {}
     }
     Ok(())
+}
+
+/// Keep the deletion/type inventory current when a wire filesystem mutation
+/// mirrors kernel state into the host shadow. Without this write-side update,
+/// a host runtime can delete a freshly-created shadow path before the next
+/// read-side reconciliation and the kernel copy will be resurrected because
+/// that pathname was never part of the previous inventory.
+fn refresh_shadow_inventory_path(vm: &mut VmState, guest_path: &str) -> Result<(), SidecarError> {
+    let guest_path = normalize_path(guest_path);
+    let mut updates = collect_shadow_inventory_ancestors(vm, &guest_path)?;
+    let Some(node_type) = shadow_inventory_kernel_node_type(vm, &guest_path)? else {
+        forget_shadow_inventory_path(vm, &guest_path);
+        return Ok(());
+    };
+    updates.insert(
+        guest_path.clone(),
+        ShadowSyncInventoryEntry::present(node_type),
+    );
+    if node_type == ShadowNodeType::Directory {
+        let entries = vm
+            .kernel
+            .read_dir_recursive(&guest_path, None)
+            .map_err(kernel_error)?;
+        for entry in entries {
+            let path = normalize_path(&entry.path);
+            if let Some(node_type) = shadow_inventory_kernel_node_type(vm, &path)? {
+                updates.insert(path, ShadowSyncInventoryEntry::present(node_type));
+            }
+        }
+    }
+
+    // Commit only after the complete replacement inventory has been built.
+    // A failed stat/read must leave the previous deletion baseline intact.
+    forget_shadow_inventory_path(vm, &guest_path);
+    vm.shadow_sync_inventory.extend(updates);
+    Ok(())
+}
+
+/// Refresh only a pathname's structural type. Metadata operations such as
+/// chmod/utimes must not recursively read a directory after making it mode
+/// 000: Linux reports the metadata operation as successful, and existing
+/// descendant inventory remains valid even though readdir is now denied.
+fn refresh_shadow_inventory_node(vm: &mut VmState, guest_path: &str) -> Result<(), SidecarError> {
+    let guest_path = normalize_path(guest_path);
+    let mut updates = collect_shadow_inventory_ancestors(vm, &guest_path)?;
+    if let Some(node_type) = shadow_inventory_kernel_node_type(vm, &guest_path)? {
+        updates.insert(
+            guest_path.clone(),
+            ShadowSyncInventoryEntry::present(node_type),
+        );
+    }
+    vm.shadow_sync_inventory.extend(updates);
+    Ok(())
+}
+
+fn collect_shadow_inventory_ancestors(
+    vm: &mut VmState,
+    guest_path: &str,
+) -> Result<BTreeMap<String, ShadowSyncInventoryEntry>, SidecarError> {
+    // `create_dir_all` may have created ancestors as part of mirroring a leaf.
+    // Record those too so removing a newly-created empty parent directly from
+    // the shadow has the same unlink/rmdir effect in the kernel VFS.
+    let mut ancestors = Vec::new();
+    let mut cursor = guest_path.to_owned();
+    loop {
+        let Some(parent) = Path::new(&cursor).parent() else {
+            break;
+        };
+        let parent = normalize_path(&parent.to_string_lossy());
+        if parent == "/" {
+            break;
+        }
+        ancestors.push(parent.clone());
+        cursor = parent;
+    }
+    let mut updates = BTreeMap::new();
+    for ancestor in ancestors.into_iter().rev() {
+        if shadow_inventory_kernel_node_type(vm, &ancestor)? == Some(ShadowNodeType::Directory) {
+            updates.insert(
+                ancestor,
+                ShadowSyncInventoryEntry::present(ShadowNodeType::Directory),
+            );
+        }
+    }
+    Ok(updates)
+}
+
+fn shadow_inventory_kernel_node_type(
+    vm: &mut VmState,
+    guest_path: &str,
+) -> Result<Option<ShadowNodeType>, SidecarError> {
+    let stat = match vm.kernel.lstat(guest_path) {
+        Ok(stat) => stat,
+        Err(error) if error.code() == "ENOENT" => return Ok(None),
+        Err(error) => return Err(kernel_error(error)),
+    };
+    let node_type = if stat.is_symbolic_link {
+        ShadowNodeType::Symlink
+    } else if stat.is_directory {
+        ShadowNodeType::Directory
+    } else {
+        ShadowNodeType::File
+    };
+    Ok(Some(node_type))
+}
+
+fn forget_shadow_inventory_path(vm: &mut VmState, guest_path: &str) {
+    let guest_path = normalize_path(guest_path);
+    vm.shadow_sync_inventory
+        .retain(|path, _| !shadow_inventory_path_is_at_or_below(path, &guest_path));
+}
+
+fn shadow_inventory_path_is_at_or_below(path: &str, prefix: &str) -> bool {
+    path == prefix || (prefix != "/" && path.starts_with(&format!("{prefix}/")))
 }
 
 pub(crate) fn handle_python_vfs_rpc_request<B>(
@@ -714,15 +845,19 @@ where
                 // entry the guest just removed.
                 PythonVfsRpcMethod::Unlink => {
                     match vm.kernel.remove_file(&path).map_err(kernel_error) {
-                        Ok(()) => remove_guest_shadow_path(vm, &path)
-                            .map(|()| PythonVfsRpcResponsePayload::Empty),
+                        Ok(()) => remove_guest_shadow_path(vm, &path).map(|()| {
+                            forget_shadow_inventory_path(vm, &path);
+                            PythonVfsRpcResponsePayload::Empty
+                        }),
                         Err(error) => Err(error),
                     }
                 }
                 PythonVfsRpcMethod::Rmdir => {
                     match vm.kernel.remove_dir(&path).map_err(kernel_error) {
-                        Ok(()) => remove_guest_shadow_path(vm, &path)
-                            .map(|()| PythonVfsRpcResponsePayload::Empty),
+                        Ok(()) => remove_guest_shadow_path(vm, &path).map(|()| {
+                            forget_shadow_inventory_path(vm, &path);
+                            PythonVfsRpcResponsePayload::Empty
+                        }),
                         Err(error) => Err(error),
                     }
                 }
@@ -735,8 +870,13 @@ where
                     })?;
                     let destination = normalize_python_vfs_rpc_path(destination)?;
                     match vm.kernel.rename(&path, &destination).map_err(kernel_error) {
-                        Ok(()) => rename_guest_shadow_path(vm, &path, &destination)
-                            .map(|()| PythonVfsRpcResponsePayload::Empty),
+                        Ok(()) => {
+                            rename_guest_shadow_path(vm, &path, &destination).and_then(|()| {
+                                forget_shadow_inventory_path(vm, &path);
+                                refresh_shadow_inventory_path(vm, &destination)?;
+                                Ok(PythonVfsRpcResponsePayload::Empty)
+                            })
+                        }
                         Err(error) => Err(error),
                     }
                 }
@@ -1306,15 +1446,14 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                         phase_start,
                     );
                     let phase_start = Instant::now();
-                    return open_mapped_host_fd(process, opened, Some(path.to_string())).inspect(
-                        |_| {
+                    return open_mapped_host_fd(kernel, process, opened, Some(path.to_string()))
+                        .inspect(|_| {
                             record_fs_sync_subphase(
                                 request.method.as_str(),
                                 "open_mapped_fd",
                                 phase_start,
                             );
-                        },
-                    );
+                        });
                 }
                 Some(MappedRuntimeHostAccess::ReadOnly(_)) => {
                     return Err(read_only_mapped_runtime_host_path_error(path));
@@ -1555,11 +1694,19 @@ pub(crate) fn service_javascript_fs_sync_rpc(
                     "EBADF: file descriptor {fd} is not open for writing"
                 )));
             }
-            let path = kernel
-                .fd_path(EXECUTION_DRIVER_NAME, kernel_pid, fd)
+            kernel
+                .fd_truncate(EXECUTION_DRIVER_NAME, kernel_pid, fd, length)
                 .map_err(kernel_error)?;
-            kernel.truncate(&path, length).map_err(kernel_error)?;
-            mirror_kernel_path_to_process_shadow(kernel, process, kernel_pid, &path)?;
+            if kernel
+                .fd_path(EXECUTION_DRIVER_NAME, kernel_pid, fd)
+                .ok()
+                .is_some_and(|path| kernel.exists(&path).unwrap_or(false))
+            {
+                let path = kernel
+                    .fd_path(EXECUTION_DRIVER_NAME, kernel_pid, fd)
+                    .map_err(kernel_error)?;
+                mirror_kernel_path_to_process_shadow(kernel, process, kernel_pid, &path)?;
+            }
             Ok(Value::Null)
         }
         "fs.readFileSync" | "fs.promises.readFile" => {
@@ -3469,10 +3616,22 @@ fn materialize_mapped_host_path_from_kernel(
 /// [`std::fs::File`] — no path re-open, so there is no TOCTOU window and no
 /// `/proc/self/fd` dependency.
 fn open_mapped_host_fd(
+    kernel: &SidecarKernel,
     process: &mut ActiveProcess,
     opened: MappedRuntimeOpenedPath,
     guest_path: Option<String>,
 ) -> Result<Value, SidecarError> {
+    if let Some(limit) = kernel.resource_limits().max_open_fds {
+        let observed = kernel
+            .resource_snapshot()
+            .open_fds
+            .saturating_add(process.mapped_host_fds.len());
+        if observed >= limit {
+            return Err(SidecarError::InvalidState(format!(
+                "EMFILE: VM open file descriptor limit {limit} reached (limits.resources.maxOpenFds); raise the limit to open more mapped host files"
+            )));
+        }
+    }
     let host_path = opened.host_path;
     let file = std::fs::File::from(opened.handle.into_owned_fd());
     let fd = process.allocate_mapped_host_fd(crate::state::ActiveMappedHostFd {
@@ -4254,9 +4413,18 @@ fn rename_guest_shadow_path(
     let from_shadow_path = shadow_host_path_for_guest(&vm.cwd, &from_path);
     let to_shadow_path = shadow_host_path_for_guest(&vm.cwd, &to_path);
 
-    if !from_shadow_path.exists() {
-        remove_shadow_path_if_exists(&to_shadow_path, &to_path)?;
-        return Ok(());
+    match fs::symlink_metadata(&from_shadow_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            remove_shadow_path_if_exists(&to_shadow_path, &to_path)?;
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(SidecarError::Io(format!(
+                "failed to inspect shadow rename source {}: {error}",
+                from_shadow_path.display()
+            )));
+        }
     }
 
     if let Some(parent) = to_shadow_path.parent() {

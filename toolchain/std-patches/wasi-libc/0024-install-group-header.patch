@@ -18,5 +18,5 @@ index 4a9f079..d589a77 100755
 +    "scsi/scsi.h" "scsi/scsi_ioctl.h" "scsi/sg.h" "sys/auxv.h" \
 +    "shadow.h" "mntent.h" "resolv.h" "pty.h" "ulimit.h" "sys/xattr.h" \
      "wordexp.h" "sys/membarrier.h" "sys/signalfd.h" \
-     "net/if.h" "net/if_arp.h" \
+     "net/if_arp.h" \
      "net/ethernet.h" "net/route.h" "netinet/if_ether.h" "netinet/ether.h" \

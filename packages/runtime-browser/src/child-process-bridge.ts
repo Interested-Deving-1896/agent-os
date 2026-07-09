@@ -6,6 +6,7 @@ export type BrowserChildProcessBytes = {
 };
 
 export type BrowserChildProcessSpawnOptions = {
+	argv0?: string;
 	cwd?: string;
 	env?: Record<string, string>;
 	input?: BrowserChildProcessBytes | string | Uint8Array;
@@ -19,7 +20,11 @@ export type BrowserChildProcessSpawnRequest = {
 
 export type BrowserChildProcessPollEvent =
 	| { type: "stdout" | "stderr"; data: BrowserChildProcessBytes }
-	| { type: "exit"; exitCode: number; signal: null };
+	| {
+			type: "exit";
+			exitCode: number | null;
+			signal: number | string | null;
+	  };
 
 export function encodeChildProcessBytes(
 	data: Uint8Array,
@@ -81,7 +86,12 @@ export function parseChildProcessSpawnRequest(
 		command: record.command,
 		args: record.args.map((entry) => String(entry)),
 		options: {
-			cwd: typeof optionsRecord.cwd === "string" ? optionsRecord.cwd : undefined,
+			argv0:
+				typeof optionsRecord.argv0 === "string"
+					? optionsRecord.argv0
+					: undefined,
+			cwd:
+				typeof optionsRecord.cwd === "string" ? optionsRecord.cwd : undefined,
 			env,
 			input: optionsRecord.input as BrowserChildProcessSpawnOptions["input"],
 		},

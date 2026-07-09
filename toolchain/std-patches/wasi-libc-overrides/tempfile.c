@@ -8,16 +8,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <time.h>
 #include <unistd.h>
+#include <wasi/api.h>
 
 static const char alphabet[] =
 	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-static unsigned long counter;
 
 static int fill_template(char *template, int suffix_len) {
 	size_t len = strlen(template);
@@ -27,11 +25,28 @@ static int fill_template(char *template, int suffix_len) {
 		return -1;
 	}
 
-	uint64_t value = (uint64_t)time(NULL) ^ (uintptr_t)template ^ counter++;
 	char *slot = template + len - suffix_len - 6;
-	for (int i = 0; i < 6; i++) {
-		value = value * 6364136223846793005ULL + 1442695040888963407ULL;
-		slot[i] = alphabet[value % (sizeof(alphabet) - 1)];
+	unsigned char random_bytes[16];
+	size_t generated = 0;
+	/* Rejection sampling avoids modulo bias. Thirty-two bounded entropy reads
+	 * are vastly more than needed for six symbols while still guaranteeing a
+	 * typed failure instead of an unbounded loop if the host RNG misbehaves. */
+	for (int attempts = 0; generated < 6 && attempts < 32; attempts++) {
+		__wasi_errno_t error = __wasi_random_get(random_bytes,
+			sizeof(random_bytes));
+		if (error != __WASI_ERRNO_SUCCESS) {
+			errno = error;
+			return -1;
+		}
+		for (size_t i = 0; i < sizeof(random_bytes) && generated < 6; i++) {
+			if (random_bytes[i] >= 248)
+				continue;
+			slot[generated++] = alphabet[random_bytes[i] % 62];
+		}
+	}
+	if (generated != 6) {
+		errno = EIO;
+		return -1;
 	}
 	return 0;
 }
@@ -39,7 +54,7 @@ static int fill_template(char *template, int suffix_len) {
 int mkostemps(char *template, int suffix_len, int flags) {
 	char original[6];
 	size_t len = strlen(template);
-	if (len < (size_t)suffix_len + 6) {
+	if (suffix_len < 0 || len < (size_t)suffix_len + 6) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -48,7 +63,9 @@ int mkostemps(char *template, int suffix_len, int flags) {
 
 	flags &= ~O_ACCMODE;
 	for (int retries = 100; retries > 0; retries--) {
+		memcpy(slot, original, sizeof(original));
 		if (fill_template(template, suffix_len) != 0) {
+			memcpy(slot, original, sizeof(original));
 			return -1;
 		}
 		int fd = open(template, flags | O_RDWR | O_CREAT | O_EXCL, 0600);
@@ -86,8 +103,10 @@ char *mktemp(char *template) {
 		}
 		return template;
 	}
+	char *slot = template + len - 6;
 
 	for (int retries = 100; retries > 0; retries--) {
+		memcpy(slot, "XXXXXX", 6);
 		if (fill_template(template, 0) != 0) {
 			template[0] = '\0';
 			return template;
@@ -116,7 +135,9 @@ char *mkdtemp(char *template) {
 	memcpy(original, slot, sizeof(original));
 
 	for (int retries = 100; retries > 0; retries--) {
+		memcpy(slot, original, sizeof(original));
 		if (fill_template(template, 0) != 0) {
+			memcpy(slot, original, sizeof(original));
 			return NULL;
 		}
 		if (mkdir(template, 0700) == 0) {

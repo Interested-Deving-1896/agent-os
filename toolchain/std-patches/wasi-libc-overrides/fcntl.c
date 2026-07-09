@@ -14,6 +14,10 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <wasi/api.h>
 
 /* WASI headers omit F_DUPFD and F_DUPFD_CLOEXEC — define with Linux values */
@@ -27,18 +31,150 @@
 /* Host import for dup with minimum fd (F_DUPFD semantics) */
 __attribute__((import_module("host_process"), import_name("fd_dup_min")))
 int __host_fd_dup_min(int fd, int min_fd, int *ret_new_fd);
+__attribute__((import_module("host_process"), import_name("fd_getfd")))
+int __host_fd_getfd(int fd, int *ret_flags);
+__attribute__((import_module("host_process"), import_name("fd_setfd")))
+int __host_fd_setfd(int fd, int flags);
+__attribute__((import_module("host_process"), import_name("fd_record_lock")))
+int __host_fd_record_lock(int fd, int command, int lock_type,
+                          int64_t start, uint64_t length,
+                          int *ret_type, uint32_t *ret_pid,
+                          uint64_t *ret_start, uint64_t *ret_length);
 
-/* Per-fd cloexec tracking (up to 256 FDs) */
-#define MAX_FDS 256
-static unsigned char _fd_cloexec[MAX_FDS];
+static int _normalize_record_lock(int fd, const struct flock *lock,
+                                  uint64_t *ret_start, uint64_t *ret_length) {
+    int64_t base;
+    switch (lock->l_whence) {
+    case SEEK_SET:
+        base = 0;
+        break;
+    case SEEK_CUR: {
+        off_t offset = lseek(fd, 0, SEEK_CUR);
+        if (offset == (off_t)-1) return -1;
+        base = (int64_t)offset;
+        break;
+    }
+    case SEEK_END: {
+        struct stat stat;
+        if (fstat(fd, &stat) != 0) return -1;
+        base = (int64_t)stat.st_size;
+        break;
+    }
+    default:
+        errno = EINVAL;
+        return -1;
+    }
 
-/* Is `fd` a currently-open descriptor? Used to return the correct errno for
- * high fds (>= MAX_FDS) that fall outside the fixed cloexec cache: the
- * FD_SETSIZE override (0022-overrideable-fd-set-size.patch) permits fds >= 256,
- * so a valid high fd must not be reported as EBADF by F_GETFD/F_SETFD. */
+    int64_t start;
+    if (__builtin_add_overflow(base, (int64_t)lock->l_start, &start) || start < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    int64_t signed_length = (int64_t)lock->l_len;
+    if (signed_length < 0) {
+        if (signed_length == INT64_MIN || start < -signed_length) {
+            errno = EINVAL;
+            return -1;
+        }
+        start += signed_length;
+        signed_length = -signed_length;
+    }
+    *ret_start = (uint64_t)start;
+    *ret_length = (uint64_t)signed_length;
+    return 0;
+}
+
+/* Track active CLOEXEC descriptors sparsely: browser/runtime synthetic fd
+ * numbers start high, so indexing by fd would waste memory. This collection
+ * cannot outgrow the runtime's limits.resources.maxOpenFds bound because an
+ * entry is accepted only for a live descriptor. */
+static int *_cloexec_fds;
+static uint32_t _cloexec_fd_count;
+static uint32_t _cloexec_fd_capacity;
+
 static int _fd_is_open(int fd) {
     __wasi_fdstat_t stat;
     return __wasi_fd_fdstat_get((__wasi_fd_t)fd, &stat) == 0;
+}
+
+static int _cloexec_index(int fd) {
+    for (uint32_t i = 0; i < _cloexec_fd_count; i++)
+        if (_cloexec_fds[i] == fd) return (int)i;
+    return -1;
+}
+
+static int _set_cloexec_cache(int fd, int enabled) {
+    int index = _cloexec_index(fd);
+    if (!enabled) {
+        if (index >= 0)
+            _cloexec_fds[index] = _cloexec_fds[--_cloexec_fd_count];
+        return 0;
+    }
+    if (index >= 0) return 0;
+    if (_cloexec_fd_count == _cloexec_fd_capacity) {
+        uint32_t capacity = _cloexec_fd_capacity ? _cloexec_fd_capacity * 2 : 16;
+        if (capacity < _cloexec_fd_capacity ||
+            capacity > UINT32_MAX / sizeof(*_cloexec_fds)) {
+            errno = ENOMEM;
+            return -1;
+        }
+        int *fds = realloc(_cloexec_fds, capacity * sizeof(*fds));
+        if (!fds) {
+            errno = ENOMEM;
+            return -1;
+        }
+        _cloexec_fds = fds;
+        _cloexec_fd_capacity = capacity;
+    }
+    _cloexec_fds[_cloexec_fd_count++] = fd;
+    return 0;
+}
+
+static int _set_cloexec(int fd, int enabled) {
+    int was_enabled = _cloexec_index(fd) >= 0;
+    if (_set_cloexec_cache(fd, enabled) != 0) return -1;
+    int err = __host_fd_setfd(fd, enabled ? FD_CLOEXEC : 0);
+    if (err != 0) {
+        /* Restoring a previously present entry cannot allocate: disabling it
+         * retained the backing allocation, while a failed enable removes the
+         * entry that was just appended. */
+        _set_cloexec_cache(fd, was_enabled);
+        errno = err;
+        return -1;
+    }
+    return 0;
+}
+
+/* Shared by close/dup/pipe implementations in the patched libc. Newly opened
+ * descriptor numbers must never inherit a stale flag from an earlier owner. */
+int __agentos_set_cloexec_fd(int fd, int enabled) {
+    return _set_cloexec(fd, enabled);
+}
+
+int close(int fd) {
+    __wasi_errno_t err = __wasi_fd_close((__wasi_fd_t)fd);
+    if (err != 0) {
+        errno = err;
+        return -1;
+    }
+    _set_cloexec_cache(fd, 0);
+    return 0;
+}
+
+/* Used by execve() to send the close-on-exec set through host_process.proc_exec.
+ * Closed descriptors are removed before serialization. */
+uint32_t __agentos_copy_cloexec_fds(uint32_t *out, uint32_t capacity) {
+    uint32_t index = 0;
+    while (index < _cloexec_fd_count) {
+        if (!_fd_is_open(_cloexec_fds[index])) {
+            _cloexec_fds[index] = _cloexec_fds[--_cloexec_fd_count];
+            continue;
+        }
+        index++;
+    }
+    uint32_t count = _cloexec_fd_count < capacity ? _cloexec_fd_count : capacity;
+    for (uint32_t i = 0; i < count; i++) out[i] = (uint32_t)_cloexec_fds[i];
+    return _cloexec_fd_count;
 }
 
 int fcntl(int fd, int cmd, ...) {
@@ -66,8 +202,7 @@ int fcntl(int fd, int cmd, ...) {
                 errno = err;
                 result = -1;
             } else {
-                if (new_fd >= 0 && new_fd < MAX_FDS)
-                    _fd_cloexec[new_fd] = 0;
+                _set_cloexec(new_fd, 0);
                 result = new_fd;
             }
         }
@@ -90,9 +225,14 @@ int fcntl(int fd, int cmd, ...) {
                 errno = err;
                 result = -1;
             } else {
-                if (new_fd >= 0 && new_fd < MAX_FDS)
-                    _fd_cloexec[new_fd] = 1;
-                result = new_fd;
+                if (_set_cloexec(new_fd, 1) != 0) {
+                    int setfd_errno = errno;
+                    if (close(new_fd) == 0)
+                        errno = setfd_errno;
+                    result = -1;
+                } else {
+                    result = new_fd;
+                }
             }
         }
         break;
@@ -102,18 +242,15 @@ int fcntl(int fd, int cmd, ...) {
         if (fd < 0) {
             errno = EBADF;
             result = -1;
-        } else if (fd >= MAX_FDS) {
-            /* Outside the cloexec cache: a valid high fd has no tracked bit
-             * (defaults to not-cloexec). Report that instead of a false EBADF;
-             * only a genuinely-closed fd is EBADF. */
-            if (_fd_is_open(fd)) {
-                result = 0;
-            } else {
-                errno = EBADF;
-                result = -1;
-            }
         } else {
-            result = _fd_cloexec[fd] ? FD_CLOEXEC : 0;
+            int flags = 0;
+            int err = __host_fd_getfd(fd, &flags);
+            if (err != 0) {
+                errno = err;
+                result = -1;
+            } else {
+                result = flags & FD_CLOEXEC;
+            }
         }
         break;
 
@@ -122,20 +259,8 @@ int fcntl(int fd, int cmd, ...) {
         if (fd < 0) {
             errno = EBADF;
             result = -1;
-        } else if (fd >= MAX_FDS) {
-            /* Cannot persist cloexec beyond the cache; accept on a valid fd as
-             * a best-effort no-op. WASI has no exec() and the spawn model does
-             * not inherit parent fds, so the bit is moot — but a valid fd must
-             * still not report EBADF. */
-            if (_fd_is_open(fd)) {
-                result = 0;
-            } else {
-                errno = EBADF;
-                result = -1;
-            }
         } else {
-            _fd_cloexec[fd] = (arg & FD_CLOEXEC) ? 1 : 0;
-            result = 0;
+            result = _set_cloexec(fd, (arg & FD_CLOEXEC) != 0);
         }
         break;
     }
@@ -182,21 +307,67 @@ int fcntl(int fd, int cmd, ...) {
         if (!lock) {
             errno = EINVAL;
             result = -1;
+        } else if (lock->l_type != F_RDLCK && lock->l_type != F_WRLCK) {
+            errno = EINVAL;
+            result = -1;
         } else {
-            lock->l_type = F_UNLCK;
-            lock->l_pid = 0;
-            result = 0;
+            uint64_t start, length, found_start, found_length;
+            int found_type;
+            uint32_t found_pid;
+            if (_normalize_record_lock(fd, lock, &start, &length) != 0) {
+                result = -1;
+                break;
+            }
+            int err = __host_fd_record_lock(
+                fd, cmd, lock->l_type, (int64_t)start, length,
+                &found_type, &found_pid, &found_start, &found_length);
+            if (err != 0) {
+                errno = err;
+                result = -1;
+            } else {
+                lock->l_type = (short)found_type;
+                lock->l_pid = (pid_t)found_pid;
+                if (found_type != F_UNLCK) {
+                    lock->l_whence = SEEK_SET;
+                    lock->l_start = (off_t)found_start;
+                    lock->l_len = (off_t)found_length;
+                }
+                result = 0;
+            }
         }
         break;
     }
 
     case F_SETLK:
-    case F_SETLKW:
-        // WASI has no kernel-level advisory locking. Treat locks as a
-        // successful no-op so single-process workloads like DuckDB can open
-        // writable database files on the VFS-backed filesystem.
-        result = 0;
+    case F_SETLKW: {
+        struct flock *lock = va_arg(ap, struct flock *);
+        if (!lock) {
+            errno = EINVAL;
+            result = -1;
+        } else if (lock->l_type != F_RDLCK && lock->l_type != F_WRLCK &&
+                   lock->l_type != F_UNLCK) {
+            errno = EINVAL;
+            result = -1;
+        } else {
+            uint64_t start, length, ignored_start, ignored_length;
+            int ignored_type;
+            uint32_t ignored_pid;
+            if (_normalize_record_lock(fd, lock, &start, &length) != 0) {
+                result = -1;
+                break;
+            }
+            int err = __host_fd_record_lock(
+                fd, cmd, lock->l_type, (int64_t)start, length,
+                &ignored_type, &ignored_pid, &ignored_start, &ignored_length);
+            if (err != 0) {
+                errno = err;
+                result = -1;
+            } else {
+                result = 0;
+            }
+        }
         break;
+    }
 
     default:
         errno = EINVAL;

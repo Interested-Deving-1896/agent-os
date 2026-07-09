@@ -24,8 +24,9 @@ provide runtime shims in libc-bottom-half overrides.
  int execve(const char *, char *const [], char *const []);
  int execv(const char *, char *const []);
  int execle(const char *, const char *, ...);
-@@ -144,7 +146,6 @@
+@@ -144,7 +146,7 @@
  int execvp(const char *, char *const []);
++int execvpe(const char *, char *const [], char *const []);
  int execlp(const char *, const char *, ...);
  int fexecve(int, char *const [], char *const []);
 -#endif
@@ -36,10 +37,19 @@ provide runtime shims in libc-bottom-half overrides.
  pid_t getpgrp(void);
  pid_t setsid(void);
 +pid_t getpgid(pid_t);
++int setpgid(pid_t, pid_t);
  #ifdef __wasilibc_unmodified_upstream /* WASI has no full process groups */
  pid_t getpgid(pid_t);
- int setpgid(pid_t, pid_t);
+-int setpgid(pid_t, pid_t);
  pid_t getsid(pid_t);
+@@ -263,7 +265,6 @@
+ char *getusershell(void);
+ int acct(const char *);
+ long syscall(long, ...);
+-int execvpe(const char *, char *const [], char *const []);
+ int issetugid(void);
+ #endif
+ int getentropy(void *, size_t);
 --- a/libc-top-half/musl/include/sys/time.h
 +++ b/libc-top-half/musl/include/sys/time.h
 @@ -10,7 +10,6 @@

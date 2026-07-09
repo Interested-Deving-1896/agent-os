@@ -5,9 +5,9 @@ use agentos_kernel::mount_table::{MountOptions, MountTable};
 use agentos_kernel::permissions::Permissions;
 use agentos_kernel::pty::LineDisciplineConfig;
 use agentos_kernel::resource_accounting::{
-    ResourceLimits, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_OPEN_FDS, DEFAULT_MAX_PIPES,
-    DEFAULT_MAX_PROCESSES, DEFAULT_MAX_PTYS, DEFAULT_MAX_SOCKETS,
-    DEFAULT_MAX_SOCKET_BUFFERED_BYTES, DEFAULT_MAX_SOCKET_DATAGRAM_QUEUE_LEN,
+    ResourceLimits, DEFAULT_BLOCKING_READ_TIMEOUT_MS, DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_MAX_OPEN_FDS, DEFAULT_MAX_PIPES, DEFAULT_MAX_PROCESSES, DEFAULT_MAX_PTYS,
+    DEFAULT_MAX_SOCKETS, DEFAULT_MAX_SOCKET_BUFFERED_BYTES, DEFAULT_MAX_SOCKET_DATAGRAM_QUEUE_LEN,
     DEFAULT_VIRTUAL_CPU_COUNT,
 };
 use agentos_kernel::root_fs::{
@@ -100,6 +100,11 @@ fn resource_limits_default_to_bounded_values() {
         limits.max_socket_datagram_queue_len,
         Some(DEFAULT_MAX_SOCKET_DATAGRAM_QUEUE_LEN)
     );
+    assert_eq!(
+        limits.max_blocking_read_ms,
+        Some(DEFAULT_BLOCKING_READ_TIMEOUT_MS)
+    );
+    assert_eq!(DEFAULT_BLOCKING_READ_TIMEOUT_MS, 30_000);
 }
 
 #[test]
@@ -528,6 +533,155 @@ fn filesystem_limits_reject_fd_pwrite_before_resizing_file() {
         kernel
             .read_file("/tmp/data.txt")
             .expect("file should stay unchanged"),
+        b"abc".to_vec()
+    );
+
+    process.finish(0);
+    kernel.wait_and_reap(process.pid()).expect("reap shell");
+}
+
+#[test]
+fn filesystem_limits_charge_rename_over_open_files_until_the_last_fd_closes() {
+    let mut config = KernelVmConfig::new("vm-open-file-rename-accounting");
+    config.permissions = Permissions::allow_all();
+    config.resources = ResourceLimits {
+        // The registered `sh` command contributes a 32-byte executable stub;
+        // the three 4-byte data files fill the remaining quota exactly.
+        max_filesystem_bytes: Some(44),
+        ..ResourceLimits::default()
+    };
+
+    let mut filesystem = MemoryFileSystem::new();
+    filesystem
+        .write_file("/tmp/dst.bin", b"dest".to_vec())
+        .expect("seed original destination");
+    filesystem
+        .write_file("/tmp/src-one.bin", b"one!".to_vec())
+        .expect("seed first source");
+    filesystem
+        .write_file("/tmp/src-two.bin", b"two!".to_vec())
+        .expect("seed second source");
+    let mut kernel = KernelVm::new(filesystem, config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+
+    let process = kernel
+        .spawn_process(
+            "sh",
+            Vec::new(),
+            SpawnOptions {
+                requester_driver: Some(String::from("shell")),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("spawn shell");
+    let original_destination = kernel
+        .fd_open("shell", process.pid(), "/tmp/dst.bin", O_RDWR, None)
+        .expect("open original destination");
+    kernel
+        .rename("/tmp/src-one.bin", "/tmp/dst.bin")
+        .expect("replace first open destination");
+    let first_replacement = kernel
+        .fd_open("shell", process.pid(), "/tmp/dst.bin", O_RDWR, None)
+        .expect("open first replacement");
+    let first_replacement_dup = kernel
+        .fd_dup("shell", process.pid(), first_replacement)
+        .expect("duplicate first replacement fd");
+    kernel
+        .rename("/tmp/src-two.bin", "/tmp/dst.bin")
+        .expect("replace second open destination");
+
+    let full_error = kernel
+        .write_file("/tmp/extra.bin", b"x".to_vec())
+        .expect_err("both anonymous destinations must remain charged");
+    assert_eq!(full_error.code(), "ENOSPC");
+    assert!(full_error
+        .to_string()
+        .contains("limits.resources.maxFilesystemBytes"));
+
+    kernel
+        .fd_close("shell", process.pid(), original_destination)
+        .expect("close original destination");
+    let duplicate_still_charged = kernel
+        .write_file("/tmp/extra.bin", b"12345".to_vec())
+        .expect_err("open duplicate must retain the anonymous destination charge");
+    assert_eq!(duplicate_still_charged.code(), "ENOSPC");
+
+    kernel
+        .fd_close("shell", process.pid(), first_replacement)
+        .expect("close first replacement fd");
+    let last_duplicate_still_charged = kernel
+        .write_file("/tmp/extra.bin", b"12345".to_vec())
+        .expect_err("charge must remain until the last duplicate closes");
+    assert_eq!(last_duplicate_still_charged.code(), "ENOSPC");
+
+    kernel
+        .fd_close("shell", process.pid(), first_replacement_dup)
+        .expect("close last replacement duplicate");
+    kernel
+        .write_file("/tmp/extra.bin", b"12345678".to_vec())
+        .expect("last close must release anonymous-file quota");
+
+    process.finish(0);
+    kernel.wait_and_reap(process.pid()).expect("reap shell");
+}
+
+#[test]
+fn filesystem_limits_reject_anonymous_fd_growth_with_typed_limit_errors() {
+    let mut config = KernelVmConfig::new("vm-anonymous-fd-growth-limit");
+    config.permissions = Permissions::allow_all();
+    config.resources = ResourceLimits {
+        // The registered `sh` stub (32 bytes) plus the 3-byte file leave two
+        // bytes of headroom before anonymous growth must fail.
+        max_filesystem_bytes: Some(37),
+        ..ResourceLimits::default()
+    };
+
+    let mut filesystem = MemoryFileSystem::new();
+    filesystem
+        .write_file("/tmp/data.bin", b"abc".to_vec())
+        .expect("seed file");
+    let mut kernel = KernelVm::new(filesystem, config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+    let process = kernel
+        .spawn_process(
+            "sh",
+            Vec::new(),
+            SpawnOptions {
+                requester_driver: Some(String::from("shell")),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("spawn shell");
+    let fd = kernel
+        .fd_open("shell", process.pid(), "/tmp/data.bin", O_RDWR, None)
+        .expect("open data file");
+    kernel
+        .remove_file("/tmp/data.bin")
+        .expect("unlink data file");
+
+    let pwrite_error = kernel
+        .fd_pwrite("shell", process.pid(), fd, b"z", 5)
+        .expect_err("anonymous pwrite growth must respect byte limit");
+    assert_eq!(pwrite_error.code(), "ENOSPC");
+    assert!(pwrite_error
+        .to_string()
+        .contains("limits.resources.maxFilesystemBytes"));
+
+    let truncate_error = kernel
+        .fd_truncate("shell", process.pid(), fd, 6)
+        .expect_err("anonymous truncate growth must respect byte limit");
+    assert_eq!(truncate_error.code(), "ENOSPC");
+    assert!(truncate_error
+        .to_string()
+        .contains("limits.resources.maxFilesystemBytes"));
+    assert_eq!(
+        kernel
+            .fd_pread("shell", process.pid(), fd, 3, 0)
+            .expect("rejected growth must leave anonymous file unchanged"),
         b"abc".to_vec()
     );
 

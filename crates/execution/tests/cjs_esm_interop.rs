@@ -78,6 +78,7 @@ fn run_guest_result(
     let execution = engine
         .start_execution(StartJavascriptExecutionRequest {
             limits: Default::default(),
+            argv0: None,
             guest_runtime: Default::default(),
             vm_id: String::from("vm-js"),
             context_id: context.context_id,

@@ -3,6 +3,7 @@ RELEASE_DIR := target/$(WASM_TARGET)/release
 WASI_C_SYSROOT := $(CURDIR)/c/sysroot
 WASI_C_CC := $(CURDIR)/c/vendor/wasi-sdk/bin/clang
 WASI_C_AR := $(CURDIR)/c/vendor/wasi-sdk/bin/llvm-ar
+WASI_C_LIBDIR := $(WASI_C_SYSROOT)/lib/wasm32-wasi
 
 # Standalone binary output directory (configurable)
 COMMANDS_DIR ?= $(RELEASE_DIR)/commands
@@ -11,19 +12,31 @@ COMMANDS_DIR ?= $(RELEASE_DIR)/commands
 PATCHES := $(wildcard std-patches/*.patch)
 PATCH_SCRIPT := scripts/patch-std.sh
 
-# Resolve WASI sysroot for CRT/libc needed by -Z build-std linking
-# Uses rustc without +toolchain override so rust-toolchain.toml is respected
-WASI_SYSROOT_SELF_CONTAINED := $(shell rustc --print sysroot)/lib/rustlib/$(WASM_TARGET)/lib/self-contained
+# Disable rustc's stock self-contained WASI libraries and explicitly link the
+# command CRT and libc from AgentOS's owned sysroot. Merely putting this libdir
+# first in -L is insufficient: rustc selects its bundled libc internally.
+# Include the libc digest in rustc's metadata so Cargo relinks Rust commands
+# whenever the external sysroot is rebuilt; Cargo does not otherwise track
+# archives passed as linker arguments.
+WASI_C_LIBC_DIGEST = $(shell if command -v sha256sum >/dev/null 2>&1; then sha256sum "$(WASI_C_LIBDIR)/libc.a"; elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$(WASI_C_LIBDIR)/libc.a"; else cksum "$(WASI_C_LIBDIR)/libc.a"; fi 2>/dev/null | cut -d ' ' -f1 | cut -c1-16)
+WASI_RUSTFLAGS = -C link-self-contained=no -C link-arg=$(WASI_C_LIBDIR)/crt1-command.o -C link-arg=$(WASI_C_LIBDIR)/libc.a -C link-arg=$(WASI_C_LIBDIR)/libwasi-emulated-pthread.a -C link-arg=-L$(WASI_C_LIBDIR) -C metadata=agentos-libc-$(WASI_C_LIBC_DIGEST) --cfg tokio_unstable
 
 # Discover command binary names from colocated package crates plus toolchain
 # helper crates. Keep known slow/heavy commands out of the default software
 # gate; they can still be built explicitly
 # with `make cmd/<name>`.
+# Cargo package names are normally `cmd-<command>`. `_stubs` is the only
+# workspace package whose historical name differs from the installed binary.
+# The `cmd-fd` and `cmd-rg` packages pull their bin-only upstream crates into
+# vendor/; their real binaries are built by manifest path below because a
+# crates.io dependency is not selectable with `cargo -p`.
+cargo_package_for_command = $(if $(filter _stubs,$(1)),cmd-stubs,cmd-$(1))
+
 SOFTWARE_COMMAND_CRATES := $(wildcard ../software/*/native/crates/cmd-*)
 TOOLCHAIN_COMMAND_CRATES := $(wildcard crates/commands/*)
-SKIPPED_BULK_COMMANDS := _stubs git codex codex-exec
+SKIPPED_BULK_COMMANDS := git codex codex-exec
 COMMAND_NAMES := $(filter-out $(SKIPPED_BULK_COMMANDS),$(patsubst cmd-%,%,$(notdir $(SOFTWARE_COMMAND_CRATES))) $(notdir $(TOOLCHAIN_COMMAND_CRATES)))
-COMMAND_PACKAGES := $(addprefix -p cmd-,$(COMMAND_NAMES))
+COMMAND_PACKAGES := $(foreach command,$(COMMAND_NAMES),-p $(call cargo_package_for_command,$(command)))
 
 # Alias symlinks: link_name:target_binary
 ALIAS_SYMLINKS := \
@@ -41,19 +54,19 @@ STUB_COMMANDS := \
 	groups id \
 	hostname hostid \
 	install \
-	kill \
 	mkfifo mknod \
 	pinky who users uptime \
 	stty sync tty
 
-.PHONY: all commands wasm wasm-opt-check host test clean patch-std patch-check vendor patch-vendor vendor-patch-check size-report install c-wasm codex
+.PHONY: all commands wasm wasm-opt-check host test clean patch-std patch-check vendor patch-vendor vendor-patch-check size-report install c-wasm codex fd-mapping-contract-wasm fd-mapping-contract-native
 
 all: wasm
 
 # Build the fast command set that lands in COMMANDS_DIR: Rust commands except
 # known heavy/external ones, then the opted-in fast C commands. Heavy commands
-# (git, duckdb, vim), generated helpers (_stubs), and the external codex build
-# are intentionally excluded from the default software-build gate.
+# (git, duckdb, vim) and the external codex build are intentionally excluded
+# from the default software-build gate; `_stubs` is a required Rust input for
+# the generated stub aliases and is built with the default command set.
 commands: wasm
 	$(MAKE) -C c programs install
 
@@ -181,11 +194,27 @@ wasm: c/sysroot/lib/wasm32-wasi/libc.a vendor patch-vendor patch-std wasm-opt-ch
 	CC_wasm32_wasip1="$(WASI_C_CC)" \
 	AR_wasm32_wasip1="$(WASI_C_AR)" \
 	CFLAGS_wasm32_wasip1="--sysroot=$(WASI_C_SYSROOT)" \
-	RUSTFLAGS="-C link-arg=-L$(WASI_SYSROOT_SELF_CONTAINED) --cfg tokio_unstable" \
+	RUSTFLAGS="$(WASI_RUSTFLAGS)" \
 	cargo build --target $(WASM_TARGET) \
 		-Z build-std=std,panic_abort \
 		--release \
 		$(COMMAND_PACKAGES)
+	@set -e; \
+	for spec in "fd:vendor/fd-find/Cargo.toml" "rg:vendor/ripgrep/Cargo.toml"; do \
+		bin=$${spec%%:*}; manifest=$${spec#*:}; \
+		rm -f "$${manifest%/*}/Cargo.lock"; \
+		CC_wasm32_wasip1="$(WASI_C_CC)" \
+		AR_wasm32_wasip1="$(WASI_C_AR)" \
+		CFLAGS_wasm32_wasip1="--sysroot=$(WASI_C_SYSROOT)" \
+		RUSTFLAGS="$(WASI_RUSTFLAGS)" \
+		cargo build --manifest-path "$$manifest" \
+			--target-dir target \
+			--target $(WASM_TARGET) \
+			-Z build-std=std,panic_abort \
+			--release \
+			--no-default-features \
+			--bin "$$bin"; \
+	done
 	@mkdir -p $(COMMANDS_DIR)
 	@TOTAL=0; SKIPPED=0; \
 	HAS_OPT=$$(command -v wasm-opt >/dev/null 2>&1 && echo 1 || echo 0); \
@@ -242,7 +271,7 @@ wasm: c/sysroot/lib/wasm32-wasi/libc.a vendor patch-vendor patch-std wasm-opt-ch
 #   codex     the codex fork build    (codex, codex-exec)
 # `just toolchain-cmd <name>` calls this. `make wasm` builds the fast
 # Rust set; `make -C c programs install` builds/installs the fast C set.
-C_COMMANDS := zip unzip envsubst sqlite3 curl wget grep git duckdb vim ssh
+C_COMMANDS := zip unzip envsubst sqlite3 curl wget grep git duckdb vim ssh ssh-keysign ssh-sk-helper
 
 .PHONY: cmd/%
 cmd/%:
@@ -251,8 +280,12 @@ cmd/%:
 	if [ -n "$$crate_dir" ] || [ -d "crates/commands/$$name" ]; then \
 		$(MAKE) wasm-cmd CMD=$$name; \
 	elif echo " $(C_COMMANDS) " | grep -q " $$name "; then \
-		src=$$name; [ "$$name" = "sqlite3" ] && src=sqlite3_cli; \
-		$(MAKE) -C c sysroot "build/$$src" && $(MAKE) -C c install COMMANDS="$$name"; \
+		src=$$name; install_commands=$$name; \
+		[ "$$name" = "sqlite3" ] && src=sqlite3_cli; \
+		[ "$$name" = "git" ] && install_commands="git git-remote-http"; \
+		[ "$$name" = "ssh" ] && install_commands="ssh ssh-keysign ssh-sk-helper"; \
+		$(MAKE) -C c sysroot "build/$$src" && \
+			$(MAKE) -C c install COMMANDS="$$install_commands"; \
 	elif [ "$$name" = "codex" ] || [ "$$name" = "codex-exec" ]; then \
 		$(MAKE) codex-required; \
 	else \
@@ -268,23 +301,34 @@ wasm-cmd: c/sysroot/lib/wasm32-wasi/libc.a vendor patch-vendor patch-std wasm-op
 	@crate_dir=$$(find ../software -path "*/native/crates/cmd-$(CMD)" -type d -print -quit); \
 	test -n "$$crate_dir" || test -d "crates/commands/$(CMD)" || { \
 		echo "ERROR: no software/*/native/crates/cmd-$(CMD) or crates/commands/$(CMD)"; exit 1; }
-	@cargo_pkg="cmd-$(CMD)"; cargo_bin="$(CMD)"; \
-	if [ "$(CMD)" = "fd" ]; then \
-		cargo_pkg="fd-find"; \
-		cargo_bin="fd"; \
-	elif [ "$(CMD)" = "rg" ]; then \
-		cargo_pkg="ripgrep"; \
-		cargo_bin="rg"; \
-	fi; \
-	CC_wasm32_wasip1="$(WASI_C_CC)" \
-	AR_wasm32_wasip1="$(WASI_C_AR)" \
-	CFLAGS_wasm32_wasip1="--sysroot=$(WASI_C_SYSROOT)" \
-	RUSTFLAGS="-C link-arg=-L$(WASI_SYSROOT_SELF_CONTAINED) --cfg tokio_unstable" \
-	cargo build --target $(WASM_TARGET) \
-		-Z build-std=std,panic_abort \
-		--release \
-		-p $$cargo_pkg \
-		--bin $$cargo_bin
+	@cargo_pkg="$(call cargo_package_for_command,$(CMD))"; cargo_bin="$(CMD)"; \
+	manifest=""; \
+	[ "$(CMD)" = "fd" ] && manifest="vendor/fd-find/Cargo.toml"; \
+	[ "$(CMD)" = "rg" ] && manifest="vendor/ripgrep/Cargo.toml"; \
+	if [ -n "$$manifest" ]; then \
+		rm -f "$${manifest%/*}/Cargo.lock"; \
+		CC_wasm32_wasip1="$(WASI_C_CC)" \
+		AR_wasm32_wasip1="$(WASI_C_AR)" \
+		CFLAGS_wasm32_wasip1="--sysroot=$(WASI_C_SYSROOT)" \
+		RUSTFLAGS="$(WASI_RUSTFLAGS)" \
+		cargo build --manifest-path "$$manifest" \
+			--target-dir target \
+			--target $(WASM_TARGET) \
+			-Z build-std=std,panic_abort \
+			--release \
+			--no-default-features \
+			--bin $$cargo_bin; \
+	else \
+		CC_wasm32_wasip1="$(WASI_C_CC)" \
+		AR_wasm32_wasip1="$(WASI_C_AR)" \
+		CFLAGS_wasm32_wasip1="--sysroot=$(WASI_C_SYSROOT)" \
+		RUSTFLAGS="$(WASI_RUSTFLAGS)" \
+		cargo build --target $(WASM_TARGET) \
+			-Z build-std=std,panic_abort \
+			--release \
+			-p $$cargo_pkg \
+			--bin $$cargo_bin; \
+	fi
 	@mkdir -p $(COMMANDS_DIR)
 	@if command -v wasm-opt >/dev/null 2>&1; then \
 		wasm-opt -O3 --strip-debug --all-features "$(RELEASE_DIR)/$(CMD).wasm" -o "$(COMMANDS_DIR)/$(CMD)"; \
@@ -292,6 +336,47 @@ wasm-cmd: c/sysroot/lib/wasm32-wasi/libc.a vendor patch-vendor patch-std wasm-op
 		cp "$(RELEASE_DIR)/$(CMD).wasm" "$(COMMANDS_DIR)/$(CMD)"; \
 	fi
 	@echo "Built $(COMMANDS_DIR)/$(CMD)"
+
+.PHONY: command-dispatch-check
+command-dispatch-check:
+	@test "$(call cargo_package_for_command,_stubs)" = "cmd-stubs"
+	@test "$(call cargo_package_for_command,fd)" = "cmd-fd"
+	@test "$(call cargo_package_for_command,rg)" = "cmd-rg"
+	@test "$(call cargo_package_for_command,sh)" = "cmd-sh"
+	@test -n "$(filter _stubs,$(COMMAND_NAMES))"
+	@test -n "$(filter cmd-stubs,$(COMMAND_PACKAGES))"
+	@test -n "$(filter cmd-fd,$(COMMAND_PACKAGES))"
+	@test -n "$(filter cmd-rg,$(COMMAND_PACKAGES))"
+	@echo "Command package dispatch mappings verified"
+
+# Rust fixture for exact parent->child fd-map parity. It lives outside the
+# production workspace so it cannot become a shipped command accidentally;
+# the C conformance build invokes these targets and mounts the resulting binary
+# from c/build alongside the other native/WASM fixtures.
+FD_MAPPING_CONTRACT := test-programs/fd-mapping-contract/Cargo.toml
+FD_MAPPING_CONTRACT_TARGET := target/fd-mapping-contract
+
+fd-mapping-contract-wasm: c/sysroot/lib/wasm32-wasi/libc.a patch-std
+	CC_wasm32_wasip1="$(WASI_C_CC)" \
+	AR_wasm32_wasip1="$(WASI_C_AR)" \
+	CFLAGS_wasm32_wasip1="--sysroot=$(WASI_C_SYSROOT)" \
+	RUSTFLAGS="$(WASI_RUSTFLAGS)" \
+	cargo build --manifest-path $(FD_MAPPING_CONTRACT) \
+		--target-dir $(FD_MAPPING_CONTRACT_TARGET) \
+		--target $(WASM_TARGET) \
+		-Z build-std=std,panic_abort \
+		--release
+	@mkdir -p c/build
+	@cp $(FD_MAPPING_CONTRACT_TARGET)/$(WASM_TARGET)/release/fd-mapping-contract.wasm \
+		c/build/fd_mapping_contract
+
+fd-mapping-contract-native:
+	cargo build --manifest-path $(FD_MAPPING_CONTRACT) \
+		--target-dir $(FD_MAPPING_CONTRACT_TARGET)/native \
+		--release
+	@mkdir -p c/build/native
+	@cp $(FD_MAPPING_CONTRACT_TARGET)/native/release/fd-mapping-contract \
+		c/build/native/fd_mapping_contract
 
 # Show per-command binary sizes in COMMANDS_DIR
 size-report:
@@ -355,6 +440,9 @@ clean-vendor:
 
 patch-check:
 ifneq ($(PATCHES),)
+	@if [ -x scripts/test-patch-std-check.sh ]; then \
+		./scripts/test-patch-std-check.sh; \
+	fi
 	@if [ -x "$(PATCH_SCRIPT)" ]; then \
 		./$(PATCH_SCRIPT) --check; \
 	else \

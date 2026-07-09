@@ -122,4 +122,83 @@ describeIf(!skipReason(), "WasmVM Unix domain socket integration", { timeout: 30
 		expect(decodeChunks(server.stdoutChunks)).toContain("received: ping");
 		expect(decodeChunks(server.stdoutChunks)).toContain("sent: 4");
 	});
+
+	it("unix_socket: matches Linux abstract namespace bind/connect", async () => {
+		ctx = await createIntegrationKernel({
+			runtimes: ["wasmvm"],
+			commandDirs: [C_BUILD_DIR, COMMANDS_DIR],
+		});
+		const contract = spawnGuestProgram(ctx.kernel, "unix_socket", [
+			"--abstract-contract",
+		]);
+		const exitCode = await contract.process.wait();
+
+		expect(exitCode).toBe(0);
+		expect(decodeChunks(contract.stderrChunks)).toBe("");
+		expect(decodeChunks(contract.stdoutChunks)).toBe(
+			"abstract_unix_namespace=ok\n",
+		);
+	});
+
+	it("node: abstract Unix sockets use the same VM-local namespace", async () => {
+		ctx = await createIntegrationKernel({ runtimes: ["node"] });
+		const result = await runGuestNodeProgram(
+			ctx.kernel,
+			[
+				"const net = require('net');",
+				"const path = '\\0agentos-node-abstract-contract';",
+				"const server = net.createServer((socket) => socket.once('data', (chunk) => socket.end('pong:' + chunk)));",
+				"server.listen(path, () => {",
+				"  const client = net.connect(path, () => client.write('ping'));",
+				"  client.once('data', (chunk) => { console.log(chunk.toString()); client.end(); server.close(); });",
+				"  client.once('error', (error) => { console.error(error); process.exitCode = 1; server.close(); });",
+				"});",
+				"server.once('error', (error) => { console.error(error); process.exit(1); });",
+			].join("\n"),
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr).toBe("");
+		expect(result.stdout).toBe("pong:ping\n");
+	});
+
+	it("node: pathname socket surfaces and close/relisten match Linux", async () => {
+		ctx = await createIntegrationKernel({ runtimes: ["node"] });
+		await ctx.kernel.mkdir("/tmp");
+		const result = await runGuestNodeProgram(
+			ctx.kernel,
+			[
+				"const fs = require('fs');",
+				"const net = require('net');",
+				`const path = ${JSON.stringify("/tmp/node-close.sock")};`,
+				"const summarize = (socket) => ({",
+				"  address: socket.address(),",
+				"  localAddress: socket.localAddress,",
+				"  remoteAddress: socket.remoteAddress,",
+				"  hasLocalAddress: Object.hasOwn(socket, 'localAddress'),",
+				"  hasRemoteAddress: Object.hasOwn(socket, 'remoteAddress'),",
+				"});",
+				"const server = net.createServer((socket) => { console.log('accepted=' + JSON.stringify(summarize(socket))); socket.end(); });",
+				"server.listen(path, () => {",
+				"  console.log('server=' + JSON.stringify(server.address()));",
+				"  const client = net.connect(path, () => console.log('client=' + JSON.stringify(summarize(client))));",
+				"  client.once('close', () => server.close(() => {",
+				"    console.log('unlinked=' + String(!fs.existsSync(path)));",
+				"    server.once('listening', () => { console.log('relisten=' + JSON.stringify(server.address())); server.close(); });",
+				"    server.listen(path);",
+				"  }));",
+				"});",
+				"server.once('error', (error) => { console.error(error); process.exit(1); });",
+			].join("\n"),
+		);
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr).toBe("");
+		expect(result.stdout).toContain('server="/tmp/node-close.sock"');
+		expect(result.stdout).toContain('"address":{}');
+		expect(result.stdout).toContain('"hasLocalAddress":false');
+		expect(result.stdout).toContain('"hasRemoteAddress":false');
+		expect(result.stdout).toContain("unlinked=true");
+		expect(result.stdout).toContain('relisten="/tmp/node-close.sock"');
+	});
 });

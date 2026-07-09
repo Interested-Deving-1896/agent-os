@@ -1,0 +1,41 @@
+Keep Rust std's pathname metadata lookup outside the guest fd namespace.
+
+Rust std supplements WASI filestat with AgentOS' host_fs.path_mode import.
+That lookup is part of ordinary pathname resolution, but it passed raw fd 3,
+allowing close(3)/dup2(..., 3) to redirect subsequent stat metadata queries.
+Use the same private preopen tag as the patched libc; explicit descriptor APIs
+continue to pass their exact guest descriptor.
+
+--- a/library/std/src/sys/fs/unix.rs
++++ b/library/std/src/sys/fs/unix.rs
+@@ -105,6 +105,8 @@ mod host_fs {
+     }
+ }
+ 
++#[cfg(target_os = "wasi")]
++const AGENTOS_HIDDEN_PREOPEN_FD: u32 = 0x40000003;
+ #[cfg(target_os = "wasi")]
+ use crate::os::wasi::prelude::*;
+ use crate::path::{Path, PathBuf};
+@@ -2184,7 +2186,9 @@ pub fn stat(p: &CStr) -> io::Result<FileAttr> {
+     #[cfg(target_os = "wasi")]
+     {
+         let bytes = p.to_bytes();
+-        let mode = unsafe { host_fs::path_mode(3, bytes.as_ptr(), bytes.len() as u32, 1) };
++        let mode = unsafe {
++            host_fs::path_mode(AGENTOS_HIDDEN_PREOPEN_FD, bytes.as_ptr(), bytes.len() as u32, 1)
++        };
+         if mode != 0 { stat.st_mode = mode as libc::mode_t; }
+     }
+     Ok(FileAttr::from_stat64(stat))
+@@ -2207,7 +2211,9 @@ pub fn lstat(p: &CStr) -> io::Result<FileAttr> {
+     #[cfg(target_os = "wasi")]
+     {
+         let bytes = p.to_bytes();
+-        let mode = unsafe { host_fs::path_mode(3, bytes.as_ptr(), bytes.len() as u32, 0) };
++        let mode = unsafe {
++            host_fs::path_mode(AGENTOS_HIDDEN_PREOPEN_FD, bytes.as_ptr(), bytes.len() as u32, 0)
++        };
+         if mode != 0 { stat.st_mode = mode as libc::mode_t; }
+     }
+     Ok(FileAttr::from_stat64(stat))

@@ -23,7 +23,7 @@ set -euo pipefail
 TOOLCHAIN_FILE="$WASI_SDK_DIR/share/cmake/wasi-sdk.cmake"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 : "${PATCH_DIR:=$SCRIPT_DIR/../patches/duckdb}"
-COMMON_FLAGS="-I$OVERLAY_INCLUDE_DIR -D_WASI_EMULATED_PTHREAD -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS"
+COMMON_FLAGS="-I$OVERLAY_INCLUDE_DIR -D_WASI_EMULATED_PTHREAD -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS"
 COMMON_CXX_FLAGS="$COMMON_FLAGS -DDUCKDB_DISABLE_EXTENSION_LOAD -DSQLITE_NOHAVE_SYSTEM -DSQLITE_OMIT_POPEN -fwasm-exceptions -DWEBDB_FAST_EXCEPTIONS=1"
 CXX_STDLIB_INCLUDE="$SYSROOT_DIR/include/wasm32-wasi/c++/v1"
 RUNTIME_LIB_DIR="$(cd "$(dirname "$SYSROOT_DIR")" && pwd)/build/llvm-runtimes-install/lib"
@@ -89,7 +89,7 @@ cmake \
   -DCMAKE_CXX_FLAGS="$COMMON_CXX_FLAGS -isystem $CXX_STDLIB_INCLUDE" \
   -DCMAKE_C_COMPILER_LAUNCHER="" \
   -DCMAKE_CXX_COMPILER_LAUNCHER="" \
-  -DCMAKE_EXE_LINKER_FLAGS="$SHIM_OBJECTS -L$RUNTIME_LIB_DIR -fwasm-exceptions -lwasi-emulated-mman -lwasi-emulated-signal -lwasi-emulated-process-clocks" \
+  -DCMAKE_EXE_LINKER_FLAGS="$SHIM_OBJECTS -L$RUNTIME_LIB_DIR -fwasm-exceptions -lwasi-emulated-mman -lwasi-emulated-process-clocks" \
   -DCMAKE_SHARED_LINKER_FLAGS="-L$RUNTIME_LIB_DIR -fwasm-exceptions" \
   -DCMAKE_CXX_STANDARD_LIBRARIES="-lc++ -lc++abi -lunwind -lc" \
   -DBUILD_UNITTESTS=0 \

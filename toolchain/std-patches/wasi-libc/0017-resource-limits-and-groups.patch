@@ -1,16 +1,17 @@
 Expose resource limits and supplementary groups in the AgentOS WASI sysroot.
 
 GNU Wget's configure script and source expect getgroups(2) and getrlimit(2).
-WASI has no kernel-backed process limits or supplementary group database, so the
-patched sysroot provides deterministic compatibility shims: one effective group
-and fixed per-process limit values.
+The patched sysroot reports the runtime-enforced open-descriptor cap, one
+effective supplementary group, and deterministic values for unenforced
+resources. RLIMIT_NOFILE changes are routed to the runtime so the mutable
+per-process soft and hard limits are inherited and enforced across execution.
 
 diff --git a/libc-bottom-half/sources/host_resource_user.c b/libc-bottom-half/sources/host_resource_user.c
 new file mode 100644
 index 0000000..8d91a2f
 --- /dev/null
 +++ b/libc-bottom-half/sources/host_resource_user.c
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,135 @@
 +// Process resource and group compatibility for AgentOS WASI commands.
 +
 +#include <errno.h>
@@ -18,6 +19,14 @@ index 0000000..8d91a2f
 +#include <string.h>
 +#include <sys/resource.h>
 +#include <unistd.h>
++#include <wasi/api.h>
++
++__attribute__((import_module("host_process"), import_name("proc_getrlimit")))
++__wasi_errno_t host_proc_getrlimit(uint32_t resource, uint64_t *soft,
++                                   uint64_t *hard);
++__attribute__((import_module("host_process"), import_name("proc_setrlimit")))
++__wasi_errno_t host_proc_setrlimit(uint32_t resource, uint64_t soft,
++                                   uint64_t hard);
 +
 +static int is_known_rlimit_resource(int resource) {
 +    return resource >= 0 && resource < RLIMIT_NLIMITS;
@@ -25,8 +34,11 @@ index 0000000..8d91a2f
 +
 +static rlim_t default_limit_for(int resource) {
 +    switch (resource) {
-+        case RLIMIT_NOFILE:
-+            return 1024;
++#ifdef RLIMIT_MEMLOCK
++        case RLIMIT_MEMLOCK:
++            /* Match the common Linux container default and keep it bounded. */
++            return 8 * 1024 * 1024;
++#endif
 +        case RLIMIT_CPU:
 +        case RLIMIT_FSIZE:
 +        case RLIMIT_DATA:
@@ -37,9 +49,6 @@ index 0000000..8d91a2f
 +#endif
 +#ifdef RLIMIT_NPROC
 +        case RLIMIT_NPROC:
-+#endif
-+#ifdef RLIMIT_MEMLOCK
-+        case RLIMIT_MEMLOCK:
 +#endif
 +#ifdef RLIMIT_AS
 +        case RLIMIT_AS:
@@ -76,22 +85,66 @@ index 0000000..8d91a2f
 +}
 +
 +int getrlimit(int resource, struct rlimit *rlim) {
-+    if (rlim == NULL || !is_known_rlimit_resource(resource)) {
++    uint64_t soft, hard;
++    __wasi_errno_t error;
++
++    if (rlim == NULL) {
++        errno = EFAULT;
++        return -1;
++    }
++    if (!is_known_rlimit_resource(resource)) {
 +        errno = EINVAL;
 +        return -1;
 +    }
++    if (resource == RLIMIT_NOFILE) {
++        error = host_proc_getrlimit((uint32_t)resource, &soft, &hard);
++        if (error != __WASI_ERRNO_SUCCESS) {
++            errno = error;
++            return -1;
++        }
++        rlim->rlim_cur = (rlim_t)soft;
++        rlim->rlim_max = (rlim_t)hard;
++        return 0;
++    }
 +
++#ifdef RLIMIT_MEMLOCK
++    if (resource == RLIMIT_MEMLOCK) {
++        rlim->rlim_cur = default_limit_for(resource);
++        rlim->rlim_max = default_limit_for(resource);
++        return 0;
++    }
++#endif
 +    rlim->rlim_cur = default_limit_for(resource);
 +    rlim->rlim_max = default_limit_for(resource);
 +    return 0;
 +}
 +
 +int setrlimit(int resource, const struct rlimit *rlim) {
-+    if (rlim == NULL || !is_known_rlimit_resource(resource)) {
++    __wasi_errno_t error;
++
++    if (rlim == NULL) {
++        errno = EFAULT;
++        return -1;
++    }
++    if (!is_known_rlimit_resource(resource)) {
++        errno = EINVAL;
++        return -1;
++    }
++    if (rlim->rlim_cur > rlim->rlim_max) {
 +        errno = EINVAL;
 +        return -1;
 +    }
 +
++    if (resource != RLIMIT_NOFILE) {
++        errno = ENOTSUP;
++        return -1;
++    }
++    error = host_proc_setrlimit((uint32_t)resource,
++        (uint64_t)rlim->rlim_cur, (uint64_t)rlim->rlim_max);
++    if (error != __WASI_ERRNO_SUCCESS) {
++        errno = error;
++        return -1;
++    }
 +    return 0;
 +}
 diff --git a/libc-top-half/musl/include/sys/resource.h b/libc-top-half/musl/include/sys/resource.h

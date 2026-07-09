@@ -291,6 +291,20 @@ pub trait VirtualFileSystem {
     fn link(&mut self, old_path: &str, new_path: &str) -> VfsResult<()>;
     fn chmod(&mut self, path: &str, mode: u32) -> VfsResult<()>;
     fn chown(&mut self, path: &str, uid: u32, gid: u32) -> VfsResult<()>;
+    fn chown_spec(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        follow_symlinks: bool,
+    ) -> VfsResult<()> {
+        if !follow_symlinks {
+            return Err(VfsError::unsupported(format!(
+                "lchown is not supported for '{path}'"
+            )));
+        }
+        self.chown(path, uid, gid)
+    }
     fn utimes(&mut self, path: &str, atime_ms: u64, mtime_ms: u64) -> VfsResult<()>;
     fn utimes_spec(
         &mut self,
@@ -1288,6 +1302,20 @@ impl VirtualFileSystem for MemoryFileSystem {
 
     fn chown(&mut self, path: &str, uid: u32, gid: u32) -> VfsResult<()> {
         let inode = self.inode_mut_for_existing_path(path, "chown", true)?;
+        inode.metadata.uid = uid;
+        inode.metadata.gid = gid;
+        inode.metadata.ctime_ms = now_ms();
+        Ok(())
+    }
+
+    fn chown_spec(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        follow_symlinks: bool,
+    ) -> VfsResult<()> {
+        let inode = self.inode_mut_for_existing_path(path, "chown", follow_symlinks)?;
         inode.metadata.uid = uid;
         inode.metadata.gid = gid;
         inode.metadata.ctime_ms = now_ms();

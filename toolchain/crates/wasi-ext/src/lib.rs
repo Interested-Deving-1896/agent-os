@@ -15,10 +15,11 @@ pub type Errno = u32;
 pub const ERRNO_SUCCESS: Errno = 0;
 pub const ERRNO_BADF: Errno = 8;
 pub const ERRNO_INVAL: Errno = 28;
+pub const ERRNO_IO: Errno = 29;
 pub const ERRNO_NOSYS: Errno = 52;
 pub const ERRNO_NOENT: Errno = 44;
 pub const ERRNO_SRCH: Errno = 71; // No such process
-pub const ERRNO_CHILD: Errno = 10; // No child processes
+pub const ERRNO_CHILD: Errno = 12; // No child processes
 /// WASI `errno::again` (EAGAIN/EWOULDBLOCK). Returned by a non-blocking `recv`
 /// when no data is currently available.
 pub const ERRNO_AGAIN: Errno = 6;
@@ -73,42 +74,87 @@ extern "C" {
     /// The executable path is separate from the serialized argument vector so `argv[0]` is
     /// preserved verbatim.
     /// Environment is serialized similarly via `envp_ptr`/`envp_len`.
-    /// File descriptors `stdin_fd`, `stdout_fd`, `stderr_fd` are inherited.
+    /// Ordered child file actions are serialized separately from the caller's
+    /// descriptor table. Spawn attributes carry the effective signal mask and
+    /// requested default dispositions.
     /// Current working directory is passed as `cwd_ptr`/`cwd_len`.
     /// On success, the child's virtual PID is written to `ret_pid`.
     /// Returns errno.
-    fn proc_spawn(
+    fn proc_spawn_v3(
         exec_path_ptr: *const u8,
         exec_path_len: u32,
         argv_ptr: *const u8,
         argv_len: u32,
         envp_ptr: *const u8,
         envp_len: u32,
-        stdin_fd: u32,
-        stdout_fd: u32,
-        stderr_fd: u32,
+        actions_ptr: *const u8,
+        actions_len: u32,
         cwd_ptr: *const u8,
         cwd_len: u32,
+        attr_flags: u32,
+        sigdefault_lo: u32,
+        sigdefault_hi: u32,
+        sigmask_lo: u32,
+        sigmask_hi: u32,
+        pgroup: u32,
         ret_pid: *mut u32,
+    ) -> Errno;
+
+    /// Query or update the authoritative process signal mask.
+    ///
+    /// `how` uses the POSIX SIG_BLOCK/SIG_UNBLOCK/SIG_SETMASK values; 3 is the
+    /// internal query-only operation used for `sigprocmask(..., NULL, ...)`.
+    fn proc_signal_mask_v2(
+        how: u32,
+        set_lo: u32,
+        set_hi: u32,
+        ret_old_lo: *mut u32,
+        ret_old_hi: *mut u32,
+    ) -> Errno;
+
+    /// Replace the current process image. Success never returns.
+    fn proc_exec(
+        exec_path_ptr: *const u8,
+        exec_path_len: u32,
+        argv_ptr: *const u8,
+        argv_len: u32,
+        envp_ptr: *const u8,
+        envp_len: u32,
+        cloexec_fds_ptr: *const u32,
+        cloexec_fds_len: u32,
+    ) -> Errno;
+
+    /// Replace the current process image from an already-open executable fd.
+    /// Success never returns and does not change the descriptor's offset.
+    fn proc_fexec(
+        exec_fd: u32,
+        argv_ptr: *const u8,
+        argv_len: u32,
+        envp_ptr: *const u8,
+        envp_len: u32,
+        cloexec_fds_ptr: *const u32,
+        cloexec_fds_len: u32,
     ) -> Errno;
 
     /// Wait for a child process to exit.
     ///
     /// Blocks (via Atomics.wait on the host side) until the child exits.
-    /// `options` is reserved (pass 0). Normal exit and terminating signal are returned separately.
+    /// `options` accepts the WNOHANG bit. Normal exit and terminating signal are returned separately.
     /// The actual waited-for PID is written to `ret_pid` (important for pid=-1).
     /// Returns errno.
-    fn proc_waitpid(
+    fn proc_waitpid_v2(
         pid: u32,
         options: u32,
         ret_exit_code: *mut u32,
         ret_signal: *mut u32,
         ret_pid: *mut u32,
+        ret_core_dumped: *mut u32,
     ) -> Errno;
 
     /// Send a signal to a process.
     ///
-    /// Only SIGTERM (15) and SIGKILL (9) are meaningful.
+    /// Standard Linux signals 1 through 64 are supported; signal zero performs
+    /// existence and permission checks without delivery.
     /// Returns errno.
     fn proc_kill(pid: u32, signal: u32) -> Errno;
 
@@ -121,6 +167,12 @@ extern "C" {
     ///
     /// Writes parent PID to `ret_pid`. Returns errno.
     fn proc_getppid(ret_pid: *mut u32) -> Errno;
+
+    /// Get a process group ID. PID zero selects the current process.
+    fn proc_getpgid(pid: u32, ret_pgid: *mut u32) -> Errno;
+
+    /// Move a process into a process group using Linux setpgid semantics.
+    fn proc_setpgid(pid: u32, pgid: u32) -> Errno;
 
     /// Create an anonymous pipe.
     ///
@@ -138,6 +190,56 @@ extern "C" {
     /// `old_fd` is duplicated to `new_fd`. If `new_fd` is already open, it is closed first.
     /// Returns errno.
     fn fd_dup2(old_fd: u32, new_fd: u32) -> Errno;
+
+    /// Close every guest-visible descriptor greater than or equal to `low_fd`.
+    ///
+    /// This includes high synthetic descriptors that cannot be reached by a
+    /// bounded libc-side loop. Returns errno.
+    fn proc_closefrom(low_fd: u32) -> Errno;
+
+    /// Create a connected local socket pair in the kernel FD table.
+    ///
+    /// On success, the two socket FDs are written to `ret_fd0` and `ret_fd1`.
+    /// Returns errno.
+    fn fd_socketpair(
+        domain: u32,
+        sock_type: u32,
+        protocol: u32,
+        ret_fd0: *mut u32,
+        ret_fd1: *mut u32,
+    ) -> Errno;
+
+    /// Send data and kernel FDs over a local socket.
+    ///
+    /// `rights_ptr` points to `rights_len` guest FD numbers. The host duplicates
+    /// their kernel handles into the receiver when the message is received.
+    /// Returns errno.
+    fn fd_sendmsg_rights(
+        socket_fd: u32,
+        data_ptr: *const u8,
+        data_len: u32,
+        rights_ptr: *const u32,
+        rights_len: u32,
+        flags: u32,
+        ret_sent: *mut u32,
+    ) -> Errno;
+
+    /// Receive data and kernel FDs from a local socket.
+    ///
+    /// `rights_ptr` has room for `rights_capacity` guest FD numbers. The host
+    /// reports the received byte count, FD count, and message flags separately.
+    /// Returns errno.
+    fn fd_recvmsg_rights(
+        socket_fd: u32,
+        data_ptr: *mut u8,
+        data_len: u32,
+        rights_ptr: *mut u32,
+        rights_capacity: u32,
+        flags: u32,
+        ret_received: *mut u32,
+        ret_rights_len: *mut u32,
+        ret_msg_flags: *mut u32,
+    ) -> Errno;
 
     /// Sleep for the specified number of milliseconds.
     ///
@@ -210,24 +312,65 @@ pub fn spawn(
     stderr_fd: u32,
     cwd: &[u8],
 ) -> Result<u32, Errno> {
+    const FDOP_OPEN: u32 = 3;
+    const FDOP_DUP2: u32 = 2;
+    const ACTION_BYTES: usize = 24;
+    const O_WRONLY: u32 = 1;
+
+    // Rust's Command implementation supplies only the three stdio overrides.
+    // Encode them in the same ordered action stream used by libc posix_spawn.
+    let mut actions = [0_u8; (ACTION_BYTES * 3) + (b"/dev/null".len() * 3)];
+    let mut actions_len = 0;
+    for (source, target) in [
+        (stdin_fd, 0_u32),
+        (stdout_fd, 1_u32),
+        (stderr_fd, 2_u32),
+    ]
+    .into_iter()
+    {
+        if source == target {
+            continue;
+        }
+        let path = if source == u32::MAX { b"/dev/null".as_slice() } else { &[] };
+        let base = actions_len;
+        let command = if path.is_empty() { FDOP_DUP2 } else { FDOP_OPEN };
+        actions[base..base + 4].copy_from_slice(&command.to_le_bytes());
+        actions[base + 4..base + 8].copy_from_slice(&target.to_le_bytes());
+        if command == FDOP_DUP2 {
+            actions[base + 8..base + 12].copy_from_slice(&source.to_le_bytes());
+        } else if target != 0 {
+            actions[base + 12..base + 16].copy_from_slice(&O_WRONLY.to_le_bytes());
+        }
+        actions[base + 20..base + 24]
+            .copy_from_slice(&(path.len() as u32).to_le_bytes());
+        actions[base + ACTION_BYTES..base + ACTION_BYTES + path.len()]
+            .copy_from_slice(path);
+        actions_len += ACTION_BYTES + path.len();
+    }
+    let (sigmask_lo, sigmask_hi) = signal_mask(3, 0, 0)?;
     let mut pid: u32 = 0;
     let exec_path_len = checked_u32_len(exec_path.len())?;
     let argv_len = checked_u32_len(argv.len())?;
     let envp_len = checked_u32_len(envp.len())?;
     let cwd_len = checked_u32_len(cwd.len())?;
     let errno = unsafe {
-        proc_spawn(
+        proc_spawn_v3(
             exec_path.as_ptr(),
             exec_path_len,
             argv.as_ptr(),
             argv_len,
             envp.as_ptr(),
             envp_len,
-            stdin_fd,
-            stdout_fd,
-            stderr_fd,
+            actions.as_ptr(),
+            checked_u32_len(actions_len)?,
             cwd.as_ptr(),
             cwd_len,
+            0,
+            0,
+            0,
+            sigmask_lo,
+            sigmask_hi,
+            0,
             &mut pid,
         )
     };
@@ -236,6 +379,104 @@ pub fn spawn(
     } else {
         Err(errno)
     }
+}
+
+/// Query or update the authoritative process signal mask.
+pub fn signal_mask(how: u32, set_lo: u32, set_hi: u32) -> Result<(u32, u32), Errno> {
+    let mut old_lo = 0;
+    let mut old_hi = 0;
+    let errno = unsafe {
+        proc_signal_mask_v2(how, set_lo, set_hi, &mut old_lo, &mut old_hi)
+    };
+    if errno == ERRNO_SUCCESS {
+        Ok((old_lo, old_hi))
+    } else {
+        Err(errno)
+    }
+}
+
+/// Return the process group for `pid`; zero selects the current process.
+pub fn getpgid(pid: u32) -> Result<u32, Errno> {
+    let mut pgid = 0;
+    let errno = unsafe { proc_getpgid(pid, &mut pgid) };
+    if errno == ERRNO_SUCCESS {
+        Ok(pgid)
+    } else {
+        Err(errno)
+    }
+}
+
+/// Apply Linux setpgid semantics to a process owned by the current driver.
+pub fn setpgid(pid: u32, pgid: u32) -> Result<(), Errno> {
+    let errno = unsafe { proc_setpgid(pid, pgid) };
+    if errno == ERRNO_SUCCESS {
+        Ok(())
+    } else {
+        Err(errno)
+    }
+}
+
+/// Replace the current process image. Returns only when the host rejects the
+/// request; a successful replacement terminates this WASM execution.
+pub fn exec(
+    exec_path: &[u8],
+    argv: &[u8],
+    envp: &[u8],
+) -> Result<core::convert::Infallible, Errno> {
+    exec_with_cloexec(exec_path, argv, envp, &[])
+}
+
+/// Replace the current process image and close the supplied descriptors on a
+/// successful replacement. Returns only when the host rejects the request.
+pub fn exec_with_cloexec(
+    exec_path: &[u8],
+    argv: &[u8],
+    envp: &[u8],
+    cloexec_fds: &[u32],
+) -> Result<core::convert::Infallible, Errno> {
+    let errno = unsafe {
+        proc_exec(
+            exec_path.as_ptr(),
+            checked_u32_len(exec_path.len())?,
+            argv.as_ptr(),
+            checked_u32_len(argv.len())?,
+            envp.as_ptr(),
+            checked_u32_len(envp.len())?,
+            cloexec_fds.as_ptr(),
+            checked_u32_len(cloexec_fds.len())?,
+        )
+    };
+    Err(if errno == ERRNO_SUCCESS {
+        ERRNO_IO
+    } else {
+        errno
+    })
+}
+
+/// Replace the current process image from an open descriptor. The host reads
+/// from offset zero without changing the descriptor offset, matching fexecve.
+pub fn fexec_with_cloexec(
+    exec_fd: u32,
+    argv: &[u8],
+    envp: &[u8],
+    cloexec_fds: &[u32],
+) -> Result<core::convert::Infallible, Errno> {
+    let errno = unsafe {
+        proc_fexec(
+            exec_fd,
+            argv.as_ptr(),
+            checked_u32_len(argv.len())?,
+            envp.as_ptr(),
+            checked_u32_len(envp.len())?,
+            cloexec_fds.as_ptr(),
+            checked_u32_len(cloexec_fds.len())?,
+        )
+    };
+    Err(if errno == ERRNO_SUCCESS {
+        ERRNO_IO
+    } else {
+        errno
+    })
 }
 
 /// The result of waiting for a child process.
@@ -247,6 +488,8 @@ pub struct WaitStatus {
     pub signal: u32,
     /// The PID that was reaped (relevant when waiting for any child).
     pub pid: u32,
+    /// Whether the terminating signal produced a core-dump wait status.
+    pub core_dumped: bool,
 }
 
 impl WaitStatus {
@@ -267,12 +510,23 @@ pub fn waitpid(pid: u32, options: u32) -> Result<WaitStatus, Errno> {
     let mut exit_code: u32 = 0;
     let mut signal: u32 = 0;
     let mut actual_pid: u32 = 0;
-    let errno = unsafe { proc_waitpid(pid, options, &mut exit_code, &mut signal, &mut actual_pid) };
+    let mut core_dumped: u32 = 0;
+    let errno = unsafe {
+        proc_waitpid_v2(
+            pid,
+            options,
+            &mut exit_code,
+            &mut signal,
+            &mut actual_pid,
+            &mut core_dumped,
+        )
+    };
     if errno == ERRNO_SUCCESS {
         Ok(WaitStatus {
             exit_code,
             signal,
             pid: actual_pid,
+            core_dumped: core_dumped != 0,
         })
     } else {
         Err(errno)
@@ -354,6 +608,95 @@ pub fn dup2(old_fd: u32, new_fd: u32) -> Result<(), Errno> {
     } else {
         Err(errno)
     }
+}
+
+/// Close every guest-visible descriptor greater than or equal to `low_fd`.
+pub fn closefrom(low_fd: u32) -> Result<(), Errno> {
+    let errno = unsafe { proc_closefrom(low_fd) };
+    if errno == ERRNO_SUCCESS {
+        Ok(())
+    } else {
+        Err(errno)
+    }
+}
+
+/// Create a connected local socket pair.
+///
+/// Returns `Ok((fd0, fd1))` on success, `Err(errno)` on failure.
+pub fn socketpair(domain: u32, sock_type: u32, protocol: u32) -> Result<(u32, u32), Errno> {
+    let mut fd0 = 0;
+    let mut fd1 = 0;
+    let errno = unsafe { fd_socketpair(domain, sock_type, protocol, &mut fd0, &mut fd1) };
+    if errno == ERRNO_SUCCESS {
+        Ok((fd0, fd1))
+    } else {
+        Err(errno)
+    }
+}
+
+/// Send data and guest FDs over a local socket.
+///
+/// Returns `Ok(bytes_sent)` on success, `Err(errno)` on failure.
+pub fn sendmsg_rights(
+    socket_fd: u32,
+    data: &[u8],
+    rights: &[u32],
+    flags: u32,
+) -> Result<u32, Errno> {
+    let data_len = checked_u32_len(data.len())?;
+    let rights_len = checked_u32_len(rights.len())?;
+    let mut sent = 0;
+    let errno = unsafe {
+        fd_sendmsg_rights(
+            socket_fd,
+            data.as_ptr(),
+            data_len,
+            rights.as_ptr(),
+            rights_len,
+            flags,
+            &mut sent,
+        )
+    };
+    if errno == ERRNO_SUCCESS {
+        validate_returned_len(sent, data.len())
+    } else {
+        Err(errno)
+    }
+}
+
+/// Receive data and guest FDs from a local socket.
+///
+/// Returns `(bytes_received, rights_received, message_flags)` on success.
+pub fn recvmsg_rights(
+    socket_fd: u32,
+    data: &mut [u8],
+    rights: &mut [u32],
+    flags: u32,
+) -> Result<(u32, u32, u32), Errno> {
+    let data_len = checked_u32_len(data.len())?;
+    let rights_capacity = checked_u32_len(rights.len())?;
+    let mut received = 0;
+    let mut rights_len = 0;
+    let mut msg_flags = 0;
+    let errno = unsafe {
+        fd_recvmsg_rights(
+            socket_fd,
+            data.as_mut_ptr(),
+            data_len,
+            rights.as_mut_ptr(),
+            rights_capacity,
+            flags,
+            &mut received,
+            &mut rights_len,
+            &mut msg_flags,
+        )
+    };
+    if errno != ERRNO_SUCCESS {
+        return Err(errno);
+    }
+    let received = validate_returned_len(received, data.len())?;
+    let rights_len = validate_returned_len(rights_len, rights.len())?;
+    Ok((received, rights_len, msg_flags))
 }
 
 /// Sleep for the specified number of milliseconds.

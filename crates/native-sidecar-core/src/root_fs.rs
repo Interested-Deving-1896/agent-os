@@ -1,3 +1,5 @@
+use crate::ca::default_ca_snapshot;
+use crate::services::default_services_snapshot;
 use agentos_bridge::FilesystemSnapshot;
 use agentos_kernel::mount_table::MountTable;
 use agentos_kernel::root_fs::{
@@ -107,7 +109,7 @@ pub fn build_root_filesystem_with_loaded_snapshot(
     limits: &impl RootFilesystemResourceLimits,
 ) -> Result<RootFileSystem, SidecarCoreError> {
     let import_limits = RootFilesystemImportLimits::from_resource_limits(limits);
-    let descriptor = if let Some(restored) = supported_loaded_snapshot(loaded_snapshot) {
+    let mut descriptor = if let Some(restored) = supported_loaded_snapshot(loaded_snapshot) {
         KernelRootFilesystemDescriptor {
             mode: root_filesystem_mode_from_config(config.mode),
             disable_default_base_layer: true,
@@ -127,6 +129,56 @@ pub fn build_root_filesystem_with_loaded_snapshot(
     } else {
         root_filesystem_descriptor_from_config_with_import_limits(config, &import_limits)?
     };
+    // Adding any explicit lower disables the kernel's automatic minimal lower.
+    // Preserve that scaffold when the CA is the only explicit layer.
+    if descriptor.disable_default_base_layer && descriptor.lowers.is_empty() {
+        let mut minimal_root = RootFileSystem::from_descriptor_with_import_limits(
+            KernelRootFilesystemDescriptor {
+                mode: KernelRootFilesystemMode::Ephemeral,
+                disable_default_base_layer: true,
+                lowers: Vec::new(),
+                bootstrap_entries: Vec::new(),
+            },
+            &import_limits,
+        )
+        .map_err(|error| {
+            SidecarCoreError::new(format!("build minimal root filesystem: {error}"))
+        })?;
+        descriptor.lowers.push(
+            minimal_root.snapshot().map_err(|error| {
+                SidecarCoreError::new(format!("snapshot minimal root: {error}"))
+            })?,
+        );
+    }
+
+    // This is the final (lowest-precedence) AgentOS lower. Overlay lookup checks
+    // user lowers first, and bootstrap entries are applied to the upper, so an
+    // explicit trust store always replaces these defaults.
+    let bootstrap_replaces_bundle = descriptor
+        .bootstrap_entries
+        .iter()
+        .any(|entry| normalize_path(&entry.path) == crate::ca::CA_CERTIFICATES_GUEST_PATH);
+    let bootstrap_replaces_cert_pem = descriptor
+        .bootstrap_entries
+        .iter()
+        .any(|entry| normalize_path(&entry.path) == crate::ca::CA_CERTIFICATES_SYMLINK_PATH);
+    // `write_file` follows a lower-layer symlink during copy-up. When an
+    // explicit bootstrap node replaces one of the trust paths, remove that
+    // exact lower entry first so a regular file replaces the symlink itself
+    // instead of overwriting its target. This also handles restored snapshots
+    // that captured an older default CA layout.
+    for lower in &mut descriptor.lowers {
+        lower.entries.retain(|entry| {
+            let path = normalize_path(&entry.path);
+            !(bootstrap_replaces_bundle && path == crate::ca::CA_CERTIFICATES_GUEST_PATH)
+                && !(bootstrap_replaces_cert_pem && path == crate::ca::CA_CERTIFICATES_SYMLINK_PATH)
+        });
+    }
+    descriptor.lowers.push(default_services_snapshot());
+    descriptor.lowers.push(default_ca_snapshot(
+        bootstrap_replaces_bundle,
+        bootstrap_replaces_cert_pem,
+    ));
     RootFileSystem::from_descriptor_with_import_limits(descriptor, &import_limits)
         .map_err(|error| SidecarCoreError::new(format!("build root filesystem: {error}")))
 }
@@ -449,6 +501,11 @@ fn snapshot_entry_content(content: Vec<u8>) -> (String, ProtocolRootFilesystemEn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ca::{
+        CA_CERTIFICATES_BUNDLE, CA_CERTIFICATES_GUEST_PATH, CA_CERTIFICATES_SYMLINK_PATH,
+        CA_CERTIFICATES_SYMLINK_TARGET,
+    };
+    use crate::services::{BASELINE_SERVICES, SERVICES_GUEST_PATH};
     use agentos_kernel::resource_accounting::ResourceLimits;
     use agentos_kernel::vfs::VirtualFileSystem;
 
@@ -491,6 +548,24 @@ mod tests {
             root.read_file("/workspace/value.txt")
                 .expect("read merged value"),
             b"upper".to_vec()
+        );
+    }
+
+    #[test]
+    fn installs_default_linux_services_database() {
+        let mut root = build_root_filesystem(
+            &vm_config::RootFilesystemConfig {
+                disable_default_base_layer: true,
+                ..vm_config::RootFilesystemConfig::default()
+            },
+            &ResourceLimits::default(),
+        )
+        .expect("build root filesystem");
+
+        assert_eq!(
+            root.read_file(SERVICES_GUEST_PATH)
+                .expect("read default services"),
+            BASELINE_SERVICES.as_bytes()
         );
     }
 
@@ -710,6 +785,178 @@ mod tests {
         assert!(
             root.read_file("/workspace/ignored-lower.txt").is_err(),
             "restored snapshots should replace configured lowers"
+        );
+    }
+
+    #[test]
+    fn installs_default_ca_in_read_only_roots_before_bootstrap_finishes() {
+        let mut root = build_root_filesystem(
+            &vm_config::RootFilesystemConfig {
+                mode: vm_config::RootFilesystemMode::ReadOnly,
+                disable_default_base_layer: true,
+                ..vm_config::RootFilesystemConfig::default()
+            },
+            &ResourceLimits::default(),
+        )
+        .expect("build read-only root filesystem");
+
+        assert_eq!(
+            root.read_file(CA_CERTIFICATES_GUEST_PATH)
+                .expect("read default CA bundle"),
+            CA_CERTIFICATES_BUNDLE
+        );
+        assert_eq!(
+            root.read_link(CA_CERTIFICATES_SYMLINK_PATH)
+                .expect("read default CA symlink"),
+            CA_CERTIFICATES_SYMLINK_TARGET
+        );
+        assert!(
+            root.exists("/usr/bin/env"),
+            "adding the CA lower must preserve the kernel's minimal root scaffold"
+        );
+
+        root.finish_bootstrap();
+        assert_eq!(
+            root.read_file(CA_CERTIFICATES_SYMLINK_PATH)
+                .expect("read CA through symlink after read-only lock"),
+            CA_CERTIFICATES_BUNDLE
+        );
+        assert!(
+            root.write_file(CA_CERTIFICATES_GUEST_PATH, b"replacement")
+                .is_err(),
+            "read-only root must lock the seeded trust store with all other writes"
+        );
+    }
+
+    #[test]
+    fn installs_default_ca_in_ephemeral_bundled_roots() {
+        let mut root = build_root_filesystem(
+            &vm_config::RootFilesystemConfig::default(),
+            &ResourceLimits::default(),
+        )
+        .expect("build default ephemeral root filesystem");
+
+        assert_eq!(
+            root.read_file(CA_CERTIFICATES_GUEST_PATH)
+                .expect("read default CA bundle from bundled root"),
+            CA_CERTIFICATES_BUNDLE
+        );
+        assert_eq!(
+            root.read_file(CA_CERTIFICATES_SYMLINK_PATH)
+                .expect("read default CA through bundled-root symlink"),
+            CA_CERTIFICATES_BUNDLE
+        );
+    }
+
+    #[test]
+    fn explicit_ca_entries_replace_defaults_across_lower_and_bootstrap_layers() {
+        let custom_bundle = "custom lower bundle\n";
+        let custom_cert_pem = "custom bootstrap cert.pem\n";
+        let mut root = build_root_filesystem(
+            &vm_config::RootFilesystemConfig {
+                disable_default_base_layer: true,
+                lowers: vec![vm_config::RootFilesystemLowerDescriptor::Snapshot {
+                    entries: vec![vm_config::RootFilesystemEntry {
+                        path: CA_CERTIFICATES_GUEST_PATH.to_string(),
+                        kind: vm_config::RootFilesystemEntryKind::File,
+                        mode: None,
+                        uid: None,
+                        gid: None,
+                        content: Some(custom_bundle.to_string()),
+                        encoding: Some(vm_config::RootFilesystemEntryEncoding::Utf8),
+                        target: None,
+                        executable: false,
+                    }],
+                }],
+                bootstrap_entries: vec![vm_config::RootFilesystemEntry {
+                    path: CA_CERTIFICATES_SYMLINK_PATH.to_string(),
+                    kind: vm_config::RootFilesystemEntryKind::File,
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    content: Some(custom_cert_pem.to_string()),
+                    encoding: Some(vm_config::RootFilesystemEntryEncoding::Utf8),
+                    target: None,
+                    executable: false,
+                }],
+                ..vm_config::RootFilesystemConfig::default()
+            },
+            &ResourceLimits::default(),
+        )
+        .expect("build root filesystem with custom trust");
+
+        assert_eq!(
+            root.read_file(CA_CERTIFICATES_GUEST_PATH)
+                .expect("read custom lower bundle"),
+            custom_bundle.as_bytes()
+        );
+        assert_eq!(
+            root.read_file(CA_CERTIFICATES_SYMLINK_PATH)
+                .expect("read regular custom cert.pem"),
+            custom_cert_pem.as_bytes()
+        );
+        assert!(
+            !root
+                .lstat(CA_CERTIFICATES_SYMLINK_PATH)
+                .expect("lstat custom cert.pem")
+                .is_symbolic_link,
+            "a regular custom cert.pem must replace the default symlink"
+        );
+    }
+
+    #[test]
+    fn restored_snapshot_ca_replaces_default_ca() {
+        let restored_bundle = b"restored trust bundle\n";
+        let restored = RootFilesystemSnapshot {
+            entries: vec![
+                FilesystemEntry::file(CA_CERTIFICATES_GUEST_PATH, restored_bundle),
+                FilesystemEntry::symlink(
+                    CA_CERTIFICATES_SYMLINK_PATH,
+                    CA_CERTIFICATES_SYMLINK_TARGET,
+                ),
+            ],
+        };
+        let loaded_snapshot = FilesystemSnapshot {
+            format: String::from(agentos_kernel::root_fs::ROOT_FILESYSTEM_SNAPSHOT_FORMAT),
+            bytes: agentos_kernel::root_fs::encode_snapshot(&restored)
+                .expect("encode restored snapshot"),
+        };
+        let mut root = build_root_filesystem_with_loaded_snapshot(
+            &vm_config::RootFilesystemConfig {
+                disable_default_base_layer: true,
+                bootstrap_entries: vec![vm_config::RootFilesystemEntry {
+                    path: CA_CERTIFICATES_SYMLINK_PATH.to_string(),
+                    kind: vm_config::RootFilesystemEntryKind::File,
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    content: Some("restored custom cert.pem\n".to_string()),
+                    encoding: Some(vm_config::RootFilesystemEntryEncoding::Utf8),
+                    target: None,
+                    executable: false,
+                }],
+                ..vm_config::RootFilesystemConfig::default()
+            },
+            Some(&loaded_snapshot),
+            &ResourceLimits::default(),
+        )
+        .expect("build root filesystem from restored snapshot");
+
+        assert_eq!(
+            root.read_file(CA_CERTIFICATES_GUEST_PATH)
+                .expect("read restored CA bundle"),
+            restored_bundle
+        );
+        assert_eq!(
+            root.read_file(CA_CERTIFICATES_SYMLINK_PATH)
+                .expect("read restored custom regular cert.pem"),
+            b"restored custom cert.pem\n"
+        );
+        assert!(
+            !root
+                .lstat(CA_CERTIFICATES_SYMLINK_PATH)
+                .expect("lstat restored custom cert.pem")
+                .is_symbolic_link
         );
     }
 }

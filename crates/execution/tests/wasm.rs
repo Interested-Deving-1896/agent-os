@@ -212,7 +212,13 @@ fn wasm_limits_from_env(env: &BTreeMap<String, String>) -> WasmExecutionLimits {
         max_fuel: parse(WASM_MAX_FUEL_ENV),
         max_memory_bytes: parse(WASM_MAX_MEMORY_BYTES_ENV),
         max_stack_bytes: parse(WASM_MAX_STACK_BYTES_ENV),
+        max_module_file_bytes: None,
+        max_spawn_file_actions: None,
+        max_spawn_file_action_bytes: None,
         prewarm_timeout_ms: None,
+        max_open_fds: None,
+        max_sockets: None,
+        max_blocking_read_ms: None,
         runner_heap_limit_mb: None,
     }
 }
@@ -226,6 +232,18 @@ fn run_wasm_execution(
     permission_tier: WasmPermissionTier,
 ) -> (String, String, i32) {
     let limits = wasm_limits_from_env(&env);
+    run_wasm_execution_with_limits(engine, context_id, cwd, argv, env, permission_tier, limits)
+}
+
+fn run_wasm_execution_with_limits(
+    engine: &mut WasmExecutionEngine,
+    context_id: String,
+    cwd: &Path,
+    argv: Vec<String>,
+    env: BTreeMap<String, String>,
+    permission_tier: WasmPermissionTier,
+    limits: WasmExecutionLimits,
+) -> (String, String, i32) {
     let execution = engine
         .start_execution(StartWasmExecutionRequest {
             limits,
@@ -270,6 +288,67 @@ fn wasm_stdout_module() -> Vec<u8> {
 "#,
     )
     .expect("compile wasm fixture")
+}
+
+fn wasm_spawn_action_errno_module(
+    action_bytes: u32,
+    expected_errno: u32,
+    memory_pages: u32,
+) -> Vec<u8> {
+    let initial_actions = "\\00".repeat(48);
+    wat::parse_str(format!(
+        r#"
+(module
+  (type $spawn_t (func (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (type $exit_t (func (param i32)))
+  (import "host_process" "proc_spawn_v3" (func $spawn (type $spawn_t)))
+  (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (type $exit_t)))
+  (memory (export "memory") {memory_pages})
+  (data (i32.const 128) "{initial_actions}")
+  (func $_start (export "_start")
+    (if
+      (i32.ne
+        (call $spawn
+          (i32.const 0) (i32.const 0)
+          (i32.const 0) (i32.const 0)
+          (i32.const 0) (i32.const 0)
+          (i32.const 128) (i32.const {action_bytes})
+          (i32.const 0) (i32.const 0)
+          (i32.const 0) (i32.const 0) (i32.const 0)
+          (i32.const 0) (i32.const 0) (i32.const 0)
+          (i32.const 64))
+        (i32.const {expected_errno}))
+      (then (call $proc_exit (i32.const 42))))))
+"#,
+    ))
+    .expect("compile spawn action errno fixture")
+}
+
+fn wasm_getrlimit_nofile_module(expected_limit: u64) -> Vec<u8> {
+    wat::parse_str(format!(
+        r#"
+(module
+  (type $getrlimit_t (func (param i32 i32 i32) (result i32)))
+  (type $exit_t (func (param i32)))
+  (import "host_process" "proc_getrlimit" (func $getrlimit (type $getrlimit_t)))
+  (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (type $exit_t)))
+  (memory (export "memory") 1)
+  (func $_start (export "_start")
+    (if
+      (i32.ne
+        (call $getrlimit (i32.const 7) (i32.const 0) (i32.const 8))
+        (i32.const 0))
+      (then (call $proc_exit (i32.const 41))))
+    (if
+      (i64.ne (i64.load (i32.const 0)) (i64.const {expected_limit}))
+      (then (call $proc_exit (i32.const 42))))
+    (if
+      (i64.ne (i64.load (i32.const 8)) (i64.const {expected_limit}))
+      (then (call $proc_exit (i32.const 43)))))
+)
+"#,
+    ))
+    .expect("compile getrlimit nofile fixture")
 }
 
 fn wasm_stdin_echo_module() -> Vec<u8> {
@@ -930,6 +1009,104 @@ fn wasm_execution_runs_guest_module_through_v8() {
 
     let stdout = String::from_utf8(result.stdout).expect("stdout utf8");
     assert!(stdout.contains("stdout:wasm-smoke"));
+}
+
+fn wasm_spawn_action_decoder_enforces_typed_limits_with_e2big() {
+    assert_node_available();
+
+    let cases = [
+        (
+            "count",
+            wasm_spawn_action_errno_module(48, 1, 1),
+            WasmExecutionLimits {
+                max_spawn_file_actions: Some(1),
+                max_spawn_file_action_bytes: Some(128),
+                ..Default::default()
+            },
+            "limits.process.maxSpawnFileActions",
+        ),
+        (
+            "bytes",
+            wasm_spawn_action_errno_module(24, 1, 1),
+            WasmExecutionLimits {
+                max_spawn_file_actions: Some(10),
+                max_spawn_file_action_bytes: Some(23),
+                ..Default::default()
+            },
+            "limits.process.maxSpawnFileActionBytes",
+        ),
+        (
+            "raised-above-defaults",
+            wasm_spawn_action_errno_module(1_048_584, 28, 17),
+            WasmExecutionLimits {
+                max_spawn_file_actions: Some(44_000),
+                max_spawn_file_action_bytes: Some(1_100_000),
+                ..Default::default()
+            },
+            "near limits.process.maxSpawnFileActionBytes",
+        ),
+    ];
+
+    for (name, module, limits, expected_stderr) in cases {
+        let temp = tempdir().expect("create temp dir");
+        write_fixture(&temp.path().join("guest.wasm"), &module);
+        let mut engine = WasmExecutionEngine::default();
+        let context = engine.create_context(CreateWasmContextRequest {
+            vm_id: String::from("vm-wasm"),
+            module_path: Some(String::from("./guest.wasm")),
+        });
+        let (stdout, stderr, exit_code) = run_wasm_execution_with_limits(
+            &mut engine,
+            context.context_id,
+            temp.path(),
+            Vec::new(),
+            BTreeMap::new(),
+            WasmPermissionTier::Full,
+            limits,
+        );
+        assert_eq!(exit_code, 0, "{name}: stdout={stdout} stderr={stderr}");
+        assert!(
+            stderr.contains(expected_stderr),
+            "{name}: missing {expected_stderr:?} in stderr={stderr:?}"
+        );
+        if name == "raised-above-defaults" {
+            assert!(
+                stderr.contains("near limits.process.maxSpawnFileActions"),
+                "{name}: missing count near-limit warning in stderr={stderr:?}"
+            );
+        }
+    }
+}
+
+fn wasm_getrlimit_nofile_reports_typed_fd_limit() {
+    assert_node_available();
+
+    let temp = tempdir().expect("create temp dir");
+    write_fixture(
+        &temp.path().join("guest.wasm"),
+        &wasm_getrlimit_nofile_module(37),
+    );
+    let mut engine = WasmExecutionEngine::default();
+    let context = engine.create_context(CreateWasmContextRequest {
+        vm_id: String::from("vm-wasm"),
+        module_path: Some(String::from("./guest.wasm")),
+    });
+    let (stdout, stderr, exit_code) = run_wasm_execution_with_limits(
+        &mut engine,
+        context.context_id,
+        temp.path(),
+        Vec::new(),
+        BTreeMap::new(),
+        WasmPermissionTier::Full,
+        WasmExecutionLimits {
+            max_open_fds: Some(37),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(exit_code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.is_empty(), "unexpected stdout: {stdout:?}");
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
 }
 
 fn wasm_snapshot_runner_block_round_trips_twice() {
@@ -2755,6 +2932,8 @@ fn wasm_suite() {
     wasm_contexts_preserve_vm_and_module_configuration();
     wasm_execution_stays_inside_v8_runtime_without_host_node_launches();
     wasm_execution_runs_guest_module_through_v8();
+    wasm_spawn_action_decoder_enforces_typed_limits_with_e2big();
+    wasm_getrlimit_nofile_reports_typed_fd_limit();
     wasm_snapshot_runner_block_round_trips_twice();
     wasm_snapshot_runner_warm_worker_pool_hits();
     wasm_snapshot_runner_warm_worker_pool_disabled_falls_back();

@@ -233,6 +233,19 @@ impl<V: VirtualFileSystem> VirtualFileSystem for DeviceLayer<V> {
         self.inner.chown(path, uid, gid)
     }
 
+    fn chown_spec(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        follow_symlinks: bool,
+    ) -> VfsResult<()> {
+        if is_device_path(path) {
+            return Ok(());
+        }
+        self.inner.chown_spec(path, uid, gid, follow_symlinks)
+    }
+
     fn utimes(&mut self, path: &str, atime_ms: u64, mtime_ms: u64) -> VfsResult<()> {
         if is_device_path(path) {
             return Ok(());

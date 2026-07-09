@@ -634,6 +634,23 @@ impl<F: VirtualFileSystem> VirtualFileSystem for PermissionedFileSystem<F> {
         self.inner.chown(path, uid, gid)
     }
 
+    fn chown_spec(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        follow_symlinks: bool,
+    ) -> VfsResult<()> {
+        if follow_symlinks {
+            self.check_subject(FsOperation::Chown, path)?;
+        } else {
+            validate_path(path)?;
+            let subject = self.resolved_destination_path(path)?;
+            self.check(FsOperation::Chown, &subject)?;
+        }
+        self.inner.chown_spec(path, uid, gid, follow_symlinks)
+    }
+
     fn utimes(&mut self, path: &str, atime_ms: u64, mtime_ms: u64) -> VfsResult<()> {
         self.check_subject(FsOperation::Utimes, path)?;
         self.inner.utimes(path, atime_ms, mtime_ms)

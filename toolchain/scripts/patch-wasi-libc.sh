@@ -199,6 +199,17 @@ else
         esac
     done
 
+    # `git apply --check` accepts trailing added lines after an under-counted
+    # final hunk as patch garbage. Verify the terminal definition in the
+    # materialized spawn override so a truncated generated source cannot make
+    # the patch-only check green and then fail during the sysroot build.
+    SPAWN_OVERRIDE="$WASI_LIBC_SRC_DIR/libc-bottom-half/sources/host_spawn_wait.c"
+    if [ -f "$SPAWN_OVERRIDE" ] &&
+        ! grep -Fq 'pid_t wait(int *status) {' "$SPAWN_OVERRIDE"; then
+        echo "ERROR: materialized host_spawn_wait.c is truncated"
+        exit 1
+    fi
+
     echo ""
     case "$MODE" in
         check)   echo "All patches verified."; exit 0 ;;
@@ -353,7 +364,7 @@ if [ -d "$OVERRIDES_DIR" ] && ls "$OVERRIDES_DIR"/*.c >/dev/null 2>&1; then
     # are in a single mutex.o — remove it so our override replaces them all.
     # pthread_key: create, delete, and tsd_run_dtors are in a single .o — remove
     # via __pthread_key_create to replace the whole TSD compilation unit.
-    for sym in fcntl strfmon open_wmemstream swprintf inet_ntop __pthread_mutex_lock pthread_attr_setguardsize pthread_mutexattr_setrobust __pthread_key_create fmtmsg; do
+    for sym in fcntl close strfmon open_wmemstream swprintf inet_ntop __pthread_mutex_lock pthread_attr_setguardsize pthread_mutexattr_setrobust __pthread_key_create fmtmsg; do
         OBJ_LINE=$("$WASI_NM" --print-file-name "$SYSROOT_LIB/libc.a" 2>/dev/null | { grep " [TW] ${sym}\$" || true; } | head -1)
         if [ -n "$OBJ_LINE" ]; then
             OBJ=$(echo "$OBJ_LINE" | extract_obj)

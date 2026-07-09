@@ -261,6 +261,8 @@ pub struct AgentOsLimits {
     pub python: Option<PythonLimits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wasm: Option<WasmLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessLimits>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,6 +589,40 @@ pub struct WasmLimits {
         skip_serializing_if = "Option::is_none"
     )]
     pub runner_heap_limit_mb: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessLimits {
+    #[serde(
+        default,
+        rename = "maxSpawnFileActions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_spawn_file_actions: Option<u64>,
+    #[serde(
+        default,
+        rename = "maxSpawnFileActionBytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_spawn_file_action_bytes: Option<u64>,
+    #[serde(
+        default,
+        rename = "pendingStdinBytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pending_stdin_bytes: Option<u64>,
+    #[serde(
+        default,
+        rename = "pendingEventCount",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pending_event_count: Option<u64>,
+    #[serde(
+        default,
+        rename = "pendingEventBytes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pending_event_bytes: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

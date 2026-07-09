@@ -36,6 +36,16 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
     rationale: "Host process signal bridge reference."
   },
   {
+    name: "_processExec",
+    classification: "hardened",
+    rationale: "Host process image replacement bridge reference."
+  },
+  {
+    name: "_processExecFdImageCommit",
+    classification: "hardened",
+    rationale: "Host descriptor-backed process image commit bridge reference."
+  },
+  {
     name: "_processSignalState",
     classification: "hardened",
     rationale: "Host process signal-listener state bridge reference."
@@ -44,6 +54,11 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
     name: "_processTakeSignal",
     classification: "hardened",
     rationale: "Host process pending-signal drain bridge reference."
+  },
+  {
+    name: "_processWasmSyncRpc",
+    classification: "hardened",
+    rationale: "Allowlisted WASM process syscall bridge reference."
   },
   {
     name: "_osConfig",
@@ -866,6 +881,11 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
     rationale: "Host net socket connect-wait bridge reference."
   },
   {
+    name: "_netSocketWaitConnectSyncRaw",
+    classification: "hardened",
+    rationale: "Host synchronous net socket connect-wait bridge reference."
+  },
+  {
     name: "_netSocketReadRaw",
     classification: "hardened",
     rationale: "Host net socket read bridge reference."
@@ -931,6 +951,16 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
     rationale: "Host net server listen bridge reference."
   },
   {
+    name: "_netBindUnixRaw",
+    classification: "hardened",
+    rationale: "Host Unix-domain listener bind bridge reference."
+  },
+  {
+    name: "_netBindConnectedUnixRaw",
+    classification: "hardened",
+    rationale: "Host connected Unix-domain socket bind bridge reference."
+  },
+  {
     name: "_netServerAcceptRaw",
     classification: "hardened",
     rationale: "Host net server accept bridge reference."
@@ -939,6 +969,11 @@ var NODE_CUSTOM_GLOBAL_INVENTORY = [
     name: "_netServerCloseRaw",
     classification: "hardened",
     rationale: "Host net server close bridge reference."
+  },
+  {
+    name: "_netServerCloseSyncRaw",
+    classification: "hardened",
+    rationale: "Host synchronous net server close bridge reference."
   },
   {
     name: "_dgramSocketCreateRaw",

@@ -98,6 +98,7 @@ fn node_permission_flags_allow_workers_for_internal_javascript_loader_runtime() 
     let default_result = js_engine
         .start_execution(StartJavascriptExecutionRequest {
             limits: Default::default(),
+            argv0: None,
             guest_runtime: Default::default(),
             vm_id: String::from("vm-js"),
             context_id: context.context_id.clone(),
@@ -115,6 +116,7 @@ fn node_permission_flags_allow_workers_for_internal_javascript_loader_runtime() 
     let worker_result = js_engine
         .start_execution(StartJavascriptExecutionRequest {
             limits: Default::default(),
+            argv0: None,
             guest_runtime: Default::default(),
             vm_id: String::from("vm-js"),
             context_id: context.context_id,
@@ -177,6 +179,7 @@ fn node_permission_flags_only_propagate_nested_child_capabilities_when_parent_ex
     let denied_result = js_engine
         .start_execution(StartJavascriptExecutionRequest {
             limits: Default::default(),
+            argv0: None,
             guest_runtime: Default::default(),
             vm_id: String::from("vm-js"),
             context_id: context.context_id.clone(),
@@ -194,6 +197,7 @@ fn node_permission_flags_only_propagate_nested_child_capabilities_when_parent_ex
     let allowed_result = js_engine
         .start_execution(StartJavascriptExecutionRequest {
             limits: Default::default(),
+            argv0: None,
             guest_runtime: Default::default(),
             vm_id: String::from("vm-js"),
             context_id: context.context_id,

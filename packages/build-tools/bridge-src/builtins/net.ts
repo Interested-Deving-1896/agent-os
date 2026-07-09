@@ -220,8 +220,8 @@ function wakePeerBridgeReads(socket) {
     countNetBridgeMetric("peerWakeMiss");
     return;
   }
-  const localPath = typeof socket.localPath === "string" ? socket.localPath : void 0;
-  const remotePath = typeof socket.remotePath === "string" ? socket.remotePath : void 0;
+  const localPath = typeof socket._localUnixPath === "string" ? socket._localUnixPath : void 0;
+  const remotePath = typeof socket._remoteUnixPath === "string" ? socket._remoteUnixPath : void 0;
   if (localPath === void 0 && remotePath === void 0) {
     countNetBridgeMetric("peerWakeInvalidTargets");
     return;
@@ -231,8 +231,8 @@ function wakePeerBridgeReads(socket) {
     if (peer === socket || peer.destroyed) {
       continue;
     }
-    const peerLocalPath = typeof peer.localPath === "string" ? peer.localPath : void 0;
-    const peerRemotePath = typeof peer.remotePath === "string" ? peer.remotePath : void 0;
+    const peerLocalPath = typeof peer._localUnixPath === "string" ? peer._localUnixPath : void 0;
+    const peerRemotePath = typeof peer._remoteUnixPath === "string" ? peer._remoteUnixPath : void 0;
     const fullPathMirror = localPath !== void 0 && remotePath !== void 0 && peerLocalPath !== void 0 && peerRemotePath !== void 0 && peerLocalPath === remotePath && peerRemotePath === localPath;
     const remoteToPeerLocal = remotePath !== void 0 && peerLocalPath !== void 0 && peerLocalPath === remotePath;
     const localToPeerRemote = localPath !== void 0 && peerRemotePath !== void 0 && peerRemotePath === localPath;
@@ -313,7 +313,7 @@ function wakeNetServerAcceptForSocket(socket) {
     }
     return wakeNetServerAccept(server);
   }
-  const path = socket?.remotePath;
+  const path = socket?._remoteUnixPath;
   if (typeof path !== "string") {
     countNetBridgeMetric("acceptWakeSocketInvalidTargets");
     return;
@@ -513,6 +513,15 @@ function normalizeConnectArgs(portOrOptions, hostOrCallback, callback) {
     host: typeof hostOrCallback === "string" ? hostOrCallback : "127.0.0.1",
     callback: typeof hostOrCallback === "function" ? hostOrCallback : callback
   };
+}
+
+function unixSocketRequest(path) {
+  if (path.charCodeAt(0) === 0) {
+    return {
+      abstractPathHex: Buffer.from(path.slice(1), "utf8").toString("hex")
+    };
+  }
+  return { path };
 }
 
 function isValidIPv4Segment(segment) {
@@ -1590,14 +1599,6 @@ var NetSocket = class _NetSocket {
   readyState = "open";
   readableLength = 0;
   writableLength = 0;
-  remoteAddress;
-  remotePort;
-  remoteFamily;
-  localAddress = "0.0.0.0";
-  localPort = 0;
-  localFamily = "IPv4";
-  localPath;
-  remotePath;
   bytesRead = 0;
   bytesWritten = 0;
   bufferSize = 0;
@@ -1618,6 +1619,8 @@ var NetSocket = class _NetSocket {
   _readableState = { endEmitted: false, ended: false };
   _readQueue = [];
   _handle = null;
+  _localUnixPath;
+  _remoteUnixPath;
   constructor(options) {
     if (options?.allowHalfOpen) this.allowHalfOpen = true;
     if (options?.handle) this._handle = options.handle;
@@ -1638,15 +1641,29 @@ var NetSocket = class _NetSocket {
     } = normalizeConnectArgs(portOrOptions, hostOrCallback, callback);
     if (cb) this.once("connect", cb);
     this.connecting = true;
-    this.remoteAddress = path ?? host;
-    this.remotePort = path ? void 0 : port;
-    this.remotePath = path;
+    if (path) {
+      delete this.remoteAddress;
+      delete this.remotePort;
+      delete this.remoteFamily;
+      delete this.localAddress;
+      delete this.localPort;
+      delete this.localFamily;
+      delete this.localPath;
+      delete this.remotePath;
+    } else {
+      this.remoteAddress = host;
+      this.remotePort = port;
+      this.localAddress ??= "0.0.0.0";
+      this.localPort ??= 0;
+      this.localFamily ??= "IPv4";
+    }
+    this._remoteUnixPath = path;
     this.pending = false;
     let handle;
     try {
       handle = normalizeNetSocketHandle(_netSocketConnectRaw.applySync(
         void 0,
-        [path ? { path } : { host, port, localAddress, localPort }]
+        [path ? unixSocketRequest(path) : { host, port, localAddress, localPort }]
       ));
     } catch (error) {
       this.connecting = false;
@@ -1973,14 +1990,25 @@ var NetSocket = class _NetSocket {
     if (!info) {
       return;
     }
+    if (info.localPath !== undefined || info.remotePath !== undefined) {
+      this._localUnixPath = info.localPath;
+      this._remoteUnixPath = info.remotePath ?? this._remoteUnixPath;
+      delete this.localAddress;
+      delete this.localPort;
+      delete this.localFamily;
+      delete this.remoteAddress;
+      delete this.remotePort;
+      delete this.remoteFamily;
+      delete this.localPath;
+      delete this.remotePath;
+      return;
+    }
     this.localAddress = info.localAddress;
     this.localPort = info.localPort;
     this.localFamily = info.localFamily;
-    this.localPath = info.localPath;
     this.remoteAddress = info.remoteAddress ?? this.remoteAddress;
     this.remotePort = info.remotePort ?? this.remotePort;
     this.remoteFamily = info.remoteFamily ?? this.remoteFamily;
-    this.remotePath = info.remotePath ?? this.remotePath;
   }
   _applyAcceptedKeepAlive(initialDelay) {
     this._keepAliveState = true;
@@ -2115,6 +2143,9 @@ var NetSocket = class _NetSocket {
   uncork() {
   }
   address() {
+    if (this._localUnixPath !== undefined || this._remoteUnixPath !== undefined) {
+      return {};
+    }
     return { port: this.localPort, family: this.localFamily, address: this.localAddress };
   }
   getCipher() {
@@ -2845,8 +2876,8 @@ var NetServer = class {
             _socketId: clientHandle.socketId,
             localPort: clientHandle.info.localPort,
             remotePort: clientHandle.info.remotePort,
-            localPath: clientHandle.info.localPath,
-            remotePath: clientHandle.info.remotePath
+            _localUnixPath: clientHandle.info.localPath,
+            _remoteUnixPath: clientHandle.info.remotePath
           });
           return;
         }
@@ -2885,7 +2916,14 @@ var NetServer = class {
     try {
       const resultValue = _netServerListenRaw.applySyncPromise(
         void 0,
-        [{ port, host, path, backlog, readableAll, writableAll }]
+        [{
+          port,
+          host,
+          ...(path ? unixSocketRequest(path) : {}),
+          backlog,
+          readableAll,
+          writableAll
+        }]
       );
       const result = typeof resultValue === "string" ? JSON.parse(resultValue) : resultValue;
       const address = result.address ?? result;
@@ -2936,8 +2974,12 @@ var NetServer = class {
     this._serverId = 0;
     void (async () => {
       try {
-        await _netServerCloseRaw.apply(void 0, [serverId], {
+        await _netServerCloseRaw.apply(void 0, [serverId, true], {
           result: { promise: true }
+        });
+      } catch (error) {
+        queueMicrotask(() => {
+          this._emit("error", error);
         });
       } finally {
         this._address = null;

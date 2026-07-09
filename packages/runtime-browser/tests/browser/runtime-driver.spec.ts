@@ -1245,14 +1245,15 @@ test("routes browser child_process through the driver command executor", async (
 					invalidSignalCode = error && error.code;
 				}
 				child.kill("SIGUSR1");
-				const asyncCode = await new Promise((resolve, reject) => {
+				const [asyncCode, asyncSignal] = await new Promise((resolve, reject) => {
 					child.on("error", reject);
-					child.on("exit", resolve);
+					child.on("exit", (code, signal) => resolve([code, signal]));
 				});
 				console.log(JSON.stringify({
 					syncStatus: sync.status,
 					syncStdout: sync.stdout.trim(),
 					asyncCode,
+					asyncSignal,
 					asyncStdout: stdout.trim(),
 					invalidSignalCode,
 				}));
@@ -1264,7 +1265,8 @@ test("routes browser child_process through the driver command executor", async (
 	expect(JSON.parse(getLastStdioMessage(result, "stdout"))).toEqual({
 		syncStatus: 0,
 		syncStdout: "sync-value",
-		asyncCode: 138,
+		asyncCode: null,
+		asyncSignal: "SIGUSR1",
 		asyncStdout: "signal:10",
 		invalidSignalCode: "ERR_UNKNOWN_SIGNAL",
 	});

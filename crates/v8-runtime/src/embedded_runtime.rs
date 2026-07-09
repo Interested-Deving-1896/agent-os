@@ -373,6 +373,18 @@ impl EmbeddedV8SessionHandle {
         })
     }
 
+    pub fn pause(&self) -> io::Result<()> {
+        self.runtime.dispatch(RuntimeCommand::PauseSession {
+            session_id: self.session_id.clone(),
+        })
+    }
+
+    pub fn resume(&self) -> io::Result<()> {
+        self.runtime.dispatch(RuntimeCommand::ResumeSession {
+            session_id: self.session_id.clone(),
+        })
+    }
+
     pub fn destroy(&self) -> io::Result<()> {
         self.runtime.unregister_session(&self.session_id);
         self.runtime.dispatch(RuntimeCommand::DestroySession {
@@ -634,6 +646,14 @@ fn dispatch_runtime_command(
             };
             shutdown.finish();
             Ok(())
+        }
+        RuntimeCommand::PauseSession { session_id } => {
+            let mgr = session_mgr.lock().expect("session manager lock poisoned");
+            mgr.pause_session(&session_id).map_err(other_io_error)
+        }
+        RuntimeCommand::ResumeSession { session_id } => {
+            let mgr = session_mgr.lock().expect("session manager lock poisoned");
+            mgr.resume_session(&session_id).map_err(other_io_error)
         }
         RuntimeCommand::SendToSession {
             session_id,

@@ -72,6 +72,11 @@ pub enum TrackedLimit {
     SidecarStdoutFrames,
     CompletedSidecarResponses,
     PendingProcessEvents,
+    PendingProcessEventBytes,
+    PendingExecutionEvents,
+    PendingExecutionEventBytes,
+    PendingKernelStdinBytes,
+    PendingWasmSignals,
     PendingSidecarResponses,
     OutboundSidecarRequests,
     VmProcesses,
@@ -104,6 +109,11 @@ impl TrackedLimit {
             TrackedLimit::SidecarStdoutFrames => "sidecar_stdout_frames",
             TrackedLimit::CompletedSidecarResponses => "completed_sidecar_responses",
             TrackedLimit::PendingProcessEvents => "pending_process_events",
+            TrackedLimit::PendingProcessEventBytes => "pending_process_event_bytes",
+            TrackedLimit::PendingExecutionEvents => "pending_execution_events",
+            TrackedLimit::PendingExecutionEventBytes => "pending_execution_event_bytes",
+            TrackedLimit::PendingKernelStdinBytes => "pending_kernel_stdin_bytes",
+            TrackedLimit::PendingWasmSignals => "pending_wasm_signals",
             TrackedLimit::PendingSidecarResponses => "pending_sidecar_responses",
             TrackedLimit::OutboundSidecarRequests => "outbound_sidecar_requests",
             TrackedLimit::VmProcesses => "vm_processes",
@@ -134,6 +144,11 @@ impl TrackedLimit {
             | TrackedLimit::SidecarStdoutFrames
             | TrackedLimit::CompletedSidecarResponses
             | TrackedLimit::PendingProcessEvents
+            | TrackedLimit::PendingProcessEventBytes
+            | TrackedLimit::PendingExecutionEvents
+            | TrackedLimit::PendingExecutionEventBytes
+            | TrackedLimit::PendingKernelStdinBytes
+            | TrackedLimit::PendingWasmSignals
             | TrackedLimit::PendingSidecarResponses
             | TrackedLimit::OutboundSidecarRequests => LimitCategory::Queue,
             TrackedLimit::VmProcesses

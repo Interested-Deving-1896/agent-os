@@ -441,21 +441,56 @@ impl ProcessTable {
         ctx: ProcessContext,
         driver_process: Arc<dyn DriverProcess>,
     ) -> ProcessEntry {
-        let (pgid, sid) = {
-            let state = self.inner.lock_state();
-            match state.entries.get(&ctx.ppid) {
-                Some(parent) => (parent.entry.pgid, parent.entry.sid),
-                None => (pid, pid),
-            }
+        self.register_with_process_group(pid, driver, command, args, ctx, driver_process, None)
+            .expect("inheriting a process group cannot fail")
+    }
+
+    pub fn register_with_process_group(
+        &self,
+        pid: u32,
+        driver: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        ctx: ProcessContext,
+        driver_process: Arc<dyn DriverProcess>,
+        requested_pgid: Option<u32>,
+    ) -> ProcessResult<ProcessEntry> {
+        let driver = driver.into();
+        let command = command.into();
+        let mut state = self.inner.lock_state();
+        let (inherited_pgid, sid) = match state.entries.get(&ctx.ppid) {
+            Some(parent) => (parent.entry.pgid, parent.entry.sid),
+            None => (pid, pid),
         };
+        let pgid = requested_pgid.map_or(inherited_pgid, |pgid| if pgid == 0 { pid } else { pgid });
+        if requested_pgid.is_some() && pgid != pid {
+            let mut group_exists = false;
+            for record in state.entries.values() {
+                if record.entry.pgid != pgid || record.entry.status == ProcessStatus::Exited {
+                    continue;
+                }
+                if record.entry.sid != sid {
+                    return Err(ProcessTableError::permission_denied(
+                        "cannot join process group in different session",
+                    ));
+                }
+                group_exists = true;
+                break;
+            }
+            if !group_exists {
+                return Err(ProcessTableError::permission_denied(format!(
+                    "no such process group {pgid}"
+                )));
+            }
+        }
 
         let entry = ProcessEntry {
             pid,
             ppid: ctx.ppid,
             pgid,
             sid,
-            driver: driver.into(),
-            command: command.into(),
+            driver,
+            command,
             args,
             status: ProcessStatus::Running,
             exit_code: None,
@@ -466,6 +501,19 @@ impl ProcessTable {
             identity: ctx.identity,
         };
 
+        state.next_pid = next_pid_after_registered(state.next_pid, pid);
+        state.entries.insert(
+            pid,
+            ProcessRecord {
+                entry: entry.clone(),
+                driver_process: driver_process.clone(),
+                pending_wait_events: VecDeque::new(),
+                blocked_signals: ctx.blocked_signals,
+                pending_signals: ctx.pending_signals,
+            },
+        );
+        drop(state);
+
         let weak = Arc::downgrade(&self.inner);
         driver_process.set_on_exit(Arc::new(move |code| {
             if let Some(inner) = weak.upgrade() {
@@ -473,20 +521,7 @@ impl ProcessTable {
             }
         }));
 
-        let mut state = self.inner.lock_state();
-        state.next_pid = next_pid_after_registered(state.next_pid, pid);
-        state.entries.insert(
-            pid,
-            ProcessRecord {
-                entry: entry.clone(),
-                driver_process,
-                pending_wait_events: VecDeque::new(),
-                blocked_signals: ctx.blocked_signals,
-                pending_signals: ctx.pending_signals,
-            },
-        );
-
-        entry
+        Ok(entry)
     }
 
     pub fn get(&self, pid: u32) -> Option<ProcessEntry> {
@@ -495,6 +530,38 @@ impl ProcessTable {
             .entries
             .get(&pid)
             .map(|record| record.entry.clone())
+    }
+
+    /// Replace the userspace image metadata while retaining Linux process
+    /// identity (PID/PPID/PGID/SID), wait relationships, signal mask, pending
+    /// signals, and the driver process used to report the eventual exit.
+    pub fn exec(
+        &self,
+        pid: u32,
+        driver: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        cwd: String,
+    ) -> ProcessResult<()> {
+        let mut state = self.inner.lock_state();
+        let record = state
+            .entries
+            .get_mut(&pid)
+            .ok_or_else(|| ProcessTableError::no_such_process(pid))?;
+        if record.entry.status == ProcessStatus::Exited {
+            return Err(ProcessTableError::no_such_process(pid));
+        }
+        record.entry.driver = driver.into();
+        record.entry.command = command.into();
+        record.entry.args = args;
+        record.entry.env = env;
+        record.entry.cwd = cwd;
+        record.entry.status = ProcessStatus::Running;
+        record.entry.exit_code = None;
+        record.entry.exit_time_ms = None;
+        self.inner.waiters.notify_all();
+        Ok(())
     }
 
     pub fn zombie_timer_count(&self) -> usize {
@@ -604,6 +671,45 @@ impl ProcessTable {
 
             state = self.inner.wait_for_state(state);
         }
+    }
+
+    /// Consume one waitable stopped/continued transition without observing or
+    /// reaping terminal state. Sidecar child-process bridges use this while
+    /// terminal reaping remains coupled to stdout/stderr EOF delivery.
+    pub fn take_nonterminal_wait_event_for(
+        &self,
+        waiter_pid: u32,
+        pid: i32,
+        flags: WaitPidFlags,
+    ) -> ProcessResult<Option<ProcessWaitResult>> {
+        let mut state = self.inner.lock_state();
+        let selector = resolve_wait_selector(&state, waiter_pid, pid)?;
+        let matching_children = matching_child_pids(&state, waiter_pid, selector);
+        if matching_children.is_empty() {
+            return Err(ProcessTableError::no_matching_child(waiter_pid, pid));
+        }
+
+        for child_pid in matching_children {
+            let Some(record) = state.entries.get_mut(&child_pid) else {
+                continue;
+            };
+            let Some(index) = record.pending_wait_events.iter().position(|event| {
+                event.event != ProcessWaitEvent::Exited && is_waitable_event(event.event, flags)
+            }) else {
+                continue;
+            };
+            let event = record
+                .pending_wait_events
+                .remove(index)
+                .expect("pending nonterminal wait event should exist");
+            return Ok(Some(ProcessWaitResult {
+                pid: child_pid,
+                status: event.status,
+                event: event.event,
+            }));
+        }
+
+        Ok(None)
     }
 
     pub fn kill(&self, pid: i32, signal: i32) -> ProcessResult<()> {
@@ -1536,11 +1642,120 @@ mod tests {
         }
     }
 
+    struct AlreadyExitedDriverProcess(i32);
+
+    impl DriverProcess for AlreadyExitedDriverProcess {
+        fn kill(&self, _signal: i32) {}
+
+        fn wait(&self, _timeout: Duration) -> Option<i32> {
+            Some(self.0)
+        }
+
+        fn set_on_exit(&self, callback: ProcessExitCallback) {
+            callback(self.0);
+        }
+    }
+
     fn context(ppid: u32) -> ProcessContext {
         ProcessContext {
             ppid,
             ..ProcessContext::default()
         }
+    }
+
+    #[test]
+    fn register_accepts_synchronous_already_exited_callback() {
+        let table = ProcessTable::with_zombie_ttl(Duration::from_secs(3600));
+        table.register(
+            10,
+            "test",
+            "already-exited",
+            Vec::new(),
+            context(0),
+            Arc::new(AlreadyExitedDriverProcess(27)),
+        );
+
+        let entry = table.get(10).expect("registered process remains a zombie");
+        assert_eq!(entry.status, ProcessStatus::Exited);
+        assert_eq!(entry.exit_code, Some(27));
+    }
+
+    #[test]
+    fn spawn_process_group_is_applied_atomically() {
+        let table = ProcessTable::with_zombie_ttl(Duration::from_secs(3600));
+        table.register(
+            10,
+            "test",
+            "parent",
+            Vec::new(),
+            context(0),
+            Arc::new(TestDriverProcess::default()),
+        );
+
+        let leader = table
+            .register_with_process_group(
+                11,
+                "test",
+                "leader",
+                Vec::new(),
+                context(10),
+                Arc::new(TestDriverProcess::default()),
+                Some(0),
+            )
+            .expect("spawn should create a new process group");
+        assert_eq!(leader.pgid, 11);
+
+        let peer = table
+            .register_with_process_group(
+                12,
+                "test",
+                "peer",
+                Vec::new(),
+                context(10),
+                Arc::new(TestDriverProcess::default()),
+                Some(11),
+            )
+            .expect("spawn should join an existing group in the same session");
+        assert_eq!(peer.pgid, 11);
+
+        let error = table
+            .register_with_process_group(
+                13,
+                "test",
+                "invalid",
+                Vec::new(),
+                context(10),
+                Arc::new(TestDriverProcess::default()),
+                Some(999),
+            )
+            .expect_err("spawn must reject a nonexistent process group");
+        assert_eq!(error.code(), "EPERM");
+        assert!(
+            table.get(13).is_none(),
+            "failed spawn must not register a child"
+        );
+
+        table.register(
+            20,
+            "test",
+            "other-session",
+            Vec::new(),
+            context(0),
+            Arc::new(TestDriverProcess::default()),
+        );
+        let error = table
+            .register_with_process_group(
+                14,
+                "test",
+                "cross-session",
+                Vec::new(),
+                context(10),
+                Arc::new(TestDriverProcess::default()),
+                Some(20),
+            )
+            .expect_err("spawn must reject a process group in another session");
+        assert_eq!(error.code(), "EPERM");
+        assert!(table.get(14).is_none(), "failed spawn must remain atomic");
     }
 
     #[test]

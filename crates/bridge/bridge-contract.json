@@ -192,8 +192,11 @@
 					"_childProcessStdinClose",
 					"_childProcessKill",
 					"_processKill",
+					"_processExec",
+					"_processExecFdImageCommit",
 					"_processSignalState",
-					"_processTakeSignal"
+					"_processTakeSignal",
+					"_processWasmSyncRpc"
 				]
 			},
 		{
@@ -245,6 +248,8 @@
 				"_upgradeSocketEndRaw",
 				"_upgradeSocketDestroyRaw",
 				"_networkDnsLookupSyncRaw",
+				"_netBindUnixRaw",
+				"_netBindConnectedUnixRaw",
 				"_netSocketConnectRaw",
 				"_netSocketPollRaw",
 				"_netSocketReadRaw",
@@ -261,6 +266,8 @@
 				"_netReleaseTcpPortRaw",
 				"_netServerListenRaw",
 				"_netServerAcceptRaw",
+				"_netServerCloseSyncRaw",
+				"_netSocketWaitConnectSyncRaw",
 				"_dgramSocketCreateRaw",
 				"_dgramSocketBindRaw",
 				"_dgramSocketRecvRaw",
@@ -758,6 +765,14 @@
 			"method": "net.release_tcp_port",
 			"translateArgs": false
 		},
+		"_netBindConnectedUnixRaw": {
+			"method": "net.bind_connected_unix",
+			"translateArgs": false
+		},
+		"_netBindUnixRaw": {
+			"method": "net.bind_unix",
+			"translateArgs": false
+		},
 		"_netReserveTcpPortRaw": {
 			"method": "net.reserve_tcp_port",
 			"translateArgs": false
@@ -767,6 +782,10 @@
 			"translateArgs": false
 		},
 		"_netServerCloseRaw": {
+			"method": "net.server_close",
+			"translateArgs": false
+		},
+		"_netServerCloseSyncRaw": {
 			"method": "net.server_close",
 			"translateArgs": false
 		},
@@ -815,6 +834,10 @@
 			"translateArgs": false
 		},
 		"_netSocketWaitConnectRaw": {
+			"method": "net.socket_wait_connect",
+			"translateArgs": false
+		},
+		"_netSocketWaitConnectSyncRaw": {
 			"method": "net.socket_wait_connect",
 			"translateArgs": false
 		},
@@ -946,12 +969,24 @@
 			"method": "process.kill",
 			"translateArgs": false
 		},
+		"_processExec": {
+			"method": "process.exec",
+			"translateArgs": false
+		},
+		"_processExecFdImageCommit": {
+			"method": "process.exec_fd_image_commit",
+			"translateArgs": false
+		},
 			"_processSignalState": {
 				"method": "process.signal_state",
 				"translateArgs": false
 			},
 			"_processTakeSignal": {
 				"method": "process.take_signal",
+				"translateArgs": false
+			},
+			"_processWasmSyncRpc": {
+				"method": "process.wasm_sync_rpc",
 				"translateArgs": false
 			},
 			"_ptySetRawMode": {

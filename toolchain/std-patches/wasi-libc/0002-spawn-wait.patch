@@ -7,8 +7,8 @@ host_process.proc_spawn and host_process.proc_waitpid WASM imports.
 Also provides posix_spawn_file_actions and posix_spawnattr helpers since
 musl's versions (in process/) are not compiled for WASI.
 
-file_actions are processed in order: dup2 maps stdio FDs, close is no-op
-(child doesn't inherit parent FDs), open maps files to stdio overrides.
+file_actions are serialized in order and applied by the host to the cloned
+child descriptor table and working directory before execution.
 
 waitpid returns the actual waited-for PID from the host via ret_pid,
 fixing waitpid(-1, ...) which previously returned -1 (error convention).
@@ -17,7 +17,7 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 
 --- /dev/null	2026-03-16 11:59:07.564000026 -0700
 +++ b/libc-bottom-half/sources/host_spawn_wait.c	2026-03-19 20:51:08.698271081 -0700
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,497 @@
 +// Process spawning and waiting via wasmVM host_process imports.
 +//
 +// Replaces musl's posix_spawn (which uses fork/clone, unavailable in WASI)
@@ -33,54 +33,44 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +#include <__errno.h>
 +#include <__errno_values.h>
 +#include <fcntl.h>
++#include <sched.h>
 +#include <stdint.h>
++#include <signal.h>
++#include <spawn.h>
 +#include <stdlib.h>
 +#include <string.h>
 +#include <unistd.h>
 +#include <sys/types.h>
 +#include <wasi/api.h>
 +
-+// spawn.h and sys/wait.h are not installed in the wasi sysroot.
-+// Define the needed types inline (matching musl's spawn.h layout).
-+
-+#define __NEED_sigset_t
-+#include <bits/alltypes.h>
-+
-+typedef struct {
-+    int __flags;
-+    pid_t __pgrp;
-+    sigset_t __def, __mask;
-+    int __prio, __pol;
-+    void *__fn;
-+    char __pad[64-sizeof(void *)];
-+} posix_spawnattr_t;
-+
-+typedef struct {
-+    int __pad0[2];
-+    void *__actions;
-+    int __pad[16];
-+} posix_spawn_file_actions_t;
-+
-+struct sched_param { int sched_priority; };
-+
 +#define WASM_IMPORT(mod, fn) \
 +    __attribute__((__import_module__(mod), __import_name__(fn)))
 +
-+// host_process.proc_spawn(exec_path_ptr, exec_path_len, argv_ptr, argv_len, envp_ptr, envp_len,
-+//   stdin_fd, stdout_fd, stderr_fd, cwd_ptr, cwd_len, ret_pid) -> errno
-+WASM_IMPORT("host_process", "proc_spawn")
++// host_process.proc_spawn_v4(exec_path_ptr, exec_path_len, argv_ptr, argv_len,
++//   envp_ptr, envp_len, actions_ptr, actions_len, cwd_ptr, cwd_len,
++//   search_path_ptr, search_path_len, attr_flags, sigdefault_lo, sigdefault_hi,
++//   sigmask_lo, sigmask_hi, pgroup, sched_policy, sched_priority, ret_pid)
++//   -> errno
++WASM_IMPORT("host_process", "proc_spawn_v4")
 +uint32_t __host_proc_spawn(
 +    const uint8_t *exec_path_ptr, uint32_t exec_path_len,
 +    const uint8_t *argv_ptr, uint32_t argv_len,
 +    const uint8_t *envp_ptr, uint32_t envp_len,
-+    uint32_t stdin_fd, uint32_t stdout_fd, uint32_t stderr_fd,
++    const uint8_t *actions_ptr, uint32_t actions_len,
 +    const uint8_t *cwd_ptr, uint32_t cwd_len,
++    const uint8_t *search_path_ptr, uint32_t search_path_len,
++    uint32_t attr_flags, uint32_t sigdefault_lo, uint32_t sigdefault_hi,
++    uint32_t sigmask_lo, uint32_t sigmask_hi, uint32_t pgroup,
++    int32_t sched_policy, int32_t sched_priority,
 +    uint32_t *ret_pid);
 +
-+// host_process.proc_waitpid(pid, options, ret_exit_code, ret_signal, ret_pid) -> errno
-+WASM_IMPORT("host_process", "proc_waitpid")
++int __agentos_get_current_sigmask(uint32_t *lo, uint32_t *hi);
++
++// host_process.proc_waitpid_v3(pid, options, ret_status, ret_pid) -> errno.
++// ret_status is the raw Linux wait status, including stop/continue states.
++WASM_IMPORT("host_process", "proc_waitpid_v3")
 +uint32_t __host_proc_waitpid(uint32_t pid, uint32_t options,
-+    uint32_t *ret_exit_code, uint32_t *ret_signal, uint32_t *ret_pid);
++    uint32_t *ret_status, uint32_t *ret_pid);
 +
 +// Internal file operation descriptor (matches musl's fdop.h layout)
 +#define FDOP_CLOSE 1
@@ -88,6 +78,14 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +#define FDOP_OPEN  3
 +#define FDOP_CHDIR 4
 +#define FDOP_FCHDIR 5
++#define FDOP_CLOSEFROM 6
++#define FDOP_WIRE_HEADER_SIZE 24
++
++#define SUPPORTED_SPAWN_FLAGS (POSIX_SPAWN_RESETIDS | \
++    POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF | \
++    POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSCHEDPARAM | \
++    POSIX_SPAWN_SETSCHEDULER | POSIX_SPAWN_USEVFORK | \
++    POSIX_SPAWN_SETSID)
 +
 +struct __fdop {
 +    struct __fdop *next, *prev;
@@ -95,6 +93,76 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +    mode_t mode;
 +    char path[];
 +};
++
++static void store_u32_le(uint8_t *destination, uint32_t value) {
++    destination[0] = (uint8_t)value;
++    destination[1] = (uint8_t)(value >> 8);
++    destination[2] = (uint8_t)(value >> 16);
++    destination[3] = (uint8_t)(value >> 24);
++}
++
++static int serialize_file_actions(const posix_spawn_file_actions_t *fa,
++    uint8_t **buffer_out, uint32_t *length_out) {
++    size_t total = 0;
++    *buffer_out = NULL;
++    *length_out = 0;
++    if (fa == NULL)
++        return 0;
++    for (struct __fdop *op = fa->__actions; op; op = op->next) {
++        size_t path_length = op->cmd == FDOP_OPEN || op->cmd == FDOP_CHDIR
++            ? strlen(op->path) : 0;
++        if (path_length > UINT32_MAX ||
++            total > UINT32_MAX - FDOP_WIRE_HEADER_SIZE ||
++            path_length > UINT32_MAX - total - FDOP_WIRE_HEADER_SIZE)
++            return E2BIG;
++        total += FDOP_WIRE_HEADER_SIZE + path_length;
++    }
++    if (total == 0)
++        return 0;
++
++    uint8_t *buffer = malloc(total);
++    if (buffer == NULL)
++        return ENOMEM;
++    size_t offset = 0;
++    for (struct __fdop *op = fa->__actions; op; op = op->next) {
++        size_t path_length = op->cmd == FDOP_OPEN || op->cmd == FDOP_CHDIR
++            ? strlen(op->path) : 0;
++        uint8_t *header = buffer + offset;
++        store_u32_le(header, (uint32_t)op->cmd);
++        store_u32_le(header + 4, (uint32_t)op->fd);
++        store_u32_le(header + 8, (uint32_t)op->srcfd);
++        store_u32_le(header + 12, (uint32_t)op->oflag);
++        store_u32_le(header + 16, (uint32_t)op->mode);
++        store_u32_le(header + 20, (uint32_t)path_length);
++        if (path_length != 0)
++            memcpy(header + FDOP_WIRE_HEADER_SIZE, op->path, path_length);
++        offset += FDOP_WIRE_HEADER_SIZE + path_length;
++    }
++    *buffer_out = buffer;
++    *length_out = (uint32_t)total;
++    return 0;
++}
++
++static int sigset_to_words(const sigset_t *set, uint32_t *lo, uint32_t *hi) {
++    *lo = 0;
++    *hi = 0;
++    if (set == NULL)
++        return 0;
++    for (int signal = 1; signal < NSIG; signal++) {
++        int member = sigismember(set, signal);
++        if (member < 0)
++            return EINVAL;
++        if (!member)
++            continue;
++        if (signal <= 32)
++            *lo |= UINT32_C(1) << (signal - 1);
++        else if (signal <= 64)
++            *hi |= UINT32_C(1) << (signal - 33);
++        else
++            return EINVAL;
++    }
++    return 0;
++}
 +
 +// --- posix_spawn_file_actions helpers ---
 +
@@ -131,7 +199,7 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +
 +int posix_spawn_file_actions_adddup2(posix_spawn_file_actions_t *fa, int srcfd, int fd) {
 +    if (srcfd < 0 || fd < 0) return EBADF;
-+    struct __fdop *op = malloc(sizeof(*op));
++    struct __fdop *op = calloc(1, sizeof(*op));
 +    if (!op) return ENOMEM;
 +    op->cmd = FDOP_DUP2;
 +    op->srcfd = srcfd;
@@ -141,10 +209,20 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +
 +int posix_spawn_file_actions_addclose(posix_spawn_file_actions_t *fa, int fd) {
 +    if (fd < 0) return EBADF;
-+    struct __fdop *op = malloc(sizeof(*op));
++    struct __fdop *op = calloc(1, sizeof(*op));
 +    if (!op) return ENOMEM;
 +    op->cmd = FDOP_CLOSE;
 +    op->fd = fd;
++    return __addfdop(fa, op);
++}
++
++int posix_spawn_file_actions_addclosefrom_np(posix_spawn_file_actions_t *fa,
++    int lowfd) {
++    if (lowfd < 0) return EBADF;
++    struct __fdop *op = calloc(1, sizeof(*op));
++    if (!op) return ENOMEM;
++    op->cmd = FDOP_CLOSEFROM;
++    op->fd = lowfd;
 +    return __addfdop(fa, op);
 +}
 +
@@ -152,7 +230,7 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +    const char *path, int oflag, mode_t mode) {
 +    if (fd < 0) return EBADF;
 +    size_t l = strlen(path);
-+    struct __fdop *op = malloc(sizeof(*op) + l + 1);
++    struct __fdop *op = calloc(1, sizeof(*op) + l + 1);
 +    if (!op) return ENOMEM;
 +    op->cmd = FDOP_OPEN;
 +    op->fd = fd;
@@ -162,11 +240,10 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +    return __addfdop(fa, op);
 +}
 +
-+#if defined(_BSD_SOURCE) || defined(_GNU_SOURCE)
-+int posix_spawn_file_actions_addchdir_np(posix_spawn_file_actions_t *restrict fa,
++static int addchdir_action(posix_spawn_file_actions_t *restrict fa,
 +    const char *restrict path) {
 +    size_t l = strlen(path);
-+    struct __fdop *op = malloc(sizeof(*op) + l + 1);
++    struct __fdop *op = calloc(1, sizeof(*op) + l + 1);
 +    if (!op) return ENOMEM;
 +    op->cmd = FDOP_CHDIR;
 +    op->fd = 0;
@@ -174,9 +251,20 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +    return __addfdop(fa, op);
 +}
 +
++int posix_spawn_file_actions_addchdir(posix_spawn_file_actions_t *restrict fa,
++    const char *restrict path) {
++    return addchdir_action(fa, path);
++}
++
++#if defined(_BSD_SOURCE) || defined(_GNU_SOURCE)
++int posix_spawn_file_actions_addchdir_np(posix_spawn_file_actions_t *restrict fa,
++    const char *restrict path) {
++    return addchdir_action(fa, path);
++}
++
 +int posix_spawn_file_actions_addfchdir_np(posix_spawn_file_actions_t *fa, int fd) {
 +    if (fd < 0) return EBADF;
-+    struct __fdop *op = malloc(sizeof(*op));
++    struct __fdop *op = calloc(1, sizeof(*op));
 +    if (!op) return ENOMEM;
 +    op->cmd = FDOP_FCHDIR;
 +    op->fd = fd;
@@ -184,11 +272,19 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +}
 +#endif
 +
-+// --- posix_spawnattr helpers (silently ignored by posix_spawn) ---
++// --- posix_spawnattr helpers ---
 +
 +int posix_spawnattr_init(posix_spawnattr_t *attr) { memset(attr, 0, sizeof(*attr)); return 0; }
 +int posix_spawnattr_destroy(posix_spawnattr_t *attr) { (void)attr; return 0; }
-+int posix_spawnattr_setflags(posix_spawnattr_t *a, short f) { a->__flags = f; return 0; }
++int posix_spawnattr_setflags(posix_spawnattr_t *a, short f) {
++    const int known = POSIX_SPAWN_RESETIDS | POSIX_SPAWN_SETPGROUP |
++        POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK |
++        POSIX_SPAWN_SETSCHEDPARAM | POSIX_SPAWN_SETSCHEDULER |
++        POSIX_SPAWN_USEVFORK | POSIX_SPAWN_SETSID;
++    if (((int)f & ~known) != 0) return EINVAL;
++    a->__flags = f;
++    return 0;
++}
 +int posix_spawnattr_getflags(const posix_spawnattr_t *restrict a, short *restrict f) { *f = (short)a->__flags; return 0; }
 +int posix_spawnattr_setpgroup(posix_spawnattr_t *a, pid_t g) { a->__pgrp = g; return 0; }
 +int posix_spawnattr_getpgroup(const posix_spawnattr_t *restrict a, pid_t *restrict g) { *g = a->__pgrp; return 0; }
@@ -197,30 +293,87 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +int posix_spawnattr_setsigdefault(posix_spawnattr_t *restrict a, const sigset_t *restrict d) { a->__def = *d; return 0; }
 +int posix_spawnattr_getsigdefault(const posix_spawnattr_t *restrict a, sigset_t *restrict d) { *d = a->__def; return 0; }
 +
-+// Scheduling attributes — store values but not enforced in sandbox
-+int posix_spawnattr_setschedparam(posix_spawnattr_t *restrict a, const struct sched_param *restrict p) { a->__prio = p->sched_priority; return 0; }
-+int posix_spawnattr_getschedparam(const posix_spawnattr_t *restrict a, struct sched_param *restrict p) { p->sched_priority = a->__prio; return 0; }
++int posix_spawnattr_setschedparam(posix_spawnattr_t *restrict a,
++    const struct sched_param *restrict p) {
++    // wasi-libc's bottom-half include path intentionally shadows sched.h with
++    // an empty private header. The public POSIX type starts with this int;
++    // copy it without dereferencing the incomplete private declaration.
++    int priority;
++    memcpy(&priority, p, sizeof(priority));
++    a->__prio = priority;
++    return 0;
++}
++int posix_spawnattr_getschedparam(const posix_spawnattr_t *restrict a,
++    struct sched_param *restrict p) {
++    memcpy(p, &a->__prio, sizeof(a->__prio));
++    return 0;
++}
 +int posix_spawnattr_setschedpolicy(posix_spawnattr_t *a, int pol) { a->__pol = pol; return 0; }
 +int posix_spawnattr_getschedpolicy(const posix_spawnattr_t *restrict a, int *restrict pol) { *pol = a->__pol; return 0; }
 +
 +// --- posix_spawn ---
 +
-+int posix_spawn(pid_t *restrict res, const char *restrict path,
++static int spawn_common(pid_t *restrict res, const char *restrict path,
 +    const posix_spawn_file_actions_t *fa,
 +    const posix_spawnattr_t *restrict attr,
-+    char *const argv[restrict], char *const envp[restrict]) {
-+    (void)attr;
++    char *const argv[restrict], char *const envp[restrict],
++    const char *search_path) {
++    uint32_t attr_flags = attr != NULL ? (uint32_t)attr->__flags : 0;
++    uint32_t sigdefault_lo = 0;
++    uint32_t sigdefault_hi = 0;
++    uint32_t sigmask_lo = 0;
++    uint32_t sigmask_hi = 0;
++    uint32_t pgroup = 0;
++    int32_t sched_policy = 0;
++    int32_t sched_priority = 0;
++    uint8_t *actions_buf = NULL;
++    uint32_t actions_len = 0;
++    int setup_error;
++
++    if (path == NULL || path[0] == '\0') return ENOENT;
++    size_t exec_path_length = strlen(path);
++    if (exec_path_length > UINT32_MAX) return E2BIG;
++    if ((attr_flags & ~SUPPORTED_SPAWN_FLAGS) != 0) return ENOTSUP;
++    if ((attr_flags & POSIX_SPAWN_SETSIGDEF) != 0) {
++        setup_error = sigset_to_words(&attr->__def,
++            &sigdefault_lo, &sigdefault_hi);
++        if (setup_error != 0) return setup_error;
++    }
++    if ((attr_flags & POSIX_SPAWN_SETSIGMASK) != 0) {
++        setup_error = sigset_to_words(&attr->__mask, &sigmask_lo, &sigmask_hi);
++    } else {
++        setup_error = __agentos_get_current_sigmask(&sigmask_lo, &sigmask_hi);
++    }
++    if (setup_error != 0) return setup_error;
++    if ((attr_flags & POSIX_SPAWN_SETPGROUP) != 0)
++        pgroup = (uint32_t)attr->__pgrp;
++    if ((attr_flags & (POSIX_SPAWN_SETSCHEDPARAM |
++        POSIX_SPAWN_SETSCHEDULER)) != 0)
++        sched_priority = attr->__prio;
++    if ((attr_flags & POSIX_SPAWN_SETSCHEDULER) != 0)
++        sched_policy = attr->__pol;
++    setup_error = serialize_file_actions(fa, &actions_buf, &actions_len);
++    if (setup_error != 0) return setup_error;
 +
 +    // Serialize argv verbatim. The executable path travels separately so callers retain control
 +    // of argv[0] (login shells and multicall binaries depend on this distinction).
 +    size_t argv_buf_len = 0;
 +    if (argv) {
-+        for (int i = 0; argv[i]; i++)
-+            argv_buf_len += strlen(argv[i]) + 1;
++        for (int i = 0; argv[i]; i++) {
++            size_t item_len = strlen(argv[i]) + 1;
++            if (item_len > UINT32_MAX - argv_buf_len) {
++                free(actions_buf);
++                return E2BIG;
++            }
++            argv_buf_len += item_len;
++        }
 +    }
 +
 +    uint8_t *argv_buf = argv_buf_len > 0 ? malloc(argv_buf_len) : NULL;
-+    if (argv_buf_len > 0 && !argv_buf) return ENOMEM;
++    if (argv_buf_len > 0 && !argv_buf) {
++        free(actions_buf);
++        return ENOMEM;
++    }
 +
 +    uint8_t *p = argv_buf;
 +    size_t len;
@@ -237,14 +390,25 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +
 +    size_t envp_buf_len = 0;
 +    if (env) {
-+        for (int i = 0; env[i]; i++)
-+            envp_buf_len += strlen(env[i]) + 1;
++        for (int i = 0; env[i]; i++) {
++            size_t item_len = strlen(env[i]) + 1;
++            if (item_len > UINT32_MAX - envp_buf_len) {
++                free(actions_buf);
++                free(argv_buf);
++                return E2BIG;
++            }
++            envp_buf_len += item_len;
++        }
 +    }
 +
 +    uint8_t *envp_buf = NULL;
 +    if (envp_buf_len > 0) {
 +        envp_buf = malloc(envp_buf_len);
-+        if (!envp_buf) { free(argv_buf); return ENOMEM; }
++        if (!envp_buf) {
++            free(actions_buf);
++            free(argv_buf);
++            return ENOMEM;
++        }
 +        p = envp_buf;
 +        for (int i = 0; env[i]; i++) {
 +            len = strlen(env[i]) + 1;
@@ -252,83 +416,99 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 +        }
 +    }
 +
-+    // Process file_actions in order: extract stdio overrides and handle close/open
-+    uint32_t stdin_fd = 0, stdout_fd = 1, stderr_fd = 2;
-+    if (fa && fa->__actions) {
-+        for (struct __fdop *op = fa->__actions; op; op = op->next) {
-+            switch (op->cmd) {
-+            case FDOP_DUP2:
-+                if (op->fd == 0) stdin_fd = (uint32_t)op->srcfd;
-+                else if (op->fd == 1) stdout_fd = (uint32_t)op->srcfd;
-+                else if (op->fd == 2) stderr_fd = (uint32_t)op->srcfd;
-+                break;
-+            case FDOP_CLOSE:
-+                // No-op: child doesn't inherit parent FDs in our model.
-+                // POSIX close-in-child semantics are handled by the host:
-+                // proc_spawn closes stdio override FDs after fork.
-+                break;
-+            case FDOP_OPEN: {
-+                int opened = open(op->path, op->oflag, op->mode);
-+                if (opened < 0) {
-+                    free(argv_buf);
-+                    free(envp_buf);
-+                    return errno;
-+                }
-+                if (op->fd == 0) stdin_fd = (uint32_t)opened;
-+                else if (op->fd == 1) stdout_fd = (uint32_t)opened;
-+                else if (op->fd == 2) stderr_fd = (uint32_t)opened;
-+                else close(opened);
-+                break;
-+            }
-+            }
++    // The host applies serialized chdir/fchdir actions on top of this current
++    // directory. Use the live cwd rather than PWD, and do not impose a fixed
++    // path buffer that is smaller than Linux PATH_MAX.
++    char *cwd_str = getcwd(NULL, 0);
++    if (cwd_str == NULL) {
++        int cwd_error = errno;
++        free(actions_buf);
++        free(argv_buf);
++        free(envp_buf);
++        return cwd_error;
++    }
++
++    // Exact posix_spawn of a bare name is relative to cwd. A non-NULL
++    // search_path tells the host to resolve posix_spawnp once, after the host
++    // has applied file actions, so lookup observes the staged child state and
++    // failed PATH candidates cannot repeat action side effects.
++    char *cwd_path = NULL;
++    const char *spawn_path = path;
++    if (search_path == NULL && strchr(path, '/') == NULL) {
++        cwd_path = malloc(exec_path_length + 3);
++        if (cwd_path == NULL) {
++            free(actions_buf);
++            free(argv_buf);
++            free(envp_buf);
++            free(cwd_str);
++            return ENOMEM;
 +        }
++        cwd_path[0] = '.';
++        cwd_path[1] = '/';
++        memcpy(cwd_path + 2, path, exec_path_length + 1);
++        spawn_path = cwd_path;
 +    }
 +
 +    uint32_t child_pid;
 +    uint32_t err = __host_proc_spawn(
-+        (const uint8_t *)path, (uint32_t)strlen(path),
++        (const uint8_t *)spawn_path, (uint32_t)strlen(spawn_path),
 +        argv_buf ? argv_buf : (const uint8_t *)"", (uint32_t)argv_buf_len,
 +        envp_buf ? envp_buf : (const uint8_t *)"", (uint32_t)envp_buf_len,
-+        stdin_fd, stdout_fd, stderr_fd,
-+        (const uint8_t *)"", 0,
++        actions_buf ? actions_buf : (const uint8_t *)"", actions_len,
++        cwd_str ? (const uint8_t *)cwd_str : (const uint8_t *)"",
++        cwd_str ? (uint32_t)strlen(cwd_str) : 0,
++        search_path ? (const uint8_t *)search_path : NULL,
++        search_path ? (uint32_t)strlen(search_path) : 0,
++        attr_flags, sigdefault_lo, sigdefault_hi,
++        sigmask_lo, sigmask_hi, pgroup,
++        sched_policy, sched_priority,
 +        &child_pid);
 +
++    free(cwd_path);
++    free(actions_buf);
 +    free(argv_buf);
 +    free(envp_buf);
++    free(cwd_str);
 +
 +    if (err != 0) return (int)err;
 +    if (res) *res = (pid_t)child_pid;
 +    return 0;
 +}
 +
++int posix_spawn(pid_t *restrict res, const char *restrict path,
++    const posix_spawn_file_actions_t *fa,
++    const posix_spawnattr_t *restrict attr,
++    char *const argv[restrict], char *const envp[restrict]) {
++    return spawn_common(res, path, fa, attr, argv, envp, NULL);
++}
++
 +int posix_spawnp(pid_t *restrict res, const char *restrict file,
 +    const posix_spawn_file_actions_t *fa,
 +    const posix_spawnattr_t *restrict attr,
 +    char *const argv[restrict], char *const envp[restrict]) {
-+    return posix_spawn(res, file, fa, attr, argv, envp);
++    if (!file || file[0] == '\0') return ENOENT;
++    if (strchr(file, '/')) return posix_spawn(res, file, fa, attr, argv, envp);
++
++    // POSIX requires the caller's PATH (not the child's envp) for spawnp.
++    const char *search = getenv("PATH");
++    if (!search) search = "/bin:/usr/bin";
++    if (strlen(search) > UINT32_MAX) return E2BIG;
++    return spawn_common(res, file, fa, attr, argv, envp, search);
 +}
 +
 +// --- waitpid / wait ---
 +
 +pid_t waitpid(pid_t pid, int *status, int options) {
-+    uint32_t exit_code;
-+    uint32_t termination_signal;
++    uint32_t raw_status;
 +    uint32_t actual_pid;
 +    uint32_t err = __host_proc_waitpid((uint32_t)pid, (uint32_t)options,
-+        &exit_code, &termination_signal, &actual_pid);
++        &raw_status, &actual_pid);
 +    if (err != 0) {
 +        errno = (int)err;
 +        return -1;
 +    }
-+    // The host carries normal exit and signal termination separately, so exit(137) remains a
-+    // normal exit while SIGKILL produces a signal wait status.
-+    if (status) {
-+        if (termination_signal != 0) {
-+            *status = (int)(termination_signal & 0x7f);
-+        } else {
-+            *status = (int)((exit_code & 0xff) << 8);
-+        }
-+    }
++    if (actual_pid == 0) return 0;
++    if (status) *status = (int)raw_status;
 +    return (pid_t)actual_pid;
 +}
 +

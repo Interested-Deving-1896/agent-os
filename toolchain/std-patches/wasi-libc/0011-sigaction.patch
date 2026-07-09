@@ -30,7 +30,7 @@ new file mode 100644
 index 0000000..303734f
 --- /dev/null
 +++ b/libc-bottom-half/sources/host_sigaction.c
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,192 @@
 +// sigaction() / signal() / __wasi_signal_trampoline via wasmVM host_process import.
 +//
 +// Cooperative signal handling for WasmVM:
@@ -46,10 +46,6 @@ index 0000000..303734f
 +#include <signal.h>
 +#include <stdint.h>
 +#include <string.h>
-+
-+#define WASM_SIG_DFL ((void (*)(int))0)
-+#define WASM_SIG_IGN ((void (*)(int))1)
-+#define WASM_SIG_ERR ((void (*)(int))-1)
 +
 +#define WASM_IMPORT(mod, fn) \
 +    __attribute__((__import_module__(mod), __import_name__(fn)))
@@ -174,8 +170,8 @@ index 0000000..303734f
 +    }
 +
 +    uint32_t action = 2;
-+    if (act->sa_handler == WASM_SIG_DFL) action = 0;
-+    else if (act->sa_handler == WASM_SIG_IGN) action = 1;
++    if (act->sa_handler == SIG_DFL) action = 0;
++    else if (act->sa_handler == SIG_IGN) action = 1;
 +
 +    uint32_t mask_lo = 0;
 +    uint32_t mask_hi = 0;
@@ -203,7 +199,7 @@ index 0000000..303734f
 +    act.sa_flags = 0;
 +
 +    if (sigaction(sig, &act, &oldact) != 0) {
-+        return WASM_SIG_ERR;
++        return SIG_ERR;
 +    }
 +    return oldact.sa_handler;
 +}
@@ -215,12 +211,12 @@ index 0000000..303734f
 +    }
 +
 +    void (*handler)(int) = _handlers[signum];
-+    if (handler == WASM_SIG_DFL || handler == WASM_SIG_IGN || handler == WASM_SIG_ERR) {
++    if (handler == SIG_DFL || handler == SIG_IGN || handler == SIG_ERR) {
 +        return;
 +    }
 +
 +    if ((_flags[signum] & SA_RESETHAND) != 0) {
-+        _handlers[signum] = WASM_SIG_DFL;
++        _handlers[signum] = SIG_DFL;
 +        sigemptyset(&_masks[signum]);
 +        _flags[signum] = 0;
 +    }
@@ -261,7 +257,7 @@ index 9bf8833..6830b5b 100644
  #endif
  
  #ifdef __wasilibc_unmodified_upstream /* WASI has no ucontext/sigaction */
-@@ -60,6 +62,33 @@ typedef struct sigaltstack stack_t;
+@@ -60,6 +62,36 @@ typedef struct sigaltstack stack_t;
  
  #include <bits/signal.h>
  
@@ -286,6 +282,9 @@ index 9bf8833..6830b5b 100644
 +#endif
 +#ifndef SA_RESETHAND
 +#define SA_RESETHAND 0x80000000
++#endif
++#ifndef SA_NODEFER
++#define SA_NODEFER 0x40000000
 +#endif
 +#ifndef SA_ONESHOT
 +#define SA_ONESHOT SA_RESETHAND

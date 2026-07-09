@@ -1,7 +1,8 @@
 use agentos_kernel::command_registry::CommandDriver;
 use agentos_kernel::fd_table::{
-    FD_CLOEXEC, F_DUPFD, F_GETFD, F_GETFL, F_SETFD, F_SETFL, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN,
-    O_APPEND, O_CREAT, O_EXCL, O_NONBLOCK, O_RDWR,
+    RecordLockType, FD_CLOEXEC, F_DUPFD, F_GETFD, F_GETFL, F_SETFD, F_SETFL, LOCK_EX, LOCK_NB,
+    LOCK_SH, LOCK_UN, O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_NONBLOCK, O_RDONLY,
+    O_RDWR, O_TRUNC,
 };
 use agentos_kernel::kernel::{
     ExecOptions, KernelVm, KernelVmConfig, OpenShellOptions, SpawnOptions, WaitPidFlags,
@@ -11,6 +12,7 @@ use agentos_kernel::mount_table::{MountOptions, MountTable};
 use agentos_kernel::permissions::Permissions;
 use agentos_kernel::pipe_manager::MAX_PIPE_BUFFER_BYTES;
 use agentos_kernel::process_table::{ProcessWaitEvent, SIGWINCH};
+use agentos_kernel::socket_table::SocketType;
 use agentos_kernel::vfs::{
     MemoryFileSystem, VfsResult, VirtualDirEntry, VirtualFileSystem, VirtualStat, MAX_PATH_LENGTH,
 };
@@ -261,6 +263,28 @@ fn kernel_fd_surface_supports_open_seek_positional_io_dup_and_dev_fd_views() {
     kernel
         .fd_write("shell", process.pid(), created_fd, b"created")
         .expect("write created file");
+    kernel
+        .fd_sync("shell", process.pid(), created_fd)
+        .expect("sync regular file");
+    let directory_fd = kernel
+        .fd_open("shell", process.pid(), "/tmp", 0, None)
+        .expect("open directory for sync");
+    kernel
+        .fd_sync("shell", process.pid(), directory_fd)
+        .expect("sync directory");
+    let directory_entries = kernel
+        .fd_read_dir_with_types("shell", process.pid(), directory_fd)
+        .expect("read directory through fd");
+    assert!(directory_entries.iter().any(|entry| {
+        entry.name == "data.txt" && !entry.is_directory && !entry.is_symbolic_link
+    }));
+    assert!(directory_entries.iter().any(|entry| {
+        entry.name == "created.txt" && !entry.is_directory && !entry.is_symbolic_link
+    }));
+    assert_kernel_error_code(
+        kernel.fd_read_dir_with_types("shell", process.pid(), created_fd),
+        "ENOTDIR",
+    );
     assert_eq!(
         kernel
             .filesystem_mut()
@@ -337,6 +361,17 @@ fn kernel_fd_surface_supports_open_seek_positional_io_dup_and_dev_fd_views() {
     assert!(!file_stat.is_directory);
 
     let (read_fd, write_fd) = kernel.open_pipe("shell", process.pid()).expect("open pipe");
+    assert_kernel_error_code(kernel.fd_sync("shell", process.pid(), read_fd), "EINVAL");
+    let (socket_fd, peer_fd) = kernel
+        .fd_socketpair("shell", process.pid(), SocketType::Stream, false, false)
+        .expect("open socketpair for sync validation");
+    assert_kernel_error_code(kernel.fd_sync("shell", process.pid(), socket_fd), "EINVAL");
+    kernel
+        .fd_close("shell", process.pid(), socket_fd)
+        .expect("close first socket");
+    kernel
+        .fd_close("shell", process.pid(), peer_fd)
+        .expect("close second socket");
     kernel
         .fd_write("shell", process.pid(), write_fd, b"pipe-data")
         .expect("write pipe");
@@ -357,11 +392,232 @@ fn kernel_fd_surface_supports_open_seek_positional_io_dup_and_dev_fd_views() {
     let pipe_stat = kernel
         .dev_fd_stat("shell", process.pid(), read_fd)
         .expect("stat pipe fd");
-    assert_eq!(pipe_stat.mode, 0o666);
+    let write_pipe_stat = kernel
+        .dev_fd_stat("shell", process.pid(), write_fd)
+        .expect("stat pipe write fd");
+    assert_eq!(pipe_stat.mode, 0o010600);
     assert_eq!(pipe_stat.size, 0);
     assert_eq!(pipe_stat.blocks, 0);
-    assert_eq!(pipe_stat.dev, 2);
+    assert_ne!(pipe_stat.dev, 0);
+    assert_eq!(pipe_stat.nlink, 1);
+    assert_eq!(write_pipe_stat.dev, pipe_stat.dev);
+    assert_eq!(write_pipe_stat.ino, pipe_stat.ino);
     assert!(!pipe_stat.is_directory);
+
+    kernel
+        .fd_close("shell", process.pid(), directory_fd)
+        .expect("close directory fd");
+    assert_kernel_error_code(
+        kernel.fd_read_dir_with_types("shell", process.pid(), directory_fd),
+        "EBADF",
+    );
+    kernel
+        .fd_close("shell", process.pid(), created_fd)
+        .expect("close synced file fd");
+    assert_kernel_error_code(kernel.fd_sync("shell", process.pid(), created_fd), "EBADF");
+
+    process.finish(0);
+    kernel.waitpid(process.pid()).expect("wait for shell");
+}
+
+#[test]
+fn fd_open_directory_truncate_rejects_regular_file_without_truncating_it() {
+    let mut config = KernelVmConfig::new("vm-open-directory-truncate");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+    kernel
+        .write_file("/regular", b"payload")
+        .expect("seed regular file");
+    let process = spawn_shell(&mut kernel);
+
+    assert_kernel_error_code(
+        kernel.fd_open(
+            "shell",
+            process.pid(),
+            "/regular",
+            O_RDONLY | O_DIRECTORY | O_TRUNC,
+            None,
+        ),
+        "ENOTDIR",
+    );
+    assert_eq!(
+        kernel.read_file("/regular").expect("read regular file"),
+        b"payload"
+    );
+}
+
+#[test]
+fn fd_open_nofollow_truncate_rejects_symlink_without_truncating_target() {
+    let mut config = KernelVmConfig::new("vm-open-nofollow-truncate");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+    kernel
+        .write_file("/target", b"payload")
+        .expect("seed target file");
+    kernel
+        .symlink("/target", "/target-link")
+        .expect("create target symlink");
+    let process = spawn_shell(&mut kernel);
+
+    assert_kernel_error_code(
+        kernel.fd_open(
+            "shell",
+            process.pid(),
+            "/target-link",
+            O_RDONLY | O_NOFOLLOW | O_TRUNC,
+            None,
+        ),
+        "ELOOP",
+    );
+    assert_eq!(
+        kernel.read_file("/target").expect("read target file"),
+        b"payload"
+    );
+}
+
+#[test]
+fn fd_open_directory_create_rejects_missing_path_without_creating_it() {
+    let mut config = KernelVmConfig::new("vm-open-directory-create");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+    let process = spawn_shell(&mut kernel);
+
+    assert_kernel_error_code(
+        kernel.fd_open(
+            "shell",
+            process.pid(),
+            "/missing",
+            O_RDONLY | O_DIRECTORY | O_CREAT,
+            None,
+        ),
+        "EINVAL",
+    );
+    assert!(!kernel.exists("/missing").expect("query missing path"));
+}
+
+#[test]
+fn fd_open_nofollow_rejects_proc_and_dev_fd_symlink_aliases() {
+    let mut config = KernelVmConfig::new("vm-open-nofollow-special-links");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+    kernel
+        .write_file("/target", b"payload")
+        .expect("seed target file");
+    let process = spawn_shell(&mut kernel);
+    let target_fd = kernel
+        .fd_open("shell", process.pid(), "/target", O_RDONLY, None)
+        .expect("open target file");
+
+    for path in [
+        String::from("/proc/self"),
+        String::from("/proc/self/cwd"),
+        format!("/proc/self/fd/{target_fd}"),
+        format!("/dev/fd/{target_fd}"),
+    ] {
+        assert_kernel_error_code(
+            kernel.fd_open("shell", process.pid(), &path, O_RDONLY | O_NOFOLLOW, None),
+            "ELOOP",
+        );
+    }
+
+    for path in ["/proc/self/fd/999999", "/dev/fd/999999"] {
+        assert_kernel_error_code(
+            kernel.fd_open("shell", process.pid(), path, O_RDONLY | O_NOFOLLOW, None),
+            "ENOENT",
+        );
+    }
+}
+
+#[test]
+fn open_file_descriptions_survive_unlink_and_follow_rename() {
+    let mut config = KernelVmConfig::new("vm-api-open-file-description");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+    kernel
+        .write_file("/tmp/unlinked.txt", b"hello".to_vec())
+        .expect("seed unlink target");
+    kernel
+        .write_file("/tmp/renamed.txt", b"rename".to_vec())
+        .expect("seed rename target");
+
+    let process = spawn_shell(&mut kernel);
+    let unlinked_fd = kernel
+        .fd_open("shell", process.pid(), "/tmp/unlinked.txt", O_RDWR, None)
+        .expect("open unlink target");
+    kernel
+        .remove_file("/tmp/unlinked.txt")
+        .expect("unlink open file");
+    assert_eq!(
+        kernel
+            .read_link_for_process(
+                "shell",
+                process.pid(),
+                &format!("/proc/self/fd/{unlinked_fd}"),
+            )
+            .expect("read unlinked file proc fd target"),
+        "/tmp/unlinked.txt (deleted)"
+    );
+
+    assert!(!kernel
+        .exists("/tmp/unlinked.txt")
+        .expect("check removed path"));
+    assert_eq!(
+        kernel
+            .fd_pread("shell", process.pid(), unlinked_fd, 5, 0)
+            .expect("read unlinked file description"),
+        b"hello".to_vec()
+    );
+    kernel
+        .fd_pwrite("shell", process.pid(), unlinked_fd, b"X", 1)
+        .expect("write unlinked file description");
+    kernel
+        .fd_chmod("shell", process.pid(), unlinked_fd, 0o600)
+        .expect("chmod unlinked file description");
+    let unlinked_stat = kernel
+        .dev_fd_stat("shell", process.pid(), unlinked_fd)
+        .expect("stat unlinked file description");
+    assert_eq!(unlinked_stat.size, 5);
+    assert_eq!(unlinked_stat.mode & 0o777, 0o600);
+    assert_eq!(
+        kernel
+            .fd_pread("shell", process.pid(), unlinked_fd, 5, 0)
+            .expect("read updated unlinked file description"),
+        b"hXllo".to_vec()
+    );
+
+    let renamed_fd = kernel
+        .fd_open("shell", process.pid(), "/tmp/renamed.txt", O_RDWR, None)
+        .expect("open rename target");
+    kernel
+        .rename("/tmp/renamed.txt", "/tmp/moved.txt")
+        .expect("rename open file");
+    assert_eq!(
+        kernel
+            .fd_path("shell", process.pid(), renamed_fd)
+            .expect("resolve renamed fd path"),
+        "/tmp/moved.txt"
+    );
+    assert_eq!(
+        kernel
+            .fd_pread("shell", process.pid(), renamed_fd, 6, 0)
+            .expect("read renamed file description"),
+        b"rename".to_vec()
+    );
 
     process.finish(0);
     kernel.waitpid(process.pid()).expect("wait for shell");
@@ -417,6 +673,43 @@ fn kernel_process_umask_applies_to_created_files_and_directories() {
     let dir_stat = kernel.stat("/tmp/private-dir").expect("stat private dir");
     assert_eq!(dir_stat.mode & 0o777, 0o750);
 
+    let child = kernel
+        .spawn_process(
+            "sh",
+            Vec::new(),
+            SpawnOptions {
+                requester_driver: Some(String::from("shell")),
+                parent_pid: Some(process.pid()),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("spawn child with inherited umask");
+    assert_eq!(
+        kernel
+            .umask("shell", child.pid(), None)
+            .expect("read child umask"),
+        0o027
+    );
+    let child_fd = kernel
+        .fd_open(
+            "shell",
+            child.pid(),
+            "/tmp/child-umask-file.txt",
+            O_CREAT | O_RDWR,
+            Some(0o666),
+        )
+        .expect("create file with inherited child umask");
+    kernel
+        .fd_close("shell", child.pid(), child_fd)
+        .expect("close child-created file");
+    let child_stat = kernel
+        .stat("/tmp/child-umask-file.txt")
+        .expect("stat child umask file");
+    assert_eq!(child_stat.mode & 0o777, 0o640);
+
+    child.finish(0);
+    kernel.waitpid(child.pid()).expect("wait for child");
+
     process.finish(0);
     kernel.waitpid(process.pid()).expect("wait for shell");
 }
@@ -463,6 +756,130 @@ fn read_dir_with_types_for_process_reports_entries_and_enforces_driver_ownership
     assert_kernel_error_code(
         kernel.read_dir_with_types_for_process("other", process.pid(), "/tmp"),
         "EPERM",
+    );
+
+    process.finish(0);
+    kernel.waitpid(process.pid()).expect("wait for shell");
+}
+
+#[test]
+fn descriptor_readdir_reports_linux_dot_order_and_inode_identity() {
+    let mut config = KernelVmConfig::new("vm-api-fd-readdir-inodes");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+    kernel.mkdir("/real", true).expect("create real root");
+    kernel
+        .mkdir("/real/target", true)
+        .expect("create target directory");
+    kernel.mkdir("/links", true).expect("create link root");
+    kernel
+        .write_file("/real/target/child", b"child")
+        .expect("create child");
+    kernel
+        .symlink("/real/target", "/links/target-link")
+        .expect("create directory symlink");
+
+    let process = spawn_shell(&mut kernel);
+    let directory_fd = kernel
+        .fd_open("shell", process.pid(), "/links/target-link", 0, None)
+        .expect("open directory through symlink");
+    let entries = kernel
+        .fd_read_dir_with_types("shell", process.pid(), directory_fd)
+        .expect("read descriptor directory");
+    assert_eq!(entries[0].name, ".");
+    assert_eq!(entries[1].name, "..");
+    assert!(entries.iter().all(|entry| entry.ino != 0));
+    assert_eq!(entries[0].ino, kernel.stat("/real/target").unwrap().ino);
+    assert_eq!(entries[1].ino, kernel.stat("/real").unwrap().ino);
+    assert_ne!(entries[1].ino, kernel.stat("/links").unwrap().ino);
+    assert_eq!(
+        entries
+            .iter()
+            .find(|entry| entry.name == "child")
+            .unwrap()
+            .ino,
+        kernel.lstat("/real/target/child").unwrap().ino
+    );
+    assert_eq!(
+        entries,
+        kernel
+            .fd_read_dir_with_types("shell", process.pid(), directory_fd)
+            .expect("repeat descriptor directory read")
+    );
+
+    let root_fd = kernel
+        .fd_open("shell", process.pid(), "/", 0, None)
+        .expect("open root directory");
+    let root_entries = kernel
+        .fd_read_dir_with_types("shell", process.pid(), root_fd)
+        .expect("read root directory");
+    assert_eq!(root_entries[0].name, ".");
+    assert_eq!(root_entries[1].name, "..");
+    assert_ne!(root_entries[0].ino, 0);
+    assert_eq!(root_entries[0].ino, root_entries[1].ino);
+    assert_eq!(root_entries[0].ino, kernel.stat("/").unwrap().ino);
+
+    kernel
+        .mkdir("/renamed-before", true)
+        .expect("create directory before rename");
+    kernel
+        .write_file("/renamed-before/child", b"child")
+        .expect("create renamed child");
+    let renamed_fd = kernel
+        .fd_open("shell", process.pid(), "/renamed-before", 0, None)
+        .expect("open directory before rename");
+    let renamed_ino = kernel.stat("/renamed-before").unwrap().ino;
+    kernel
+        .rename("/renamed-before", "/renamed-after")
+        .expect("rename open directory");
+    assert_eq!(
+        kernel
+            .fd_path("shell", process.pid(), renamed_fd)
+            .expect("descriptor path follows rename"),
+        "/renamed-after"
+    );
+    let renamed_entries = kernel
+        .fd_read_dir_with_types("shell", process.pid(), renamed_fd)
+        .expect("read renamed directory descriptor");
+    assert_eq!(renamed_entries[0].ino, renamed_ino);
+    assert!(renamed_entries.iter().any(|entry| entry.name == "child"));
+
+    kernel
+        .mkdir("/removed-open", true)
+        .expect("create directory to remove while open");
+    let removed_fd = kernel
+        .fd_open("shell", process.pid(), "/removed-open", 0, None)
+        .expect("open directory before removal");
+    let removed_stat = kernel
+        .dev_fd_stat("shell", process.pid(), removed_fd)
+        .expect("stat open directory before removal");
+    kernel
+        .remove_dir("/removed-open")
+        .expect("remove open empty directory");
+    assert_eq!(
+        kernel
+            .read_link_for_process(
+                "shell",
+                process.pid(),
+                &format!("/proc/self/fd/{removed_fd}"),
+            )
+            .expect("read detached directory proc fd target"),
+        "/removed-open (deleted)"
+    );
+    let detached_stat = kernel
+        .dev_fd_stat("shell", process.pid(), removed_fd)
+        .expect("fstat detached directory");
+    assert_eq!(detached_stat.ino, removed_stat.ino);
+    assert_eq!(detached_stat.mode, removed_stat.mode);
+    assert!(
+        kernel
+            .fd_read_dir_with_types("shell", process.pid(), removed_fd)
+            .expect("read detached directory")
+            .is_empty(),
+        "Linux getdents returns EOF for an unlinked open directory"
     );
 
     process.finish(0);
@@ -869,6 +1286,220 @@ fn kernel_fd_surface_shares_advisory_locks_across_fork_inherited_fds() {
     kernel.waitpid(parent.pid()).expect("wait parent");
     kernel.waitpid(child.pid()).expect("wait child");
     kernel.waitpid(contender.pid()).expect("wait contender");
+}
+
+#[test]
+fn kernel_fd_surface_enforces_posix_record_lock_ranges_and_close_semantics() {
+    let mut config = KernelVmConfig::new("vm-api-record-locks");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+    kernel
+        .filesystem_mut()
+        .write_file("/tmp/record-lock.txt", vec![0; 64])
+        .expect("seed record-lock file");
+
+    let owner = spawn_shell(&mut kernel);
+    let contender = spawn_shell(&mut kernel);
+    let owner_fd = kernel
+        .fd_open("shell", owner.pid(), "/tmp/record-lock.txt", O_RDWR, None)
+        .expect("owner opens file");
+    let owner_dup = kernel
+        .fd_dup("shell", owner.pid(), owner_fd)
+        .expect("duplicate owner fd");
+    let contender_fd = kernel
+        .fd_open(
+            "shell",
+            contender.pid(),
+            "/tmp/record-lock.txt",
+            O_RDWR,
+            None,
+        )
+        .expect("contender opens file");
+
+    kernel
+        .fd_record_lock(
+            "shell",
+            owner.pid(),
+            owner_fd,
+            RecordLockType::Write,
+            10,
+            20,
+            false,
+        )
+        .expect("owner locks [10, 30)");
+    let conflict = kernel
+        .fd_record_lock(
+            "shell",
+            contender.pid(),
+            contender_fd,
+            RecordLockType::Read,
+            0,
+            64,
+            true,
+        )
+        .expect("query conflicting lock")
+        .expect("write lock should conflict");
+    assert_eq!(conflict.pid, owner.pid());
+    assert_eq!(conflict.lock_type, RecordLockType::Write);
+    assert_eq!((conflict.start, conflict.length()), (10, 20));
+    assert_kernel_error_code(
+        kernel
+            .fd_record_lock(
+                "shell",
+                contender.pid(),
+                contender_fd,
+                RecordLockType::Write,
+                20,
+                2,
+                false,
+            )
+            .map(|_| ()),
+        "EWOULDBLOCK",
+    );
+    kernel
+        .fd_record_lock(
+            "shell",
+            contender.pid(),
+            contender_fd,
+            RecordLockType::Write,
+            30,
+            10,
+            false,
+        )
+        .expect("adjacent range does not conflict");
+
+    kernel
+        .fd_record_lock(
+            "shell",
+            owner.pid(),
+            owner_fd,
+            RecordLockType::Unlock,
+            15,
+            10,
+            false,
+        )
+        .expect("split owner range");
+    kernel
+        .fd_record_lock(
+            "shell",
+            contender.pid(),
+            contender_fd,
+            RecordLockType::Write,
+            15,
+            10,
+            false,
+        )
+        .expect("unlocked middle range is available");
+
+    // Linux process locks are released when any descriptor for the inode is
+    // closed, not only when the last duplicate closes.
+    kernel
+        .fd_close("shell", owner.pid(), owner_dup)
+        .expect("close owner duplicate");
+    assert!(kernel
+        .fd_record_lock(
+            "shell",
+            contender.pid(),
+            contender_fd,
+            RecordLockType::Write,
+            0,
+            15,
+            false,
+        )
+        .is_ok());
+
+    owner.finish(0);
+    contender.finish(0);
+    kernel.waitpid(owner.pid()).expect("wait owner");
+    kernel.waitpid(contender.pid()).expect("wait contender");
+}
+
+#[test]
+fn kernel_fd_record_lock_wait_detects_deadlock_and_cleans_up_waiters() {
+    let mut config = KernelVmConfig::new("vm-api-record-lock-deadlock");
+    config.permissions = Permissions::allow_all();
+    let mut kernel = KernelVm::new(MemoryFileSystem::new(), config);
+    kernel
+        .register_driver(CommandDriver::new("shell", ["sh"]))
+        .expect("register shell");
+    kernel
+        .filesystem_mut()
+        .write_file("/tmp/record-lock-a", vec![0; 8])
+        .expect("seed first record-lock file");
+    kernel
+        .filesystem_mut()
+        .write_file("/tmp/record-lock-b", vec![0; 8])
+        .expect("seed second record-lock file");
+
+    let first = spawn_shell(&mut kernel);
+    let second = spawn_shell(&mut kernel);
+    let first_a = kernel
+        .fd_open("shell", first.pid(), "/tmp/record-lock-a", O_RDWR, None)
+        .expect("first process opens first file");
+    let first_b = kernel
+        .fd_open("shell", first.pid(), "/tmp/record-lock-b", O_RDWR, None)
+        .expect("first process opens second file");
+    let second_a = kernel
+        .fd_open("shell", second.pid(), "/tmp/record-lock-a", O_RDWR, None)
+        .expect("second process opens first file");
+    let second_b = kernel
+        .fd_open("shell", second.pid(), "/tmp/record-lock-b", O_RDWR, None)
+        .expect("second process opens second file");
+
+    kernel
+        .fd_record_lock(
+            "shell",
+            first.pid(),
+            first_a,
+            RecordLockType::Write,
+            0,
+            8,
+            false,
+        )
+        .expect("first process locks first file");
+    kernel
+        .fd_record_lock(
+            "shell",
+            second.pid(),
+            second_b,
+            RecordLockType::Write,
+            0,
+            8,
+            false,
+        )
+        .expect("second process locks second file");
+
+    assert_kernel_error_code(
+        kernel.fd_record_lock_wait("shell", first.pid(), first_b, RecordLockType::Write, 0, 8),
+        "EWOULDBLOCK",
+    );
+    assert_kernel_error_code(
+        kernel.fd_record_lock_wait("shell", second.pid(), second_a, RecordLockType::Write, 0, 8),
+        "EDEADLK",
+    );
+
+    kernel
+        .fd_record_lock_cancel("shell", first.pid())
+        .expect("cancel first process wait");
+    assert_kernel_error_code(
+        kernel.fd_record_lock_wait("shell", second.pid(), second_a, RecordLockType::Write, 0, 8),
+        "EWOULDBLOCK",
+    );
+    kernel
+        .fd_close("shell", second.pid(), second_a)
+        .expect("close cancels second process wait");
+
+    second.finish(0);
+    kernel.waitpid(second.pid()).expect("wait second process");
+    kernel
+        .fd_record_lock_wait("shell", first.pid(), first_b, RecordLockType::Write, 0, 8)
+        .expect("process exit releases lock and wait edge");
+
+    first.finish(0);
+    kernel.waitpid(first.pid()).expect("wait first process");
 }
 
 #[test]

@@ -110,6 +110,19 @@ type BrowserChildProcessSession = {
 	exited: boolean;
 };
 
+function normalizeCommandWaitResult(
+	result: Awaited<ReturnType<BrowserChildProcessSession["process"]["wait"]>>,
+): Extract<BrowserChildProcessPollEvent, { type: "exit" }> {
+	if (typeof result === "number") {
+		return { type: "exit", exitCode: result, signal: null };
+	}
+	return {
+		type: "exit",
+		exitCode: result.exitCode,
+		signal: result.signal,
+	};
+}
+
 type BrowserNetworkPermission = NonNullable<
 	RuntimeDriverOptions["system"]["permissions"]
 >["network"];
@@ -310,6 +323,7 @@ async function handleSyncBridgeOperation(
 			const sessionId = host.allocateChildProcessSessionId();
 			const events: BrowserChildProcessPollEvent[] = [];
 			const process = host.commandExecutor.spawn(command, args, {
+				argv0: options.argv0,
 				cwd: options.cwd,
 				env: options.env,
 				onStdout: (data) => {
@@ -333,12 +347,18 @@ async function handleSyncBridgeOperation(
 			};
 			void process
 				.wait()
-				.then((code) => {
+				.then((result) => {
 					session.exited = true;
-					session.events.push({ type: "exit", exitCode: code, signal: null });
+					session.events.push(normalizeCommandWaitResult(result));
 				})
-				.catch(() => {
+				.catch((error) => {
 					session.exited = true;
+					const message =
+						error instanceof Error ? error.message : String(error);
+					session.events.push({
+						type: "stderr",
+						data: encodeChildProcessBytes(new TextEncoder().encode(message)),
+					});
 					session.events.push({ type: "exit", exitCode: 1, signal: null });
 				});
 			host.childProcessSessions.set(sessionId, session);
@@ -382,8 +402,11 @@ async function handleSyncBridgeOperation(
 			if (!session || session.executionId !== message.executionId) {
 				throw new Error(`unknown child_process session ${sessionId}`);
 			}
-			session.process.kill(signal);
-			return { kind: SYNC_BRIDGE_KIND_NONE };
+			const accepted = session.process.kill(signal);
+			return {
+				kind: SYNC_BRIDGE_KIND_JSON,
+				value: accepted !== false,
+			};
 		}
 		case "child_process.spawn_sync": {
 			const request = parseChildProcessSpawnRequest(
@@ -395,6 +418,7 @@ async function handleSyncBridgeOperation(
 			const stdoutChunks: Uint8Array[] = [];
 			const stderrChunks: Uint8Array[] = [];
 			const proc = host.commandExecutor.spawn(command, args, {
+				argv0: options.argv0,
 				cwd: options.cwd,
 				env: options.env,
 				onStdout: (data) => stdoutChunks.push(data),
@@ -405,14 +429,15 @@ async function handleSyncBridgeOperation(
 				proc.writeStdin(input);
 			}
 			proc.closeStdin();
-			const exitCode = await proc.wait();
+			const waitResult = normalizeCommandWaitResult(await proc.wait());
 			const decoder = new TextDecoder();
 			return {
 				kind: SYNC_BRIDGE_KIND_TEXT,
 				value: JSON.stringify({
 					stdout: stdoutChunks.map((chunk) => decoder.decode(chunk)).join(""),
 					stderr: stderrChunks.map((chunk) => decoder.decode(chunk)).join(""),
-					code: exitCode,
+					code: waitResult.exitCode,
+					signal: waitResult.signal,
 				}),
 			};
 		}
@@ -511,6 +536,9 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 				options.runtime.process,
 				options.system.permissions,
 			),
+			// The converged sidecar VM config is trusted host input and the source of
+			// truth for policy. Never derive these caps from guest bootstrap options.
+			processLimits: factoryOptions.convergedSidecar?.config.limits?.process,
 			osConfig: options.runtime.os,
 			filesystem: browserSystemOptions.filesystem,
 			networkEnabled: browserSystemOptions.networkEnabled,
@@ -980,7 +1008,9 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 			operation,
 			args,
 			async () => {
-				throw new Error(`legacy PTY fallback is not available for ${operation}`);
+				throw new Error(
+					`legacy PTY fallback is not available for ${operation}`,
+				);
 			},
 		);
 	}
@@ -994,7 +1024,9 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 			{ fd, data: toUint8Array(data) },
 		]);
 		if (response.kind !== SYNC_BRIDGE_KIND_JSON) {
-			throw new Error(`Expected JSON response from pty.write, received ${response.kind}`);
+			throw new Error(
+				`Expected JSON response from pty.write, received ${response.kind}`,
+			);
 		}
 		return Number((response.value as { written?: unknown }).written ?? 0);
 	}
@@ -1012,7 +1044,9 @@ export class BrowserRuntimeDriver implements NodeRuntimeDriver {
 			},
 		]);
 		if (response.kind !== SYNC_BRIDGE_KIND_JSON) {
-			throw new Error(`Expected JSON response from pty.read, received ${response.kind}`);
+			throw new Error(
+				`Expected JSON response from pty.read, received ${response.kind}`,
+			);
 		}
 		const data = (response.value as { data?: unknown }).data;
 		return typeof data === "string" ? base64ToBytes(data) : null;

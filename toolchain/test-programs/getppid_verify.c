@@ -1,10 +1,7 @@
 /* getppid_verify.c -- verify child's getppid() matches parent's getpid()
  *
  * Parent calls getpid(), spawns getppid_test with piped stdout, captures
- * child output, verifies child's ppid matches parent's pid.
- *
- * Note: first piped spawn in a WASM process has a pipe-capture quirk,
- * so we do a warmup piped spawn of 'true' first. */
+ * child output, verifies child's ppid matches parent's pid. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,14 +53,6 @@ static ssize_t spawn_capture(const char *cmd, char *const argv[],
 int main(void) {
     pid_t my_pid = getpid();
     printf("parent_pid=%d\n", my_pid);
-
-    /* Warmup piped spawn — works around first-pipe-capture WASM quirk */
-    {
-        char buf[64];
-        int ec;
-        char *argv[] = {"true", NULL};
-        spawn_capture("true", argv, buf, sizeof(buf), &ec);
-    }
 
     /* Spawn getppid_test with piped stdout to capture child's ppid output */
     char buf[512];

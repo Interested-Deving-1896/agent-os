@@ -4,6 +4,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
+use crate::vfs::VirtualStat;
+
 pub const MAX_FDS_PER_PROCESS: usize = 256;
 
 pub const O_RDONLY: u32 = 0;
@@ -14,6 +16,8 @@ pub const O_EXCL: u32 = 0o200;
 pub const O_TRUNC: u32 = 0o1000;
 pub const O_APPEND: u32 = 0o2000;
 pub const O_NONBLOCK: u32 = 0o4000;
+pub const O_DIRECTORY: u32 = 0o200000;
+pub const O_NOFOLLOW: u32 = 0o400000;
 pub const F_DUPFD: u32 = 0;
 pub const F_GETFD: u32 = 1;
 pub const F_SETFD: u32 = 2;
@@ -24,16 +28,106 @@ pub const LOCK_SH: u32 = 1;
 pub const LOCK_EX: u32 = 2;
 pub const LOCK_NB: u32 = 4;
 pub const LOCK_UN: u32 = 8;
+const DEFAULT_MAX_RECORD_LOCKS: usize = 4096;
 
 pub const FILETYPE_UNKNOWN: u8 = 0;
 pub const FILETYPE_CHARACTER_DEVICE: u8 = 2;
 pub const FILETYPE_DIRECTORY: u8 = 3;
 pub const FILETYPE_REGULAR_FILE: u8 = 4;
+pub const FILETYPE_SOCKET_DGRAM: u8 = 5;
+pub const FILETYPE_SOCKET_STREAM: u8 = 6;
 pub const FILETYPE_PIPE: u8 = 6;
 pub const FILETYPE_SYMBOLIC_LINK: u8 = 7;
 
 pub type FdResult<T> = Result<T, FdTableError>;
 pub type SharedFileDescription = Arc<FileDescription>;
+
+// Every kernel subsystem keys pipes, PTYs, sockets, locks, and poll state by
+// open-file-description identity. Allocate that identity from one global
+// monotonic domain: per-subsystem counters can eventually overlap and make an
+// unrelated regular file look like a stale socket or pipe.
+static NEXT_FILE_DESCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn allocate_file_description_id() -> u64 {
+    NEXT_FILE_DESCRIPTION_ID
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+        .expect("open-file-description id space exhausted")
+}
+
+#[derive(Debug, Default)]
+pub struct AnonymousFileUsage {
+    bytes: AtomicU64,
+    inodes: AtomicUsize,
+}
+
+impl AnonymousFileUsage {
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::SeqCst)
+    }
+
+    pub fn inodes(&self) -> usize {
+        self.inodes.load(Ordering::SeqCst)
+    }
+
+    fn add_file(&self, size: u64) {
+        self.bytes.fetch_add(size, Ordering::SeqCst);
+        self.inodes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn remove_file(&self, size: u64) {
+        self.bytes.fetch_sub(size, Ordering::SeqCst);
+        self.inodes.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn resize_file(&self, old_size: u64, new_size: u64) {
+        if new_size >= old_size {
+            self.bytes
+                .fetch_add(new_size.saturating_sub(old_size), Ordering::SeqCst);
+        } else {
+            self.bytes
+                .fetch_sub(old_size.saturating_sub(new_size), Ordering::SeqCst);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AnonymousFile {
+    pub data: Vec<u8>,
+    pub stat: VirtualStat,
+    usage: Arc<AnonymousFileUsage>,
+}
+
+impl AnonymousFile {
+    pub fn new(data: Vec<u8>, stat: VirtualStat, usage: Arc<AnonymousFileUsage>) -> Self {
+        usage.add_file(stat.size);
+        Self { data, stat, usage }
+    }
+}
+
+impl Drop for AnonymousFile {
+    fn drop(&mut self) {
+        self.usage.remove_file(self.stat.size);
+    }
+}
+
+pub type SharedAnonymousFile = Arc<Mutex<AnonymousFile>>;
+
+#[derive(Debug)]
+enum FileBacking {
+    Path(String),
+    LinkedAlias {
+        former_path: String,
+        live_path: String,
+    },
+    Anonymous {
+        former_path: String,
+        file: SharedAnonymousFile,
+    },
+    DetachedDirectory {
+        former_path: String,
+        stat: VirtualStat,
+    },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FdTableError {
@@ -60,6 +154,13 @@ impl FdTableError {
         }
     }
 
+    fn no_memory(message: impl Into<String>) -> Self {
+        Self {
+            code: "ENOMEM",
+            message: message.into(),
+        }
+    }
+
     fn invalid_argument(message: impl Into<String>) -> Self {
         Self {
             code: "EINVAL",
@@ -70,6 +171,13 @@ impl FdTableError {
     fn would_block(message: impl Into<String>) -> Self {
         Self {
             code: "EWOULDBLOCK",
+            message: message.into(),
+        }
+    }
+
+    fn deadlock(message: impl Into<String>) -> Self {
+        Self {
+            code: "EDEADLK",
             message: message.into(),
         }
     }
@@ -86,7 +194,7 @@ impl Error for FdTableError {}
 #[derive(Debug)]
 pub struct FileDescription {
     id: u64,
-    path: String,
+    backing: Mutex<FileBacking>,
     lock_target: Option<FileLockTarget>,
     cursor: AtomicU64,
     flags: AtomicU32,
@@ -120,7 +228,7 @@ impl FileDescription {
     ) -> Self {
         Self {
             id,
-            path: path.into(),
+            backing: Mutex::new(FileBacking::Path(path.into())),
             lock_target,
             cursor: AtomicU64::new(0),
             flags: AtomicU32::new(flags),
@@ -132,8 +240,230 @@ impl FileDescription {
         self.id
     }
 
-    pub fn path(&self) -> &str {
-        &self.path
+    pub fn path(&self) -> String {
+        match &*lock_or_recover(&self.backing) {
+            FileBacking::Path(path) => path.clone(),
+            FileBacking::LinkedAlias { live_path, .. } => live_path.clone(),
+            FileBacking::Anonymous { former_path, .. } => former_path.clone(),
+            FileBacking::DetachedDirectory { former_path, .. } => former_path.clone(),
+        }
+    }
+
+    /// Linux renders an unlinked open file description through procfs with a
+    /// ` (deleted)` suffix while the description itself remains usable.
+    pub fn proc_display_path(&self) -> String {
+        match &*lock_or_recover(&self.backing) {
+            FileBacking::Path(path) => path.clone(),
+            FileBacking::LinkedAlias { former_path, .. }
+            | FileBacking::Anonymous { former_path, .. }
+            | FileBacking::DetachedDirectory { former_path, .. } => {
+                format!("{former_path} (deleted)")
+            }
+        }
+    }
+
+    pub fn is_path_backed_by(&self, expected: &str) -> bool {
+        match &*lock_or_recover(&self.backing) {
+            FileBacking::Path(path) => path == expected,
+            FileBacking::LinkedAlias { live_path, .. } => live_path == expected,
+            FileBacking::Anonymous { .. } | FileBacking::DetachedDirectory { .. } => false,
+        }
+    }
+
+    pub fn rename_path_prefix(&self, old_path: &str, new_path: &str) {
+        let mut backing = lock_or_recover(&self.backing);
+        let path = match &mut *backing {
+            FileBacking::Path(path) => path,
+            FileBacking::LinkedAlias { live_path, .. } => live_path,
+            FileBacking::Anonymous { .. } | FileBacking::DetachedDirectory { .. } => return,
+        };
+        if path == old_path {
+            *path = new_path.to_string();
+        } else if let Some(suffix) = path
+            .strip_prefix(old_path)
+            .filter(|value| value.starts_with('/'))
+        {
+            *path = format!("{new_path}{suffix}");
+        }
+    }
+
+    pub fn detach_path(&self, expected: &str, file: SharedAnonymousFile) -> bool {
+        let mut backing = lock_or_recover(&self.backing);
+        let former_path = match &*backing {
+            FileBacking::Path(path) if path == expected => expected.to_string(),
+            FileBacking::LinkedAlias {
+                former_path,
+                live_path,
+            } if live_path == expected => former_path.clone(),
+            _ => return false,
+        };
+        *backing = FileBacking::Anonymous { former_path, file };
+        true
+    }
+
+    /// Keep an unlinked open description attached to the same inode through a
+    /// surviving hard-link name. The former name remains visible through
+    /// procfs, while descriptor operations use the live alias.
+    pub fn rebind_deleted_path(&self, expected: &str, live_path: &str) -> bool {
+        let mut backing = lock_or_recover(&self.backing);
+        let former_path = match &*backing {
+            FileBacking::Path(path) if path == expected => expected.to_string(),
+            FileBacking::LinkedAlias {
+                former_path,
+                live_path: current,
+            } if current == expected => former_path.clone(),
+            _ => return false,
+        };
+        *backing = FileBacking::LinkedAlias {
+            former_path,
+            live_path: live_path.to_string(),
+        };
+        true
+    }
+
+    pub fn detach_directory(&self, _expected: &str, stat: VirtualStat) -> bool {
+        let mut backing = lock_or_recover(&self.backing);
+        let FileBacking::Path(former_path) = &*backing else {
+            return false;
+        };
+        let former_path = former_path.clone();
+        *backing = FileBacking::DetachedDirectory { former_path, stat };
+        true
+    }
+
+    pub fn detached_directory_stat(&self) -> Option<VirtualStat> {
+        match &*lock_or_recover(&self.backing) {
+            FileBacking::DetachedDirectory { stat, .. } => Some(stat.clone()),
+            FileBacking::Path(_)
+            | FileBacking::LinkedAlias { .. }
+            | FileBacking::Anonymous { .. } => None,
+        }
+    }
+
+    pub fn anonymous_stat(&self) -> Option<VirtualStat> {
+        let file = match &*lock_or_recover(&self.backing) {
+            FileBacking::Anonymous { file, .. } => Arc::clone(file),
+            FileBacking::Path(_)
+            | FileBacking::LinkedAlias { .. }
+            | FileBacking::DetachedDirectory { .. } => return None,
+        };
+        let stat = lock_or_recover(&file).stat.clone();
+        Some(stat)
+    }
+
+    pub fn anonymous_pread(&self, offset: u64, length: usize) -> Option<Vec<u8>> {
+        let file = match &*lock_or_recover(&self.backing) {
+            FileBacking::Anonymous { file, .. } => Arc::clone(file),
+            FileBacking::Path(_)
+            | FileBacking::LinkedAlias { .. }
+            | FileBacking::DetachedDirectory { .. } => return None,
+        };
+        let file = lock_or_recover(&file);
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        if start >= file.data.len() {
+            return Some(Vec::new());
+        }
+        let end = start.saturating_add(length).min(file.data.len());
+        Some(file.data[start..end].to_vec())
+    }
+
+    pub fn anonymous_pwrite(&self, offset: u64, data: &[u8]) -> Option<FdResult<u64>> {
+        let file = match &*lock_or_recover(&self.backing) {
+            FileBacking::Anonymous { file, .. } => Arc::clone(file),
+            FileBacking::Path(_)
+            | FileBacking::LinkedAlias { .. }
+            | FileBacking::DetachedDirectory { .. } => return None,
+        };
+        let mut file = lock_or_recover(&file);
+        let Ok(start) = usize::try_from(offset) else {
+            return Some(Err(FdTableError::invalid_argument(
+                "anonymous file offset exceeds host address space",
+            )));
+        };
+        let Some(end) = start.checked_add(data.len()) else {
+            return Some(Err(FdTableError::invalid_argument(
+                "anonymous file write range overflows",
+            )));
+        };
+        if end > file.data.len() {
+            let additional = end - file.data.len();
+            if file.data.try_reserve(additional).is_err() {
+                return Some(Err(FdTableError::no_memory(
+                    "anonymous file write allocation failed",
+                )));
+            }
+            file.data.resize(end, 0);
+        }
+        file.data[start..end].copy_from_slice(data);
+        let old_size = file.stat.size;
+        file.stat.size = file.data.len() as u64;
+        file.stat.blocks = file.stat.size.div_ceil(512);
+        file.usage.resize_file(old_size, file.stat.size);
+        Some(Ok(file.stat.size))
+    }
+
+    pub fn anonymous_truncate(&self, length: u64) -> Option<FdResult<()>> {
+        let file = match &*lock_or_recover(&self.backing) {
+            FileBacking::Anonymous { file, .. } => Arc::clone(file),
+            FileBacking::Path(_)
+            | FileBacking::LinkedAlias { .. }
+            | FileBacking::DetachedDirectory { .. } => return None,
+        };
+        let Ok(length) = usize::try_from(length) else {
+            return Some(Err(FdTableError::invalid_argument(
+                "anonymous file length exceeds host address space",
+            )));
+        };
+        let mut file = lock_or_recover(&file);
+        let additional = length.saturating_sub(file.data.len());
+        if additional > 0 && file.data.try_reserve(additional).is_err() {
+            return Some(Err(FdTableError::no_memory(
+                "anonymous file truncate allocation failed",
+            )));
+        }
+        file.data.resize(length, 0);
+        let old_size = file.stat.size;
+        file.stat.size = length as u64;
+        file.stat.blocks = file.stat.size.div_ceil(512);
+        file.usage.resize_file(old_size, file.stat.size);
+        Some(Ok(()))
+    }
+
+    pub fn detached_chmod(&self, mode: u32) -> bool {
+        let mut backing = lock_or_recover(&self.backing);
+        match &mut *backing {
+            FileBacking::Anonymous { file, .. } => {
+                let mut file = lock_or_recover(file);
+                file.stat.mode = (file.stat.mode & !0o7777) | (mode & 0o7777);
+                true
+            }
+            FileBacking::DetachedDirectory { stat, .. } => {
+                stat.mode = (stat.mode & !0o7777) | (mode & 0o7777);
+                true
+            }
+            FileBacking::Path(_) | FileBacking::LinkedAlias { .. } => false,
+        }
+    }
+
+    pub fn detached_chown(&self, uid: u32, gid: u32, changed_mode: Option<u32>) -> bool {
+        let mut backing = lock_or_recover(&self.backing);
+        match &mut *backing {
+            FileBacking::Anonymous { file, .. } => {
+                let mut file = lock_or_recover(file);
+                file.stat.uid = uid;
+                file.stat.gid = gid;
+                if let Some(mode) = changed_mode {
+                    file.stat.mode = mode;
+                }
+                true
+            }
+            FileBacking::DetachedDirectory { stat, .. } => {
+                stat.uid = uid;
+                stat.gid = gid;
+                true
+            }
+            FileBacking::Path(_) | FileBacking::LinkedAlias { .. } => false,
+        }
     }
 
     pub fn lock_target(&self) -> Option<FileLockTarget> {
@@ -199,6 +529,65 @@ pub struct FdEntry {
     pub filetype: u8,
 }
 
+#[derive(Debug)]
+pub struct TransferredFd {
+    description: SharedFileDescription,
+    status_flags: u32,
+    rights: u64,
+    filetype: u8,
+}
+
+impl Clone for TransferredFd {
+    fn clone(&self) -> Self {
+        self.description.increment_ref_count();
+        Self {
+            description: Arc::clone(&self.description),
+            status_flags: self.status_flags,
+            rights: self.rights,
+            filetype: self.filetype,
+        }
+    }
+}
+
+impl PartialEq for TransferredFd {
+    fn eq(&self, other: &Self) -> bool {
+        self.description.id() == other.description.id()
+            && self.status_flags == other.status_flags
+            && self.rights == other.rights
+            && self.filetype == other.filetype
+    }
+}
+
+impl Eq for TransferredFd {}
+
+impl Drop for TransferredFd {
+    fn drop(&mut self) {
+        self.description.decrement_ref_count();
+    }
+}
+
+impl TransferredFd {
+    pub(crate) fn description(&self) -> SharedFileDescription {
+        Arc::clone(&self.description)
+    }
+
+    pub fn description_id(&self) -> u64 {
+        self.description.id()
+    }
+
+    pub fn status_flags(&self) -> u32 {
+        self.status_flags
+    }
+
+    pub fn rights(&self) -> u64 {
+        self.rights
+    }
+
+    pub fn filetype(&self) -> u8 {
+        self.filetype
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FdStat {
     pub filetype: u8,
@@ -213,15 +602,11 @@ pub struct StdioOverride {
 }
 
 #[derive(Debug, Clone)]
-struct DescriptionFactory {
-    next_description_id: Arc<AtomicU64>,
-}
+struct DescriptionFactory {}
 
 impl DescriptionFactory {
-    fn new(starting_id: u64) -> Self {
-        Self {
-            next_description_id: Arc::new(AtomicU64::new(starting_id)),
-        }
+    fn new(_starting_id: u64) -> Self {
+        Self {}
     }
 
     fn allocate(&self, path: &str, flags: u32) -> SharedFileDescription {
@@ -234,7 +619,7 @@ impl DescriptionFactory {
         flags: u32,
         lock_target: Option<FileLockTarget>,
     ) -> SharedFileDescription {
-        let next_id = self.next_description_id.fetch_add(1, Ordering::SeqCst);
+        let next_id = allocate_file_description_id();
         Arc::new(FileDescription::new_with_lock(
             next_id,
             path,
@@ -246,12 +631,17 @@ impl DescriptionFactory {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FileLockTarget {
+    dev: u64,
     ino: u64,
 }
 
 impl FileLockTarget {
-    pub const fn new(ino: u64) -> Self {
-        Self { ino }
+    pub const fn new(dev: u64, ino: u64) -> Self {
+        Self { dev, ino }
+    }
+
+    pub const fn dev(self) -> u64 {
+        self.dev
     }
 
     pub const fn ino(self) -> u64 {
@@ -263,6 +653,45 @@ impl FileLockTarget {
 enum FileLockMode {
     Shared,
     Exclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordLockType {
+    Read,
+    Write,
+    Unlock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordLock {
+    pub lock_type: RecordLockType,
+    pub start: u64,
+    /// Exclusive end offset. `None` means through EOF, including future growth.
+    pub end: Option<u64>,
+    pub pid: u32,
+}
+
+impl RecordLock {
+    pub fn new(lock_type: RecordLockType, start: u64, length: u64, pid: u32) -> FdResult<Self> {
+        let end =
+            if length == 0 {
+                None
+            } else {
+                Some(start.checked_add(length).ok_or_else(|| {
+                    FdTableError::invalid_argument("record lock range exceeds u64")
+                })?)
+            };
+        Ok(Self {
+            lock_type,
+            start,
+            end,
+            pid,
+        })
+    }
+
+    pub fn length(self) -> u64 {
+        self.end.map_or(0, |end| end - self.start)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,6 +735,10 @@ impl ProcessFdTable {
 
     pub fn max_fds(&self) -> usize {
         self.max_fds
+    }
+
+    pub fn available_fd_capacity(&self) -> usize {
+        self.max_fds.saturating_sub(self.entries.len())
     }
 
     pub fn init_stdio(
@@ -460,8 +893,145 @@ impl ProcessFdTable {
         Ok(fd)
     }
 
+    pub fn open_pair_with_details(
+        &mut self,
+        first_path: &str,
+        second_path: &str,
+        status_flags: u32,
+        fd_flags: u32,
+        filetype: u8,
+    ) -> FdResult<(u32, u32, SharedFileDescription, SharedFileDescription)> {
+        if self.entries.len().saturating_add(2) > self.max_fds {
+            return Err(FdTableError::too_many_open_files());
+        }
+        let first_fd = self.allocate_fd()?;
+        let second_fd = match self.allocate_fd() {
+            Ok(fd) => fd,
+            Err(error) => {
+                self.next_fd = first_fd;
+                return Err(error);
+            }
+        };
+        let first = self.alloc_desc.allocate(first_path, O_RDWR);
+        let second = self.alloc_desc.allocate(second_path, O_RDWR);
+        for (fd, description) in [
+            (first_fd, Arc::clone(&first)),
+            (second_fd, Arc::clone(&second)),
+        ] {
+            self.entries.insert(
+                fd,
+                FdEntry {
+                    fd,
+                    description,
+                    status_flags: status_flags & ENTRY_STATUS_FLAG_MASK,
+                    fd_flags: fd_flags & FD_CLOEXEC,
+                    rights: 0,
+                    filetype,
+                },
+            );
+        }
+        Ok((first_fd, second_fd, first, second))
+    }
+
+    pub fn transfer(&self, fd: u32) -> FdResult<TransferredFd> {
+        let entry = self
+            .entries
+            .get(&fd)
+            .ok_or_else(|| FdTableError::bad_file_descriptor(fd))?;
+        entry.description.increment_ref_count();
+        Ok(TransferredFd {
+            description: Arc::clone(&entry.description),
+            status_flags: entry.status_flags,
+            rights: entry.rights,
+            filetype: entry.filetype,
+        })
+    }
+
+    /// Create an open-file-description transfer without consuming an fd slot.
+    ///
+    /// SCM_RIGHTS queues descriptions, not temporary descriptors in the
+    /// sending process. Keeping this separate from `open_with_details` avoids
+    /// spuriously returning EMFILE when the sender's descriptor table is full.
+    pub fn create_transfer(&self, path: &str, flags: u32, filetype: u8) -> TransferredFd {
+        TransferredFd {
+            description: self.alloc_desc.allocate(path, description_flags(flags)),
+            status_flags: status_flags(flags),
+            rights: 0,
+            filetype,
+        }
+    }
+
+    pub fn install_transferred(
+        &mut self,
+        transfers: &[TransferredFd],
+        close_on_exec: bool,
+    ) -> FdResult<Vec<u32>> {
+        if self.entries.len().saturating_add(transfers.len()) > self.max_fds {
+            return Err(FdTableError::too_many_open_files());
+        }
+        let mut candidates = Vec::with_capacity(transfers.len());
+        let mut cursor = self.next_fd;
+        for _ in transfers {
+            let start = usize::try_from(cursor).unwrap_or(0) % self.max_fds;
+            let candidate = (0..self.max_fds)
+                .map(|offset| ((start + offset) % self.max_fds) as u32)
+                .find(|fd| !self.entries.contains_key(fd) && !candidates.contains(fd))
+                .ok_or_else(FdTableError::too_many_open_files)?;
+            candidates.push(candidate);
+            cursor = candidate.saturating_add(1);
+        }
+        for (fd, transfer) in candidates.iter().copied().zip(transfers) {
+            transfer.description.increment_ref_count();
+            self.entries.insert(
+                fd,
+                FdEntry {
+                    fd,
+                    description: Arc::clone(&transfer.description),
+                    status_flags: transfer.status_flags,
+                    fd_flags: if close_on_exec { FD_CLOEXEC } else { 0 },
+                    rights: transfer.rights,
+                    filetype: transfer.filetype,
+                },
+            );
+        }
+        self.next_fd = cursor;
+        Ok(candidates)
+    }
+
+    /// Install a transferred open file description at an exact descriptor.
+    /// This is used by spawn staging, where the post-file-action descriptor
+    /// numbers are already canonical and must not be allocated a second time.
+    pub(crate) fn install_transferred_at(
+        &mut self,
+        transfer: &TransferredFd,
+        fd: u32,
+        fd_flags: u32,
+    ) -> FdResult<()> {
+        self.validate_fd_bounds(fd)?;
+        if self.entries.contains_key(&fd) {
+            self.close(fd);
+        }
+        transfer.description.increment_ref_count();
+        self.entries.insert(
+            fd,
+            FdEntry {
+                fd,
+                description: Arc::clone(&transfer.description),
+                status_flags: transfer.status_flags,
+                fd_flags: fd_flags & FD_CLOEXEC,
+                rights: transfer.rights,
+                filetype: transfer.filetype,
+            },
+        );
+        Ok(())
+    }
+
     pub fn get(&self, fd: u32) -> Option<&FdEntry> {
         self.entries.get(&fd)
+    }
+
+    pub fn values(&self) -> Values<'_, u32, FdEntry> {
+        self.entries.values()
     }
 
     pub fn close(&mut self, fd: u32) -> bool {
@@ -470,6 +1040,17 @@ impl ProcessFdTable {
         };
         entry.description.decrement_ref_count();
         true
+    }
+
+    /// File descriptors that must be closed when the current process image is
+    /// replaced by exec(2). The caller performs the closes through the kernel
+    /// so pipe/socket lifecycle accounting receives the same notifications as
+    /// an explicit close(2).
+    pub fn close_on_exec_fds(&self) -> Vec<u32> {
+        self.entries
+            .iter()
+            .filter_map(|(fd, entry)| (entry.fd_flags & FD_CLOEXEC != 0).then_some(*fd))
+            .collect()
     }
 
     pub fn dup(&mut self, fd: u32) -> FdResult<u32> {
@@ -579,6 +1160,19 @@ impl ProcessFdTable {
     }
 
     pub fn fork(&self) -> Self {
+        self.fork_with_cloexec(false)
+    }
+
+    /// Clone this descriptor table at the fork half of a deferred exec.
+    ///
+    /// Linux keeps `FD_CLOEXEC` descriptors across `fork(2)` so spawn file
+    /// actions can use them as sources. The exec half closes any descriptors
+    /// that remain marked after those actions have run.
+    pub fn fork_preserving_cloexec(&self) -> Self {
+        self.fork_with_cloexec(true)
+    }
+
+    fn fork_with_cloexec(&self, preserve_cloexec: bool) -> Self {
         let mut child = Self::new(self.alloc_desc.clone(), self.max_fds);
         child.next_fd = self.next_fd;
 
@@ -589,7 +1183,7 @@ impl ProcessFdTable {
             // pipe's writer refcount above zero forever, so a blocked reader
             // (for example a grandchild sharing the parent's stdin pipe)
             // would never observe EOF.
-            if entry.fd_flags & FD_CLOEXEC != 0 {
+            if !preserve_cloexec && entry.fd_flags & FD_CLOEXEC != 0 {
                 continue;
             }
             entry.description.increment_ref_count();
@@ -819,15 +1413,36 @@ impl FdTableManager {
     }
 
     pub fn fork(&mut self, parent_pid: u32, child_pid: u32) -> &mut ProcessFdTable {
+        self.fork_with_cloexec(parent_pid, child_pid, false)
+    }
+
+    pub fn fork_preserving_cloexec(
+        &mut self,
+        parent_pid: u32,
+        child_pid: u32,
+    ) -> &mut ProcessFdTable {
+        self.fork_with_cloexec(parent_pid, child_pid, true)
+    }
+
+    fn fork_with_cloexec(
+        &mut self,
+        parent_pid: u32,
+        child_pid: u32,
+        preserve_cloexec: bool,
+    ) -> &mut ProcessFdTable {
         if !self.tables.contains_key(&parent_pid) {
             return self.create(child_pid);
         }
 
-        let child = self
+        let parent = self
             .tables
             .get(&parent_pid)
-            .expect("parent table presence was checked")
-            .fork();
+            .expect("parent table presence was checked");
+        let child = if preserve_cloexec {
+            parent.fork_preserving_cloexec()
+        } else {
+            parent.fork()
+        };
         self.remove(child_pid);
         self.tables.insert(child_pid, child);
         self.tables
@@ -875,15 +1490,37 @@ pub struct FileLockManager {
     inner: Arc<FileLockManagerInner>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct FileLockManagerInner {
     state: Mutex<FileLockState>,
     wake: Condvar,
+    max_record_locks: usize,
+}
+
+impl Default for FileLockManagerInner {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(FileLockState::default()),
+            wake: Condvar::new(),
+            max_record_locks: DEFAULT_MAX_RECORD_LOCKS,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct FileLockState {
     entries: BTreeMap<FileLockTarget, FileLockEntry>,
+    record_locks: Vec<(FileLockTarget, RecordLock)>,
+    record_lock_waits: BTreeMap<u32, RecordLockWait>,
+    warned_near_record_lock_limit: bool,
+    warned_near_record_lock_wait_limit: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RecordLockWait {
+    target: FileLockTarget,
+    request: RecordLock,
+    blockers: BTreeSet<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -894,7 +1531,17 @@ struct FileLockEntry {
 
 impl FileLockManager {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_record_lock_limit(DEFAULT_MAX_RECORD_LOCKS)
+    }
+
+    pub fn with_record_lock_limit(max_record_locks: usize) -> Self {
+        Self {
+            inner: Arc::new(FileLockManagerInner {
+                state: Mutex::new(FileLockState::default()),
+                wake: Condvar::new(),
+                max_record_locks: max_record_locks.max(1),
+            }),
+        }
     }
 
     pub fn apply(
@@ -935,6 +1582,209 @@ impl FileLockManager {
         released
     }
 
+    pub fn query_record_lock(
+        &self,
+        target: FileLockTarget,
+        request: RecordLock,
+    ) -> Option<RecordLock> {
+        let state = lock_or_recover(&self.inner.state);
+        state
+            .record_locks
+            .iter()
+            .filter_map(|(candidate_target, candidate)| {
+                (*candidate_target == target
+                    && candidate.pid != request.pid
+                    && record_locks_conflict(*candidate, request))
+                .then_some(*candidate)
+            })
+            .min_by_key(|candidate| (candidate.start, candidate.pid))
+    }
+
+    pub fn set_record_lock(&self, target: FileLockTarget, request: RecordLock) -> FdResult<()> {
+        self.set_record_lock_inner(target, request, false)
+    }
+
+    pub fn set_blocking_record_lock(
+        &self,
+        target: FileLockTarget,
+        request: RecordLock,
+    ) -> FdResult<()> {
+        self.set_record_lock_inner(target, request, true)
+    }
+
+    fn set_record_lock_inner(
+        &self,
+        target: FileLockTarget,
+        request: RecordLock,
+        blocking: bool,
+    ) -> FdResult<()> {
+        let mut state = lock_or_recover(&self.inner.state);
+        let blockers = if request.lock_type == RecordLockType::Unlock {
+            BTreeSet::new()
+        } else {
+            conflicting_record_lock_pids(&state.record_locks, target, request)
+        };
+        if !blockers.is_empty() {
+            if blocking {
+                self.register_record_lock_wait(&mut state, target, request, blockers)?;
+            } else {
+                state.record_lock_waits.remove(&request.pid);
+            }
+            return Err(FdTableError::would_block(
+                "POSIX record lock is held by another process",
+            ));
+        }
+
+        state.record_lock_waits.remove(&request.pid);
+
+        let mut next = Vec::with_capacity(state.record_locks.len().saturating_add(2));
+        for (candidate_target, candidate) in state.record_locks.iter().copied() {
+            if candidate_target != target
+                || candidate.pid != request.pid
+                || !record_ranges_overlap(candidate, request)
+            {
+                next.push((candidate_target, candidate));
+                continue;
+            }
+
+            if candidate.start < request.start {
+                next.push((
+                    target,
+                    RecordLock {
+                        end: Some(request.start),
+                        ..candidate
+                    },
+                ));
+            }
+            if let Some(request_end) = request.end {
+                if candidate
+                    .end
+                    .is_none_or(|candidate_end| candidate_end > request_end)
+                {
+                    next.push((
+                        target,
+                        RecordLock {
+                            start: request_end,
+                            ..candidate
+                        },
+                    ));
+                }
+            }
+        }
+
+        if request.lock_type != RecordLockType::Unlock {
+            next.push((target, request));
+        }
+        coalesce_record_locks(&mut next);
+        let warning_threshold = (self.inner.max_record_locks.saturating_mul(4) / 5).max(1);
+        if !state.warned_near_record_lock_limit && next.len() >= warning_threshold {
+            state.warned_near_record_lock_limit = true;
+            eprintln!(
+                "[agentos] POSIX record lock usage {}/{} is near the limit derived from limits.resources.maxOpenFds; raise limits.resources.maxOpenFds if needed",
+                next.len(), self.inner.max_record_locks
+            );
+        }
+        if next.len() > self.inner.max_record_locks {
+            return Err(FdTableError {
+                code: "ENOLCK",
+                message: format!(
+                    "POSIX record lock table limit ({}) derived from limits.resources.maxOpenFds reached; raise limits.resources.maxOpenFds if needed",
+                    self.inner.max_record_locks
+                ),
+            });
+        }
+        state.record_locks = next;
+        refresh_record_lock_waits(&mut state);
+        drop(state);
+        self.inner.wake.notify_all();
+        Ok(())
+    }
+
+    pub fn cancel_record_lock_wait(&self, pid: u32) -> bool {
+        let mut state = lock_or_recover(&self.inner.state);
+        state.record_lock_waits.remove(&pid).is_some()
+    }
+
+    /// POSIX process-associated locks are all discarded when the process
+    /// closes any descriptor referring to the same file.
+    pub fn release_process_target(&self, pid: u32, target: FileLockTarget) -> bool {
+        let mut state = lock_or_recover(&self.inner.state);
+        let previous = state.record_locks.len();
+        state
+            .record_locks
+            .retain(|(candidate_target, lock)| *candidate_target != target || lock.pid != pid);
+        let wait_cancelled = state.record_lock_waits.remove(&pid).is_some();
+        let released = state.record_locks.len() != previous;
+        if released || wait_cancelled {
+            refresh_record_lock_waits(&mut state);
+        }
+        drop(state);
+        if released || wait_cancelled {
+            self.inner.wake.notify_all();
+        }
+        released || wait_cancelled
+    }
+
+    pub fn release_process(&self, pid: u32) -> bool {
+        let mut state = lock_or_recover(&self.inner.state);
+        let previous = state.record_locks.len();
+        state.record_locks.retain(|(_, lock)| lock.pid != pid);
+        let wait_cancelled = state.record_lock_waits.remove(&pid).is_some();
+        let released = state.record_locks.len() != previous;
+        if released || wait_cancelled {
+            refresh_record_lock_waits(&mut state);
+        }
+        drop(state);
+        if released || wait_cancelled {
+            self.inner.wake.notify_all();
+        }
+        released || wait_cancelled
+    }
+
+    fn register_record_lock_wait(
+        &self,
+        state: &mut FileLockState,
+        target: FileLockTarget,
+        request: RecordLock,
+        blockers: BTreeSet<u32>,
+    ) -> FdResult<()> {
+        let new_waiter = !state.record_lock_waits.contains_key(&request.pid);
+        let waiter_count = state.record_lock_waits.len() + usize::from(new_waiter);
+        if new_waiter && waiter_count > self.inner.max_record_locks {
+            return Err(FdTableError {
+                code: "ENOLCK",
+                message: format!(
+                    "POSIX record lock waiter limit ({}) derived from limits.resources.maxOpenFds reached; raise limits.resources.maxOpenFds if needed",
+                    self.inner.max_record_locks
+                ),
+            });
+        }
+        let warning_threshold = (self.inner.max_record_locks.saturating_mul(4) / 5).max(1);
+        if !state.warned_near_record_lock_wait_limit && waiter_count >= warning_threshold {
+            state.warned_near_record_lock_wait_limit = true;
+            eprintln!(
+                "[agentos] POSIX record lock waiter usage {}/{} is near the limit derived from limits.resources.maxOpenFds; raise limits.resources.maxOpenFds if needed",
+                waiter_count,
+                self.inner.max_record_locks
+            );
+        }
+        state.record_lock_waits.insert(
+            request.pid,
+            RecordLockWait {
+                target,
+                request,
+                blockers,
+            },
+        );
+        if record_lock_wait_cycle(state, request.pid) {
+            state.record_lock_waits.remove(&request.pid);
+            return Err(FdTableError::deadlock(
+                "POSIX record lock wait would create a deadlock",
+            ));
+        }
+        Ok(())
+    }
+
     fn acquire(
         &self,
         owner_id: u64,
@@ -959,6 +1809,85 @@ impl FileLockManager {
             state = wait_or_recover(&self.inner.wake, state);
         }
     }
+}
+
+fn record_ranges_overlap(left: RecordLock, right: RecordLock) -> bool {
+    left.end.is_none_or(|end| right.start < end) && right.end.is_none_or(|end| left.start < end)
+}
+
+fn record_locks_conflict(left: RecordLock, right: RecordLock) -> bool {
+    record_ranges_overlap(left, right)
+        && (left.lock_type == RecordLockType::Write || right.lock_type == RecordLockType::Write)
+}
+
+fn conflicting_record_lock_pids(
+    locks: &[(FileLockTarget, RecordLock)],
+    target: FileLockTarget,
+    request: RecordLock,
+) -> BTreeSet<u32> {
+    locks
+        .iter()
+        .filter_map(|(candidate_target, candidate)| {
+            (*candidate_target == target
+                && candidate.pid != request.pid
+                && record_locks_conflict(*candidate, request))
+            .then_some(candidate.pid)
+        })
+        .collect()
+}
+
+fn refresh_record_lock_waits(state: &mut FileLockState) {
+    let FileLockState {
+        record_locks,
+        record_lock_waits,
+        ..
+    } = state;
+    for wait in record_lock_waits.values_mut() {
+        wait.blockers = conflicting_record_lock_pids(record_locks, wait.target, wait.request);
+    }
+}
+
+fn record_lock_wait_cycle(state: &FileLockState, requester: u32) -> bool {
+    let Some(wait) = state.record_lock_waits.get(&requester) else {
+        return false;
+    };
+    let mut pending = wait.blockers.iter().copied().collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    while let Some(pid) = pending.pop() {
+        if pid == requester {
+            return true;
+        }
+        if !visited.insert(pid) {
+            continue;
+        }
+        if let Some(wait) = state.record_lock_waits.get(&pid) {
+            pending.extend(wait.blockers.iter().copied());
+        }
+    }
+    false
+}
+
+fn coalesce_record_locks(locks: &mut Vec<(FileLockTarget, RecordLock)>) {
+    locks.sort_by_key(|(target, lock)| (*target, lock.pid, lock.lock_type as u8, lock.start));
+    let mut merged: Vec<(FileLockTarget, RecordLock)> = Vec::with_capacity(locks.len());
+    for (target, lock) in locks.drain(..) {
+        if let Some((previous_target, previous)) = merged.last_mut() {
+            let touches = previous.end.is_none_or(|end| lock.start <= end);
+            if *previous_target == target
+                && previous.pid == lock.pid
+                && previous.lock_type == lock.lock_type
+                && touches
+            {
+                previous.end = match (previous.end, lock.end) {
+                    (None, _) | (_, None) => None,
+                    (Some(left), Some(right)) => Some(left.max(right)),
+                };
+                continue;
+            }
+        }
+        merged.push((target, lock));
+    }
+    *locks = merged;
 }
 
 impl FileLockEntry {

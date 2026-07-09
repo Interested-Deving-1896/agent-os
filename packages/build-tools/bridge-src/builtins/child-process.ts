@@ -263,26 +263,28 @@ function routeChildProcessEvent(sessionId, type, data) {
     completeDetachedChildBootstrap(child);
     const wasConnected = child.connected;
     child.connected = false;
-    const signalCode = child._pendingSignalCode ?? (data && typeof data === "object" ? data.signal ?? null : null);
+    const signalCode = data && typeof data === "object" ? data.signal ?? null : null;
     const exitCode = data && typeof data === "object" ? data.code : data;
     child._pendingSignalCode = null;
     child.signalCode = signalCode;
     child.exitCode = signalCode == null ? exitCode : null;
-    child.stdout.emit("end");
-    child.stderr.emit("end");
     if (wasConnected) {
       child.emit("disconnect");
     }
-    child.emit("close", child.exitCode, child.signalCode);
     child.emit("exit", child.exitCode, child.signalCode);
-    if (Array.isArray(child._inheritedFds)) {
-      for (const fd of child._inheritedFds) releaseChildInheritedFd(fd);
-      child._inheritedFds = [];
-    }
-    childProcessInstances.delete(sessionId);
-    if (typeof _unregisterHandle === "function") {
-      _unregisterHandle(`child:${sessionId}`);
-    }
+    child.stdout.emit("end");
+    child.stderr.emit("end");
+    queueMicrotask(() => {
+      child.emit("close", child.exitCode, child.signalCode);
+      if (Array.isArray(child._inheritedFds)) {
+        for (const fd of child._inheritedFds) releaseChildInheritedFd(fd);
+        child._inheritedFds = [];
+      }
+      childProcessInstances.delete(sessionId);
+      if (typeof _unregisterHandle === "function") {
+        _unregisterHandle(`child:${sessionId}`);
+      }
+    });
   }
 }
 var childProcessDispatch = (eventTypeOrSessionId, payloadOrType, data) => {
@@ -942,7 +944,7 @@ var ChildProcess = class {
     }
   }
   _complete(stdout, stderr, code) {
-    const signalCode = this._pendingSignalCode ?? this.signalCode;
+    const signalCode = this.signalCode;
     this._pendingSignalCode = null;
     this.signalCode = signalCode ?? null;
     this.exitCode = signalCode == null ? code : null;
@@ -954,10 +956,10 @@ var ChildProcess = class {
       const buf = typeof Buffer !== "undefined" ? Buffer.from(stderr) : stderr;
       this.stderr.emit("data", buf);
     }
+    this.emit("exit", this.exitCode, this.signalCode);
     this.stdout.emit("end");
     this.stderr.emit("end");
-    this.emit("close", this.exitCode, this.signalCode);
-    this.emit("exit", this.exitCode, this.signalCode);
+    queueMicrotask(() => this.emit("close", this.exitCode, this.signalCode));
   }
 };
 function exec(command, options, callback) {
@@ -1056,9 +1058,12 @@ function execSync(command, options) {
     JSON.stringify({
       cwd: effectiveCwd,
       env: opts.env,
+      argv0: opts.argv0 == null ? void 0 : String(opts.argv0),
       input: opts.input == null ? null : encodeBridgeBytes(opts.input),
       maxBuffer,
-      shell: true
+      shell: true,
+      timeout: Number.isInteger(opts.timeout) && opts.timeout > 0 ? opts.timeout : null,
+      killSignal: normalizeChildProcessSignal(opts.killSignal).signalCode ?? "SIGTERM"
     })
   ]);
   const result = typeof jsonResult === "string" ? JSON.parse(jsonResult) : jsonResult;
@@ -1070,6 +1075,16 @@ function execSync(command, options) {
     result.stdout = typeof result.stdout === "string" ? "" : Buffer.from("");
   }
   redirectSyncOutputToInheritedFd(execSyncStdio[2], result.stderr);
+  if (result.timedOut) {
+    const err = new Error(`spawnSync ${command} ETIMEDOUT`);
+    err.code = "ETIMEDOUT";
+    err.status = result.signal == null && typeof result.code === "number" ? result.code : null;
+    err.signal = result.signal ?? null;
+    err.stdout = result.stdout;
+    err.stderr = result.stderr;
+    err.output = [null, result.stdout, result.stderr];
+    throw err;
+  }
   if (result.maxBufferExceeded) {
     const err = new Error("stdout maxBuffer length exceeded");
     err.code = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
@@ -1077,9 +1092,10 @@ function execSync(command, options) {
     err.stderr = result.stderr;
     throw err;
   }
-  if (result.code !== 0) {
+  if (result.code !== 0 || result.signal != null) {
     const err = new Error("Command failed: " + command);
-    err.status = result.code;
+    err.status = result.signal == null ? result.code : null;
+    err.signal = result.signal ?? null;
     err.stdout = result.stdout;
     err.stderr = result.stderr;
     err.output = [null, result.stdout, result.stderr];
@@ -1129,6 +1145,7 @@ function spawn(command, args, options) {
         JSON.stringify({
           cwd: effectiveCwd,
           env: opts.env,
+          argv0: opts.argv0 == null ? void 0 : String(opts.argv0),
           shell: opts.shell === true || typeof opts.shell === "string",
           detached: opts.detached === true
         })
@@ -1264,6 +1281,7 @@ function spawnSync(command, args, options) {
       JSON.stringify({
         cwd: effectiveCwd,
         env: opts.env,
+        argv0: opts.argv0 == null ? void 0 : String(opts.argv0),
         input: opts.input == null ? null : encodeBridgeBytes(opts.input),
         maxBuffer,
         shell: opts.shell === true || typeof opts.shell === "string",
@@ -1291,8 +1309,8 @@ function spawnSync(command, args, options) {
         output: [null, stdoutValue, stderrValue],
         stdout: stdoutValue,
         stderr: stderrValue,
-        status: null,
-        signal: result.signal ?? killSignal,
+        status: typeof result.code === "number" && result.signal == null ? result.code : null,
+        signal: result.signal ?? null,
         error: err
       };
     }
@@ -1304,8 +1322,8 @@ function spawnSync(command, args, options) {
         output: [null, stdoutValue, stderrValue],
         stdout: stdoutValue,
         stderr: stderrValue,
-        status: result.code,
-        signal: null,
+        status: typeof result.code === "number" && result.signal == null ? result.code : null,
+        signal: result.signal ?? null,
         error: err
       };
     }
@@ -1314,8 +1332,8 @@ function spawnSync(command, args, options) {
       output: [null, stdoutValue, stderrValue],
       stdout: stdoutValue,
       stderr: stderrValue,
-      status: result.code,
-      signal: null,
+      status: typeof result.code === "number" && result.signal == null ? result.code : null,
+      signal: result.signal ?? null,
       error: void 0
     };
   } catch (err) {

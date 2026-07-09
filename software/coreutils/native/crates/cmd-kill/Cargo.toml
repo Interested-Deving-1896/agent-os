@@ -1,0 +1,14 @@
+[package]
+workspace = "../../../../../toolchain"
+name = "cmd-kill"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "kill standalone binary for AgentOS VMs"
+
+[[bin]]
+name = "kill"
+path = "src/main.rs"
+
+[dependencies]
+uu_kill = "0.7.0"

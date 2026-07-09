@@ -8,8 +8,8 @@ describe("wasi command bootstrap", () => {
 			command: "sh",
 			args: ["-i"],
 			commands: {
-				echo: "/commands/echo",
-				ls: "/commands/ls",
+				"/bin/echo": "/commands/echo",
+				"/bin/ls": "/commands/ls",
 			},
 			env: {
 				PATH: "/bin:/usr/bin",

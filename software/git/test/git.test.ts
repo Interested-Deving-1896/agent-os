@@ -11,6 +11,7 @@ import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https';
 import { spawn, spawnSync, execSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createWasmVmRuntime } from '@agentos/test-harness';
 import {
   allowAll,
@@ -588,18 +589,45 @@ describeIf(hasGit, 'git command', () => {
     let untrustedPort: number;
     let trustedCaPem = '';
     let untrustedCaPem = '';
+    let sawChunkedReceivePack = false;
+    let receivePackBodyBytes = 0;
+    let receivePackBodyEnded = false;
+    let receivePackOffset = -1;
+    let receivePackObjectCount = -1;
+    let receivePackTrailerValid = false;
 
     // A CGI bridge to `git http-backend`. receive-pack is enabled on the origin
     // (below) so pushes are accepted; GIT_HTTP_EXPORT_ALL allows anonymous read.
     function makeBackendHandler() {
       return (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => {
         const url = new URL(req.url ?? '/', 'https://127.0.0.1');
+        const isReceivePack =
+          req.method === 'POST' &&
+          url.pathname.endsWith('/git-receive-pack');
+        if (
+          isReceivePack &&
+          String(req.headers['transfer-encoding'] ?? '').split(/\s*,\s*/).includes('chunked')
+        ) {
+          sawChunkedReceivePack = true;
+        }
         const bodyChunks: Buffer[] = [];
         req.on('data', (chunk) => {
           bodyChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
         });
         req.on('end', () => {
           const requestBody = Buffer.concat(bodyChunks);
+          if (isReceivePack) {
+            receivePackBodyEnded = true;
+            receivePackBodyBytes = requestBody.length;
+            receivePackOffset = requestBody.indexOf(Buffer.from('PACK'));
+            if (receivePackOffset >= 0 && requestBody.length >= receivePackOffset + 32) {
+              receivePackObjectCount = requestBody.readUInt32BE(receivePackOffset + 8);
+              const pack = requestBody.subarray(receivePackOffset);
+              const expectedTrailer = pack.subarray(pack.length - 20);
+              const actualTrailer = createHash('sha1').update(pack.subarray(0, -20)).digest();
+              receivePackTrailerValid = actualTrailer.equals(expectedTrailer);
+            }
+          }
           const gitProtocol = req.headers['git-protocol'];
           const env = {
             ...process.env,
@@ -794,22 +822,41 @@ describeIf(hasGit, 'git command', () => {
       expect(originRef.stdout.trim()).toMatch(/^[0-9a-f]{40,64}$/);
     });
 
-    it('push streams a >1 MiB commit over HTTPS (chunked POST)', async () => {
+    it('push streams an unknown-size pack over HTTPS with chunked POST', async () => {
       ({ kernel, vfs, dispose } = await createGitKernelWithNet([trustedPort], trustedCaPem));
       await run(kernel, git(`clone ${trustedUrl()} /tmp/clone`));
 
-      // Incompressible >1 MiB payload so the pack exceeds http.postBuffer (1 MiB)
-      // and libcurl must use chunked Transfer-Encoding + Expect: 100-continue.
+      // Match upstream Git's smart-HTTP chunking coverage: lower the supported
+      // postBuffer knob and exceed it with incompressible data. Anonymous Git
+      // deliberately suppresses Expect: 100-continue, so chunked transfer is
+      // the Linux behavior under test here.
       const { randomBytes } = await import('node:crypto');
-      const big = randomBytes(2 * 1024 * 1024);
+      const big = randomBytes(Number(process.env.AGENTOS_GIT_PUSH_BYTES ?? 128 * 1024));
       await kernel.writeFile('/tmp/clone/big.bin', big);
       await run(kernel, git('-C /tmp/clone add big.bin'));
       await run(kernel, git("-C /tmp/clone commit -m 'push large'"));
+      const guestObjectSize = await run(
+        kernel,
+        git('-C /tmp/clone cat-file -s HEAD:big.bin'),
+      );
+      expect(Number(guestObjectSize.stdout.trim())).toBe(big.length);
+      sawChunkedReceivePack = false;
+      receivePackBodyBytes = 0;
+      receivePackBodyEnded = false;
+      receivePackOffset = -1;
+      receivePackObjectCount = -1;
+      receivePackTrailerValid = false;
       const pushed = await kernel.exec(
-        git('-C /tmp/clone push origin HEAD:refs/heads/large-push'),
+        git('-c http.postBuffer=65536 -C /tmp/clone push origin HEAD:refs/heads/large-push'),
         { env: { GIT_TRACE: '1' } },
       );
       expect(pushed.exitCode, pushed.stderr).toBe(0);
+      expect(sawChunkedReceivePack).toBe(true);
+      expect(receivePackBodyEnded).toBe(true);
+      expect(receivePackBodyBytes).toBeGreaterThan(big.length);
+      expect(receivePackOffset).toBeGreaterThanOrEqual(0);
+      expect(receivePackObjectCount).toBeGreaterThan(0);
+      expect(receivePackTrailerValid).toBe(true);
       const demuxStart = pushed.stderr.indexOf('sideband--helper demux send-pack');
       const packStart = pushed.stderr.indexOf('pack-objects');
       expect(demuxStart, pushed.stderr).toBeGreaterThanOrEqual(0);
@@ -824,11 +871,12 @@ describeIf(hasGit, 'git command', () => {
       // Confirm the large object is actually present in the origin object store.
       const cat = spawnSync(
         'git',
-        ['-C', join(repoRoot, 'origin.git'), 'cat-file', '-s', `${originRef.stdout.trim()}^{tree}`],
+        ['-C', join(repoRoot, 'origin.git'), 'cat-file', '-s', `${originRef.stdout.trim()}:big.bin`],
         { encoding: 'utf8' },
       );
       expect(cat.status).toBe(0);
-    });
+      expect(Number(cat.stdout.trim())).toBe(big.length);
+    }, Number(process.env.AGENTOS_GIT_PUSH_TIMEOUT_MS ?? 60_000));
 
     it('pack-objects failure reports the same smart-HTTP transport failure as native Git', async () => {
       const trustedCaPath = join(repoRoot, 'trusted-ca.pem');

@@ -1,11 +1,12 @@
 use crate::bridge::{build_mount_plugin_registry, MountPluginContext};
 pub(crate) use crate::execution::{
-    build_javascript_socket_path_context, canonical_signal_name, dispatch_loopback_http_request,
-    error_code, format_tcp_resource, ignore_stale_javascript_sync_rpc_response,
-    javascript_sync_rpc_arg_i32, javascript_sync_rpc_arg_str, javascript_sync_rpc_arg_u32,
-    javascript_sync_rpc_arg_u32_optional, javascript_sync_rpc_arg_u64,
-    javascript_sync_rpc_arg_u64_optional, javascript_sync_rpc_bytes_arg,
-    javascript_sync_rpc_bytes_value, javascript_sync_rpc_encoding, javascript_sync_rpc_error_code,
+    apply_active_process_default_signal, build_javascript_socket_path_context,
+    canonical_signal_name, dispatch_loopback_http_request, error_code, flush_pending_kernel_stdin,
+    format_tcp_resource, ignore_stale_javascript_sync_rpc_response, javascript_sync_rpc_arg_i32,
+    javascript_sync_rpc_arg_str, javascript_sync_rpc_arg_u32, javascript_sync_rpc_arg_u32_optional,
+    javascript_sync_rpc_arg_u64, javascript_sync_rpc_arg_u64_optional,
+    javascript_sync_rpc_bytes_arg, javascript_sync_rpc_bytes_value, javascript_sync_rpc_encoding,
+    javascript_sync_rpc_error_code, javascript_sync_rpc_may_make_fd_readable,
     javascript_sync_rpc_option_bool, javascript_sync_rpc_option_u32, kernel_poll_response,
     kernel_stdin_read_response, mark_execute_exit_event_queued, parse_kernel_poll_args,
     parse_kernel_stdin_read_args, parse_signal, record_execute_exit_event_queue_wait,
@@ -144,26 +145,15 @@ pub use crate::state::{NativeSidecarConfig, SidecarError};
 
 #[derive(Debug, Default, Deserialize)]
 struct LegacyJavascriptChildProcessSpawnOptions {
-    #[serde(default)]
-    argv0: Option<String>,
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    env: BTreeMap<String, String>,
-    #[serde(default)]
-    input: Option<Value>,
-    #[serde(default)]
-    shell: bool,
-    #[serde(default)]
-    detached: bool,
-    #[serde(default)]
-    stdio: Vec<String>,
+    // The V8 sync host binding still carries command/argv/options as three
+    // strings. Flatten the canonical options object here so every newly added
+    // field crosses that compatibility bridge automatically; keeping a second
+    // hand-copied field list previously dropped POSIX spawn attributes and fd
+    // mappings without an error.
+    #[serde(flatten)]
+    options: JavascriptChildProcessSpawnOptions,
     #[serde(default, rename = "maxBuffer")]
     max_buffer: Option<usize>,
-    #[serde(default)]
-    timeout: Option<u64>,
-    #[serde(default, rename = "killSignal")]
-    kill_signal: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,36 +187,38 @@ pub(crate) fn parse_javascript_child_process_spawn_request(
     let parsed_args = serde_json::from_str::<Vec<String>>(raw_args).map_err(|error| {
         SidecarError::InvalidState(format!("invalid child_process.spawn args payload: {error}"))
     })?;
-    let parsed_options = serde_json::from_str::<LegacyJavascriptChildProcessSpawnOptions>(
-        raw_options,
-    )
-    .map_err(|error| {
-        SidecarError::InvalidState(format!(
-            "invalid child_process.spawn options payload: {error}"
-        ))
-    })?;
+    let parsed_options =
+        parse_legacy_javascript_child_process_spawn_options(&vm.guest_env, raw_options)?;
+    let max_buffer = parsed_options.max_buffer;
+    let options = parsed_options.options;
 
     Ok((
         JavascriptChildProcessSpawnRequest {
             command,
             args: parsed_args,
-            options: JavascriptChildProcessSpawnOptions {
-                argv0: parsed_options.argv0,
-                cwd: parsed_options.cwd,
-                env: parsed_options.env,
-                internal_bootstrap_env: sanitize_javascript_child_process_internal_bootstrap_env(
-                    &vm.guest_env,
-                ),
-                input: parsed_options.input,
-                shell: parsed_options.shell,
-                detached: parsed_options.detached,
-                stdio: parsed_options.stdio,
-                timeout: parsed_options.timeout,
-                kill_signal: parsed_options.kill_signal,
-            },
+            options,
         },
-        parsed_options.max_buffer,
+        max_buffer,
     ))
+}
+
+fn parse_legacy_javascript_child_process_spawn_options(
+    vm_guest_env: &BTreeMap<String, String>,
+    raw_options: &str,
+) -> Result<LegacyJavascriptChildProcessSpawnOptions, SidecarError> {
+    let mut parsed = serde_json::from_str::<LegacyJavascriptChildProcessSpawnOptions>(raw_options)
+        .map_err(|error| {
+            SidecarError::InvalidState(format!(
+                "invalid child_process.spawn options payload: {error}"
+            ))
+        })?;
+    let mut internal_bootstrap_env =
+        sanitize_javascript_child_process_internal_bootstrap_env(vm_guest_env);
+    internal_bootstrap_env.extend(sanitize_javascript_child_process_internal_bootstrap_env(
+        &parsed.options.internal_bootstrap_env,
+    ));
+    parsed.options.internal_bootstrap_env = internal_bootstrap_env;
+    Ok(parsed)
 }
 
 impl<B> SharedBridge<B> {
@@ -672,6 +664,7 @@ pub struct NativeSidecar<B> {
     pub(crate) completed_sidecar_response_order: VecDeque<RequestId>,
     pub(crate) completed_sidecar_responses_gauge: Arc<QueueGauge>,
     pub(crate) pending_process_events_gauge: Arc<QueueGauge>,
+    pub(crate) pending_process_event_bytes_gauge: Arc<QueueGauge>,
     pub(crate) pending_sidecar_responses_gauge: Arc<QueueGauge>,
     pub(crate) outbound_sidecar_requests_gauge: Arc<QueueGauge>,
     pub(crate) sidecar_requests: SharedSidecarRequestClient,
@@ -680,6 +673,8 @@ pub struct NativeSidecar<B> {
     pub(crate) extension_sessions: BTreeMap<(String, String), ExtensionSessionResources>,
     pub(crate) extension_process_output_buffers:
         BTreeMap<(String, String), ExtensionBufferedProcessOutput>,
+    #[cfg(test)]
+    pub(crate) fail_next_exec_start_after_commit: bool,
     /// Session scopes (connection_id, session_id) disposed since the stdio
     /// transport last drained them. Lets the transport remove dead sessions from
     /// its active-session set instead of iterating them forever (M5).
@@ -777,6 +772,10 @@ where
                 TrackedLimit::PendingProcessEvents,
                 MAX_PROCESS_EVENT_QUEUE,
             ),
+            pending_process_event_bytes_gauge: register_queue(
+                TrackedLimit::PendingProcessEventBytes,
+                agentos_native_sidecar_core::limits::DEFAULT_PROCESS_PENDING_EVENT_BYTES,
+            ),
             pending_sidecar_responses_gauge: register_queue(
                 TrackedLimit::PendingSidecarResponses,
                 MAX_PENDING_SIDECAR_RESPONSES,
@@ -790,6 +789,8 @@ where
             extensions: BTreeMap::new(),
             extension_sessions: BTreeMap::new(),
             extension_process_output_buffers: BTreeMap::new(),
+            #[cfg(test)]
+            fail_next_exec_start_after_commit: false,
             disposed_sessions: Vec::new(),
         })
     }
@@ -1048,15 +1049,22 @@ where
         &mut self,
         envelope: ProcessEventEnvelope,
     ) -> Result<(), SidecarError> {
-        if self.pending_process_events.len() >= MAX_PROCESS_EVENT_QUEUE {
-            return Err(process_event_queue_overflow_error());
+        self.try_queue_pending_process_event(envelope)
+            .map_err(|(error, _envelope)| error)
+    }
+
+    pub(crate) fn try_queue_pending_process_event(
+        &mut self,
+        envelope: ProcessEventEnvelope,
+    ) -> Result<(), (SidecarError, ProcessEventEnvelope)> {
+        if let Err(error) = self.check_pending_process_event_capacity(&envelope) {
+            return Err((error, envelope));
         }
         if matches!(&envelope.event, ActiveExecutionEvent::Exited(_)) {
             mark_execute_exit_event_queued(&envelope.vm_id, &envelope.process_id);
         }
         self.pending_process_events.push_back(envelope);
-        self.pending_process_events_gauge
-            .observe_depth(self.pending_process_events.len());
+        self.observe_pending_process_event_depth();
         Ok(())
     }
 
@@ -1064,20 +1072,68 @@ where
         &mut self,
         envelope: ProcessEventEnvelope,
     ) -> Result<(), SidecarError> {
-        if self.pending_process_events.len() >= MAX_PROCESS_EVENT_QUEUE {
-            return Err(process_event_queue_overflow_error());
-        }
+        self.check_pending_process_event_capacity(&envelope)?;
         if matches!(&envelope.event, ActiveExecutionEvent::Exited(_)) {
             mark_execute_exit_event_queued(&envelope.vm_id, &envelope.process_id);
         }
         self.pending_process_events.push_front(envelope);
-        self.pending_process_events_gauge
-            .observe_depth(self.pending_process_events.len());
+        self.observe_pending_process_event_depth();
         Ok(())
     }
 
     pub(crate) fn pending_process_event_capacity(&self) -> usize {
         MAX_PROCESS_EVENT_QUEUE.saturating_sub(self.pending_process_events.len())
+    }
+
+    pub(crate) fn check_pending_process_event_capacity(
+        &self,
+        envelope: &ProcessEventEnvelope,
+    ) -> Result<(), SidecarError> {
+        if self.pending_process_events.len() >= MAX_PROCESS_EVENT_QUEUE {
+            return Err(process_event_queue_overflow_error());
+        }
+        let defaults = agentos_native_sidecar_core::limits::ProcessLimits::default();
+        let limits = self
+            .vms
+            .get(&envelope.vm_id)
+            .map(|vm| &vm.limits.process)
+            .unwrap_or(&defaults);
+        let mut vm_count = 0usize;
+        let mut vm_bytes = 0usize;
+        for pending in self
+            .pending_process_events
+            .iter()
+            .filter(|pending| pending.vm_id == envelope.vm_id)
+        {
+            vm_count = vm_count.saturating_add(1);
+            vm_bytes = vm_bytes.saturating_add(pending.retained_bytes());
+        }
+        if vm_count >= limits.pending_event_count {
+            return Err(SidecarError::InvalidState(format!(
+                "VM {} process event queue exceeded {} events (limits.process.pendingEventCount)",
+                envelope.vm_id, limits.pending_event_count
+            )));
+        }
+        let next_bytes = vm_bytes.saturating_add(envelope.retained_bytes());
+        if next_bytes > limits.pending_event_bytes {
+            return Err(SidecarError::InvalidState(format!(
+                "VM {} process event queue exceeded {} retained bytes (limits.process.pendingEventBytes)",
+                envelope.vm_id, limits.pending_event_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe_pending_process_event_depth(&self) {
+        self.pending_process_events_gauge
+            .observe_depth(self.pending_process_events.len());
+        self.pending_process_event_bytes_gauge.observe_depth(
+            self.pending_process_events
+                .iter()
+                .fold(0usize, |bytes, event| {
+                    bytes.saturating_add(event.retained_bytes())
+                }),
+        );
     }
 
     pub fn dispatch_blocking(
@@ -1309,6 +1365,7 @@ where
                 let Some(envelope) = self.pending_process_events.remove(index) else {
                     continue;
                 };
+                self.observe_pending_process_event_depth();
                 if let Some(frame) = self.handle_process_event_envelope(envelope)? {
                     return Ok(Some(frame));
                 }
@@ -1403,21 +1460,8 @@ where
                 }
             }
             self.pending_process_events = deferred;
+            self.observe_pending_process_event_depth();
             record_execute_phase("process_exit_trailing_pending_scan", phase_start.elapsed());
-            let drain_limit = self
-                .pending_process_event_capacity()
-                .saturating_sub(trailing.len().saturating_add(1));
-            let phase_start = Instant::now();
-            trailing.extend(
-                self.drain_process_events_blocking_with_limit(&vm_id, &process_id, drain_limit)?
-                    .into_iter()
-                    .filter(|event| !matches!(event, ActiveExecutionEvent::Exited(_))),
-            );
-            record_execute_phase(
-                "process_exit_trailing_blocking_drain",
-                phase_start.elapsed(),
-            );
-
             if !trailing.is_empty() {
                 if self.pending_process_event_capacity() < trailing.len() {
                     return Err(process_event_queue_overflow_error());
@@ -1797,6 +1841,10 @@ where
             log_stale_process_event(&self.bridge, vm_id, process_id, "deferred kernel wait RPC");
             return Ok(None);
         };
+        // Reading from the pipe frees capacity. Top it off before every root
+        // process read/poll probe, matching the descendant-process path, and
+        // deliver a deferred close only after all accepted bytes are written.
+        flush_pending_kernel_stdin(&mut vm.kernel, process)?;
         let kernel_pid = process.kernel_pid;
         let deadline = match &process.deferred_kernel_wait_rpc {
             Some((parked, parked_deadline)) if parked.id == request.id => *parked_deadline,
@@ -1976,6 +2024,42 @@ where
                     )?;
                     Ok(Value::Null.into())
                 }
+                "process.exec_fd_image_commit" => {
+                    let Some(vm) = self.vms.get(vm_id) else {
+                        log_stale_process_event(
+                            &self.bridge,
+                            vm_id,
+                            process_id,
+                            "javascript sync RPC process.exec_fd_image_commit",
+                        );
+                        return Ok(());
+                    };
+                    let (payload, _) =
+                        parse_javascript_child_process_spawn_request(vm, &request.args)?;
+                    self.commit_wasm_fd_process_image(vm_id, process_id, &[], payload)?;
+                    Ok(json!({ "committed": true }).into())
+                }
+                "process.exec" => {
+                    let Some(vm) = self.vms.get(vm_id) else {
+                        log_stale_process_event(
+                            &self.bridge,
+                            vm_id,
+                            process_id,
+                            "javascript sync RPC process.exec",
+                        );
+                        return Ok(());
+                    };
+                    let (payload, _) =
+                        parse_javascript_child_process_spawn_request(vm, &request.args)?;
+                    let local_replacement = payload.options.local_replacement;
+                    match self.exec_javascript_process_image(vm_id, process_id, &[], payload) {
+                        Ok(()) if local_replacement => Ok(json!({ "committed": true }).into()),
+                        // Success destroys the blocked old image. Never reply:
+                        // returning would resume instructions after execve.
+                        Ok(()) => return Ok(()),
+                        Err(error) => Err(error),
+                    }
+                }
                 "process.kill" => {
                     let target_pid =
                         javascript_sync_rpc_arg_i32(&request.args, 0, "process.kill target pid")?;
@@ -2029,9 +2113,9 @@ where
                         };
                         let pgid = target_pid.unsigned_abs();
                         match self.signal_vm_process_group(vm_id, caller_kernel_pid, pgid, signal) {
-                            Ok(true) => Ok(self
+                            Ok(true) => self
                                 .apply_self_process_kill(vm_id, process_id, parsed_signal)
-                                .into()),
+                                .map(Into::into),
                             Ok(false) => Ok(Value::Null.into()),
                             Err(error) => Err(error),
                         }
@@ -2089,9 +2173,9 @@ where
                             }
                         };
                         match target {
-                            ProcessKillTarget::SelfProcess => Ok(self
+                            ProcessKillTarget::SelfProcess => self
                                 .apply_self_process_kill(vm_id, process_id, parsed_signal)
-                                .into()),
+                                .map(Into::into),
                             ProcessKillTarget::Child(child_process_id) => {
                                 self.kill_javascript_child_process(
                                     vm_id,
@@ -2286,6 +2370,12 @@ where
                 }
             };
 
+        if response.is_ok() && javascript_sync_rpc_may_make_fd_readable(&request) {
+            if let Some(vm) = self.vms.get_mut(vm_id) {
+                Self::wake_ready_deferred_fd_reads(vm)?;
+            }
+        }
+
         let Some(vm) = self.vms.get_mut(vm_id) else {
             log_stale_process_event(
                 &self.bridge,
@@ -2353,7 +2443,7 @@ where
         vm_id: &str,
         process_id: &str,
         parsed_signal: i32,
-    ) -> Value {
+    ) -> Result<Value, SidecarError> {
         let action = self
             .vms
             .get(vm_id)
@@ -2370,18 +2460,18 @@ where
         {
             if let Some(vm) = self.vms.get_mut(vm_id) {
                 if let Some(process) = vm.active_processes.get_mut(process_id) {
-                    process.pending_self_signal_exit = Some(parsed_signal);
+                    apply_active_process_default_signal(&mut vm.kernel, process, parsed_signal)?;
                 }
             }
         }
-        json!({
+        Ok(json!({
             "self": true,
             "action": match action {
                 SignalDispositionAction::Default => "default",
                 SignalDispositionAction::Ignore => "ignore",
                 SignalDispositionAction::User => "user",
             },
-        })
+        }))
     }
 
     pub(crate) fn vm_ids_for_scope(
@@ -2511,7 +2601,9 @@ where
             .iter()
             .position(|event| event.vm_id == vm_id && event.process_id == process_id)
         {
-            return Ok(self.pending_process_events.remove(index));
+            let envelope = self.pending_process_events.remove(index);
+            self.observe_pending_process_event_depth();
+            return Ok(envelope);
         }
 
         let mut matching_envelope = None;
@@ -3345,6 +3437,118 @@ fn symlinked_node_modules_hint(stderr: &str) -> Option<&'static str> {
         return Some(HOISTED_NODE_MODULES_GUIDANCE);
     }
     None
+}
+
+#[cfg(test)]
+mod legacy_child_spawn_options_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_v8_string_bridge_preserves_canonical_spawn_options() {
+        let vm_guest_env = BTreeMap::from([
+            (
+                String::from("AGENTOS_ALLOWED_NODE_BUILTINS"),
+                String::from("node:path"),
+            ),
+            (String::from("AGENTOS_NOT_ALLOWED"), String::from("drop-me")),
+        ]);
+        let parsed = parse_legacy_javascript_child_process_spawn_options(
+            &vm_guest_env,
+            r#"{
+                "argv0":"custom-zero",
+                "cloexecFds":[9,10],
+                "localReplacement":true,
+                "executableFd":11,
+                "cwd":"/work",
+                "env":{"VISIBLE":"yes"},
+                "internalBootstrapEnv":{
+                    "AGENTOS_WASM_INITIAL_SIGNAL_MASK":"[10]",
+                    "AGENTOS_NOT_ALLOWED":"drop-me-too"
+                },
+                "spawnAttrFlags":70,
+                "spawnExactPath":false,
+                "spawnSearchPath":"/custom/bin:/bin",
+                "spawnSchedPolicy":0,
+                "spawnSchedPriority":0,
+                "spawnPgroup":42,
+                "spawnSignalDefaults":[13],
+                "spawnSignalMask":[10,12],
+                "spawnFileActions":[{
+                    "command":2,
+                    "guestFd":41,
+                    "fd":8,
+                    "sourceFd":7,
+                    "guestSourceFd":40,
+                    "oflag":0,
+                    "mode":420,
+                    "path":"/tmp/unused"
+                }],
+                "spawnFdMappings":[[40,7],[50,8]],
+                "input":{"type":"Buffer","data":[97]},
+                "shell":true,
+                "detached":true,
+                "stdio":["pipe","inherit","ignore"],
+                "maxBuffer":1234,
+                "timeout":5678,
+                "killSignal":"SIGUSR2"
+            }"#,
+        )
+        .expect("parse V8 three-string options payload");
+
+        assert_eq!(parsed.max_buffer, Some(1234));
+        let options = parsed.options;
+        assert_eq!(options.argv0.as_deref(), Some("custom-zero"));
+        assert_eq!(options.cloexec_fds, vec![9, 10]);
+        assert!(options.local_replacement);
+        assert_eq!(options.executable_fd, Some(11));
+        assert_eq!(options.cwd.as_deref(), Some("/work"));
+        assert_eq!(options.env.get("VISIBLE").map(String::as_str), Some("yes"));
+        assert_eq!(
+            options
+                .internal_bootstrap_env
+                .get("AGENTOS_ALLOWED_NODE_BUILTINS")
+                .map(String::as_str),
+            Some("node:path")
+        );
+        assert_eq!(
+            options
+                .internal_bootstrap_env
+                .get("AGENTOS_WASM_INITIAL_SIGNAL_MASK")
+                .map(String::as_str),
+            Some("[10]")
+        );
+        assert!(!options
+            .internal_bootstrap_env
+            .contains_key("AGENTOS_NOT_ALLOWED"));
+        assert_eq!(options.spawn_attr_flags, 70);
+        assert!(!options.spawn_exact_path);
+        assert_eq!(
+            options.spawn_search_path.as_deref(),
+            Some("/custom/bin:/bin")
+        );
+        assert_eq!(options.spawn_sched_policy, Some(0));
+        assert_eq!(options.spawn_sched_priority, Some(0));
+        assert_eq!(options.spawn_pgroup, Some(42));
+        assert_eq!(options.spawn_signal_defaults, vec![13]);
+        assert_eq!(options.spawn_signal_mask, vec![10, 12]);
+        assert_eq!(options.spawn_fd_mappings, vec![[40, 7], [50, 8]]);
+        assert_eq!(options.spawn_file_actions.len(), 1);
+        let action = &options.spawn_file_actions[0];
+        assert_eq!(action.command, 2);
+        assert_eq!(action.guest_fd, Some(41));
+        assert_eq!(action.fd, 8);
+        assert_eq!(action.source_fd, 7);
+        assert_eq!(action.guest_source_fd, Some(40));
+        assert_eq!(action.oflag, 0);
+        assert_eq!(action.mode, 420);
+        assert_eq!(action.path, "/tmp/unused");
+        assert_eq!(options.input, Some(json!({"type":"Buffer","data":[97]})));
+        assert!(options.shell);
+        assert!(options.detached);
+        assert_eq!(options.stdio, vec!["pipe", "inherit", "ignore"]);
+        assert_eq!(options.timeout, Some(5678));
+        assert_eq!(options.kill_signal.as_deref(), Some("SIGUSR2"));
+    }
 }
 
 #[cfg(test)]

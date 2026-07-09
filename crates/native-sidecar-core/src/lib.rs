@@ -3,6 +3,7 @@
 //! Backend-agnostic sidecar logic shared by native and browser shells.
 
 pub mod bridge_bytes;
+pub mod ca;
 pub mod diagnostics;
 pub mod frames;
 pub mod guest_fs;
@@ -15,6 +16,7 @@ pub mod net;
 pub mod permissions;
 pub mod root_fs;
 pub mod router;
+pub mod services;
 pub mod signals;
 pub mod tools;
 pub mod vm_fetch;

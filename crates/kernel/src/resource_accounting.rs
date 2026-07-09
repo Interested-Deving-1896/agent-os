@@ -23,7 +23,7 @@ pub const DEFAULT_MAX_SOCKETS: usize = 256;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 pub const DEFAULT_MAX_SOCKET_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_SOCKET_DATAGRAM_QUEUE_LEN: usize = 1_024;
-pub const DEFAULT_BLOCKING_READ_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_BLOCKING_READ_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_MAX_PREAD_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_FD_WRITE_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_PROCESS_ARGV_BYTES: usize = 1024 * 1024;
@@ -572,7 +572,7 @@ impl ResourceAccountant {
         if let Some(limit) = self.limits.max_filesystem_bytes {
             if resulting_bytes > limit {
                 return Err(ResourceError::filesystem_full(
-                    "maximum filesystem size limit reached",
+                    "maximum filesystem size limit reached; raise limits.resources.maxFilesystemBytes if needed",
                 ));
             }
         }
@@ -580,7 +580,7 @@ impl ResourceAccountant {
         if let Some(limit) = self.limits.max_inode_count {
             if resulting_inodes > limit {
                 return Err(ResourceError::filesystem_full(
-                    "maximum inode count limit reached",
+                    "maximum inode count limit reached; raise limits.resources.maxInodeCount if needed",
                 ));
             }
         }

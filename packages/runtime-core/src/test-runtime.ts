@@ -49,6 +49,8 @@ const KERNEL_POSIX_BOOTSTRAP_DIRS = [
 	"/srv",
 	"/sys",
 	"/opt",
+	"/opt/agentos",
+	"/opt/agentos/bin",
 	"/mnt",
 	"/media",
 	"/home",
@@ -82,9 +84,21 @@ const SIDECAR_BUILD_INPUTS = [
 	path.join(REPO_ROOT, "Cargo.toml"),
 	path.join(REPO_ROOT, "Cargo.lock"),
 	path.join(REPO_ROOT, "crates/bridge"),
+	path.join(REPO_ROOT, "crates/build-support"),
 	path.join(REPO_ROOT, "crates/execution"),
 	path.join(REPO_ROOT, "crates/kernel"),
-	path.join(REPO_ROOT, "crates/sidecar"),
+	path.join(REPO_ROOT, "crates/native-sidecar"),
+	path.join(REPO_ROOT, "crates/native-sidecar-core"),
+	path.join(REPO_ROOT, "crates/sidecar-protocol"),
+	path.join(REPO_ROOT, "crates/v8-runtime"),
+	path.join(REPO_ROOT, "crates/vfs"),
+	path.join(REPO_ROOT, "crates/vm-config"),
+	path.join(REPO_ROOT, "packages/build-tools/bridge-src"),
+	path.join(REPO_ROOT, "packages/build-tools/package.json"),
+	path.join(REPO_ROOT, "packages/build-tools/scripts/build-v8-bridge.mjs"),
+	path.join(REPO_ROOT, "packages/core/fixtures/base-filesystem.json"),
+	path.join(REPO_ROOT, "packages/runtime-core/fixtures/base-filesystem.json"),
+	path.join(REPO_ROOT, "pnpm-lock.yaml"),
 ] as const;
 
 export type KernelBootTimingPhase =
@@ -152,7 +166,12 @@ export interface VirtualFileSystem {
 	lstat(path: string): Promise<VirtualStat>;
 	link(oldPath: string, newPath: string): Promise<void>;
 	chmod(path: string, mode: number): Promise<void>;
-	chown(path: string, uid: number, gid: number): Promise<void>;
+	chown(
+		path: string,
+		uid: number,
+		gid: number,
+		options?: { followSymlinks?: boolean },
+	): Promise<void>;
 	utimes(path: string, atime: number, mtime: number): Promise<void>;
 	truncate(path: string, length: number): Promise<void>;
 	pread(path: string, offset: number, length: number): Promise<Uint8Array>;
@@ -899,8 +918,15 @@ export class InMemoryFileSystem implements VirtualFileSystem {
 		entry.ctimeMs = Date.now();
 	}
 
-	async chown(targetPath: string, uid: number, gid: number): Promise<void> {
-		const entry = this.resolveEntry(targetPath);
+	async chown(
+		targetPath: string,
+		uid: number,
+		gid: number,
+		options?: { followSymlinks?: boolean },
+	): Promise<void> {
+		const entry = options?.followSymlinks === false
+			? this.entries.get(normalizePath(targetPath))
+			: this.resolveEntry(targetPath);
 		if (!entry) throw errnoError("ENOENT", `chown '${targetPath}'`);
 		entry.uid = uid;
 		entry.gid = gid;
@@ -1176,8 +1202,18 @@ export class NodeFileSystem implements VirtualFileSystem {
 		await fs.chmod(this.normalizeTarget(targetPath), mode);
 	}
 
-	async chown(targetPath: string, uid: number, gid: number): Promise<void> {
-		await fs.chown(this.normalizeTarget(targetPath), uid, gid);
+	async chown(
+		targetPath: string,
+		uid: number,
+		gid: number,
+		options?: { followSymlinks?: boolean },
+	): Promise<void> {
+		const normalized = this.normalizeTarget(targetPath);
+		if (options?.followSymlinks === false) {
+			await fs.lchown(normalized, uid, gid);
+		} else {
+			await fs.chown(normalized, uid, gid);
+		}
 	}
 
 	async utimes(
@@ -1970,7 +2006,6 @@ function ensureNativeSidecarBinary(): string {
 	// the prebuilt platform binary (or an explicit sidecar override).
 	if (
 		process.env.AGENTOS_SIDECAR_BIN ||
-		process.env.AGENTOS_SIDECAR_BIN ||
 		!fsSync.existsSync(path.join(REPO_ROOT, "Cargo.toml"))
 	) {
 		return resolvePublishedSidecarBinary();
@@ -2016,7 +2051,7 @@ function createBootstrapEntries(commandNames: string[]): RootFilesystemEntry[] {
 		...KERNEL_POSIX_BOOTSTRAP_DIRS.map((entryPath) => ({
 			path: entryPath,
 			kind: "directory" as const,
-			mode: 0o755,
+			mode: entryPath === "/tmp" || entryPath === "/var/tmp" ? 0o1777 : 0o755,
 			uid: 0,
 			gid: 0,
 		})),
@@ -2234,9 +2269,16 @@ async function ensureCommandStubs(
 ): Promise<void> {
 	const rootView = proxy.createRootView();
 	for (const command of commands) {
-		const stubPath = `/bin/${command}`;
-		await rootView.writeFile(stubPath, KERNEL_COMMAND_STUB);
-		await rootView.chmod(stubPath, 0o755);
+		// `/bin` supports PATH-based test commands. `/opt/agentos/bin` mirrors
+		// the package projection used by production VMs and is required by
+		// upstream tools that exec private helpers via an absolute libexec path.
+		for (const stubPath of [
+			`/bin/${command}`,
+			`/opt/agentos/bin/${command}`,
+		]) {
+			await rootView.writeFile(stubPath, KERNEL_COMMAND_STUB);
+			await rootView.chmod(stubPath, 0o755);
+		}
 	}
 }
 
@@ -2305,8 +2347,13 @@ class DeferredFileSystem implements VirtualFileSystem {
 	chmod(path: string, mode: number): Promise<void> {
 		return this.filesystem().chmod(path, mode);
 	}
-	chown(path: string, uid: number, gid: number): Promise<void> {
-		return this.filesystem().chown(path, uid, gid);
+	chown(
+		path: string,
+		uid: number,
+		gid: number,
+		options?: { followSymlinks?: boolean },
+	): Promise<void> {
+		return this.filesystem().chown(path, uid, gid, options);
 	}
 	utimes(path: string, atime: number, mtime: number): Promise<void> {
 		return this.filesystem().utimes(path, atime, mtime);
@@ -2360,7 +2407,16 @@ interface LiveFilesystemBinding {
 	restore(): void;
 }
 
-const LIVE_FILESYSTEM_SYNC_CHUNK_SIZE = 512 * 1024;
+const DEFAULT_LIVE_FILESYSTEM_SYNC_MAX_BYTES = 64 * 1024 * 1024;
+
+type LiveFilesystemSnapshotEntry =
+	| { kind: "directory"; path: string }
+	| { kind: "symlink"; path: string; target: string }
+	| { kind: "file"; path: string; content: Uint8Array };
+
+class LiveFilesystemSyncLimitError extends Error {
+	readonly code = "ERR_AGENTOS_LIVE_FILESYSTEM_SYNC_LIMIT";
+}
 
 function topLevelSyncRoot(targetPath: string): string {
 	const normalized = normalizePath(targetPath);
@@ -2408,72 +2464,106 @@ async function syncLiveFilesystemToBoundMethods(
 	live: VirtualFileSystem,
 	methods: BoundVirtualFileSystemMethods,
 	paths: readonly string[],
+	maxBytes: number,
 ): Promise<void> {
+	const snapshot: LiveFilesystemSnapshotEntry[] = [];
+	const usage = { bytes: 0 };
 	for (const targetPath of [...new Set(paths.map(normalizePath))].sort((left, right) =>
 		left.localeCompare(right),
 	)) {
 		if (!(await live.exists(targetPath).catch(() => false))) {
 			continue;
 		}
-		await syncLiveFilesystemPathToBoundMethods(live, methods, targetPath);
+		await snapshotLiveFilesystemPath(live, targetPath, snapshot, usage, maxBytes);
+	}
+	if (usage.bytes >= maxBytes * 0.8) {
+		process.emitWarning(
+			`live filesystem sync retained ${usage.bytes} of ${maxBytes} bytes; ` +
+				"raise createKernel({ maxFilesystemBytes }) before increasing VM filesystem limits",
+			{ code: "AGENTOS_LIVE_FILESYSTEM_SYNC_NEAR_LIMIT" },
+		);
+	}
+	for (const entry of snapshot) {
+		await applyLiveFilesystemSnapshotEntry(methods, entry);
 	}
 }
 
-async function syncLiveFilesystemPathToBoundMethods(
+async function snapshotLiveFilesystemPath(
 	live: VirtualFileSystem,
-	methods: BoundVirtualFileSystemMethods,
 	targetPath: string,
+	snapshot: LiveFilesystemSnapshotEntry[],
+	usage: { bytes: number },
+	maxBytes: number,
+	knownEntry?: Pick<VirtualDirEntry, "isDirectory" | "isSymbolicLink">,
 ): Promise<void> {
-	const stat = targetPath === "/" ? await live.stat(targetPath) : await live.lstat(targetPath);
+	const stat = knownEntry ??
+		(targetPath === "/" ? await live.stat(targetPath) : await live.lstat(targetPath));
 	if (stat.isSymbolicLink) {
-		await ensureBoundParentDirectory(methods, targetPath);
-		await callBoundFilesystemMethod(methods, "removeFile", targetPath).catch(
-			() => {},
-		);
-		await callBoundFilesystemMethod(
-			methods,
-			"symlink",
-			await live.readlink(targetPath),
-			targetPath,
-		);
+		snapshot.push({ kind: "symlink", path: targetPath, target: await live.readlink(targetPath) });
 		return;
 	}
 	if (stat.isDirectory) {
-		await callBoundFilesystemMethod(methods, "mkdir", targetPath, {
-			recursive: true,
-		});
+		snapshot.push({ kind: "directory", path: targetPath });
 		const children = (await live.readDirWithTypes(targetPath))
-			.map((entry) => entry.name)
-			.filter((name) => name !== "." && name !== "..")
-			.sort((left, right) => left.localeCompare(right));
+			.filter((entry) => entry.name !== "." && entry.name !== "..")
+			.sort((left, right) => left.name.localeCompare(right.name));
 		for (const child of children) {
-			await syncLiveFilesystemPathToBoundMethods(
+			await snapshotLiveFilesystemPath(
 				live,
-				methods,
-				targetPath === "/" ? posixPath.join("/", child) : posixPath.join(targetPath, child),
+				targetPath === "/"
+					? posixPath.join("/", child.name)
+					: posixPath.join(targetPath, child.name),
+				snapshot,
+				usage,
+				maxBytes,
+				child,
 			);
 		}
 		return;
 	}
 
-	await ensureBoundParentDirectory(methods, targetPath);
-	await callBoundFilesystemMethod(methods, "writeFile", targetPath, new Uint8Array(0));
-	for (let offset = 0; offset < stat.size; offset += LIVE_FILESYSTEM_SYNC_CHUNK_SIZE) {
-		const chunk = await live.pread(
-			targetPath,
-			offset,
-			Math.min(LIVE_FILESYSTEM_SYNC_CHUNK_SIZE, stat.size - offset),
+	const fileSize =
+		"size" in stat && typeof stat.size === "number"
+			? stat.size
+			: (await live.lstat(targetPath)).size;
+	if (fileSize > maxBytes - usage.bytes) {
+		throw new LiveFilesystemSyncLimitError(
+			`live filesystem sync for ${targetPath} exceeds ${maxBytes} bytes ` +
+				"(createKernel maxFilesystemBytes); raise createKernel({ maxFilesystemBytes })",
 		);
-		if (chunk.length === 0) {
-			break;
-		}
-		await callBoundFilesystemMethod(methods, "pwrite", targetPath, offset, chunk);
 	}
+	const content = await live.readFile(targetPath);
+	if (content.byteLength > maxBytes - usage.bytes) {
+		throw new LiveFilesystemSyncLimitError(
+			`live filesystem sync for ${targetPath} exceeds ${maxBytes} bytes ` +
+				"(createKernel maxFilesystemBytes); raise createKernel({ maxFilesystemBytes })",
+		);
+	}
+	usage.bytes += content.byteLength;
+	snapshot.push({ kind: "file", path: targetPath, content });
+}
+
+async function applyLiveFilesystemSnapshotEntry(
+	methods: BoundVirtualFileSystemMethods,
+	entry: LiveFilesystemSnapshotEntry,
+): Promise<void> {
+	if (entry.kind === "directory") {
+		await callBoundFilesystemMethod(methods, "mkdir", entry.path, { recursive: true });
+		return;
+	}
+	await ensureBoundParentDirectory(methods, entry.path);
+	if (entry.kind === "symlink") {
+		await callBoundFilesystemMethod(methods, "removeFile", entry.path).catch(() => {});
+		await callBoundFilesystemMethod(methods, "symlink", entry.target, entry.path);
+		return;
+	}
+	await callBoundFilesystemMethod(methods, "writeFile", entry.path, entry.content);
 }
 
 function bindLiveFilesystem(
 	target: VirtualFileSystem,
 	getFilesystem: () => VirtualFileSystem | null,
+	maxBytes: number,
 ): LiveFilesystemBinding {
 	const fallback: BoundVirtualFileSystemMethods = {};
 	for (const method of VIRTUAL_FILESYSTEM_METHOD_NAMES) {
@@ -2508,7 +2598,7 @@ function bindLiveFilesystem(
 			if (!filesystem) {
 				return;
 			}
-			await syncLiveFilesystemToBoundMethods(filesystem, fallback, paths);
+			await syncLiveFilesystemToBoundMethods(filesystem, fallback, paths, maxBytes);
 		},
 		restore(): void {
 			for (const [method, delegate] of Object.entries(fallback)) {
@@ -2570,6 +2660,7 @@ class NativeKernel implements Kernel {
 				readOnly?: boolean;
 			}>;
 			syncFilesystemOnDispose?: boolean;
+			maxFilesystemBytes?: number;
 		},
 	) {
 		this.env = { ...(options.env ?? {}) };
@@ -2612,6 +2703,7 @@ class NativeKernel implements Kernel {
 		this.liveFilesystemBinding = bindLiveFilesystem(
 			this.options.filesystem,
 			() => this.rootFilesystem,
+			options.maxFilesystemBytes ?? DEFAULT_LIVE_FILESYSTEM_SYNC_MAX_BYTES,
 		);
 	}
 
@@ -3225,6 +3317,7 @@ export function createKernel(options: {
 	logger?: unknown;
 	mounts?: Array<{ path: string; fs: VirtualFileSystem; readOnly?: boolean }>;
 	syncFilesystemOnDispose?: boolean;
+	maxFilesystemBytes?: number;
 }): Kernel {
 	return new NativeKernel(options);
 }

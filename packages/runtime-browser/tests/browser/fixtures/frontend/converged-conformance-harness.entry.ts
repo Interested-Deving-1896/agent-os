@@ -135,6 +135,7 @@ function createEchoCommandExecutor() {
 			let stdout = "";
 			let stderr = "";
 			let exitCode = 0;
+			let exitSignal: number | null = null;
 			let stdin = "";
 			let resolveWait: (() => void) | undefined;
 			let waitPromise: Promise<void> = Promise.resolve();
@@ -155,7 +156,9 @@ function createEchoCommandExecutor() {
 			return {
 				async wait() {
 					await waitPromise;
-					return exitCode;
+					return exitSignal === null
+						? exitCode
+						: { exitCode: null, signal: exitSignal };
 				},
 				writeStdin(data: string | Uint8Array) {
 					stdin += typeof data === "string" ? data : new TextDecoder().decode(data);
@@ -167,11 +170,12 @@ function createEchoCommandExecutor() {
 				},
 				kill(signal = 15) {
 					const signalNumber = Number(signal) || 15;
-					exitCode = 128 + signalNumber;
+					exitSignal = signalNumber;
 					options.onStdout?.(
 						new TextEncoder().encode(`signal:${signalNumber}\n`),
 					);
 					resolveWait?.();
+					return true;
 				},
 			};
 		},

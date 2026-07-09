@@ -16,6 +16,7 @@ struct MockDnsResolver {
     requests: Arc<Mutex<Vec<DnsLookupRequest>>>,
     record_requests: Arc<Mutex<Vec<DnsRecordLookupRequest>>>,
     response: Vec<IpAddr>,
+    record_error: Option<DnsResolverError>,
 }
 
 impl MockDnsResolver {
@@ -24,7 +25,13 @@ impl MockDnsResolver {
             requests: Arc::new(Mutex::new(Vec::new())),
             record_requests: Arc::new(Mutex::new(Vec::new())),
             response,
+            record_error: None,
         }
+    }
+
+    fn with_record_error(mut self, error: DnsResolverError) -> Self {
+        self.record_error = Some(error);
+        self
     }
 
     fn requests(&self) -> Vec<DnsLookupRequest> {
@@ -56,7 +63,9 @@ impl DnsResolver for MockDnsResolver {
             .lock()
             .expect("mock record requests")
             .push(request.clone());
-        Ok(Vec::new())
+        self.record_error
+            .clone()
+            .map_or_else(|| Ok(Vec::new()), Err)
     }
 }
 
@@ -204,4 +213,30 @@ fn kernel_dns_resolution_denies_by_default_before_resolver_lookup() {
         resolver.record_requests().is_empty(),
         "permission denial should happen before record resolver lookup"
     );
+}
+
+#[test]
+fn kernel_dns_record_resolution_preserves_nxdomain_and_nodata() {
+    for (resolver, expected_code) in [
+        (MockDnsResolver::new(Vec::new()), "ENODATA"),
+        (
+            MockDnsResolver::new(Vec::new())
+                .with_record_error(DnsResolverError::nx_domain("name does not exist")),
+            "ENOENT",
+        ),
+    ] {
+        let mut config = KernelVmConfig::new(format!("vm-dns-{expected_code}"));
+        config.permissions = Permissions::allow_all();
+        config.dns_resolver = Arc::new(resolver);
+        let kernel = new_kernel(config);
+
+        let error = kernel
+            .resolve_dns_records(
+                "missing.example.test",
+                RecordType::SSHFP,
+                DnsLookupPolicy::CheckPermissions,
+            )
+            .expect_err("empty DNS record answer must retain its negative status");
+        assert_eq!(error.code(), expected_code);
+    }
 }

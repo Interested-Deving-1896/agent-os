@@ -541,6 +541,62 @@ fn waitpid_for_reports_stopped_and_continued_children_once() {
 }
 
 #[test]
+fn nonterminal_wait_query_never_reaps_an_exited_child() {
+    let table = ProcessTable::with_zombie_ttl(Duration::from_secs(3600));
+    let parent = MockDriverProcess::new();
+    let child = MockDriverProcess::new();
+    let parent_pid = allocate_pid(&table);
+    let child_pid = allocate_pid(&table);
+    table.register(
+        parent_pid,
+        "wasmvm",
+        "parent",
+        Vec::new(),
+        create_context(0),
+        parent,
+    );
+    table.register(
+        child_pid,
+        "wasmvm",
+        "child",
+        Vec::new(),
+        create_context(parent_pid),
+        child.clone(),
+    );
+
+    table.mark_stopped(child_pid, SIGSTOP);
+    child.exit(17);
+    assert_eq!(
+        table
+            .take_nonterminal_wait_event_for(parent_pid, child_pid as i32, WaitPidFlags::WUNTRACED,)
+            .expect("nonterminal wait should succeed"),
+        Some(agentos_kernel::process_table::ProcessWaitResult {
+            pid: child_pid,
+            status: SIGSTOP,
+            event: ProcessWaitEvent::Stopped,
+        })
+    );
+    assert_eq!(
+        table
+            .get(child_pid)
+            .expect("transition-only query must preserve zombie")
+            .status,
+        ProcessStatus::Exited
+    );
+    assert_eq!(
+        table
+            .waitpid_for(parent_pid, child_pid as i32, WaitPidFlags::WNOHANG)
+            .expect("terminal wait should succeed"),
+        Some(agentos_kernel::process_table::ProcessWaitResult {
+            pid: child_pid,
+            status: 17,
+            event: ProcessWaitEvent::Exited,
+        })
+    );
+    assert!(table.get(child_pid).is_none());
+}
+
+#[test]
 fn kill_routes_signals_and_validates_process_existence() {
     let table = ProcessTable::new();
     let process = MockDriverProcess::new();

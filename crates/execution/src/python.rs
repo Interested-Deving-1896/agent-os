@@ -128,6 +128,8 @@ pub struct PythonVfsRpcRequest {
     pub socket_id: Option<u64>,
     pub command: Option<String>,
     pub args: Vec<String>,
+    /// Explicit child argv[0], kept separate from the executable path.
+    pub argv0: Option<String>,
     pub cwd: Option<String>,
     pub env: BTreeMap<String, String>,
     pub shell: bool,
@@ -238,6 +240,8 @@ struct PythonVfsBridgeRequestWire {
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
+    argv0: Option<String>,
+    #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
@@ -337,6 +341,7 @@ pub enum PythonExecutionError {
     StdinClosed,
     Stdin(std::io::Error),
     Kill(std::io::Error),
+    Control(std::io::Error),
     TimedOut(Duration),
     PendingVfsRpcRequest(u64),
     RpcResponse(String),
@@ -385,6 +390,7 @@ impl fmt::Display for PythonExecutionError {
             Self::StdinClosed => f.write_str("guest Python stdin is already closed"),
             Self::Stdin(err) => write!(f, "failed to write guest stdin: {err}"),
             Self::Kill(err) => write!(f, "failed to kill guest Python runtime: {err}"),
+            Self::Control(err) => write!(f, "failed to control guest Python runtime: {err}"),
             Self::TimedOut(timeout) => write!(
                 f,
                 "guest Python runtime timed out after {}ms",
@@ -470,6 +476,15 @@ impl PythonExecution {
         self.inner.uses_shared_v8_runtime()
     }
 
+    pub fn start_prepared(&mut self) -> Result<(), PythonExecutionError> {
+        self.inner.start_prepared().map_err(map_javascript_error)
+    }
+
+    #[doc(hidden)]
+    pub fn is_prepared_for_start(&self) -> bool {
+        self.inner.is_prepared_for_start()
+    }
+
     pub fn write_stdin(&mut self, chunk: &[u8]) -> Result<(), PythonExecutionError> {
         self.inner
             .write_kernel_stdin_only(chunk)
@@ -488,6 +503,14 @@ impl PythonExecution {
     pub fn kill(&mut self) -> Result<(), PythonExecutionError> {
         self.close_stdin()?;
         self.inner.terminate().map_err(map_javascript_error)
+    }
+
+    pub fn pause(&self) -> Result<(), PythonExecutionError> {
+        self.inner.pause().map_err(map_javascript_error)
+    }
+
+    pub fn resume(&self) -> Result<(), PythonExecutionError> {
+        self.inner.resume().map_err(map_javascript_error)
     }
 
     pub fn respond_vfs_rpc_success(
@@ -615,6 +638,25 @@ impl PythonExecution {
             .map_err(map_javascript_error)
     }
 
+    pub fn claim_javascript_sync_rpc_response(
+        &mut self,
+        id: u64,
+    ) -> Result<bool, PythonExecutionError> {
+        self.inner
+            .claim_sync_rpc_response(id)
+            .map_err(map_javascript_error)
+    }
+
+    pub fn respond_claimed_javascript_sync_rpc_success(
+        &mut self,
+        id: u64,
+        result: Value,
+    ) -> Result<(), PythonExecutionError> {
+        self.inner
+            .respond_claimed_sync_rpc_success(id, result)
+            .map_err(map_javascript_error)
+    }
+
     pub fn respond_javascript_sync_rpc_error(
         &mut self,
         id: u64,
@@ -623,6 +665,17 @@ impl PythonExecution {
     ) -> Result<(), PythonExecutionError> {
         self.inner
             .respond_sync_rpc_error(id, code, message)
+            .map_err(map_javascript_error)
+    }
+
+    pub fn respond_claimed_javascript_sync_rpc_error(
+        &mut self,
+        id: u64,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), PythonExecutionError> {
+        self.inner
+            .respond_claimed_sync_rpc_error(id, code, message)
             .map_err(map_javascript_error)
     }
 
@@ -894,9 +947,45 @@ impl PythonExecutionEngine {
         context
     }
 
+    /// Dispose the Python context and its private JavaScript bridge context.
+    /// Live executions retain their own bridge session and are unaffected.
+    pub fn dispose_context(&mut self, context_id: &str) -> bool {
+        let removed = self.contexts.remove(context_id).is_some();
+        if let Some(javascript_context_id) = self.javascript_context_ids.remove(context_id) {
+            self.javascript_engine
+                .dispose_context(&javascript_context_id);
+        }
+        removed
+    }
+
+    #[doc(hidden)]
+    pub fn context_count_for_test(&self) -> usize {
+        self.contexts.len()
+    }
+
+    #[doc(hidden)]
+    pub fn javascript_context_count_for_test(&self) -> usize {
+        self.javascript_engine.context_count_for_test()
+    }
+
     pub fn start_execution(
         &mut self,
         request: StartPythonExecutionRequest,
+    ) -> Result<PythonExecution, PythonExecutionError> {
+        self.create_execution(request, false)
+    }
+
+    pub fn prepare_execution(
+        &mut self,
+        request: StartPythonExecutionRequest,
+    ) -> Result<PythonExecution, PythonExecutionError> {
+        self.create_execution(request, true)
+    }
+
+    fn create_execution(
+        &mut self,
+        request: StartPythonExecutionRequest,
+        defer_execute: bool,
     ) -> Result<PythonExecution, PythonExecutionError> {
         ensure_pyodide_available()?;
         let context = self
@@ -913,16 +1002,11 @@ impl PythonExecutionEngine {
         }
 
         let frozen_time_ms = frozen_time_ms();
-        let javascript_context =
-            self.javascript_engine
-                .create_context(CreateJavascriptContextRequest {
-                    vm_id: request.vm_id.clone(),
-                    bootstrap_module: None,
-                    compile_cache_root: None,
-                });
-        let javascript_context_id = javascript_context.context_id.clone();
-        self.javascript_context_ids
-            .insert(context.context_id.clone(), javascript_context_id.clone());
+        let javascript_context_id = self
+            .javascript_context_ids
+            .get(&context.context_id)
+            .cloned()
+            .ok_or_else(|| PythonExecutionError::MissingContext(context.context_id.clone()))?;
         let warmup_metrics = {
             let import_cache = self.import_caches.entry(context.vm_id.clone()).or_default();
             import_cache
@@ -956,6 +1040,7 @@ impl PythonExecutionEngine {
                 frozen_time_ms,
                 prewarm_only: false,
                 warmup_metrics: warmup_metrics.as_deref(),
+                defer_execute,
             },
         )?;
         let pending_vfs_rpc = Arc::new(Mutex::new(None));
@@ -1020,6 +1105,7 @@ fn map_javascript_error(error: JavascriptExecutionError) -> PythonExecutionError
             PythonExecutionError::RpcResponse(message)
         }
         JavascriptExecutionError::Terminate(error) => PythonExecutionError::Kill(error),
+        JavascriptExecutionError::Control(error) => PythonExecutionError::Control(error),
         JavascriptExecutionError::StdinClosed => PythonExecutionError::StdinClosed,
         JavascriptExecutionError::Stdin(error) => PythonExecutionError::Stdin(error),
         JavascriptExecutionError::OutputBufferExceeded { stream, limit } => {
@@ -1033,6 +1119,7 @@ struct PythonJavascriptExecutionOptions<'a> {
     frozen_time_ms: u128,
     prewarm_only: bool,
     warmup_metrics: Option<&'a [u8]>,
+    defer_execute: bool,
 }
 
 fn start_python_javascript_execution(
@@ -1065,21 +1152,26 @@ fn start_python_javascript_execution(
         ..JavascriptExecutionLimits::default()
     };
 
-    javascript_engine
-        .start_execution(StartJavascriptExecutionRequest {
-            vm_id: request.vm_id.clone(),
-            context_id: javascript_context_id.to_owned(),
-            argv: vec![import_cache.python_runner_path().display().to_string()],
-            env,
-            cwd: request.cwd.clone(),
-            limits: runner_limits,
-            // Forward the guest-runtime identity so the runner's shim sets
-            // process.* from typed config rather than env.
-            guest_runtime: request.guest_runtime.clone(),
-            wasm_module_bytes: None,
-            inline_code: Some(inline_code),
-        })
-        .map_err(map_javascript_error)
+    let javascript_request = StartJavascriptExecutionRequest {
+        vm_id: request.vm_id.clone(),
+        context_id: javascript_context_id.to_owned(),
+        argv: vec![import_cache.python_runner_path().display().to_string()],
+        argv0: None,
+        env,
+        cwd: request.cwd.clone(),
+        limits: runner_limits,
+        // Forward the guest-runtime identity so the runner's shim sets
+        // process.* from typed config rather than env.
+        guest_runtime: request.guest_runtime.clone(),
+        wasm_module_bytes: None,
+        inline_code: Some(inline_code),
+    };
+    if options.defer_execute {
+        javascript_engine.prepare_execution(javascript_request)
+    } else {
+        javascript_engine.start_execution(javascript_request)
+    }
+    .map_err(map_javascript_error)
 }
 
 fn build_python_internal_env(
@@ -1304,6 +1396,7 @@ fn parse_python_bridge_sync_rpc_request(
         socket_id: wire.socket_id,
         command: wire.command,
         args: wire.args,
+        argv0: wire.argv0,
         cwd: wire.cwd,
         env: wire.env,
         shell: wire.shell,
@@ -1440,6 +1533,7 @@ fn prewarm_python_path(
             frozen_time_ms,
             prewarm_only: true,
             warmup_metrics: None,
+            defer_execute: false,
         },
     )?;
     let mut stdout = Vec::new();
@@ -2069,13 +2163,38 @@ fn warmup_metrics_line(
 #[cfg(test)]
 mod tests {
     use super::{
-        python_managed_path_kind, PythonManagedPathKind, PYODIDE_CACHE_GUEST_ROOT,
-        PYODIDE_GUEST_ROOT,
+        python_managed_path_kind, CreatePythonContextRequest, PythonExecutionEngine,
+        PythonManagedPathKind, PYODIDE_CACHE_GUEST_ROOT, PYODIDE_GUEST_ROOT,
     };
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::tempdir;
+
+    #[test]
+    fn dispose_context_reclaims_python_and_nested_javascript_metadata() {
+        let mut engine = PythonExecutionEngine::default();
+        let baseline = (
+            engine.context_count_for_test(),
+            engine.javascript_context_count_for_test(),
+        );
+        let temp = tempdir().expect("create Pyodide fixture root");
+        let context = engine.create_context(CreatePythonContextRequest {
+            vm_id: String::from("vm-python-context-dispose"),
+            pyodide_dist_path: temp.path().to_path_buf(),
+        });
+        assert_eq!(engine.context_count_for_test(), baseline.0 + 1);
+        assert_eq!(engine.javascript_context_count_for_test(), baseline.1 + 1);
+
+        assert!(engine.dispose_context(&context.context_id));
+        assert_eq!(
+            (
+                engine.context_count_for_test(),
+                engine.javascript_context_count_for_test(),
+            ),
+            baseline
+        );
+    }
 
     #[test]
     fn python_managed_guest_paths_normalize_dot_dot_inside_root() {

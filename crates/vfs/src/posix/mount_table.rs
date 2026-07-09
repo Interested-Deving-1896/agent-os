@@ -86,6 +86,20 @@ pub trait MountedFileSystem: Any {
     fn link(&mut self, old_path: &str, new_path: &str) -> VfsResult<()>;
     fn chmod(&mut self, path: &str, mode: u32) -> VfsResult<()>;
     fn chown(&mut self, path: &str, uid: u32, gid: u32) -> VfsResult<()>;
+    fn chown_spec(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        follow_symlinks: bool,
+    ) -> VfsResult<()> {
+        if !follow_symlinks {
+            return Err(VfsError::unsupported(format!(
+                "lchown is not supported for mount path '{path}'"
+            )));
+        }
+        self.chown(path, uid, gid)
+    }
     fn utimes(&mut self, path: &str, atime_ms: u64, mtime_ms: u64) -> VfsResult<()>;
     fn utimes_spec(
         &mut self,
@@ -280,6 +294,16 @@ where
         VirtualFileSystem::chown(&mut self.inner, path, uid, gid)
     }
 
+    fn chown_spec(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        follow_symlinks: bool,
+    ) -> VfsResult<()> {
+        VirtualFileSystem::chown_spec(&mut self.inner, path, uid, gid, follow_symlinks)
+    }
+
     fn utimes(&mut self, path: &str, atime_ms: u64, mtime_ms: u64) -> VfsResult<()> {
         VirtualFileSystem::utimes(&mut self.inner, path, atime_ms, mtime_ms)
     }
@@ -389,6 +413,16 @@ where
 
     fn chown(&mut self, path: &str, uid: u32, gid: u32) -> VfsResult<()> {
         (**self).chown(path, uid, gid)
+    }
+
+    fn chown_spec(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        follow_symlinks: bool,
+    ) -> VfsResult<()> {
+        (**self).chown_spec(path, uid, gid, follow_symlinks)
     }
 
     fn utimes(&mut self, path: &str, atime_ms: u64, mtime_ms: u64) -> VfsResult<()> {
@@ -540,6 +574,19 @@ where
     }
 
     fn chown(&mut self, path: &str, _uid: u32, _gid: u32) -> VfsResult<()> {
+        Err(VfsError::new(
+            "EROFS",
+            format!("read-only filesystem: {path}"),
+        ))
+    }
+
+    fn chown_spec(
+        &mut self,
+        path: &str,
+        _uid: u32,
+        _gid: u32,
+        _follow_symlinks: bool,
+    ) -> VfsResult<()> {
         Err(VfsError::new(
             "EROFS",
             format!("read-only filesystem: {path}"),
@@ -1282,10 +1329,24 @@ impl VirtualFileSystem for MountTable {
     }
 
     fn chown(&mut self, path: &str, uid: u32, gid: u32) -> VfsResult<()> {
-        let (index, relative_path) = self.resolve_index(path)?;
+        self.chown_spec(path, uid, gid, true)
+    }
+
+    fn chown_spec(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        follow_symlinks: bool,
+    ) -> VfsResult<()> {
+        let (index, relative_path) = if follow_symlinks {
+            self.resolve_index(path)?
+        } else {
+            self.resolve_link_leaf_index(path)?
+        };
         self.mounts[index]
             .filesystem
-            .chown(&relative_path, uid, gid)
+            .chown_spec(&relative_path, uid, gid, follow_symlinks)
     }
 
     fn utimes(&mut self, path: &str, atime_ms: u64, mtime_ms: u64) -> VfsResult<()> {

@@ -78,6 +78,7 @@ export interface Permissions {
 	childProcess?: PermissionCheck<{
 		command: string;
 		args: string[];
+		argv0?: string;
 		cwd?: string;
 		env?: Record<string, string>;
 	}>;
@@ -201,21 +202,29 @@ export interface ProcessConfig {
 export type StdioEvent = { channel: StdioChannel; message: string };
 export type StdioHook = (event: StdioEvent) => void;
 
+export type CommandWaitResult =
+	| number
+	| {
+			exitCode: number | null;
+			signal: number | string | null;
+	  };
+
 export interface CommandExecutor {
 	spawn(
 		command: string,
 		args: string[],
 		options?: {
+			argv0?: string;
 			cwd?: string;
 			env?: Record<string, string>;
 			onStdout?: (data: Uint8Array) => void;
 			onStderr?: (data: Uint8Array) => void;
 		},
 	): {
-		wait(): Promise<number>;
+		wait(): Promise<CommandWaitResult>;
 		writeStdin(data: Uint8Array | string): void;
 		closeStdin(): void;
-		kill(signal?: number): void;
+		kill(signal?: number): boolean | void;
 	};
 }
 
@@ -410,13 +419,18 @@ export function wrapCommandExecutor(
 	const check = (
 		command: string,
 		args: string[],
-		options?: { cwd?: string; env?: Record<string, string> },
+		options?: {
+			argv0?: string;
+			cwd?: string;
+			env?: Record<string, string>;
+		},
 	): void => {
 		if (
 			!permissionAllowed(
 				permissions.childProcess?.({
 					command,
 					args,
+					argv0: options?.argv0,
 					cwd: options?.cwd,
 					env: options?.env,
 				}),
@@ -1169,40 +1183,41 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 	stream: `
 		class EventEmitterLike {
 			constructor() { this._listeners = Object.create(null); }
-			on(event, fn) { (this._listeners[event] = this._listeners[event] || []).push(fn); return this; }
+			on(event, fn) { (this._listeners[event] = this._listeners[event] || []).push(fn); if (event === "data" && typeof this.resume === "function") this.resume(); return this; }
 			addListener(event, fn) { return this.on(event, fn); }
 			once(event, fn) { const w = (...a) => { this.off(event, w); fn(...a); }; w._origin = fn; return this.on(event, w); }
 			off(event, fn) { if (this._listeners[event]) this._listeners[event] = this._listeners[event].filter((x) => x !== fn && x._origin !== fn); return this; }
 			removeListener(event, fn) { return this.off(event, fn); }
 			removeAllListeners(event) { if (event) delete this._listeners[event]; else this._listeners = Object.create(null); return this; }
-			emit(event, ...args) { const ls = (this._listeners[event] || []).slice(); for (const fn of ls) fn(...args); return ls.length > 0; }
+			emit(event, ...args) { const ls = (this._listeners[event] || []).slice(); if (ls.length === 0 && event === "error") throw (args[0] instanceof Error ? args[0] : new Error(String(args[0]))); for (const fn of ls) fn(...args); return ls.length > 0; }
 			listenerCount(event) { return (this._listeners[event] || []).length; }
 		}
+		const chunkLength = (chunk) => typeof chunk === "string" ? new TextEncoder().encode(chunk).length : Number(chunk && chunk.byteLength) || 1;
+		const streamError = (code, message) => { const error = new Error(message); error.code = code; return error; };
 		class Readable extends EventEmitterLike {
-			constructor(options) { super(); this.readable = true; this._readableOptions = options || {}; if (this._readableOptions.read) this._read = this._readableOptions.read; }
-			resume() { this.emit("resume"); return this; }
-			pause() { this.paused = true; return this; }
+			constructor(options) { super(); this.readable = true; this.readableEnded = false; this.destroyed = false; this.paused = true; this._buffer = []; this._bufferedBytes = 0; this._highWaterMark = Number(options && options.highWaterMark) || 16384; this._readableOptions = options || {}; this._readableAutoDestroy = this._readableOptions.autoDestroy !== false; if (this._readableOptions.read) this._read = this._readableOptions.read; }
+			_finishReadable() { if (this.readableEnded) return; this.readableEnded = true; this.readable = false; this.emit("end"); if (this._readableAutoDestroy && !this._closeScheduled) { this._closeScheduled = true; queueMicrotask(() => this.destroy()); } }
+			_flush() { while (!this.paused && this._buffer.length > 0) { const chunk = this._buffer.shift(); this._bufferedBytes -= chunkLength(chunk); this.emit("data", chunk); } if (!this.paused && this._ended && this._buffer.length === 0) this._finishReadable(); }
+			resume() { if (this.destroyed) return this; const changed = this.paused; this.paused = false; if (changed) this.emit("resume"); this._flush(); return this; }
+			pause() { this.paused = true; this.emit("pause"); return this; }
 			setEncoding() { return this; }
-			read() { return null; }
-			push(chunk) { if (chunk == null) this.emit("end"); else this.emit("data", chunk); return true; }
-			pipe(dest) { this.on("data", (c) => dest.write && dest.write(c)); this.on("end", () => dest.end && dest.end()); return dest; }
-			destroy() { this.emit("close"); return this; }
+			read() { const chunk = this._buffer.shift() ?? null; if (chunk != null) this._bufferedBytes -= chunkLength(chunk); if (chunk == null && this._ended) this._finishReadable(); return chunk; }
+			push(chunk) { if (this.destroyed || this._ended) return false; if (chunk == null) { this._ended = true; this._flush(); return false; } this._buffer.push(chunk); this._bufferedBytes += chunkLength(chunk); this._flush(); return this._bufferedBytes < this._highWaterMark; }
+			pipe(dest) { this.on("data", (chunk) => { if (dest.write && dest.write(chunk) === false) { this.pause(); dest.once && dest.once("drain", () => this.resume()); } }); this.once("end", () => dest.end && dest.end()); this.once("error", (error) => dest.destroy ? dest.destroy(error) : dest.emit && dest.emit("error", error)); return dest; }
+			destroy(error) { if (this.destroyed) return this; this.destroyed = true; this.readable = false; this._buffer.length = 0; this._bufferedBytes = 0; if (error) this.emit("error", error); this.emit("close"); return this; }
 		}
-		Readable.toWeb = (stream) => new ReadableStream({ start(controller) {
-			stream.on("data", (chunk) => controller.enqueue(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk)));
-			stream.on("end", () => { try { controller.close(); } catch (e) {} });
-			stream.on("error", (err) => controller.error(err));
-		} });
+		Readable.toWeb = (stream) => new ReadableStream({ start(controller) { stream.once("end", () => controller.close()); stream.once("error", (error) => controller.error(error)); stream.on("data", (chunk) => { controller.enqueue(chunk); if ((controller.desiredSize ?? 1) <= 0) stream.pause && stream.pause(); }); }, pull() { stream.resume && stream.resume(); }, cancel(reason) { stream.destroy && stream.destroy(reason instanceof Error ? reason : undefined); } });
 		class Writable extends EventEmitterLike {
-			constructor(options) { super(); this.writable = true; this._writableOptions = options || {}; if (this._writableOptions.write) this._writeImpl = this._writableOptions.write; }
-			write(chunk, encoding, cb) { if (typeof encoding === "function") { cb = encoding; encoding = undefined; } if (this._writeImpl) this._writeImpl(chunk, encoding, cb || (() => {})); else if (cb) cb(); this.emit("data", chunk); return true; }
-			end(chunk, encoding, cb) { const done = typeof chunk === "function" ? chunk : typeof encoding === "function" ? encoding : cb; if (chunk != null && typeof chunk !== "function") this.write(chunk); this.emit("finish"); this.emit("end"); if (done) done(); }
-			destroy() { this.emit("close"); return this; }
+			constructor(options) { super(); this.writable = true; this.writableEnded = false; this.writableFinished = false; this.destroyed = false; this._pendingWrites = 0; this._writableBufferedBytes = 0; this._writableNeedDrain = false; this._writableHighWaterMark = Number(options && options.highWaterMark) || 16384; this._writableOptions = options || {}; this._writableAutoDestroy = this._writableOptions.autoDestroy !== false; if (this._writableOptions.write) this._writeImpl = this._writableOptions.write; }
+			_finishIfReady() { if (this.writableEnded && this._pendingWrites === 0 && !this.writableFinished && !this.destroyed) { this.writableFinished = true; this.writable = false; this.emit("finish"); if (this._endCallback) { const callback = this._endCallback; this._endCallback = null; callback(); } if (this._writableAutoDestroy && !this._closeScheduled) { this._closeScheduled = true; queueMicrotask(() => this.destroy()); } } }
+			write(chunk, encoding, cb) { if (typeof encoding === "function") { cb = encoding; encoding = undefined; } if (this.destroyed || this.writableEnded) { const error = streamError("ERR_STREAM_WRITE_AFTER_END", "write after end"); queueMicrotask(() => { if (cb) cb(error); else this.emit("error", error); }); return false; } const size = chunkLength(chunk); this._pendingWrites += 1; this._writableBufferedBytes += size; const accepted = this._writableBufferedBytes < this._writableHighWaterMark; if (!accepted) this._writableNeedDrain = true; let completed = false; const done = (error) => { if (completed) return; completed = true; queueMicrotask(() => { this._pendingWrites -= 1; this._writableBufferedBytes = Math.max(0, this._writableBufferedBytes - size); if (error) { if (cb) cb(error); this.destroy(error); return; } if (cb) cb(); if (this._writableNeedDrain && this._writableBufferedBytes < this._writableHighWaterMark) { this._writableNeedDrain = false; this.emit("drain"); } this._finishIfReady(); }); }; try { if (this._writeImpl) this._writeImpl(chunk, encoding, done); else { this.emit("data", chunk); done(); } } catch (error) { done(error); } return accepted; }
+			end(chunk, encoding, cb) { const done = typeof chunk === "function" ? chunk : typeof encoding === "function" ? encoding : cb; if (this.writableEnded) { const error = streamError("ERR_STREAM_ALREADY_FINISHED", "end called after stream finished"); queueMicrotask(() => done ? done(error) : this.emit("error", error)); return this; } if (chunk != null && typeof chunk !== "function") this.write(chunk, typeof encoding === "string" ? encoding : undefined); this.writableEnded = true; this._endCallback = done || null; this._finishIfReady(); return this; }
+			destroy(error) { if (this.destroyed) return this; this.destroyed = true; this.writable = false; if (error) this.emit("error", error); this.emit("close"); return this; }
 		}
-		Writable.toWeb = (stream) => new WritableStream({ write(chunk) { return new Promise((resolve) => stream.write(chunk, undefined, () => resolve())); }, close() { stream.end && stream.end(); } });
-		class Duplex extends Readable { constructor(options) { super(options); this.writable = true; if (options && options.write) this._writeImpl = options.write; } write(chunk, encoding, cb) { if (typeof encoding === "function") { cb = encoding; } if (this._writeImpl) this._writeImpl(chunk, encoding, cb || (() => {})); else if (cb) cb(); return true; } end(chunk) { if (chunk != null) this.write(chunk); this.emit("finish"); this.emit("end"); } }
+		Writable.toWeb = (stream) => new WritableStream({ start(controller) { stream.on("error", (error) => controller.error(error)); }, write(chunk) { return new Promise((resolve, reject) => stream.write(chunk, undefined, (error) => error ? reject(error) : resolve())); }, close() { return new Promise((resolve, reject) => stream.end((error) => error ? reject(error) : resolve())); }, abort(reason) { stream.destroy && stream.destroy(reason instanceof Error ? reason : new Error(String(reason))); } });
+		class Duplex extends Readable { constructor(options) { super(options); this.writable = true; this.writableEnded = false; this.writableFinished = false; this._pendingWrites = 0; this._writableBufferedBytes = 0; this._writableNeedDrain = false; this._writableHighWaterMark = Number(options && options.highWaterMark) || 16384; this._writableOptions = options || {}; this._writableAutoDestroy = this._writableOptions.autoDestroy !== false; this._writeImpl = options && options.write; } write(...args) { return Writable.prototype.write.apply(this, args); } end(...args) { return Writable.prototype.end.apply(this, args); } _finishIfReady() { return Writable.prototype._finishIfReady.call(this); } destroy(error) { if (this.destroyed) return this; this.writable = false; return Readable.prototype.destroy.call(this, error); } }
 		class Transform extends Duplex {}
-		class PassThrough extends Transform { write(chunk, encoding, cb) { if (typeof encoding === "function") { cb = encoding; } this.emit("data", chunk); if (cb) cb(); return true; } end(chunk) { if (chunk != null) this.emit("data", chunk); this.emit("end"); this.emit("finish"); } }
+		class PassThrough extends Transform { constructor(options) { super(options); this._writeImpl = (chunk, _encoding, callback) => { this.push(chunk); callback(); }; } end(chunk, encoding, cb) { const done = typeof chunk === "function" ? chunk : typeof encoding === "function" ? encoding : cb; if (chunk != null && typeof chunk !== "function") this.write(chunk, typeof encoding === "string" ? encoding : undefined); this.push(null); return Writable.prototype.end.call(this, done); } }
 		function finished(stream, optsOrCb, maybeCb) {
 			const cb = typeof optsOrCb === "function" ? optsOrCb : maybeCb;
 			if (stream && stream.on) { let done = false; const fire = (e) => { if (done) return; done = true; if (cb) cb(e || null); }; stream.on("end", () => fire()); stream.on("finish", () => fire()); stream.on("close", () => fire()); stream.on("error", (e) => fire(e)); }
@@ -1499,8 +1514,40 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 			}
 			emit(event, ...args) {
 				const listeners = this._listeners.get(event) || [];
+				if (listeners.length === 0 && event === "error") {
+					throw (args[0] instanceof Error ? args[0] : new Error(String(args[0])));
+				}
 				for (const listener of [...listeners]) listener(...args);
 				return listeners.length > 0;
+			}
+		}
+		const streamStateError = (code, message) => {
+			const error = new Error(message);
+			error.code = code;
+			return error;
+		};
+		class ChildOutputStream extends Emitter {
+			constructor() {
+				super();
+				this.readable = true;
+				this.readableEnded = false;
+				this.destroyed = false;
+			}
+			endReadable() {
+				if (this.readableEnded) return;
+				this.readableEnded = true;
+				this.readable = false;
+				this.emit("end");
+				this.destroyed = true;
+				this.emit("close");
+			}
+			destroy(error) {
+				if (this.destroyed) return this;
+				this.destroyed = true;
+				this.readable = false;
+				if (error) this.emit("error", error);
+				this.emit("close");
+				return this;
 			}
 		}
 		class ChildProcess extends Emitter {
@@ -1510,17 +1557,77 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 				this.exitCode = null;
 				this.signalCode = null;
 				this.killed = false;
-				this.stdout = new Emitter();
-				this.stderr = new Emitter();
+				this.stdout = new ChildOutputStream();
+				this.stderr = new ChildOutputStream();
+				this.spawnfile = "";
+				this.spawnargs = [];
+				let stdinEnded = false;
 				this.stdin = {
-					write: (data) => {
-						callSync(globalThis._childProcessStdinWrite, sessionId, typeof data === "string" ? new TextEncoder().encode(data) : data);
-						return true;
+					writable: true,
+					writableEnded: false,
+					destroyed: false,
+					write: (data, encoding, callback) => {
+						const done = typeof encoding === "function" ? encoding : callback;
+						if (stdinEnded) {
+							const error = streamStateError("ERR_STREAM_WRITE_AFTER_END", "write after end");
+							queueMicrotask(() => done ? done(error) : this.stdin.emit("error", error));
+							return false;
+						}
+						try {
+							callSync(globalThis._childProcessStdinWrite, sessionId, typeof data === "string" ? new TextEncoder().encode(data) : data);
+							if (done) queueMicrotask(() => done());
+							return true;
+						} catch (error) {
+							queueMicrotask(() => done ? done(error) : this.stdin.emit("error", error));
+							return false;
+						}
 					},
-					end: (data) => {
-						if (data != null) this.stdin.write(data);
-						callSync(globalThis._childProcessStdinClose, sessionId);
+					end: (data, encoding, callback) => {
+						const done = typeof data === "function" ? data : typeof encoding === "function" ? encoding : callback;
+						if (stdinEnded) {
+							if (done) queueMicrotask(() => done());
+							return this.stdin;
+						}
+						if (data != null && typeof data !== "function") this.stdin.write(data, typeof encoding === "string" ? encoding : undefined);
+						stdinEnded = true;
+						this.stdin.writable = false;
+						this.stdin.writableEnded = true;
+						try {
+							callSync(globalThis._childProcessStdinClose, sessionId);
+							this.stdin.emit("finish");
+							queueMicrotask(() => {
+								if (done) done();
+								this.stdin.destroyed = true;
+								this.stdin.emit("close");
+							});
+						} catch (error) {
+							queueMicrotask(() => {
+								if (done) done(error);
+								else this.stdin.emit("error", error);
+								this.stdin.destroyed = true;
+								this.stdin.emit("close");
+							});
+						}
+						return this.stdin;
 					},
+					destroy: (error) => {
+						if (this.stdin.destroyed) return this.stdin;
+						if (!stdinEnded) {
+							stdinEnded = true;
+							try { callSync(globalThis._childProcessStdinClose, sessionId); } catch (closeError) { if (!error) error = closeError; }
+						}
+						this.stdin.writable = false;
+						this.stdin.writableEnded = true;
+						this.stdin.destroyed = true;
+						if (error) this.stdin.emit("error", error);
+						this.stdin.emit("close");
+						return this.stdin;
+					},
+					on: (...args) => { this.stdin._emitter.on(...args); return this.stdin; },
+					once: (...args) => { this.stdin._emitter.once(...args); return this.stdin; },
+					off: (...args) => { this.stdin._emitter.off(...args); return this.stdin; },
+					emit: (...args) => this.stdin._emitter.emit(...args),
+					_emitter: new Emitter(),
 				};
 			}
 		}
@@ -1548,6 +1655,11 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 			if (numeric !== undefined) return numeric;
 			throw unknownSignalError(signal);
 		};
+		const signalNames = Object.entries(signalNumbers).reduce((names, [name, number]) => {
+			if (names[number] === undefined) names[number] = name;
+			return names;
+		}, {});
+		const signalName = (signal) => signal == null ? null : typeof signal === "string" ? (signal.startsWith("SIG") ? signal : "SIG" + signal) : signalNames[Number(signal)] || null;
 		const unknownSignalError = (signal) => {
 			const error = new TypeError("Unknown signal: " + String(signal));
 			error.code = "ERR_UNKNOWN_SIGNAL";
@@ -1563,7 +1675,8 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 						command: String(command),
 						args: args.map(String),
 						options: {
-							cwd: options.cwd || (globalThis.process && globalThis.process.cwd ? globalThis.process.cwd() : "/"),
+							argv0: options.argv0 === undefined ? undefined : String(options.argv0),
+							cwd: options.cwd ?? (globalThis.process && globalThis.process.cwd ? globalThis.process.cwd() : "/"),
 							env: options.env,
 						},
 					},
@@ -1574,8 +1687,12 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 				return child;
 			}
 			const child = new ChildProcess(sessionId);
+			child.spawnfile = String(command);
+			child.spawnargs = [options.argv0 === undefined ? String(command) : String(options.argv0), ...args.map(String)];
 			child.kill = (signal) => {
-				callSync(globalThis._childProcessKill, sessionId, normalizeSignal(signal));
+				if (child.exitCode != null || child.signalCode != null) return false;
+				const accepted = callSync(globalThis._childProcessKill, sessionId, normalizeSignal(signal));
+				if (accepted === false) return false;
 				child.killed = true;
 				return true;
 			};
@@ -1596,10 +1713,13 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 					return;
 				}
 				if (event.type === "exit") {
-					child.exitCode = event.exitCode;
-					child.signalCode = event.signal;
-					child.emit("exit", event.exitCode, event.signal);
-					child.emit("close", event.exitCode, event.signal);
+					const terminationSignal = signalName(event.signal);
+					child.exitCode = terminationSignal == null ? event.exitCode : null;
+					child.signalCode = terminationSignal;
+					child.emit("exit", child.exitCode, terminationSignal);
+					child.stdout.endReadable();
+					child.stderr.endReadable();
+					child.emit("close", child.exitCode, terminationSignal);
 				}
 			};
 			queueMicrotask(() => {
@@ -1617,7 +1737,8 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 						command: String(command),
 						args: args.map(String),
 						options: {
-							cwd: options.cwd || (globalThis.process && globalThis.process.cwd ? globalThis.process.cwd() : "/"),
+							argv0: options.argv0 === undefined ? undefined : String(options.argv0),
+							cwd: options.cwd ?? (globalThis.process && globalThis.process.cwd ? globalThis.process.cwd() : "/"),
 							env: options.env,
 							input: encodeBytes(options.input),
 						},
@@ -1631,8 +1752,8 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 					output: [null, stdout, stderr],
 					stdout,
 					stderr,
-					status: result.code,
-					signal: null,
+					status: result.signal == null ? result.code : null,
+					signal: signalName(result.signal),
 					error: undefined,
 				};
 			} catch (error) {
@@ -2907,18 +3028,21 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 	wasi: BROWSER_WASI_POLYFILL_CODE,
 	"node:wasi": "module.exports = require('wasi');",
 	"secure-exec:wasi-command-host": `
+		const callSync = (ref, ...args) => {
+			if (typeof ref === "function") return ref(...args);
+			if (ref && typeof ref.applySync === "function") return ref.applySync(undefined, args);
+			if (ref && typeof ref.applySyncPromise === "function") return ref.applySyncPromise(undefined, args);
+			throw new Error("process exec bridge is not configured");
+		};
 		function defaultDecode(bytes) {
 			return new TextDecoder().decode(bytes);
 		}
 		function decodeNullSeparated(bytes) {
-			const out = [];
-			let start = 0;
-			for (let i = 0; i <= bytes.length; i += 1) {
-				if (i === bytes.length || bytes[i] === 0) {
-					if (i > start) out.push(defaultDecode(bytes.slice(start, i)));
-					start = i + 1;
-				}
-			}
+			if (!bytes || bytes.length === 0) return [];
+			const out = defaultDecode(bytes).split("\0");
+			// libc/std encode a terminal NUL after the last element. Remove exactly
+			// that terminator while preserving every intentional empty element.
+			if (bytes[bytes.length - 1] === 0) out.pop();
 			return out;
 		}
 		function parseEnv(bytes) {
@@ -2947,35 +3071,97 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 			const modules = new Map();
 			for (const [name, source] of Object.entries(commands || {})) {
 				const value = await readCommandBytes(source);
-				modules.set(name, value instanceof WebAssembly.Module ? value : new WebAssembly.Module(value));
+				const module = value instanceof WebAssembly.Module ? value : new WebAssembly.Module(value);
+				modules.set(name, module);
 			}
 			return modules;
+		}
+		function unsupportedBrowserNetworkError(image, networkImports) {
+			const subject = image && (image.commandPath || image.argv?.[0]);
+			const error = new Error(
+				"browser WASI command " + (subject || "<wasm>") +
+				" requires unsupported host_net imports: " + networkImports.join(", ") +
+				"; run this command in the native runtime",
+			);
+			error.code = "ERR_AGENTOS_BROWSER_WASM_NETWORK_UNSUPPORTED";
+			return error;
+		}
+		function assertBrowserNetworkSupported(image) {
+			const networkImports = WebAssembly.Module.imports(image.module)
+				.filter((entry) => entry.module === "host_net")
+				.map((entry) => entry.name);
+			if (networkImports.length > 0) {
+				throw unsupportedBrowserNetworkError(image, networkImports);
+			}
 		}
 		async function createWasiCommandHost(options) {
 			const WASI = options && options.WASI ? options.WASI : require("node:wasi").WASI;
 			const commandModules = await loadCommandModules(options && options.commands);
+			const trustedMaxSpawnFileActions = /* @agentos-process-max-spawn-file-actions */ 4096;
+			const trustedMaxSpawnFileActionBytes = /* @agentos-process-max-spawn-file-action-bytes */ 1048576;
+			const requestedMaxSpawnFileActions = Number(options?.maxSpawnFileActions);
+			const requestedMaxSpawnFileActionBytes = Number(options?.maxSpawnFileActionBytes);
+			// Guest options may lower their own cap, but can never raise the trusted VM
+			// policy embedded by the worker when this builtin is loaded.
+			const maxSpawnFileActions = Number.isSafeInteger(requestedMaxSpawnFileActions) && requestedMaxSpawnFileActions > 0
+				? Math.min(requestedMaxSpawnFileActions, trustedMaxSpawnFileActions)
+				: trustedMaxSpawnFileActions;
+			const maxSpawnFileActionBytes = Number.isSafeInteger(requestedMaxSpawnFileActionBytes) && requestedMaxSpawnFileActionBytes > 0
+				? Math.min(requestedMaxSpawnFileActionBytes, trustedMaxSpawnFileActionBytes)
+				: trustedMaxSpawnFileActionBytes;
+			let warnedSpawnFileActions = false;
+			let warnedSpawnFileActionBytes = false;
 			let memory = null;
 			let nextPid = 100;
+			let activePid = 1;
+			let activePpid = 0;
+			const processGroups = new Map([[1, 1]]);
 			const exitedChildren = new Map();
 			const deferredChildren = new Map();
 			const waitBuffer = new SharedArrayBuffer(4);
 			const wait = new Int32Array(waitBuffer);
 			const errnoSuccess = 0;
+			const errno2big = 1;
 			const errnoAcces = 2;
 			const errnoBadf = 8;
 			const errnoChild = 10;
+			const errnoFbig = 22;
 			const errnoInval = 28;
 			const errnoIo = 29;
+			const errnoLoop = 32;
 			const errnoNoent = 44;
+			const errnoNoexec = 45;
 			const errnoNosys = 52;
+			const errnoNotsup = 58;
 			const errnoPerm = 63;
 			const errnoRofs = 69;
-			let nextSyntheticFd = 1000;
+			const errnoSrch = 71;
+			const errnoMfile = 33;
+			const linuxBinprmBufferSize = 256;
+			const linuxMaxInterpreterDepth = 4;
+			const configuredModuleFileBytes = Number(options?.maxModuleFileBytes);
+			const maxModuleFileBytes = Number.isSafeInteger(configuredModuleFileBytes) && configuredModuleFileBytes >= 0
+				? configuredModuleFileBytes
+				: 256 * 1024 * 1024;
+			const syntheticFdBase = 1 << 20;
+			const configuredSyntheticFdCount = Number(options?.maxSyntheticFds);
+			const maxSyntheticFdCount = Number.isSafeInteger(configuredSyntheticFdCount) && configuredSyntheticFdCount > 0 && configuredSyntheticFdCount <= 0xffffffff - syntheticFdBase
+				? configuredSyntheticFdCount
+				: 4096;
+			const syntheticFdLimit = syntheticFdBase + maxSyntheticFdCount;
+			const syntheticFdWarnAt = Math.max(1, Math.floor(maxSyntheticFdCount * 0.9));
+			let warnedAboutSyntheticFds = false;
 			const syntheticFdEntries = new Map();
+			let activeCloexecFds = new Set();
 			let activeFdOverrides = null;
 			let activeChildCwd = null;
+			let activeWasi = null;
 			let previousLookupFdHandle = null;
 			let parentWasi = null;
+			const knownChildren = new Set();
+			const runningChildren = new Set();
+			let activeSpawnCallContext = null;
+			let activeBlockedSignals = new Set();
 			const getMemory = () => {
 				if (!memory) throw new Error("WASI host command memory is not set");
 				return memory;
@@ -2991,6 +3177,142 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 			};
 			const readBytes = (ptr, len) => bytes().slice(ptr >>> 0, (ptr >>> 0) + (len >>> 0));
 			const readString = (ptr, len) => defaultDecode(readBytes(ptr, len));
+			const decodeSignalMask = (maskLo, maskHi) => {
+				const signals = [];
+				const lo = Number(maskLo) >>> 0;
+				const hi = Number(maskHi) >>> 0;
+				for (let bit = 0; bit < 32; bit += 1) {
+					if (((lo >>> bit) & 1) === 1) signals.push(bit + 1);
+					if (((hi >>> bit) & 1) === 1) signals.push(bit + 33);
+				}
+				return signals;
+			};
+			const encodeSignalMask = (signals) => {
+				let lo = 0;
+				let hi = 0;
+				for (const signal of signals) {
+					if (signal >= 1 && signal <= 32) lo = (lo | (1 << (signal - 1))) >>> 0;
+					else if (signal >= 33 && signal <= 64) hi = (hi | (1 << (signal - 33))) >>> 0;
+				}
+				return { lo, hi };
+			};
+			const decodeSpawnActions = (actionsPtr, actionsLen, initialCwd) => {
+				const failLimit = (message) => {
+					if (process && process.stderr && typeof process.stderr.write === "function") {
+						process.stderr.write("[agentos] " + message + "\\n");
+					}
+					const error = new Error(message);
+					error.code = "E2BIG";
+					throw error;
+				};
+				const warnNearLimit = (kind, current, limit) => {
+					const countLimit = kind === "actions";
+					if ((countLimit ? warnedSpawnFileActions : warnedSpawnFileActionBytes) ||
+						current < Math.ceil(limit * 0.9)) return;
+					if (countLimit) warnedSpawnFileActions = true;
+					else warnedSpawnFileActionBytes = true;
+					const setting = countLimit
+						? "limits.process.maxSpawnFileActions"
+						: "limits.process.maxSpawnFileActionBytes";
+					if (process && process.stderr && typeof process.stderr.write === "function") {
+						process.stderr.write("[agentos] posix_spawn file-action " + kind + " near " +
+							setting + " (" + current + "/" + limit + "); raise " + setting + " if needed\\n");
+					}
+				};
+				if ((actionsLen >>> 0) > maxSpawnFileActionBytes) {
+					failLimit("posix_spawn file-action payload exceeds limits.process.maxSpawnFileActionBytes (" +
+						maxSpawnFileActionBytes + "); raise limits.process.maxSpawnFileActionBytes if needed");
+				}
+				warnNearLimit("bytes", actionsLen >>> 0, maxSpawnFileActionBytes);
+				const value = readBytes(actionsPtr, actionsLen);
+				const data = new DataView(value.buffer, value.byteOffset, value.byteLength);
+				const stdio = [0, 1, 2];
+				const closed = new Set();
+				const actions = [];
+				const actionFdPaths = new Map();
+				let cwd = initialCwd;
+				let offset = 0;
+				let actionCount = 0;
+				const fail = (code, message) => {
+					const error = new Error(message);
+					error.code = code;
+					throw error;
+				};
+				while (offset < value.byteLength) {
+					actionCount++;
+					if (actionCount > maxSpawnFileActions) {
+						failLimit("posix_spawn file actions exceed limits.process.maxSpawnFileActions (" +
+							maxSpawnFileActions + "); raise limits.process.maxSpawnFileActions if needed");
+					}
+					warnNearLimit("actions", actionCount, maxSpawnFileActions);
+					if (value.byteLength - offset < 24) fail("EINVAL", "truncated posix_spawn action header");
+					const command = data.getUint32(offset, true);
+					const fd = data.getInt32(offset + 4, true);
+					const sourceFd = data.getInt32(offset + 8, true);
+					const oflag = data.getInt32(offset + 12, true);
+					const mode = data.getUint32(offset + 16, true);
+					const pathLength = data.getUint32(offset + 20, true);
+					offset += 24;
+					const pathEnd = offset + pathLength;
+					if (pathEnd < offset || pathEnd > value.byteLength) fail("EINVAL", "truncated posix_spawn action path");
+					const actionPath = defaultDecode(value.subarray(offset, pathEnd));
+					offset = pathEnd;
+					if (command === 1) {
+						if (fd < 0) fail("EBADF", "posix_spawn close has an invalid fd");
+						closed.add(fd);
+						actionFdPaths.delete(fd);
+						if (fd <= 2) stdio[fd] = 0xffffffff;
+						actions.push({ command, fd, sourceFd, oflag, mode, path: "" });
+					} else if (command === 2) {
+						if (fd < 0 || sourceFd < 0 || closed.has(sourceFd)) fail("EBADF", "posix_spawn dup2 references a closed fd");
+						const source = sourceFd <= 2 ? stdio[sourceFd] : sourceFd;
+						if (source === 0xffffffff) fail("EBADF", "posix_spawn dup2 references a closed fd");
+						if (fd <= 2) stdio[fd] = source;
+						closed.delete(fd);
+						const sourcePath = actionFdPaths.get(sourceFd) || guestPathForBrowserFd(sourceFd);
+						if (sourcePath) actionFdPaths.set(fd, sourcePath);
+						else actionFdPaths.delete(fd);
+						actions.push({ command, fd, sourceFd, oflag, mode, path: "" });
+					} else if (command === 3) {
+						if (fd < 0) fail("EBADF", "posix_spawn open has an invalid fd");
+						if (!actionPath) fail("ENOENT", "posix_spawn open path is empty");
+						const resolvedPath = path().posix.resolve(cwd || "/", actionPath);
+						closed.delete(fd);
+						actionFdPaths.set(fd, resolvedPath);
+						if (fd <= 2) stdio[fd] = fd;
+						actions.push({ command, fd, sourceFd, oflag, mode, path: resolvedPath });
+					} else if (command === 4) {
+						if (!actionPath) fail("ENOENT", "posix_spawn chdir path is empty");
+						cwd = path().posix.resolve(cwd || "/", actionPath);
+						actions.push({ command, fd, sourceFd, oflag, mode, path: cwd });
+					} else if (command === 5) {
+						if (fd < 0 || closed.has(fd)) fail("EBADF", "posix_spawn fchdir has an invalid fd");
+						const directoryPath = actionFdPaths.get(fd) || guestPathForBrowserFd(fd);
+						if (!directoryPath) fail("EBADF", "posix_spawn fchdir references an unknown fd");
+						cwd = directoryPath;
+						actions.push({ command, fd, sourceFd, oflag, mode, path: cwd });
+					} else if (command === 6) {
+						if (fd < 0) fail("EBADF", "posix_spawn closefrom has an invalid fd");
+						for (const guestFd of new Set([
+							...syntheticFdEntries.keys(),
+							...(activeFdOverrides ? activeFdOverrides.keys() : []),
+							...actionFdPaths.keys(),
+						])) {
+							if (guestFd < fd) continue;
+							closed.add(guestFd);
+							actionFdPaths.delete(guestFd);
+						}
+						for (let stdioFd = Math.max(fd, 0); stdioFd <= 2; stdioFd += 1) {
+							closed.add(stdioFd);
+							stdio[stdioFd] = 0xffffffff;
+						}
+						actions.push({ command, fd, sourceFd, oflag, mode, path: "" });
+					} else {
+						fail("EINVAL", "unknown posix_spawn action opcode " + command);
+					}
+				}
+				return { stdio, cwd, actions };
+			};
 			const fs = () => require("node:fs");
 			const path = () => require("node:path");
 			const userRecord = new TextEncoder().encode(
@@ -3005,10 +3327,18 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 			};
 			const hostFsErrno = (error) => {
 				switch (error && typeof error === "object" ? error.code : undefined) {
+					case "E2BIG": return errno2big;
 					case "EACCES": return errnoAcces;
+					case "EBADF": return errnoBadf;
+					case "EFBIG": return errnoFbig;
+					case "EMFILE": return errnoMfile;
 					case "EPERM": return errnoPerm;
 					case "ENOENT": return errnoNoent;
+					case "ENOEXEC": return errnoNoexec;
+					case "ELOOP": return errnoLoop;
 					case "EINVAL": return errnoInval;
+					case "ENOTSUP": return errnoNotsup;
+					case "EISDIR": return errnoInval;
 					case "EROFS": return errnoRofs;
 					default: return errnoIo;
 				}
@@ -3027,27 +3357,214 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 					? path().posix.normalize(value)
 					: path().posix.resolve(currentGuestCwd(), value);
 			};
+			const pathEntries = (env) => {
+				const value = env && Object.prototype.hasOwnProperty.call(env, "PATH")
+					? String(env.PATH)
+					: "/bin:/usr/bin";
+				return value.split(":").map((entry) => entry || ".");
+			};
+			const resolveCommandModule = (commandPath, env, cwd) => {
+				const raw = String(commandPath);
+				const hasSlash = raw.includes("/");
+				const normalized = hasSlash
+					? path().posix.resolve(cwd || "/", raw)
+					: raw;
+				if (hasSlash) return commandModules.get(normalized) || null;
+				for (const directory of pathEntries(env)) {
+					const candidate = path().posix.resolve(cwd || "/", directory, raw);
+					if (commandModules.has(candidate)) return commandModules.get(candidate);
+				}
+				return null;
+			};
+			const resolveExecModule = (commandPath, cwd) => {
+				const raw = String(commandPath);
+				const normalized = path().posix.resolve(cwd || "/", raw);
+				return commandModules.get(normalized) || null;
+			};
+			const executableError = (code, message) => {
+				const error = new Error(message);
+				error.code = code;
+				return error;
+			};
+			const validateExecutableStat = (stat, subject) => {
+				if (!stat || typeof stat.isFile !== "function" || !stat.isFile()) {
+					throw executableError("EACCES", subject + " is not a regular executable file");
+				}
+				if ((Number(stat.mode) & 0o111) === 0) {
+					throw executableError("EACCES", subject + " does not have an executable mode bit");
+				}
+				const size = Number(stat.size);
+				if (!Number.isSafeInteger(size) || size < 0 || size > maxModuleFileBytes) {
+					throw executableError(
+						"EFBIG",
+						subject + " exceeds limits.wasm.maxModuleFileBytes (" + maxModuleFileBytes + "); raise limits.wasm.maxModuleFileBytes if needed",
+					);
+				}
+				return size;
+			};
+			const parseLinuxShebang = (value) => {
+				const executableBytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+				if (executableBytes.length < 2 || executableBytes[0] !== 0x23 || executableBytes[1] !== 0x21) return null;
+				const header = executableBytes.slice(2, Math.min(executableBytes.length, linuxBinprmBufferSize));
+				const newline = header.indexOf(0x0a);
+				let line = new TextDecoder().decode(newline >= 0 ? header.slice(0, newline) : header).replace(/[\t ]+$/u, "");
+				const first = line.search(/[^\t ]/u);
+				if (first < 0) throw executableError("ENOEXEC", "shebang does not name an interpreter");
+				line = line.slice(first);
+				const separator = line.search(/[\t ]/u);
+				if (newline < 0 && executableBytes.length >= linuxBinprmBufferSize && separator < 0) {
+					throw executableError("ENOEXEC", "shebang interpreter path exceeds the Linux header limit");
+				}
+				if (separator < 0) return { interpreter: line, optionalArgument: null };
+				const optionalArgument = line.slice(separator).replace(/^[\t ]+|[\t ]+$/gu, "");
+				return {
+					interpreter: line.slice(0, separator),
+					optionalArgument: optionalArgument || null,
+				};
+			};
+			const readExecutableFd = (targetFd, subject) => {
+				const stat = fs().fstatSync(targetFd);
+				const size = validateExecutableStat(stat, subject);
+				const value = new Uint8Array(size);
+				let offset = 0;
+				while (offset < size) {
+					const count = fs().readSync(targetFd, value, offset, size - offset, offset);
+					if (!Number.isInteger(count) || count <= 0) throw executableError("EIO", subject + " changed while being read");
+					offset += count;
+				}
+				return value;
+			};
+			const compileBrowserExecImage = (value, subject, argv, depth = 0) => {
+				const shebang = parseLinuxShebang(value);
+				if (shebang) {
+					if (depth >= linuxMaxInterpreterDepth) throw executableError("ELOOP", "interpreter recursion exceeds the Linux limit");
+					return loadBrowserExecImage(
+						shebang.interpreter,
+						[
+							shebang.interpreter,
+							...(shebang.optionalArgument === null ? [] : [shebang.optionalArgument]),
+							String(subject),
+							...argv.slice(1),
+						],
+						depth + 1,
+					);
+				}
+				try {
+					return { module: new WebAssembly.Module(value), argv };
+				} catch (error) {
+					if (error instanceof WebAssembly.CompileError) throw executableError("ENOEXEC", subject + " is not a supported WebAssembly executable image");
+					throw error;
+				}
+			};
+			const loadBrowserExecImage = (commandPath, argv, depth = 0) => {
+				const normalized = path().posix.resolve(currentGuestCwd(), String(commandPath));
+				const registered = commandModules.get(normalized);
+				if (registered) return { module: registered, argv };
+				const stat = fs().statSync(normalized);
+				validateExecutableStat(stat, normalized);
+				const value = fs().readFileSync(normalized);
+				if (Number(value.byteLength) > maxModuleFileBytes) throw executableError("EFBIG", normalized + " exceeds limits.wasm.maxModuleFileBytes");
+				return compileBrowserExecImage(value, String(commandPath), argv, depth);
+			};
+			const releaseGuestFileDescription = (description) => {
+				description.refCount = Math.max(0, (description.refCount || 1) - 1);
+				if (description.refCount === 0 && description.closed !== true) {
+					description.closed = true;
+					fs().closeSync(description.targetFd);
+				}
+			};
+			const createGuestFileHandle = (description, onClose) => {
+				let open = true;
+				const handle = { kind: "guest-file", description, onClose };
+				Object.defineProperties(handle, {
+					open: {
+						get: () => open,
+						set: (value) => {
+							if (value !== false || !open) return;
+							open = false;
+							if (typeof handle.onClose === "function") handle.onClose(handle);
+							releaseGuestFileDescription(description);
+						},
+					},
+					targetFd: { get: () => description.targetFd },
+					position: {
+						get: () => description.position,
+						set: (value) => {
+							description.position = value;
+							if (description.ownerEntry) description.ownerEntry.offset = value;
+						},
+					},
+					readOnly: { get: () => description.readOnly },
+					append: { get: () => description.append },
+				});
+				return handle;
+			};
 			const lookupSyntheticFd = (fd) => {
 				const descriptor = fd >>> 0;
 				const override = activeFdOverrides && activeFdOverrides.get(descriptor);
 				if (override && override.open !== false) return override;
 				const handle = syntheticFdEntries.get(descriptor);
 				if (handle && handle.open !== false) return handle;
-				if (typeof previousLookupFdHandle === "function") return previousLookupFdHandle(descriptor);
-				const parentEntry = parentWasi && parentWasi.fdTable && parentWasi.fdTable.get(descriptor);
-				if (parentEntry && parentEntry.kind === "file" && typeof parentEntry.realFd === "number") {
-					return {
-						kind: "guest-file",
-						targetFd: parentEntry.realFd,
-						position: typeof parentEntry.offset === "number" ? parentEntry.offset : 0,
-						readOnly: parentEntry.readOnly === true,
-						open: true,
-					};
+				if (typeof previousLookupFdHandle === "function") {
+					const previous = previousLookupFdHandle(descriptor);
+					if (previous) return previous;
+				}
+				const wasi = activeWasi || parentWasi;
+				const parentEntry = wasi && wasi.fdTable && wasi.fdTable.get(descriptor);
+				if (parentEntry && (parentEntry.kind === "file" || parentEntry.kind === "directory") && typeof parentEntry.realFd === "number") {
+					if (!parentEntry.__agentOSOpenFileDescription) {
+						const rights = typeof parentEntry.rightsBase === "bigint" ? parentEntry.rightsBase : null;
+						const initialPosition = typeof parentEntry.offset === "number" ? parentEntry.offset : 0;
+						const description = {
+							targetFd: parentEntry.realFd,
+							storedPosition: initialPosition,
+							readOnly: parentEntry.readOnly === true,
+							canRead: rights == null || (rights & (1n << 1n)) !== 0n,
+							canWrite: parentEntry.readOnly !== true && (rights == null || (rights & (1n << 6n)) !== 0n),
+							append: parentEntry.append === true,
+							isDirectory: parentEntry.kind === "directory",
+							refCount: 1,
+							ownerEntry: parentEntry,
+						};
+						Object.defineProperty(description, "position", {
+							get: () => typeof description.ownerEntry?.offset === "number"
+								? description.ownerEntry.offset
+								: description.storedPosition,
+							set: (value) => {
+								description.storedPosition = value;
+								if (description.ownerEntry) description.ownerEntry.offset = value;
+							},
+						});
+						parentEntry.__agentOSOpenFileDescription = description;
+					}
+					return createGuestFileHandle(
+						parentEntry.__agentOSOpenFileDescription,
+						() => {
+							if (wasi.fdTable.get(descriptor) === parentEntry) wasi.fdTable.delete(descriptor);
+						},
+					);
+				}
+				return null;
+			};
+			const guestPathForBrowserFd = (fd) => {
+				const handle = lookupSyntheticFd(fd);
+				const description = handle?.kind === "guest-file" ? handle.description : null;
+				if (typeof description?.guestPath === "string") return description.guestPath;
+				const wasi = activeWasi || parentWasi;
+				const entry = wasi?.fdTable?.get(Number(fd) >>> 0);
+				for (const candidate of [entry?.guestPath, entry?.path, entry?.preopenPath]) {
+					if (typeof candidate === "string" && candidate.startsWith("/")) {
+						return path().posix.normalize(candidate);
+					}
 				}
 				return null;
 			};
 			const closeSyntheticHandle = (handle) => {
 				if (!handle || handle.open === false) return;
+				if (handle.kind === "guest-file") {
+					handle.open = false;
+					return;
+				}
 				handle.open = false;
 				if (handle.kind === "pipe-read" && handle.pipe) {
 					handle.pipe.readHandleCount = Math.max(0, (handle.pipe.readHandleCount || 0) - 1);
@@ -3062,18 +3579,140 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 					return { kind: "stdio", targetFd: handle.targetFd, open: true };
 				}
 				if (handle.kind === "guest-file") {
-					return { ...handle, open: true };
+					if (!handle.description) return null;
+					handle.description.refCount = (handle.description.refCount || 1) + 1;
+					return createGuestFileHandle(handle.description);
 				}
 				if (!handle.pipe) return null;
 				if (handle.kind === "pipe-read") {
 					handle.pipe.readHandleCount = (handle.pipe.readHandleCount || 0) + 1;
-					return { kind: "pipe-read", pipe: handle.pipe, open: true, onClose: handle.onClose };
+					const onClose = handle.baseOnClose || handle.onClose;
+					return { kind: "pipe-read", pipe: handle.pipe, open: true, baseOnClose: onClose, onClose };
 				}
 				if (handle.kind === "pipe-write") {
 					handle.pipe.writeHandleCount = (handle.pipe.writeHandleCount || 0) + 1;
-					return { kind: "pipe-write", pipe: handle.pipe, open: true, onClose: handle.onClose };
+					const onClose = handle.baseOnClose || handle.onClose;
+					return { kind: "pipe-write", pipe: handle.pipe, open: true, baseOnClose: onClose, onClose };
 				}
 				return null;
+			};
+			const cloneOpenDescriptorsForSpawn = () => {
+				const overrides = new Map();
+				const wasi = activeWasi || parentWasi;
+				const openFds = new Set([
+					...(activeFdOverrides ? activeFdOverrides.keys() : []),
+					...syntheticFdEntries.keys(),
+					...(wasi?.fdTable instanceof Map ? wasi.fdTable.keys() : []),
+				]);
+				for (const fd of [...openFds].sort((left, right) => left - right)) {
+					const handle = lookupSyntheticFd(fd);
+					const cloned = cloneSyntheticHandle(handle);
+					if (cloned) overrides.set(fd, cloned);
+				}
+				return overrides;
+			};
+			const browserOpenFlagsFromSpawnAction = (oflag) => {
+				const value = Number(oflag) >>> 0;
+				let flags = (value & 0x10000000) !== 0
+					? ((value & 0x04000000) !== 0 ? 0o2 : 0o1)
+					: 0;
+				if ((value & 0x00000001) !== 0) flags |= 0o2000;
+				if ((value & 0x00000004) !== 0) flags |= 0o4000;
+				if ((value & (1 << 12)) !== 0) flags |= 0o100;
+				if ((value & (4 << 12)) !== 0) flags |= 0o200;
+				if ((value & (8 << 12)) !== 0) flags |= 0o1000;
+				return flags;
+			};
+			const applyBrowserSpawnFileActions = (overrides, actions, cloexecFds) => {
+				for (const action of actions || []) {
+					const fd = Number(action.fd);
+					if (!Number.isInteger(fd) || fd < 0) {
+						const error = new Error("posix_spawn action has an invalid fd");
+						error.code = "EBADF";
+						throw error;
+					}
+					if (action.command === 1) {
+						const handle = overrides.get(fd);
+						if (!handle) {
+							const error = new Error("posix_spawn close references a closed fd");
+							error.code = "EBADF";
+							throw error;
+						}
+						closeSyntheticHandle(handle);
+						overrides.delete(fd);
+						cloexecFds.delete(fd);
+						continue;
+					}
+					if (action.command === 2) {
+						const sourceFd = Number(action.sourceFd);
+						const source = overrides.get(sourceFd);
+						if (!source) {
+							const error = new Error("posix_spawn dup2 references a closed fd");
+							error.code = "EBADF";
+							throw error;
+						}
+						if (sourceFd === fd) {
+							cloexecFds.delete(fd);
+							continue;
+						}
+						const cloned = cloneSyntheticHandle(source);
+						if (!cloned) {
+							const error = new Error("posix_spawn dup2 cannot duplicate this fd");
+							error.code = "EBADF";
+							throw error;
+						}
+						const replaced = overrides.get(fd);
+						if (replaced) closeSyntheticHandle(replaced);
+						overrides.set(fd, cloned);
+						cloexecFds.delete(fd);
+						continue;
+					}
+					if (action.command === 3) {
+						const replaced = overrides.get(fd);
+						if (replaced) {
+							closeSyntheticHandle(replaced);
+							overrides.delete(fd);
+						}
+						const targetFd = fs().openSync(
+							action.path,
+							browserOpenFlagsFromSpawnAction(action.oflag),
+							Number(action.mode) >>> 0,
+						);
+						const stat = fs().fstatSync(targetFd);
+						if ((Number(action.oflag) & (2 << 12)) !== 0 && !stat.isDirectory()) {
+							fs().closeSync(targetFd);
+							const error = new Error("posix_spawn open target is not a directory");
+							error.code = "ENOTDIR";
+							throw error;
+						}
+						const rawFlags = Number(action.oflag) >>> 0;
+						const canWrite = (rawFlags & 0x10000000) !== 0;
+						const canRead = !canWrite || (rawFlags & 0x04000000) !== 0;
+						const description = {
+							targetFd,
+							position: 0,
+							readOnly: !canWrite,
+							canRead,
+							canWrite,
+							append: (rawFlags & 1) !== 0,
+							isDirectory: stat.isDirectory(),
+							guestPath: action.path,
+							refCount: 1,
+						};
+						overrides.set(fd, createGuestFileHandle(description));
+						cloexecFds.delete(fd);
+						continue;
+					}
+					if (action.command === 6) {
+						for (const [openFd, handle] of Array.from(overrides.entries())) {
+							if (openFd < fd) continue;
+							closeSyntheticHandle(handle);
+							overrides.delete(openFd);
+							cloexecFds.delete(openFd);
+						}
+					}
+				}
+				return overrides;
 			};
 			const handleMatchesStdio = (handle, expectedKind) => {
 				if (!handle || handle.open === false) return false;
@@ -3081,49 +3720,308 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 					if (expectedKind === "read") return handle.targetFd === 0;
 					if (expectedKind === "write") return handle.targetFd === 1 || handle.targetFd === 2;
 				}
-				if (expectedKind === "read") return handle.kind === "pipe-read" || handle.kind === "guest-file";
-				if (expectedKind === "write") return handle.kind === "pipe-write" || handle.kind === "guest-file";
+				if (expectedKind === "read") return handle.kind === "pipe-read" || (handle.kind === "guest-file" && !handle.description?.isDirectory);
+				if (expectedKind === "write") return handle.kind === "pipe-write" || (handle.kind === "guest-file" && !handle.description?.isDirectory && handle.description?.canWrite !== false);
 				return handle.kind === expectedKind;
 			};
-			const allocateSyntheticFd = (handle) => {
-				const fd = nextSyntheticFd++;
-				syntheticFdEntries.set(fd, handle);
-				return fd;
+			const guestFileDescription = (handle) => {
+				if (!handle || handle.kind !== "guest-file" || handle.open === false) return null;
+				if (handle.description) return handle.description;
+				if (typeof handle.targetFd !== "number") return null;
+				return handle;
+			};
+			const registerSyntheticGuestFile = (fd, handle, targetWasi = activeWasi || parentWasi) => {
+				if (!handle || handle.kind !== "guest-file" || !handle.description) return;
+				const wasi = targetWasi;
+				if (!wasi?.fdTable) return;
+				const description = handle.description;
+				const mirror = {
+					kind: description.isDirectory ? "directory" : "file",
+					realFd: description.targetFd,
+					readOnly: description.readOnly === true,
+					append: description.append === true,
+					rightsBase:
+						(description.canRead === false ? 0n : 1n << 1n) |
+						(description.canWrite === false ? 0n : 1n << 6n),
+					__agentOSSyntheticMirror: true,
+				};
+				Object.defineProperty(mirror, "offset", {
+					get: () => description.position,
+					set: (value) => { description.position = value; },
+				});
+				wasi.fdTable.set(fd, mirror);
+				handle.onClose = () => {
+					if (wasi.fdTable.get(fd) === mirror) wasi.fdTable.delete(fd);
+				};
+			};
+			const registerSyntheticHandle = (
+				fd,
+				handle,
+				entries = activeFdOverrides || syntheticFdEntries,
+				targetWasi = activeWasi || parentWasi,
+			) => {
+				registerSyntheticGuestFile(fd, handle, targetWasi);
+				if (!handle) return;
+				const onClose = handle.baseOnClose || handle.onClose;
+				handle.baseOnClose = onClose;
+				handle.onClose = (...args) => {
+					if (entries.get(fd) === handle) entries.delete(fd);
+					if (typeof onClose === "function") onClose(...args);
+				};
+			};
+			const allocateSyntheticFd = (handle, minimumFd = syntheticFdBase) => {
+				const entries = activeFdOverrides || syntheticFdEntries;
+				if (!warnedAboutSyntheticFds && entries.size >= syntheticFdWarnAt) {
+					warnedAboutSyntheticFds = true;
+					console.warn(
+						"[agentos] WASI synthetic fd usage is near the " + maxSyntheticFdCount +
+						" descriptor limit; raise createWasiCommandHost({ maxSyntheticFds }) if needed",
+					);
+				}
+				if (entries.size >= maxSyntheticFdCount) return null;
+				const firstFd = Math.max(syntheticFdBase, Number(minimumFd));
+				if (!Number.isSafeInteger(firstFd) || firstFd < 0 || firstFd >= syntheticFdLimit) return null;
+				for (let fd = firstFd; fd < syntheticFdLimit; fd += 1) {
+					if (entries.has(fd) || (activeWasi || parentWasi)?.fdTable?.has(fd)) continue;
+					entries.set(fd, handle);
+					registerSyntheticHandle(fd, handle, entries);
+					return fd;
+				}
+				return null;
 			};
 			const replaceSyntheticFd = (fd, handle) => {
 				const descriptor = fd >>> 0;
-				closeSyntheticHandle(syntheticFdEntries.get(descriptor));
-				syntheticFdEntries.set(descriptor, handle);
+				const entries = activeFdOverrides || syntheticFdEntries;
+				if (!entries.has(descriptor) && entries.size >= maxSyntheticFdCount) return false;
+				const existingSynthetic = entries.get(descriptor);
+				if (existingSynthetic) {
+					closeSyntheticHandle(existingSynthetic);
+				} else {
+					const wasi = activeWasi || parentWasi;
+					const existingEntry = wasi?.fdTable?.get(descriptor);
+					if (existingEntry) {
+						const existingHandle = lookupSyntheticFd(descriptor);
+						if (existingHandle?.kind === "guest-file") {
+							closeSyntheticHandle(existingHandle);
+						} else if (typeof existingEntry.realFd === "number") {
+							fs().closeSync(existingEntry.realFd);
+							wasi.fdTable.delete(descriptor);
+						}
+					}
+				}
+				entries.set(descriptor, handle);
+				registerSyntheticHandle(descriptor, handle, entries);
+				return true;
 			};
 			const pipeHasOpenWriters = (handle) =>
 				handle && handle.kind === "pipe-read" && handle.pipe && (handle.pipe.writeHandleCount || 0) > 0;
+			const execReplacementMarker = Symbol("agentos.browser.exec-replacement");
+			const wrappedParentWasis = new WeakSet();
+			const procFdAliasSets = new WeakMap();
+			const isExecReplacement = (error) =>
+				error && typeof error === "object" && error.marker === execReplacementMarker;
+			const readExecCloseFds = (cloexecFdsPtr, cloexecFdsLen) => {
+				const closeCount = Number(cloexecFdsLen) >>> 0;
+				if (closeCount > maxSyntheticFdCount) throw executableError("EINVAL", "exec CLOEXEC fd list exceeds the configured descriptor limit");
+				const closePtr = Number(cloexecFdsPtr) >>> 0;
+				const closeBytes = closeCount * 4;
+				if (closePtr > getMemory().buffer.byteLength - closeBytes) throw executableError("EINVAL", "exec CLOEXEC fd list is outside guest memory");
+				const closeFds = [];
+				for (let index = 0; index < closeCount; index += 1) {
+					closeFds.push(view().getUint32(closePtr + index * 4, true));
+				}
+				return closeFds;
+			};
+			const inheritWasiFdTable = (sourceWasi, targetWasi) => {
+				if (!(sourceWasi?.fdTable instanceof Map) || !(targetWasi?.fdTable instanceof Map)) return;
+				targetWasi.fdTable.clear();
+				for (const [fd, entry] of sourceWasi.fdTable) targetWasi.fdTable.set(fd, entry);
+				const inheritedNextFd = Number(sourceWasi.nextFd);
+				if (Number.isSafeInteger(inheritedNextFd) && inheritedNextFd >= 3) {
+					targetWasi.nextFd = inheritedNextFd;
+				} else {
+					const ordinaryFds = Array.from(sourceWasi.fdTable.keys())
+						.filter((fd) => Number.isSafeInteger(fd) && fd >= 3 && fd < syntheticFdBase);
+					targetWasi.nextFd = ordinaryFds.length > 0 ? Math.max(...ordinaryFds) + 1 : 3;
+				}
+			};
+			const installProcFdAliases = (wasi) => {
+				if (!wasi?.wasiImport || procFdAliasSets.has(wasi)) return;
+				const aliases = new Set();
+				procFdAliasSets.set(wasi, aliases);
+				const delegatePathOpen = typeof wasi.wasiImport.path_open === "function"
+					? wasi.wasiImport.path_open.bind(wasi.wasiImport)
+					: null;
+				const delegateFdClose = typeof wasi.wasiImport.fd_close === "function"
+					? wasi.wasiImport.fd_close.bind(wasi.wasiImport)
+					: null;
+				if (delegatePathOpen) {
+					wasi.wasiImport.path_open = (fd, dirflags, pathPtr, pathLen, oflags, rightsBase, rightsInheriting, fdflags, openedFdPtr) => {
+						const target = readString(pathPtr, pathLen);
+						const normalizedTarget = target.startsWith("/") ? target.slice(1) : target;
+						const procFdPrefix = "proc/self/fd/";
+						const sourceText = normalizedTarget.startsWith(procFdPrefix)
+							? normalizedTarget.slice(procFdPrefix.length)
+							: "";
+						if (!sourceText || !Array.from(sourceText).every((char) => char >= "0" && char <= "9")) {
+							return delegatePathOpen(fd, dirflags, pathPtr, pathLen, oflags, rightsBase, rightsInheriting, fdflags, openedFdPtr);
+						}
+						if ((Number(oflags) & 0x0f) !== 0 || (BigInt(rightsBase) & (1n << 6n)) !== 0n) return errnoAcces;
+						const sourceFd = Number(sourceText);
+						const source = wasi.fdTable?.get(sourceFd);
+						if (!source || source.kind !== "file" || typeof source.realFd !== "number") return errnoNoent;
+						let openedFd = Number(wasi.nextFd);
+						if (!Number.isSafeInteger(openedFd) || openedFd < 3) openedFd = 3;
+						while (wasi.fdTable.has(openedFd)) openedFd += 1;
+						const alias = { ...source, offset: 0, __agentOSProcFdAlias: true };
+						delete alias.__agentOSOpenFileDescription;
+						wasi.fdTable.set(openedFd, alias);
+						wasi.nextFd = openedFd + 1;
+						aliases.add(openedFd);
+						return writeU32(openedFdPtr, openedFd);
+					};
+				}
+				if (delegateFdClose) {
+					wasi.wasiImport.fd_close = (fd) => {
+						const descriptor = Number(fd) >>> 0;
+						if (aliases.delete(descriptor)) {
+							wasi.fdTable?.delete(descriptor);
+							return errnoSuccess;
+						}
+						return delegateFdClose(descriptor);
+					};
+				}
+			};
+			const installDescriptorOverrides = (wasi, overrides) => {
+				if (!(overrides instanceof Map) || !wasi?.wasiImport) return;
+				for (const [fd, handle] of overrides) {
+					registerSyntheticGuestFile(fd, handle, wasi);
+				}
+				const delegateFdClose = typeof wasi.wasiImport.fd_close === "function"
+					? wasi.wasiImport.fd_close.bind(wasi.wasiImport)
+					: null;
+				wasi.wasiImport.fd_close = (fd) => {
+					const descriptor = Number(fd) >>> 0;
+					const handle = overrides.get(descriptor);
+					if (!handle) return delegateFdClose ? delegateFdClose(descriptor) : errnoBadf;
+					closeSyntheticHandle(handle);
+					overrides.delete(descriptor);
+					wasi.fdTable?.delete(descriptor);
+					activeCloexecFds.delete(descriptor);
+					return errnoSuccess;
+				};
+			};
+			const instantiateProcessImage = (image, inheritedWasi, descriptorOverrides = null) => {
+				// Registered commands are inert data until selected by spawn/exec.
+				// Validate the selected image here so unused native-only registry
+				// commands do not make browser VM construction fail.
+				assertBrowserNetworkSupported(image);
+				const wasi = new WASI({
+					returnOnExit: true,
+					args: image.argv,
+					env: image.env,
+					preopens: inheritedWasi ? {} : { "/": image.cwd || "/" },
+				});
+				if (inheritedWasi) inheritWasiFdTable(inheritedWasi, wasi);
+				installDescriptorOverrides(wasi, descriptorOverrides);
+				installProcFdAliases(wasi);
+				const imports = {
+					wasi_snapshot_preview1: wasi.wasiImport,
+					...host.imports,
+				};
+				return {
+					wasi,
+					instance: new WebAssembly.Instance(image.module, imports),
+				};
+			};
+			const closeExecFds = (wasi, descriptors) => {
+				let warned = false;
+				const warnClose = (fd, detail) => {
+					if (warned) return;
+					warned = true;
+					console.warn("[agentos] exec committed but closing FD_CLOEXEC descriptor " + fd + " failed (" + detail + "); further close failures are suppressed");
+				};
+				for (const value of new Set(descriptors || [])) {
+					const fd = Number(value) >>> 0;
+					activeCloexecFds.delete(fd);
+					const override = activeFdOverrides?.get(fd);
+					if (override) {
+						closeSyntheticHandle(override);
+						activeFdOverrides.delete(fd);
+					}
+					const synthetic = activeFdOverrides ? null : syntheticFdEntries.get(fd);
+					if (synthetic) {
+						closeSyntheticHandle(synthetic);
+						syntheticFdEntries.delete(fd);
+					}
+					if (wasi?.fdTable?.has(fd)) {
+						try {
+							const result = wasi.wasiImport?.fd_close?.(fd);
+							if (typeof result === "number" && result !== errnoSuccess) warnClose(fd, "WASI errno " + result);
+						} catch (error) {
+							// Linux commits exec even when closing a descriptor reports an error.
+							warnClose(fd, error instanceof Error ? error.message : String(error));
+						}
+						wasi.fdTable.delete(fd);
+					}
+				}
+			};
 			const runChild = (child) => {
 				const parentMemory = memory;
+				const previousActivePid = activePid;
+				const previousActivePpid = activePpid;
 				const previousActiveFdOverrides = activeFdOverrides;
 				const previousActiveChildCwd = activeChildCwd;
+				const previousActiveWasi = activeWasi;
+				const previousBlockedSignals = activeBlockedSignals;
+				const previousCloexecFds = activeCloexecFds;
 				try {
-					const childWasi = new WASI({
-						returnOnExit: true,
-						args: child.argv.length > 0 ? child.argv : [child.commandPath],
-						env: child.env,
-						preopens: { "/": child.cwd || "/" },
-					});
-					const childImports = {
-						wasi_snapshot_preview1: childWasi.wasiImport,
-						...host.imports,
-					};
-					const childInstance = new WebAssembly.Instance(child.module, childImports);
-					memory = childInstance.exports.memory;
+					activePid = child.pid;
+					activePpid = child.ppid;
 					activeFdOverrides = child.overrides;
-					activeChildCwd = child.cwd || "/";
-					const exitCode = childWasi.start(childInstance);
-					exitedChildren.set(child.pid, exitCode);
-				} catch {
-					exitedChildren.set(child.pid, 127);
+					activeBlockedSignals = child.signalMask || new Set();
+					activeCloexecFds = child.cloexecFds || new Set();
+					runningChildren.add(child.pid);
+					let image = child;
+					let inheritedWasi = null;
+					for (;;) {
+						const started = instantiateProcessImage(image, inheritedWasi, child.overrides);
+						memory = started.instance.exports.memory;
+						activeChildCwd = image.cwd || "/";
+						activeWasi = started.wasi;
+						const mask = encodeSignalMask(activeBlockedSignals);
+						if (mask.lo !== 0 || mask.hi !== 0) {
+							const setter = started.instance.exports.__agentos_set_initial_sigmask;
+							if (typeof setter !== "function") throw new Error("spawned WASM image cannot initialize its inherited signal mask");
+							setter(mask.lo, mask.hi);
+						}
+						try {
+							const exitCode = started.wasi.start(started.instance);
+							exitedChildren.set(child.pid, { exitCode: Number(exitCode) || 0, signal: 0 });
+							break;
+						} catch (error) {
+							if (!isExecReplacement(error)) throw error;
+							closeExecFds(started.wasi, error.image.closeFds);
+							inheritedWasi = started.wasi;
+							image = error.image;
+						}
+					}
+				} catch (error) {
+					if (error?.code === "ERR_AGENTOS_BROWSER_WASM_NETWORK_UNSUPPORTED") {
+						throw error;
+					}
+					exitedChildren.set(child.pid, { exitCode: 127, signal: 0 });
 				} finally {
-					for (const handle of child.childOverrideHandles) closeSyntheticHandle(handle);
+					runningChildren.delete(child.pid);
+					for (const handle of new Set(child.overrides.values())) closeSyntheticHandle(handle);
+					child.overrides.clear();
 					activeFdOverrides = previousActiveFdOverrides;
 					activeChildCwd = previousActiveChildCwd;
+					activeWasi = previousActiveWasi;
+					activeBlockedSignals = previousBlockedSignals;
+					activeCloexecFds = previousCloexecFds;
+					activePid = previousActivePid;
+					activePpid = previousActivePpid;
 					memory = parentMemory;
 				}
 			};
@@ -3151,6 +4049,34 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 				},
 				setParentWasi(wasi) {
 					parentWasi = wasi || null;
+					if (!activeWasi) activeWasi = parentWasi;
+					if (wasi && typeof wasi.start === "function" && !wrappedParentWasis.has(wasi)) {
+						wrappedParentWasis.add(wasi);
+						const initialStart = wasi.start.bind(wasi);
+						wasi.start = (instance) => {
+							let currentWasi = wasi;
+							let currentInstance = instance;
+							let currentStart = initialStart;
+							let currentCwd = currentGuestCwd();
+							for (;;) {
+								memory = currentInstance.exports.memory;
+								activeChildCwd = currentCwd;
+								activeWasi = currentWasi;
+								parentWasi = currentWasi;
+								try {
+									return currentStart(currentInstance);
+								} catch (error) {
+									if (!isExecReplacement(error)) throw error;
+									closeExecFds(currentWasi, error.image.closeFds);
+									const started = instantiateProcessImage(error.image, currentWasi);
+									currentWasi = started.wasi;
+									currentInstance = started.instance;
+									currentStart = currentWasi.start.bind(currentWasi);
+									currentCwd = error.image.cwd || "/";
+								}
+							}
+						};
+					}
 					return host;
 				},
 				installBlockingStdin(processLike) {
@@ -3252,9 +4178,9 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 							if (descriptor <= 2) return 0o020666;
 							const handle = lookupSyntheticFd(descriptor);
 							if (handle && (handle.kind === "pipe-read" || handle.kind === "pipe-write")) return 0o010600;
-							if (handle && handle.kind === "guest-file" && typeof handle.targetFd === "number") {
+							if (handle && handle.kind === "guest-file" && typeof guestFileDescription(handle)?.targetFd === "number") {
 								try {
-									return modeFromStat(fs().fstatSync(handle.targetFd), 0o100644);
+									return modeFromStat(fs().fstatSync(guestFileDescription(handle).targetFd), 0o100644);
 								} catch {
 									return 0o100644;
 								}
@@ -3306,9 +4232,9 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 								if (
 									handle &&
 									handle.kind === "guest-file" &&
-									typeof handle.targetFd === "number"
+									typeof guestFileDescription(handle)?.targetFd === "number"
 								) {
-									return BigInt(fs().fstatSync(handle.targetFd).size ?? -1);
+									return BigInt(fs().fstatSync(guestFileDescription(handle).targetFd).size ?? -1);
 								}
 								const parentEntry =
 									parentWasi && parentWasi.fdTable && parentWasi.fdTable.get(descriptor);
@@ -3336,154 +4262,505 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 							}
 						},
 						fchmod(fd, mode) {
-							const handle = lookupSyntheticFd(fd >>> 0);
-							if (!handle || handle.kind !== "guest-file" || typeof handle.targetFd !== "number") {
-								return errnoBadf;
-							}
+							const descriptor = fd >>> 0;
+							const handle = lookupSyntheticFd(descriptor) || (descriptor <= 2
+								? { kind: "stdio", targetFd: descriptor, open: true }
+								: null);
+							if (!handle) return errnoBadf;
+							const description = guestFileDescription(handle);
+							if (!description) return errnoInval;
 							try {
-								fs().fchmodSync(handle.targetFd, Number(mode) >>> 0);
+								fs().fchmodSync(description.targetFd, Number(mode) & 0o7777);
 								return errnoSuccess;
 							} catch (error) {
 								return hostFsErrno(error);
 							}
 						},
 						ftruncate(fd, length) {
-							const handle = lookupSyntheticFd(fd >>> 0);
-							if (!handle || handle.kind !== "guest-file" || typeof handle.targetFd !== "number") {
-								return errnoBadf;
-							}
+							const descriptor = fd >>> 0;
+							const handle = lookupSyntheticFd(descriptor) || (descriptor <= 2
+								? { kind: "stdio", targetFd: descriptor, open: true }
+								: null);
+							if (!handle) return errnoBadf;
+							const description = guestFileDescription(handle);
+							if (!description) return errnoInval;
+							const size = Number(length);
+							if (!Number.isSafeInteger(size) || size < 0 || description.isDirectory) return errnoInval;
+							if (description.readOnly === true || description.canWrite === false) return errnoInval;
 							try {
-								fs().ftruncateSync(handle.targetFd, Number(length));
+								fs().ftruncateSync(description.targetFd, size);
 								return errnoSuccess;
 							} catch (error) {
 								return hostFsErrno(error);
 							}
 						},
 					},
-					host_process: {
-							proc_spawn(execPathPtr, execPathLen, argvPtr, argvLen, envpPtr, envpLen, stdinFd, stdoutFd, stderrFd, cwdPtr, cwdLen, retPid) {
-								try {
-									const commandPath = readString(execPathPtr, execPathLen);
-									if (!commandPath) return errnoNosys;
-									const argv = decodeNullSeparated(readBytes(argvPtr, argvLen));
-									const commandName = commandPath.split("/").filter(Boolean).at(-1) || commandPath;
-								const module = commandModules.get(commandName);
-									if (!module) return errnoNosys;
-								const env = {
-									...(options && options.env ? options.env : {}),
-									...parseEnv(readBytes(envpPtr, envpLen)),
-									PATH: (options && options.path) || "/bin:/usr/bin",
+						host_process: {
+						proc_spawn(argvPtr, argvLen, envpPtr, envpLen, stdinFd, stdoutFd, stderrFd, cwdPtr, cwdLen, retPid) {
+							try {
+								const argvBytes = readBytes(argvPtr, argvLen);
+								const commandLength = argvBytes.indexOf(0);
+								if (commandLength <= 0) return errnoNoent;
+								return this.proc_spawn_v2(
+									argvPtr,
+									commandLength,
+									argvPtr,
+									argvLen,
+									envpPtr,
+									envpLen,
+									stdinFd,
+									stdoutFd,
+									stderrFd,
+									cwdPtr,
+									cwdLen,
+									retPid,
+								);
+							} catch (error) {
+								return hostFsErrno(error);
+							}
+						},
+						proc_spawn_v3(execPathPtr, execPathLen, argvPtr, argvLen, envpPtr, envpLen, actionsPtr, actionsLen, cwdPtr, cwdLen, attrFlags, sigDefaultLo, sigDefaultHi, sigMaskLo, sigMaskHi, pgroup, retPid) {
+							const flags = attrFlags >>> 0;
+							const supportedFlags = 1 | 2 | 4 | 8 | 64;
+							if ((flags & ~supportedFlags) !== 0) return errnoNotsup;
+							if ((pgroup | 0) < 0) return errnoInval;
+							if (activeSpawnCallContext) return errnoIo;
+							try {
+								const initialCwd = cwdLen ? readString(cwdPtr, cwdLen) : ((options && options.cwd) || "/");
+								const actions = decodeSpawnActions(actionsPtr, actionsLen, initialCwd);
+								const signalMask = decodeSignalMask(sigMaskLo, sigMaskHi).filter((signal) => signal !== 9 && signal !== 19);
+								activeSpawnCallContext = {
+									attrFlags: flags,
+									pgroup: pgroup | 0,
+									signalMask,
+									signalDefaults: (flags & 4) !== 0 ? decodeSignalMask(sigDefaultLo, sigDefaultHi) : [],
+									fileActions: actions.actions,
 								};
-								const cwd = cwdLen ? readString(cwdPtr, cwdLen) : ((options && options.cwd) || "/");
-								const childOverrideHandles = [];
-								const overrides = new Map();
+								return this.proc_spawn_v2(
+									execPathPtr,
+									execPathLen,
+									argvPtr,
+									argvLen,
+									envpPtr,
+									envpLen,
+									actions.stdio[0],
+									actions.stdio[1],
+									actions.stdio[2],
+									cwdPtr,
+									0,
+									retPid,
+									actions.cwd,
+								);
+							} catch (error) {
+								return hostFsErrno(error);
+							} finally {
+								activeSpawnCallContext = null;
+							}
+						},
+						proc_spawn_v2(execPathPtr, execPathLen, argvPtr, argvLen, envpPtr, envpLen, stdinFd, stdoutFd, stderrFd, cwdPtr, cwdLen, retPid, resolvedCwdOverride) {
+							const childOverrideHandles = [];
+							let overrides = null;
+							try {
+								const commandPath = readString(execPathPtr, execPathLen);
+								if (!commandPath) return errnoNoent;
+								const argv = decodeNullSeparated(readBytes(argvPtr, argvLen));
+								const env = parseEnv(readBytes(envpPtr, envpLen));
+								const cwd = path().posix.resolve(typeof resolvedCwdOverride === "string" ? resolvedCwdOverride : (cwdLen ? readString(cwdPtr, cwdLen) : ((options && options.cwd) || "/")));
+								const module = resolveCommandModule(commandPath, env, cwd);
+								if (!module) return errnoNoent;
+								overrides = cloneOpenDescriptorsForSpawn();
+								const childCloexecFds = new Set(
+									[...activeCloexecFds].filter((fd) => overrides.has(fd)),
+								);
+								applyBrowserSpawnFileActions(
+									overrides,
+									activeSpawnCallContext?.fileActions || [],
+									childCloexecFds,
+								);
+								for (const fd of childCloexecFds) {
+									const handle = overrides.get(fd);
+									if (handle) closeSyntheticHandle(handle);
+									overrides.delete(fd);
+								}
+								const actionStdioFds = new Set(
+									(activeSpawnCallContext?.fileActions || [])
+										.filter((action) => action.command >= 1 && action.command <= 3 && action.fd >= 0 && action.fd <= 2)
+										.map((action) => action.fd),
+								);
 								for (const [childFd, parentFd, expectedKind] of [
 									[0, stdinFd >>> 0, "read"],
 									[1, stdoutFd >>> 0, "write"],
 									[2, stderrFd >>> 0, "write"],
 								]) {
-									const parentHandle = lookupSyntheticFd(parentFd);
+									if (actionStdioFds.has(childFd)) continue;
+									if (activeSpawnCallContext && parentFd === 0xffffffff) continue;
+									const parentHandle = overrides.get(parentFd) || lookupSyntheticFd(parentFd);
 									if (parentFd <= 2 && !parentHandle) continue;
-									if (!handleMatchesStdio(parentHandle, expectedKind)) return errnoBadf;
-									const childHandle = cloneSyntheticHandle(parentHandle);
-									if (!childHandle) return errnoBadf;
-									overrides.set(childFd, childHandle);
-									childOverrideHandles.push(childHandle);
+									if (!handleMatchesStdio(parentHandle, expectedKind)) {
+										const error = new Error("spawn stdio references an incompatible fd");
+										error.code = "EBADF";
+										throw error;
 									}
-									const pid = nextPid++;
-									const child = { pid, module, commandPath, argv, env, cwd, overrides, childOverrideHandles };
-									for (const parentFd of [stdinFd >>> 0, stdoutFd >>> 0, stderrFd >>> 0]) {
-										if (parentFd > 2) {
-											closeSyntheticHandle(syntheticFdEntries.get(parentFd));
-										}
+									const childHandle = cloneSyntheticHandle(parentHandle);
+									if (!childHandle) {
+										const error = new Error("spawn stdio fd cannot be duplicated");
+										error.code = "EBADF";
+										throw error;
+									}
+									const replaced = overrides.get(childFd);
+									if (replaced) closeSyntheticHandle(replaced);
+									overrides.set(childFd, childHandle);
 								}
+								childOverrideHandles.push(...new Set(overrides.values()));
+								const pid = nextPid++;
+								const parentPid = activePid;
+								const inheritedPgid = processGroups.get(parentPid) || parentPid;
+								const requestedPgid = activeSpawnCallContext?.attrFlags & 2
+									? (activeSpawnCallContext.pgroup === 0 ? pid : activeSpawnCallContext.pgroup)
+									: inheritedPgid;
+								if (requestedPgid !== pid && !Array.from(processGroups.values()).includes(requestedPgid)) {
+									const error = new Error("spawn requested an unknown process group");
+									error.code = "EPERM";
+									throw error;
+								}
+								processGroups.set(pid, requestedPgid);
+								const child = {
+									pid,
+									ppid: parentPid,
+									module,
+									commandPath,
+									argv,
+									env,
+									cwd,
+									overrides,
+									childOverrideHandles,
+									signalMask: new Set(activeSpawnCallContext?.signalMask || []),
+									cloexecFds: new Set(),
+								};
+								knownChildren.add(pid);
 								if (pipeHasOpenWriters(overrides.get(0))) {
 									deferredChildren.set(pid, child);
 								} else {
 									runChild(child);
 								}
 								return writeU32(retPid, pid);
-							} catch {
-								return errnoNosys;
+							} catch (error) {
+								for (const handle of new Set(overrides?.values() || childOverrideHandles)) closeSyntheticHandle(handle);
+								overrides?.clear();
+								if (error?.code === "ERR_AGENTOS_BROWSER_WASM_NETWORK_UNSUPPORTED") {
+									throw error;
+								}
+								return hostFsErrno(error);
 							}
 						},
-							proc_waitpid(pid, _options, retExitCode, retSignal, retPid) {
+							proc_exec(execPathPtr, execPathLen, argvPtr, argvLen, envpPtr, envpLen, cloexecFdsPtr, cloexecFdsLen) {
+								try {
+									const command = readString(execPathPtr, execPathLen);
+									if (!command) return errnoNoent;
+									const argv = decodeNullSeparated(readBytes(argvPtr, argvLen));
+									const env = parseEnv(readBytes(envpPtr, envpLen));
+									const cwd = currentGuestCwd();
+									const image = loadBrowserExecImage(command, argv);
+									const closeFds = readExecCloseFds(cloexecFdsPtr, cloexecFdsLen);
+									throw {
+										marker: execReplacementMarker,
+										image: { module: image.module, commandPath: command, argv: image.argv, env, cwd, closeFds },
+									};
+								} catch (error) {
+									if (isExecReplacement(error)) throw error;
+									return hostFsErrno(error);
+								}
+							},
+							proc_fexec(execFd, argvPtr, argvLen, envpPtr, envpLen, cloexecFdsPtr, cloexecFdsLen) {
+								try {
+									const descriptor = execFd >>> 0;
+									const handle = lookupSyntheticFd(descriptor);
+									const description = guestFileDescription(handle);
+									if (!description || description.isDirectory || typeof description.targetFd !== "number") return errnoBadf;
+									const argv = decodeNullSeparated(readBytes(argvPtr, argvLen));
+									const env = parseEnv(readBytes(envpPtr, envpLen));
+									const closeFds = readExecCloseFds(cloexecFdsPtr, cloexecFdsLen);
+									const scriptRef = "/proc/self/fd/" + descriptor;
+									const value = readExecutableFd(description.targetFd, scriptRef);
+									if (parseLinuxShebang(value) && closeFds.includes(descriptor)) return errnoNoent;
+									const image = compileBrowserExecImage(value, scriptRef, argv);
+									throw {
+										marker: execReplacementMarker,
+										image: {
+											module: image.module,
+											commandPath: scriptRef,
+											argv: image.argv,
+											env,
+											cwd: currentGuestCwd(),
+											closeFds,
+										},
+									};
+								} catch (error) {
+									if (isExecReplacement(error)) throw error;
+									return hostFsErrno(error);
+								}
+							},
+							proc_waitpid(pid, optionsValue, retStatus, retPid) {
 								const requested = pid >>> 0;
-								runReadyDeferredChildren(requested === 0xffffffff ? undefined : requested);
-							const childPid = requested === 0xffffffff
-								? exitedChildren.keys().next().value
-								: requested;
-							if (!childPid || !exitedChildren.has(childPid)) {
-								if ((_options >>> 0) !== 0) {
-									writeU32(retExitCode, 0);
-									writeU32(retSignal, 0);
-									writeU32(retPid, 0);
+								const waitOptions = optionsValue >>> 0;
+								const waitNoHang = 1;
+								if ((waitOptions & ~waitNoHang) !== 0) return errnoInval;
+								const anyChild = requested === 0xffffffff;
+								if (!anyChild && !knownChildren.has(requested)) return errnoChild;
+								if (anyChild && knownChildren.size === 0) return errnoChild;
+								const findExited = () => anyChild ? exitedChildren.keys().next().value : (exitedChildren.has(requested) ? requested : undefined);
+								let childPid;
+								for (;;) {
+									runReadyDeferredChildren(anyChild ? undefined : requested);
+									childPid = findExited();
+									if (childPid !== undefined) break;
+									if ((waitOptions & waitNoHang) !== 0) {
+										writeU32(retStatus, 0);
+										writeU32(retPid, 0);
 										return errnoSuccess;
 									}
-									writeU32(retPid, 0);
-									return errnoChild;
+									Atomics.wait(wait, 0, 0, 1);
 								}
-							writeU32(retExitCode, exitedChildren.get(childPid) || 0);
-							writeU32(retSignal, 0);
-							writeU32(retPid, childPid);
-							exitedChildren.delete(childPid);
-							return errnoSuccess;
-						},
-						fd_dup(fd, retNewFd) {
-							const descriptor = fd >>> 0;
-							const handle = lookupSyntheticFd(descriptor) || (descriptor <= 2
-								? { kind: "stdio", targetFd: descriptor, open: true }
-								: null);
-							if (!handle) return writeU32(retNewFd, fd);
-							const cloned = cloneSyntheticHandle(handle);
-							if (!cloned) return errnoBadf;
-							return writeU32(retNewFd, allocateSyntheticFd(cloned));
-						},
-						fd_dup2(oldFd, newFd) {
-							if (oldFd === newFd) return errnoSuccess;
-							const handle = lookupSyntheticFd(oldFd >>> 0);
-							if (!handle) return oldFd <= 2 && newFd <= 2 ? errnoSuccess : errnoBadf;
-							const cloned = cloneSyntheticHandle(handle);
-							if (!cloned) return errnoBadf;
-							replaceSyntheticFd(newFd >>> 0, cloned);
-							return errnoSuccess;
-						},
-						proc_closefrom(lowFd) {
-							const minimumFd = lowFd >>> 0;
-							for (const [fd, handle] of Array.from(syntheticFdEntries.entries())) {
-								if (fd < minimumFd) continue;
-								closeSyntheticHandle(handle);
-								syntheticFdEntries.delete(fd);
-							}
-							return errnoSuccess;
-						},
-						fd_pipe(retReadFd, retWriteFd) {
-							const pipe = {
-								chunks: [],
-								consumers: new Map(),
-								producers: new Map(),
-								readHandleCount: 1,
-								writeHandleCount: 1,
-							};
-							const readFd = allocateSyntheticFd({ kind: "pipe-read", pipe, open: true, onClose: onPipeHandleClose });
-							const writeFd = allocateSyntheticFd({ kind: "pipe-write", pipe, open: true, onClose: onPipeHandleClose });
-							writeU32(retReadFd, readFd);
-							writeU32(retWriteFd, writeFd);
-							return errnoSuccess;
-						},
-						proc_getpid(retPid) { return writeU32(retPid, 1); },
-						proc_getppid(retPid) { return writeU32(retPid, 0); },
-						proc_kill() { return errnoNosys; },
-						sleep_ms(milliseconds) {
-							const deadline = Date.now() + (milliseconds >>> 0);
-							while (Date.now() < deadline) {
-								// Keep guest sleeps interruptible by V8 termination during kill/dispose.
-								Atomics.wait(wait, 0, 0, Math.max(1, Math.min(10, deadline - Date.now())));
-							}
-							return errnoSuccess;
-						},
-						pty_open() { return errnoNosys; },
-						proc_sigaction() { return errnoSuccess; },
+								const status = exitedChildren.get(childPid);
+								const signal = status?.signal ?? 0;
+								writeU32(retStatus, signal === 0 ? (status?.exitCode ?? 0) : 128 + signal);
+								writeU32(retPid, childPid);
+								exitedChildren.delete(childPid);
+								knownChildren.delete(childPid);
+								processGroups.delete(childPid);
+								return errnoSuccess;
+							},
+							proc_waitpid_v2(pid, optionsValue, retExitCode, retSignal, retPid, retCoreDumped) {
+								const requested = pid >>> 0;
+								const waitOptions = optionsValue >>> 0;
+								const waitNoHang = 1;
+								if ((waitOptions & ~waitNoHang) !== 0) return errnoInval;
+								const anyChild = requested === 0xffffffff;
+								if (!anyChild && !knownChildren.has(requested)) return errnoChild;
+								if (anyChild && knownChildren.size === 0) return errnoChild;
+								const findExited = () => anyChild ? exitedChildren.keys().next().value : (exitedChildren.has(requested) ? requested : undefined);
+								let childPid;
+								for (;;) {
+									runReadyDeferredChildren(anyChild ? undefined : requested);
+									childPid = findExited();
+									if (childPid !== undefined) break;
+									if ((waitOptions & waitNoHang) !== 0) {
+										writeU32(retExitCode, 0);
+										writeU32(retSignal, 0);
+										writeU32(retPid, 0);
+										if (retCoreDumped !== undefined) writeU32(retCoreDumped, 0);
+										return errnoSuccess;
+									}
+									Atomics.wait(wait, 0, 0, 1);
+								}
+								const status = exitedChildren.get(childPid);
+								writeU32(retExitCode, status?.exitCode ?? 0);
+								writeU32(retSignal, status?.signal ?? 0);
+								writeU32(retPid, childPid);
+								if (retCoreDumped !== undefined) writeU32(retCoreDumped, 0);
+								exitedChildren.delete(childPid);
+								knownChildren.delete(childPid);
+								processGroups.delete(childPid);
+								return errnoSuccess;
+							},
+							fd_dup(fd, retNewFd) {
+								const descriptor = fd >>> 0;
+								const handle = lookupSyntheticFd(descriptor) || (descriptor <= 2
+									? { kind: "stdio", targetFd: descriptor, open: true }
+									: null);
+								if (!handle) return errnoBadf;
+								const cloned = cloneSyntheticHandle(handle);
+								if (!cloned) return errnoBadf;
+								const allocated = allocateSyntheticFd(cloned);
+								if (allocated == null) {
+									closeSyntheticHandle(cloned);
+									return errnoMfile;
+								}
+								activeCloexecFds.delete(allocated);
+								return writeU32(retNewFd, allocated);
+							},
+							fd_getfd(fd, retFlags) {
+								const descriptor = Number(fd);
+								if (!Number.isInteger(descriptor) || descriptor < 0) return errnoBadf;
+								const handle = lookupSyntheticFd(descriptor) || (descriptor <= 2
+									? { kind: "stdio", targetFd: descriptor, open: true }
+									: null);
+								if (!handle) return errnoBadf;
+								return writeU32(retFlags, activeCloexecFds.has(descriptor) ? 1 : 0);
+							},
+							fd_setfd(fd, flags) {
+								const descriptor = Number(fd);
+								const value = Number(flags) >>> 0;
+								if (!Number.isInteger(descriptor) || descriptor < 0) return errnoBadf;
+								if ((value & ~1) !== 0) return errnoInval;
+								const handle = lookupSyntheticFd(descriptor) || (descriptor <= 2
+									? { kind: "stdio", targetFd: descriptor, open: true }
+									: null);
+								if (!handle) return errnoBadf;
+								if ((value & 1) !== 0) activeCloexecFds.add(descriptor);
+								else activeCloexecFds.delete(descriptor);
+								return errnoSuccess;
+							},
+							fd_dup_min(fd, minFd, retNewFd) {
+								const source = Number(fd);
+								const minimum = Number(minFd);
+								if (!Number.isInteger(source) || source < 0) return errnoBadf;
+								if (!Number.isInteger(minimum) || minimum < 0) return errnoInval;
+								const handle = lookupSyntheticFd(source) || (source <= 2
+									? { kind: "stdio", targetFd: source, open: true }
+									: null);
+								if (!handle) return errnoBadf;
+								const cloned = cloneSyntheticHandle(handle);
+								if (!cloned) return errnoBadf;
+								const allocated = allocateSyntheticFd(cloned, minimum);
+								if (allocated == null) {
+									closeSyntheticHandle(cloned);
+									return errnoMfile;
+								}
+								activeCloexecFds.delete(allocated);
+								return writeU32(retNewFd, allocated);
+							},
+							fd_dup2(oldFd, newFd) {
+								const source = oldFd >>> 0;
+								const destination = newFd >>> 0;
+								const handle = lookupSyntheticFd(source) || (source <= 2 ? { kind: "stdio", targetFd: source, open: true } : null);
+								if (!handle) return errnoBadf;
+								if (source === destination) return errnoSuccess;
+								const cloned = cloneSyntheticHandle(handle);
+								if (!cloned) return errnoBadf;
+								try {
+									if (!replaceSyntheticFd(destination, cloned)) {
+										closeSyntheticHandle(cloned);
+										return errnoMfile;
+									}
+								} catch (error) {
+									closeSyntheticHandle(cloned);
+									return hostFsErrno(error);
+								}
+								activeCloexecFds.delete(destination);
+								return errnoSuccess;
+							},
+							proc_closefrom(lowFd) {
+								const minimumFd = lowFd >>> 0;
+								const entries = activeFdOverrides || syntheticFdEntries;
+								for (const [fd, handle] of Array.from(entries.entries())) {
+									if (fd < minimumFd) continue;
+									closeSyntheticHandle(handle);
+									entries.delete(fd);
+									activeCloexecFds.delete(fd);
+								}
+								const wasi = activeWasi || parentWasi;
+								if (wasi && wasi.fdTable) {
+									for (const [fd, entry] of Array.from(wasi.fdTable.entries())) {
+										if (fd < minimumFd) continue;
+										const guestHandle = activeFdOverrides
+											? activeFdOverrides.get(fd)
+											: lookupSyntheticFd(fd);
+										if (guestHandle?.kind === "guest-file") {
+											try {
+												closeSyntheticHandle(guestHandle);
+											} catch (error) {
+												return hostFsErrno(error);
+											}
+										} else if (typeof entry?.realFd === "number") {
+											try {
+												fs().closeSync(entry.realFd);
+											} catch (error) {
+												const errno = hostFsErrno(error);
+												if (errno !== errnoBadf) return errno;
+											}
+										} else if (typeof wasi.wasiImport?.fd_close === "function") {
+											const errno = wasi.wasiImport.fd_close(fd);
+											if (errno !== undefined && errno !== errnoSuccess && errno !== errnoBadf) return errno;
+										}
+										wasi.fdTable.delete(fd);
+										activeCloexecFds.delete(fd);
+									}
+								}
+								return errnoSuccess;
+							},
+							fd_pipe(retReadFd, retWriteFd) {
+								const pipe = {
+									chunks: [],
+									consumers: new Map(),
+									producers: new Map(),
+									readHandleCount: 1,
+									writeHandleCount: 1,
+								};
+								const readHandle = { kind: "pipe-read", pipe, open: true, baseOnClose: onPipeHandleClose, onClose: onPipeHandleClose };
+								const readFd = allocateSyntheticFd(readHandle);
+								if (readFd == null) return errnoMfile;
+								const writeHandle = { kind: "pipe-write", pipe, open: true, baseOnClose: onPipeHandleClose, onClose: onPipeHandleClose };
+								const writeFd = allocateSyntheticFd(writeHandle);
+								if (writeFd == null) {
+									closeSyntheticHandle(readHandle);
+									return errnoMfile;
+								}
+								activeCloexecFds.delete(readFd);
+								activeCloexecFds.delete(writeFd);
+								writeU32(retReadFd, readFd);
+								writeU32(retWriteFd, writeFd);
+								return errnoSuccess;
+							},
+							proc_getpid(retPid) { return writeU32(retPid, activePid); },
+							proc_getppid(retPid) { return writeU32(retPid, activePpid); },
+							proc_getpgid(pid, retPgid) {
+								const targetPid = (pid >>> 0) || activePid;
+								const pgid = processGroups.get(targetPid);
+								return pgid === undefined ? errnoSrch : writeU32(retPgid, pgid);
+							},
+							proc_setpgid(pid, pgid) {
+								const targetPid = (pid >>> 0) || activePid;
+								const targetPgid = (pgid >>> 0) || targetPid;
+								if (!processGroups.has(targetPid)) return errnoSrch;
+								if (targetPgid !== targetPid && !Array.from(processGroups.values()).includes(targetPgid)) return errnoPerm;
+								processGroups.set(targetPid, targetPgid);
+								return errnoSuccess;
+							},
+							proc_kill(pid, signal) {
+								const targetPid = pid >>> 0;
+								const signalNumber = signal >>> 0;
+								if (signalNumber > 31) return errnoInval;
+								if (!knownChildren.has(targetPid) || exitedChildren.has(targetPid)) return errnoSrch;
+								if (signalNumber === 0) return errnoSuccess;
+								if (![1, 2, 9, 15].includes(signalNumber)) return errnoNosys;
+								if (runningChildren.has(targetPid)) return errnoNosys;
+								const child = deferredChildren.get(targetPid);
+								if (!child) return errnoSrch;
+								deferredChildren.delete(targetPid);
+								for (const handle of child.childOverrideHandles) closeSyntheticHandle(handle);
+								exitedChildren.set(targetPid, { exitCode: 0, signal: signalNumber });
+								Atomics.notify(wait, 0);
+								return errnoSuccess;
+							},
+							sleep_ms(milliseconds) {
+								const deadline = Date.now() + (milliseconds >>> 0);
+								while (Date.now() < deadline) {
+									// Keep guest sleeps interruptible by V8 termination during kill/dispose.
+									Atomics.wait(wait, 0, 0, Math.max(1, Math.min(10, deadline - Date.now())));
+								}
+								return errnoSuccess;
+							},
+							pty_open() { return errnoNosys; },
+							proc_sigaction() { return errnoNosys; },
+							proc_signal_mask_v2(how, setLo, setHi, retOldLo, retOldHi) {
+								const previous = encodeSignalMask(activeBlockedSignals);
+								writeU32(retOldLo, previous.lo);
+								writeU32(retOldHi, previous.hi);
+								const operation = how >>> 0;
+								if (operation === 3) return errnoSuccess;
+								if (operation > 2) return errnoInval;
+								const requested = decodeSignalMask(setLo, setHi).filter((signal) => signal !== 9 && signal !== 19);
+								if (operation === 0) {
+									for (const signal of requested) activeBlockedSignals.add(signal);
+								} else if (operation === 1) {
+									for (const signal of requested) activeBlockedSignals.delete(signal);
+								} else {
+									activeBlockedSignals.clear();
+									for (const signal of requested) activeBlockedSignals.add(signal);
+								}
+								return errnoSuccess;
+							},
 					},
 				},
 			};
@@ -3543,6 +4820,46 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 	`,
 	"node:os": "module.exports = require('os');",
 };
+
+export interface WasiCommandProcessLimits {
+	maxSpawnFileActions?: number;
+	maxSpawnFileActionBytes?: number;
+}
+
+function positiveIntegerOrDefault(value: unknown, fallback: number): number {
+	return Number.isSafeInteger(value) && Number(value) > 0
+		? Number(value)
+		: fallback;
+}
+
+/** Render a builtin with trusted VM policy captured in its module closure. */
+export function getRuntimePolyfillCode(
+	moduleName: string,
+	processLimits?: WasiCommandProcessLimits,
+): string | null {
+	const name = moduleName.replace(/^node:/, "");
+	const source = POLYFILL_CODE_MAP[name];
+	if (!source || name !== "secure-exec:wasi-command-host") {
+		return source ?? null;
+	}
+	const maxSpawnFileActions = positiveIntegerOrDefault(
+		processLimits?.maxSpawnFileActions,
+		4096,
+	);
+	const maxSpawnFileActionBytes = positiveIntegerOrDefault(
+		processLimits?.maxSpawnFileActionBytes,
+		1024 * 1024,
+	);
+	return source
+		.replace(
+			"/* @agentos-process-max-spawn-file-actions */ 4096",
+			`/* @agentos-process-max-spawn-file-actions */ ${maxSpawnFileActions}`,
+		)
+		.replace(
+			"/* @agentos-process-max-spawn-file-action-bytes */ 1048576",
+			`/* @agentos-process-max-spawn-file-action-bytes */ ${maxSpawnFileActionBytes}`,
+		);
+}
 
 export function exposeCustomGlobal(name: string, value: unknown): void {
 	(globalThis as Record<string, unknown>)[name] = value;

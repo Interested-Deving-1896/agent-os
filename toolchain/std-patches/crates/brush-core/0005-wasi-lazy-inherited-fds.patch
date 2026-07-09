@@ -1,0 +1,56 @@
+Make inherited Linux descriptors available to WASI shell redirections without
+an unbounded /proc-style scan. AgentOS's patched Rust fd clone validates the
+descriptor through the bounded host fd table and returns EBADF when absent.
+
+--- a/src/interp.rs
++++ b/src/interp.rs
+@@ -133,7 +133,13 @@
+             openfiles::OpenFileEntry::NotSpecified => {
+                 // We didn't have this fd specified one way or the other; we fallback
+-                // to what's represented in the shell's open files.
+-                shell.persistent_open_files().try_fd(fd).cloned()
++                // to what's represented in the shell's open files. WASI does
++                // not expose /proc/self/fd, so lazily probe an inherited raw
++                // descriptor when it was not part of Brush's initial table.
++                shell
++                    .persistent_open_files()
++                    .try_fd(fd)
++                    .cloned()
++                    .or_else(|| sys::fd::try_get_file_for_open_fd(fd))
+             }
+         }
+     }
+--- a/src/sys/stubs/fd.rs
++++ b/src/sys/stubs/fd.rs
+@@ -1,13 +1,29 @@
+ //! File descriptor utilities.
+ 
+ use crate::{ShellFd, error, openfiles};
+ 
++#[cfg(target_os = "wasi")]
++use std::os::wasi::io::BorrowedFd;
++
+ /// Stub implementation for platforms that do not support enumerating file descriptors.
+ pub fn try_iter_open_fds() -> impl Iterator<Item = (ShellFd, openfiles::OpenFile)> {
+     std::iter::empty()
+ }
+ 
+-/// Stub implementation for platforms that do not support opening file descriptors.
+-pub fn try_get_file_for_open_fd(_fd: ShellFd) -> Option<openfiles::OpenFile> {
++/// Attempts to clone an inherited descriptor into an owned shell file.
++pub fn try_get_file_for_open_fd(fd: ShellFd) -> Option<openfiles::OpenFile> {
++    #[cfg(target_os = "wasi")]
++    {
++        // SAFETY: try_clone_to_owned validates the guest descriptor through
++        // AgentOS's fd_dup host syscall and returns EBADF for a closed fd.
++        let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
++        return borrowed_fd
++            .try_clone_to_owned()
++            .ok()
++            .map(|owned_fd| std::fs::File::from(owned_fd).into());
++    }
++
++    #[cfg(not(target_os = "wasi"))]
++    let _ = fd;
+     None
+ }

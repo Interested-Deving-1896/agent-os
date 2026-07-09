@@ -1,0 +1,85 @@
+Keep libc pathname capabilities outside the Linux descriptor namespace.
+
+WASI libc resolves ordinary absolute/cwd-relative POSIX paths through a cached
+preopen descriptor, conventionally fd 3. AgentOS also exposes a native Linux
+descriptor table where fd 3 can be closed or replaced with dup2. Passing the
+cached raw preopen number into path imports after that replacement makes an
+ordinary open("/path") indistinguishable from openat(3, "path").
+
+Tag only descriptors returned by libc's internal pathname resolver. The host
+runtime strips this private tag and routes the operation through its preserved
+hidden preopen capability. Explicit *at calls bypass these helpers and retain
+the exact guest descriptor, matching Linux when fd 3 has been replaced.
+
+Preopen discovery itself also uses the tagged alias. Otherwise an exec'd image
+whose fd 3 is a real inherited Linux descriptor sees that descriptor during
+the initial prestat scan and concludes that no capability roots exist.
+
+--- a/libc-bottom-half/sources/preopens.c
++++ b/libc-bottom-half/sources/preopens.c
+@@ -15,5 +15,7 @@
+ #include <wasi/libc-find-relpath.h>
+ #include <wasi/libc.h>
+ 
++#define AGENTOS_HIDDEN_PREOPEN_FD_TAG 0x40000000
++
+ /// A name and file descriptor pair.
+ typedef struct preopen {
+@@ -245,7 +247,8 @@ void __wasilibc_populate_preopens(void) {
+     // file descriptor.
+     for (__wasi_fd_t fd = 3; fd != 0; ++fd) {
+         __wasi_prestat_t prestat;
+-        __wasi_errno_t ret = __wasi_fd_prestat_get(fd, &prestat);
++        __wasi_fd_t hidden_fd = fd | AGENTOS_HIDDEN_PREOPEN_FD_TAG;
++        __wasi_errno_t ret = __wasi_fd_prestat_get(hidden_fd, &prestat);
+         if (ret == __WASI_ERRNO_BADF)
+             break;
+         if (ret != __WASI_ERRNO_SUCCESS)
+@@ -258,13 +262,13 @@ void __wasilibc_populate_preopens(void) {
+ 
+             // TODO: Remove the cast on `prefix` once the witx is updated with
+             // char8 support.
+-            ret = __wasi_fd_prestat_dir_name(fd, (uint8_t *)prefix,
++            ret = __wasi_fd_prestat_dir_name(hidden_fd, (uint8_t *)prefix,
+                                              prestat.u.dir.pr_name_len);
+             if (ret != __WASI_ERRNO_SUCCESS)
+                 goto oserr;
+             prefix[prestat.u.dir.pr_name_len] = '\0';
+ 
+-            if (internal_register_preopened_fd_unlocked(fd, prefix) != 0)
++            if (internal_register_preopened_fd_unlocked(hidden_fd, prefix) != 0)
+                 goto software;
+             free(prefix);
+ 
+
+--- a/libc-bottom-half/sources/posix.c
++++ b/libc-bottom-half/sources/posix.c
+@@ -16,4 +16,12 @@
+ #include <stdint.h>
+ #include <string.h>
+ 
++/* Private AgentOS host/runtime contract. This stays below INT_MAX so it can
++ * travel through the POSIX int dirfd surface without becoming negative. */
++#define AGENTOS_HIDDEN_PREOPEN_FD_TAG 0x40000000
++
++static int tag_hidden_preopen(int fd) {
++    return fd < 0 ? fd : fd | AGENTOS_HIDDEN_PREOPEN_FD_TAG;
++}
++
+ uint32_t __agentos_host_chmod(uint32_t fd, const char *path, size_t path_len,
+@@ -39,6 +47,6 @@ static int find_relpath(const char *path, char **relative) {
+     // find_relpath2 can update relative_buf, so assign it after the call
+     *relative = relative_buf;
+-    return fd;
++    return tag_hidden_preopen(fd);
+ }
+ 
+ // same as `find_relpath`, but uses another set of static variables to cache
+@@ -49,6 +57,6 @@ static int find_relpath_alt(const char *path, char **relative) {
+     // find_relpath2 can update relative_buf, so assign it after the call
+     *relative = relative_buf;
+-    return fd;
++    return tag_hidden_preopen(fd);
+ }
+ 
+ int open(const char *path, int oflag, ...) {

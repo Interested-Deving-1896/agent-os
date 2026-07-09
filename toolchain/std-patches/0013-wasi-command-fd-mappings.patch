@@ -1,0 +1,144 @@
+Allow WASI commands to inherit arbitrary Linux-style descriptors.
+
+Brush represents persistent shell redirections as child fd mappings. Keep each
+source owned until spawn, bound the mapping table, apply every dup before any
+setup fd is closed, and never close a descriptor that is a final child target.
+
+--- a/library/std/src/sys/process/wasi.rs
++++ b/library/std/src/sys/process/wasi.rs
+@@ -95,6 +95,7 @@ const FDOP_CLOSE: u32 = 1;
+ const FDOP_DUP2: u32 = 2;
+ const FDOP_OPEN: u32 = 3;
+ const O_WRONLY: u32 = 1;
++const MAX_EXTRA_FD_MAPPINGS: usize = 1024;
+ 
+ fn append_spawn_action(
+     actions: &mut Vec<u8>,
+@@ -273,6 +274,7 @@ pub struct Command {
+     stdin: Option<Stdio>,
+     stdout: Option<Stdio>,
+     stderr: Option<Stdio>,
++    extra_fd_mappings: Vec<(OwnedFd, u32)>,
+ }
+ 
+ impl Command {
+@@ -286,6 +288,7 @@ impl Command {
+             stdin: None,
+             stdout: None,
+             stderr: None,
++            extra_fd_mappings: Vec::new(),
+         }
+     }
+ 
+@@ -313,6 +316,55 @@ impl Command {
+         self.stderr = Some(stderr);
+     }
+ 
++    pub fn fd_mapping(&mut self, source: OwnedFd, target: u32) -> io::Result<()> {
++        if self.extra_fd_mappings.len() >= MAX_EXTRA_FD_MAPPINGS {
++            return Err(io::Error::other(
++                "child fd mapping limit (1024) exceeded; increase MAX_EXTRA_FD_MAPPINGS in the AgentOS patched std",
++            ));
++        }
++        if self
++            .extra_fd_mappings
++            .iter()
++            .any(|(_, existing)| *existing == target)
++        {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                format!("child file descriptor {target} has more than one mapping"),
++            ));
++        }
++
++        self.extra_fd_mappings.push((source, target));
++        Ok(())
++    }
++
++    /// Snapshot mapping sources that an earlier spawn action could overwrite.
++    ///
++    /// `dup2` actions execute sequentially in the child. A source descriptor can
++    /// also be another action's target, so emitting the mappings directly can
++    /// destroy a later source (including swaps such as 3->4, 4->3). Clone such
++    /// sources onto descriptors outside the complete target set first. Keeping
++    /// rejected clones alive makes the ordinary lowest-unused-fd allocation
++    /// advance without ever overwriting an unrelated parent descriptor.
++    fn prepare_extra_fd_mappings(
++        &self,
++        action_targets: &[u32],
++    ) -> io::Result<(Vec<(u32, u32)>, Vec<OwnedFd>)> {
++        let mut prepared = Vec::with_capacity(self.extra_fd_mappings.len());
++        let mut guards = Vec::new();
++
++        for (source, target) in &self.extra_fd_mappings {
++            let mut source_fd = source.as_raw_fd() as u32;
++            while action_targets.contains(&source_fd) {
++                let clone = source.try_clone()?;
++                source_fd = clone.as_raw_fd() as u32;
++                guards.push(clone);
++            }
++            prepared.push((source_fd, *target));
++        }
++
++        Ok((prepared, guards))
++    }
++
+     pub fn get_program(&self) -> &OsStr {
+         &self.program
+     }
+@@ -441,10 +493,29 @@ impl Command {
+                 append_stdio_action(&mut actions, source, target);
+             }
+         }
++        let mut action_targets = self
++            .extra_fd_mappings
++            .iter()
++            .map(|(_, target)| *target)
++            .collect::<Vec<_>>();
++        for (source, target) in [
++            (child_stdin_fd, 0),
++            (child_stdout_fd, 1),
++            (child_stderr_fd, 2),
++        ] {
++            if source != target {
++                action_targets.push(target);
++            }
++        }
++        let (prepared_extra_fd_mappings, _extra_fd_guards) =
++            self.prepare_extra_fd_mappings(&action_targets)?;
++        for (source, target) in &prepared_extra_fd_mappings {
++            append_spawn_action(&mut actions, FDOP_DUP2, *target, *source, 0, &[]);
++        }
+         // Close both unused halves only after every dup, so an fd needed by a
+         // later stdio action cannot be invalidated by an earlier pipe cleanup.
+-        let mut closed = [u32::MAX; 6];
+-        let mut closed_len = 0;
++        let mut closed = Vec::with_capacity(6 + self.extra_fd_mappings.len());
++        let is_extra_target = |fd| self.extra_fd_mappings.iter().any(|(_, target)| *target == fd);
+         for raw_fd in [
+             child_stdin_guard.as_ref().map(|fd| fd.as_raw_fd()),
+             child_stdout_guard.as_ref().map(|fd| fd.as_raw_fd()),
+@@ -454,10 +525,20 @@ impl Command {
+             parent_stdout.as_ref().map(|pipe| pipe.0.as_raw_fd()),
+             parent_stderr.as_ref().map(|pipe| pipe.0.as_raw_fd()),
+         ].into_iter().flatten().map(|fd| fd as u32) {
+-            if raw_fd > 2 && !closed[..closed_len].contains(&raw_fd) {
++            if raw_fd > 2 && !is_extra_target(raw_fd) && !closed.contains(&raw_fd) {
+                 append_spawn_action(&mut actions, FDOP_CLOSE, raw_fd, 0, 0, &[]);
+-                closed[closed_len] = raw_fd;
+-                closed_len += 1;
++                closed.push(raw_fd);
++            }
++        }
++        for raw_fd in self
++            .extra_fd_mappings
++            .iter()
++            .map(|(source, _)| source.as_raw_fd() as u32)
++            .chain(prepared_extra_fd_mappings.iter().map(|(source, _)| *source))
++        {
++            if raw_fd > 2 && !is_extra_target(raw_fd) && !closed.contains(&raw_fd) {
++                append_spawn_action(&mut actions, FDOP_CLOSE, raw_fd, 0, 0, &[]);
++                closed.push(raw_fd);
+             }
+         }
+ 

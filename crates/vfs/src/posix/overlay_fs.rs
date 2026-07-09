@@ -1786,6 +1786,16 @@ impl VirtualFileSystem for OverlayFileSystem {
     }
 
     fn chown(&mut self, path: &str, uid: u32, gid: u32) -> VfsResult<()> {
+        self.chown_spec(path, uid, gid, true)
+    }
+
+    fn chown_spec(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        follow_symlinks: bool,
+    ) -> VfsResult<()> {
         if self.touches_internal_metadata(path) {
             return Err(VfsError::permission_denied("chown", path));
         }
@@ -1795,7 +1805,8 @@ impl VirtualFileSystem for OverlayFileSystem {
         if !self.exists_in_upper(path) {
             self.copy_up_path(path)?;
         }
-        self.writable_upper(path)?.chown(path, uid, gid)
+        self.writable_upper(path)?
+            .chown_spec(path, uid, gid, follow_symlinks)
     }
 
     fn utimes(&mut self, path: &str, atime_ms: u64, mtime_ms: u64) -> VfsResult<()> {

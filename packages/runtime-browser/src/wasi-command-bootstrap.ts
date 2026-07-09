@@ -5,7 +5,7 @@ export interface WasiCommandBootstrapOptions {
 	command: string;
 	/** Additional argv entries for the main command. */
 	args?: string[];
-	/** Command registry used by host_process.proc_spawn for child WASI commands. */
+	/** Guest executable paths mapped to WASM sources for host_process.proc_spawn. */
 	commands?: Record<string, string>;
 	env?: Record<string, string>;
 	cwd?: string;
@@ -37,7 +37,8 @@ export function createWasiCommandBootstrapScript(
 	const bytesMessagePrefix = options.bytesMessagePrefix ?? "";
 	const startMessage = options.startMessage ?? "";
 	const exitMessagePrefix = options.exitMessagePrefix ?? "WASI_EXIT:";
-	const errorMessagePrefix = options.errorMessagePrefix ?? "WASI_COMMAND_ERROR:";
+	const errorMessagePrefix =
+		options.errorMessagePrefix ?? "WASI_COMMAND_ERROR:";
 
 	return `
 	(async () => {

@@ -16,11 +16,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WASMCORE_DIR="$(dirname "$SCRIPT_DIR")"
-PATCHES_DIR="$WASMCORE_DIR/std-patches"
+PATCHES_DIR="${PATCH_STD_PATCHES_DIR:-$WASMCORE_DIR/std-patches}"
 
-# Get the sysroot for the toolchain specified in rust-toolchain.toml
-SYSROOT="$(rustc --print sysroot)"
-STD_SRC="$SYSROOT/lib/rustlib/src/rust"
+# Resolve from the toolchain directory so this script honors its colocated
+# rust-toolchain.toml even when invoked from the repository root.
+SYSROOT=""
+if [ -n "${PATCH_STD_SOURCE_ROOT:-}" ]; then
+    STD_SRC="$PATCH_STD_SOURCE_ROOT"
+else
+    SYSROOT="$(cd "$WASMCORE_DIR" && rustc --print sysroot)"
+    STD_SRC="$SYSROOT/lib/rustlib/src/rust"
+fi
 
 if [ ! -d "$STD_SRC/library/std" ]; then
     echo "ERROR: Rust source not found at $STD_SRC"
@@ -47,26 +53,6 @@ for arg in "$@"; do
     esac
 done
 
-# `patch-std` mutates rustup's installed rust-src tree. CI runners and local
-# machines can therefore inherit a partially patched std from a prior failed
-# build, and `patch --forward` will skip instead of repairing mismatched hunks.
-# Start apply mode from a pristine rust-src component when rustup owns this
-# sysroot; non-rustup toolchains keep the historical behavior.
-if [ "$MODE" = "apply" ] && command -v rustup >/dev/null 2>&1; then
-    TOOLCHAIN="$(basename "$SYSROOT")"
-    case "$SYSROOT" in
-        */.rustup/toolchains/*)
-            echo "Refreshing rust-src for toolchain $TOOLCHAIN before applying std patches..."
-            rm -rf "$SYSROOT"
-            rustup toolchain install "$TOOLCHAIN" \
-                --profile minimal \
-                --component rust-src \
-                --target wasm32-wasip1 \
-                --force >/dev/null
-            ;;
-    esac
-fi
-
 # Find std patch files in order (reversed for --reverse mode).
 # Only top-level std-patches/*.patch are std-source patches; subdirectories
 # (std-patches/crates/*, std-patches/wasi-libc/*) target vendored crates and wasi-libc
@@ -83,11 +69,102 @@ if [ -z "$PATCH_FILES" ]; then
 fi
 
 PATCH_COUNT=$(echo "$PATCH_FILES" | wc -l)
+
+# `patch-std` mutates rustup's installed rust-src tree. Detect the two healthy
+# states (the complete series is already applied, or the complete series applies
+# to a pristine tree) in an isolated copy. Refresh rustup only for a malformed or
+# partially applied tree. This retains corruption recovery without downloading
+# and reinstalling the pinned toolchain on every single-command build.
+if [ "$MODE" = "apply" ] && [ -z "${PATCH_STD_SOURCE_ROOT:-}" ] && command -v rustup >/dev/null 2>&1; then
+    TOOLCHAIN="$(basename "$SYSROOT")"
+    case "$SYSROOT" in
+        */.rustup/toolchains/*)
+            STATE_SRC="$(mktemp -d "${TMPDIR:-/tmp}/agentos-std-patch-state.XXXXXX")"
+            cp -a "$STD_SRC/." "$STATE_SRC/"
+            FULLY_PATCHED=1
+            while IFS= read -r PATCH; do
+                if patch --batch --dry-run -R $PATCH_FLAGS -d "$STATE_SRC" < "$PATCH" > /dev/null 2>&1; then
+                    patch --batch -R $PATCH_FLAGS -d "$STATE_SRC" < "$PATCH" > /dev/null 2>&1
+                else
+                    FULLY_PATCHED=0
+                    break
+                fi
+            done < <(printf '%s\n' "$PATCH_FILES" | sort -r)
+
+            if [ "$FULLY_PATCHED" -eq 1 ]; then
+                echo "Rust std patch series is already fully applied; reusing $TOOLCHAIN."
+            else
+                rm -rf "$STATE_SRC"
+                STATE_SRC="$(mktemp -d "${TMPDIR:-/tmp}/agentos-std-patch-state.XXXXXX")"
+                cp -a "$STD_SRC/." "$STATE_SRC/"
+                PRISTINE=1
+                while IFS= read -r PATCH; do
+                    if patch --batch --dry-run $PATCH_FLAGS -d "$STATE_SRC" < "$PATCH" > /dev/null 2>&1; then
+                        patch --batch $PATCH_FLAGS -d "$STATE_SRC" < "$PATCH" > /dev/null 2>&1
+                    else
+                        PRISTINE=0
+                        break
+                    fi
+                done < <(printf '%s\n' "$PATCH_FILES" | sort)
+
+                if [ "$PRISTINE" -eq 1 ]; then
+                    echo "Rust std source is pristine; reusing $TOOLCHAIN."
+                else
+                    echo "Rust std source is partially patched or malformed; refreshing $TOOLCHAIN..."
+                    rm -rf "$SYSROOT"
+                    rustup toolchain install "$TOOLCHAIN" \
+                        --profile minimal \
+                        --component rust-src \
+                        --target wasm32-wasip1 \
+                        --force >/dev/null
+                fi
+            fi
+            rm -rf "$STATE_SRC"
+            ;;
+    esac
+fi
+
 echo "Found $PATCH_COUNT patch(es) in $PATCHES_DIR"
 echo "Rust std source: $STD_SRC"
 echo ""
 
 FAILED=0
+CHECK_SRC=""
+
+cleanup() {
+    if [ -n "$CHECK_SRC" ] && [ -d "$CHECK_SRC" ]; then
+        rm -rf "$CHECK_SRC"
+    fi
+}
+
+trap cleanup EXIT
+
+if [ "$MODE" = "check" ]; then
+    CHECK_SRC="$(mktemp -d "${TMPDIR:-/tmp}/agentos-std-patch-check.XXXXXX")"
+    cp -a "$STD_SRC/." "$CHECK_SRC/"
+
+    # The installed rust-src may be pristine, fully patched, or left patched by
+    # an earlier build. Reconstruct a pristine copy without touching the
+    # installed tree, then validate the complete series by applying each patch
+    # in order. A patch must be either cleanly present or cleanly absent during
+    # reconstruction; partial or malformed hunks are a hard failure.
+    while IFS= read -r PATCH; do
+        PATCH_NAME="$(basename "$PATCH")"
+        if patch --batch --dry-run -R $PATCH_FLAGS -d "$CHECK_SRC" < "$PATCH" > /dev/null 2>&1; then
+            patch --batch -R $PATCH_FLAGS -d "$CHECK_SRC" < "$PATCH" > /dev/null 2>&1
+        elif patch --batch --dry-run $PATCH_FLAGS -d "$CHECK_SRC" < "$PATCH" > /dev/null 2>&1; then
+            :
+        else
+            echo "FAIL: cannot reconstruct pristine std source at $PATCH_NAME"
+            echo "The patch is malformed or the installed source is only partially patched."
+            exit 1
+        fi
+    done < <(printf '%s\n' "$PATCH_FILES" | sort -r)
+
+    STD_SRC="$CHECK_SRC"
+    echo "Checking against reconstructed pristine std source: $STD_SRC"
+    echo ""
+fi
 
 for PATCH in $PATCH_FILES; do
     PATCH_NAME="$(basename "$PATCH")"
@@ -96,22 +173,11 @@ for PATCH in $PATCH_FILES; do
         check)
             echo -n "Checking $PATCH_NAME ... "
             if patch --batch --dry-run $PATCH_FLAGS -d "$STD_SRC" < "$PATCH" > /dev/null 2>&1; then
-                echo "OK (applies cleanly)"
-            elif patch --batch --dry-run -R $PATCH_FLAGS -d "$STD_SRC" < "$PATCH" > /dev/null 2>&1; then
-                echo "OK (already applied)"
+                patch --batch $PATCH_FLAGS -d "$STD_SRC" < "$PATCH" > /dev/null 2>&1
+                echo "OK"
             else
-                # When layered patches modify files created by earlier patches,
-                # neither forward nor reverse will match exactly. Check if any
-                # new files from this patch exist as a secondary heuristic.
-                NEW_FILES=$(grep '^+++ b/' "$PATCH" | sed 's|^+++ b/||' | while read -r f; do
-                    [ -f "$STD_SRC/$f" ] && echo "$f"
-                done)
-                if [ -n "$NEW_FILES" ]; then
-                    echo "OK (applied, modified by later patch)"
-                else
-                    echo "FAIL (does not apply)"
-                    FAILED=1
-                fi
+                echo "FAIL (does not apply in sequence)"
+                FAILED=1
             fi
             ;;
         apply)

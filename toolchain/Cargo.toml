@@ -9,7 +9,6 @@ members = [
     "stubs/hostname",
     "../software/*/native/crates/*",
 ]
-
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -28,3 +27,4 @@ hostname = { path = "stubs/hostname" }
 uucore = { path = "stubs/uucore" }
 codex-network-proxy = { path = "stubs/codex-network-proxy" }
 codex-otel = { path = "stubs/codex-otel" }
+wasi-ext = { path = "crates/wasi-ext" }

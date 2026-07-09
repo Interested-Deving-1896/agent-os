@@ -387,6 +387,16 @@ impl VirtualFileSystem for RootFileSystem {
         self.overlay.chown(path, uid, gid)
     }
 
+    fn chown_spec(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        follow_symlinks: bool,
+    ) -> VfsResult<()> {
+        self.overlay.chown_spec(path, uid, gid, follow_symlinks)
+    }
+
     fn utimes(&mut self, path: &str, atime_ms: u64, mtime_ms: u64) -> VfsResult<()> {
         self.overlay.utimes(path, atime_ms, mtime_ms)
     }

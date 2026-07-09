@@ -48,7 +48,10 @@ const patternRulePermissionsSchema = z
 	})
 	.strict();
 
-const fsPermissionsSchema = z.union([permissionModeSchema, fsRulePermissionsSchema]);
+const fsPermissionsSchema = z.union([
+	permissionModeSchema,
+	fsRulePermissionsSchema,
+]);
 const patternPermissionsSchema = z.union([
 	permissionModeSchema,
 	patternRulePermissionsSchema,
@@ -156,12 +159,24 @@ export const agentOsLimitsSchema = z
 			})
 			.strict()
 			.optional(),
+		process: z
+			.object({
+				maxSpawnFileActions: positiveInteger.optional(),
+				maxSpawnFileActionBytes: positiveInteger.optional(),
+				pendingStdinBytes: positiveInteger.optional(),
+				pendingEventCount: positiveInteger.optional(),
+				pendingEventBytes: positiveInteger.optional(),
+			})
+			.strict()
+			.optional(),
 	})
 	.strict();
 
 const rootLowerInputSchema = z.union([
 	z.object({ kind: z.literal("bundled-base-filesystem") }).strict(),
-	z.object({ kind: z.literal("snapshot-export"), source: z.unknown() }).strict(),
+	z
+		.object({ kind: z.literal("snapshot-export"), source: z.unknown() })
+		.strict(),
 ]);
 
 export const rootFilesystemConfigSchema = z
@@ -247,9 +262,12 @@ const toolExampleSchema = z
 export const hostToolSchema = z
 	.object({
 		description: z.string(),
-		inputSchema: z.custom((value) => typeof value === "object" && value !== null, {
-			message: "Expected Zod schema object",
-		}),
+		inputSchema: z.custom(
+			(value) => typeof value === "object" && value !== null,
+			{
+				message: "Expected Zod schema object",
+			},
+		),
 		execute: functionSchema,
 		examples: z.array(toolExampleSchema).optional(),
 		timeout: nonNegativeInteger.optional(),
@@ -290,18 +308,21 @@ export const agentOsOptionFieldSchemas = {
 	permissions: permissionsSchema.optional(),
 	sidecar: sidecarConfigSchema.optional(),
 	limits: agentOsLimitsSchema.optional(),
-	onAgentStderr: z.custom<AgentStderrHandler>(
-		(value) => typeof value === "function",
-		{ message: "Expected function" },
-	).optional(),
-	onAgentExit: z.custom<AgentExitHandler>(
-		(value) => typeof value === "function",
-		{ message: "Expected function" },
-	).optional(),
-	onLimitWarning: z.custom<LimitWarningHandler>(
-		(value) => typeof value === "function",
-		{ message: "Expected function" },
-	).optional(),
+	onAgentStderr: z
+		.custom<AgentStderrHandler>((value) => typeof value === "function", {
+			message: "Expected function",
+		})
+		.optional(),
+	onAgentExit: z
+		.custom<AgentExitHandler>((value) => typeof value === "function", {
+			message: "Expected function",
+		})
+		.optional(),
+	onLimitWarning: z
+		.custom<LimitWarningHandler>((value) => typeof value === "function", {
+			message: "Expected function",
+		})
+		.optional(),
 } as const;
 
 export const agentOsOptionsSchema = z

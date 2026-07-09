@@ -1,21 +1,9 @@
 #!/usr/bin/env node
 
 /**
- * Vendor the WASM coreutils/shell command binaries into `@rivet-dev/agentos-runtime-core`'s
- * package directory so they ship inside the published tarball.
- *
- * The kernel needs a guest `sh` (plus coreutils) to spawn any process — without
- * these binaries `NodeRuntime.create()` cannot boot. The binaries are produced
- * by the in-repo Rust command build at
- * `toolchain/target/wasm32-wasip1/release/commands/`. That path only
- * exists in a developer checkout, so we copy the whole command set (symlinks
- * included, the way `bash -> sh` and the stub aliases are laid out) into
- * `packages/core/commands/`, which is listed in `files` and resolved at runtime
- * by `node-runtime.ts` for published installs.
- *
- * This mirrors how the sidecar binary ships via `@rivet-dev/agentos-runtime-sidecar`: the
- * artifact is vendored into a published package and resolved from the installed
- * package at runtime, never from an in-repo build path.
+ * Vendor the WASM command binaries into `@rivet-dev/agentos-runtime-core` so
+ * they ship inside the published tarball. Source aliases are dereferenced
+ * because npm does not preserve this command tree's symlinks.
  */
 
 import {
@@ -23,6 +11,7 @@ import {
 	existsSync,
 	lstatSync,
 	mkdirSync,
+	readFileSync,
 	readdirSync,
 	realpathSync,
 	rmSync,
@@ -38,79 +27,190 @@ const SOURCE_DIR = path.join(
 	"toolchain/target/wasm32-wasip1/release/commands",
 );
 const DEST_DIR = path.join(PACKAGE_ROOT, "commands");
+const SOFTWARE_ROOT = path.join(REPO_ROOT, "software");
 
-function destIsPopulated() {
+// These packages are intentionally outside `make -C toolchain commands`:
+// codex is built from its separately pinned upstream checkout, while duckdb
+// and vim are explicit heavy builds. If any are present they are still copied;
+// they are simply not prerequisites for `--require`.
+const OPTIONAL_COMMAND_PACKAGES = new Set(["codex-cli", "duckdb", "vim"]);
+
+function commandNames(manifest, manifestPath) {
+	const names = [
+		...(manifest.commands ?? []),
+		...Object.keys(manifest.aliases ?? {}),
+		...(manifest.stubs ?? []),
+	];
+	for (const name of names) {
+		if (typeof name !== "string" || name.length === 0 || name.includes("/")) {
+			throw new Error(
+				`invalid command name ${JSON.stringify(name)} in ${manifestPath}`,
+			);
+		}
+	}
+	return names;
+}
+
+/** Derive the default command contract from the software package manifests. */
+export function requiredSoftwareCommandNames(softwareRoot = SOFTWARE_ROOT) {
+	const required = new Set();
+	for (const entry of readdirSync(softwareRoot, { withFileTypes: true })) {
+		if (!entry.isDirectory() || OPTIONAL_COMMAND_PACKAGES.has(entry.name)) {
+			continue;
+		}
+		const manifestPath = path.join(
+			softwareRoot,
+			entry.name,
+			"agentos-package.json",
+		);
+		if (!existsSync(manifestPath)) {
+			continue;
+		}
+		const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+		for (const name of commandNames(manifest, manifestPath)) {
+			required.add(name);
+		}
+	}
+	return [...required].sort();
+}
+
+function commandFiles(dir, { requireRealFiles = false } = {}) {
+	const files = [];
+	for (const name of readdirSync(dir).sort()) {
+		if (name.startsWith(".")) {
+			continue;
+		}
+		const entryPath = path.join(dir, name);
+		const stat = lstatSync(entryPath);
+		if (requireRealFiles) {
+			if (stat.isSymbolicLink() || !stat.isFile()) {
+				throw new Error(`vendored command is not a real file: ${entryPath}`);
+			}
+			files.push({ name, sourcePath: entryPath });
+			continue;
+		}
+
+		if (!stat.isFile() && !stat.isSymbolicLink()) {
+			throw new Error(`command source is not a file or symlink: ${entryPath}`);
+		}
+		const sourcePath = stat.isSymbolicLink()
+			? realpathSync(entryPath)
+			: entryPath;
+		if (!lstatSync(sourcePath).isFile()) {
+			throw new Error(`command source does not resolve to a file: ${entryPath}`);
+		}
+		files.push({ name, sourcePath });
+	}
+	return files;
+}
+
+function assertRequiredCommands(files, required, location) {
+	const available = new Set(files.map(({ name }) => name));
+	const missing = required.filter((name) => !available.has(name));
+	if (missing.length > 0) {
+		throw new Error(
+			`missing required default WASM commands from ${location}: ${missing.join(", ")}`,
+		);
+	}
+}
+
+function assertSameBasenames(sourceFiles, destFiles) {
+	const sourceNames = sourceFiles.map(({ name }) => name);
+	const destNames = destFiles.map(({ name }) => name);
+	if (
+		sourceNames.length !== destNames.length ||
+		sourceNames.some((name, index) => name !== destNames[index])
+	) {
+		throw new Error(
+			`copied WASM command basenames differ: source=${sourceNames.join(",")} ` +
+				`destination=${destNames.join(",")}`,
+		);
+	}
+}
+
+function destIsPopulated(destDir) {
 	try {
-		return readdirSync(DEST_DIR).some((entry) => !entry.startsWith("."));
+		return readdirSync(destDir).some((entry) => !entry.startsWith("."));
 	} catch {
 		return false;
 	}
 }
 
-function main() {
-	if (!existsSync(SOURCE_DIR)) {
-		// No in-repo build output. If `commands/` is already populated (a clean
-		// checkout that vendored earlier, or CI that dropped a prebuilt commands
-		// artifact straight into the package), keep it: it already ships.
-		if (destIsPopulated()) {
-			console.log(
-				`Using already-vendored commands at ${path.relative(REPO_ROOT, DEST_DIR)}; ` +
-					`in-repo build output ${path.relative(REPO_ROOT, SOURCE_DIR)} is absent.`,
+export function copyWasmCommands({
+	sourceDir = SOURCE_DIR,
+	destDir = DEST_DIR,
+	softwareRoot = SOFTWARE_ROOT,
+	requireCommands = false,
+	log = console.log,
+	warn = console.warn,
+} = {}) {
+	const required = requireCommands
+		? requiredSoftwareCommandNames(softwareRoot)
+		: [];
+
+	if (!existsSync(sourceDir)) {
+		// CI may download a previously validated artifact directly into the
+		// package. In require mode, validate that fallback instead of accepting a
+		// merely non-empty directory.
+		if (destIsPopulated(destDir)) {
+			if (requireCommands) {
+				const destFiles = commandFiles(destDir, { requireRealFiles: true });
+				assertRequiredCommands(destFiles, required, destDir);
+			}
+			log(
+				`Using already-vendored commands at ${path.relative(REPO_ROOT, destDir)}; ` +
+					`in-repo build output ${path.relative(REPO_ROOT, sourceDir)} is absent.`,
 			);
 			return;
 		}
-		// Nothing to ship. Don't fail the plain TypeScript build over it — a
-		// developer who hasn't built the commands can still iterate, and runtime
-		// resolution falls back to the in-repo path when it later appears. The
-		// release/pack path guards this with `--require` so a published tarball is
-		// never built without the commands.
+
 		const message =
-			`WASM commands not found at ${SOURCE_DIR} and none vendored at ${DEST_DIR}. ` +
-			"Build them with `make -C toolchain wasm` (or drop a prebuilt " +
+			`WASM commands not found at ${sourceDir} and none vendored at ${destDir}. ` +
+			"Build them with `make -C toolchain commands` (or drop a prebuilt " +
 			"commands artifact into the package) before packing so they ship in the tarball.";
-		if (process.argv.includes("--require")) {
-			console.error(`error: ${message}`);
-			process.exit(1);
+		if (requireCommands) {
+			throw new Error(message);
 		}
-		console.warn(`warning: ${message} Skipping copy.`);
+		warn(`warning: ${message} Skipping copy.`);
 		return;
 	}
 
-	rmSync(DEST_DIR, { recursive: true, force: true });
-	mkdirSync(DEST_DIR, { recursive: true });
-
-	// Copy every command as a real file, dereferencing the build's alias
-	// symlinks (bash -> sh, [ -> test, the `_stubs` aliases, dir/vdir -> ls,
-	// gunzip/zcat -> gzip). The command discovery at runtime
-	// (`discoverWasmCommandEntries`) keys each command off its filename and reads
-	// the resolved bytes, so a dereferenced copy is functionally identical to the
-	// symlink. Crucially, `npm pack` drops symlinks from the tarball, so shipping
-	// them as real files is what makes the full command set survive into a
-	// published install. The command tree is flat (no subdirectories), so a
-	// single-level walk covers it.
-	let copied = 0;
-	for (const entry of readdirSync(SOURCE_DIR)) {
-		if (entry.startsWith(".")) {
-			continue;
-		}
-		const sourcePath = path.join(SOURCE_DIR, entry);
-		const destPath = path.join(DEST_DIR, entry);
-		const stat = lstatSync(sourcePath);
-		// Resolve symlinks (and any chains) to the real file before copying so
-		// the destination is a standalone binary, not a dangling link.
-		const realSource = stat.isSymbolicLink()
-			? realpathSync(sourcePath)
-			: sourcePath;
-		if (!lstatSync(realSource).isFile()) {
-			continue;
-		}
-		copyFileSync(realSource, destPath);
-		copied += 1;
+	// Complete every fallible source/manifest check before clearing a previously
+	// valid vendored directory. A partial build must not erase known-good output.
+	const sourceFiles = commandFiles(sourceDir);
+	if (requireCommands) {
+		assertRequiredCommands(sourceFiles, required, sourceDir);
 	}
 
-	console.log(
-		`Copied ${copied} WASM command binaries to ${path.relative(REPO_ROOT, DEST_DIR)}`,
+	rmSync(destDir, { recursive: true, force: true });
+	mkdirSync(destDir, { recursive: true });
+
+	for (const { name, sourcePath } of sourceFiles) {
+		copyFileSync(sourcePath, path.join(destDir, name));
+	}
+
+	// The published tree must contain every source basename exactly once and no
+	// symlinks. This also catches future non-flat or unsupported command entries.
+	const destFiles = commandFiles(destDir, { requireRealFiles: true });
+	assertSameBasenames(sourceFiles, destFiles);
+
+	log(
+		`Copied ${destFiles.length} WASM command binaries to ${path.relative(REPO_ROOT, destDir)}`,
 	);
 }
 
-main();
+function main() {
+	try {
+		copyWasmCommands({ requireCommands: process.argv.includes("--require") });
+	} catch (error) {
+		console.error(`error: ${error instanceof Error ? error.message : String(error)}`);
+		process.exitCode = 1;
+	}
+}
+
+if (
+	process.argv[1] !== undefined &&
+	path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+	main();
+}

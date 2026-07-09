@@ -14,7 +14,7 @@ function fakeExecutor(): CommandExecutor {
 }
 
 describe("browser command executor permissions", () => {
-	it("passes command, args, cwd, and env to the child_process permission check", () => {
+	it("passes command, argv0, args, cwd, and env to the child_process permission check", () => {
 		const inner = fakeExecutor();
 		const seen: unknown[] = [];
 		const wrapped = wrapCommandExecutor(inner, {
@@ -25,6 +25,7 @@ describe("browser command executor permissions", () => {
 		});
 
 		wrapped.spawn("tool", ["--flag"], {
+			argv0: "-tool",
 			cwd: "/workspace",
 			env: { PATH: "/bin" },
 		});
@@ -33,6 +34,7 @@ describe("browser command executor permissions", () => {
 			{
 				command: "tool",
 				args: ["--flag"],
+				argv0: "-tool",
 				cwd: "/workspace",
 				env: { PATH: "/bin" },
 			},

@@ -104,7 +104,11 @@ pub use crate::features::pipes;
 pub use crate::features::process;
 #[cfg(all(unix, not(target_os = "redox")))]
 pub use crate::features::safe_traversal;
-#[cfg(all(unix, not(target_os = "fuchsia"), feature = "signals"))]
+#[cfg(all(
+    any(unix, target_os = "wasi"),
+    not(target_os = "fuchsia"),
+    feature = "signals"
+))]
 pub use crate::features::signals;
 #[cfg(all(
     unix,

@@ -546,6 +546,9 @@ pub struct VmLimitsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub wasm: Option<WasmLimitsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub process: Option<ProcessLimitsConfig>,
 }
 
 impl VmLimitsConfig {
@@ -670,6 +673,14 @@ limits_struct!(WasmLimitsConfig {
     sync_read_limit_bytes,
     prewarm_timeout_ms,
     runner_heap_limit_mb,
+});
+
+limits_struct!(ProcessLimitsConfig {
+    max_spawn_file_actions,
+    max_spawn_file_action_bytes,
+    pending_stdin_bytes,
+    pending_event_count,
+    pending_event_bytes,
 });
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]

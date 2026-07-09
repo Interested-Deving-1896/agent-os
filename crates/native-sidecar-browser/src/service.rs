@@ -1992,6 +1992,10 @@ mod tests {
         PersistenceBridge, RandomBridge,
     };
     use agentos_kernel::kernel::KernelVmConfig;
+    use agentos_kernel::permissions::Permissions;
+    use agentos_native_sidecar_core::ca::{
+        CA_CERTIFICATES_BUNDLE, CA_CERTIFICATES_GUEST_PATH, CA_CERTIFICATES_SYMLINK_PATH,
+    };
     use std::time::SystemTime;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2194,6 +2198,57 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[test]
+    fn browser_vm_bootstraps_ca_before_locking_read_only_root() {
+        let mut sidecar = BrowserSidecar::new(
+            TerminateFailingBridge::default(),
+            BrowserSidecarConfig::default(),
+        );
+        let custom_cert_pem = "browser custom cert.pem\n";
+        let mut kernel_config = KernelVmConfig::new("vm-ca");
+        kernel_config.permissions = Permissions::allow_all();
+        sidecar
+            .create_vm_with_root_filesystem(
+                kernel_config,
+                RootFilesystemConfig {
+                    mode: agentos_vm_config::RootFilesystemMode::ReadOnly,
+                    disable_default_base_layer: true,
+                    bootstrap_entries: vec![agentos_vm_config::RootFilesystemEntry {
+                        path: CA_CERTIFICATES_SYMLINK_PATH.to_string(),
+                        kind: agentos_vm_config::RootFilesystemEntryKind::File,
+                        mode: None,
+                        uid: None,
+                        gid: None,
+                        content: Some(custom_cert_pem.to_string()),
+                        encoding: Some(agentos_vm_config::RootFilesystemEntryEncoding::Utf8),
+                        target: None,
+                        executable: false,
+                    }],
+                    ..RootFilesystemConfig::default()
+                },
+            )
+            .expect("create browser VM with read-only root");
+
+        assert_eq!(
+            sidecar
+                .read_file("vm-ca", CA_CERTIFICATES_GUEST_PATH)
+                .expect("read browser VM CA bundle"),
+            CA_CERTIFICATES_BUNDLE
+        );
+        assert_eq!(
+            sidecar
+                .read_file("vm-ca", CA_CERTIFICATES_SYMLINK_PATH)
+                .expect("read custom regular cert.pem"),
+            custom_cert_pem.as_bytes()
+        );
+        assert!(
+            sidecar
+                .write_file("vm-ca", CA_CERTIFICATES_GUEST_PATH, b"replacement")
+                .is_err(),
+            "browser service must finish read-only bootstrap before returning"
+        );
     }
 
     // A mid-dispose worker-termination failure must still drain the VM, context,

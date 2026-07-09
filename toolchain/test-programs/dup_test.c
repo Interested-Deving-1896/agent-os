@@ -150,6 +150,55 @@ int main(void) {
         return 1;
     }
 
+    if (mkdir("dup-real-dirfd", 0700) != 0) {
+        dprintf(saved_stderr, "create real dirfd directory failed: %s\n", strerror(errno));
+        return 1;
+    }
+    int real_dirfd = open("dup-real-dirfd", O_RDONLY | O_DIRECTORY);
+    if (real_dirfd < 0) {
+        dprintf(saved_stderr, "open real directory failed: %s\n", strerror(errno));
+        return 1;
+    }
+    if (real_dirfd != 3 && dup2(real_dirfd, 3) != 3) {
+        dprintf(saved_stderr, "install real directory at fd3 failed\n");
+        return 1;
+    }
+    if (real_dirfd != 3) close(real_dirfd);
+
+    int child_fd = openat(3, "child", O_CREAT | O_RDWR | O_TRUNC, 0600);
+    if (child_fd < 0 || write(child_fd, "dirfd", 5) != 5) {
+        dprintf(saved_stderr, "openat on real fd3 failed: %s\n", strerror(errno));
+        return 1;
+    }
+    close(child_fd);
+    if (mkdirat(3, "nested", 0700) != 0 ||
+        renameat(3, "child", 3, "renamed") != 0 ||
+        linkat(3, "renamed", 3, "linked", 0) != 0) {
+        dprintf(saved_stderr, "descriptor-relative mutation failed: %s\n", strerror(errno));
+        return 1;
+    }
+    struct stat relative_stat;
+    if (fstatat(3, "linked", &relative_stat, 0) != 0 || relative_stat.st_size != 5) {
+        dprintf(saved_stderr, "descriptor-relative stat failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    /* Ordinary pathname resolution must still use the hidden preopen while
+     * explicit *at calls use the real directory installed at guest fd 3. */
+    FILE *hidden_path_file = fopen("dup-preopen-check.txt", "r");
+    if (!hidden_path_file) {
+        dprintf(saved_stderr, "hidden pathname preopen followed real fd3\n");
+        return 1;
+    }
+    fclose(hidden_path_file);
+
+    if (unlinkat(3, "linked", 0) != 0 || unlinkat(3, "renamed", 0) != 0 ||
+        unlinkat(3, "nested", AT_REMOVEDIR) != 0 || close(3) != 0 ||
+        rmdir("dup-real-dirfd") != 0) {
+        dprintf(saved_stderr, "descriptor-relative cleanup failed: %s\n", strerror(errno));
+        return 1;
+    }
+
     errno = 0;
 	    if (fstat(3, &closed_preopen_stat) != -1 || errno != EBADF) {
 	        dprintf(saved_stderr, "restored preopen resurrected after close\n");

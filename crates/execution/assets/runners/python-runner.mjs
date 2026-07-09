@@ -630,6 +630,7 @@ function createPythonBridgeRpcBridge() {
     subprocessRunSync(
       command,
       argsJson = '[]',
+      argv0 = null,
       cwd = null,
       envJson = '{}',
       shell = false,
@@ -646,6 +647,7 @@ function createPythonBridgeRpcBridge() {
       return JSON.stringify(requestSync('subprocessRun', {
         command,
         args,
+        argv0,
         cwd,
         env,
         shell,
@@ -852,6 +854,7 @@ function createPythonFdRpcBridge() {
     subprocessRunSync(
       command,
       argsJson = '[]',
+      argv0 = null,
       cwd = null,
       envJson = '{}',
       shell = false,
@@ -868,6 +871,7 @@ function createPythonFdRpcBridge() {
       return JSON.stringify(requestSync('subprocessRun', {
         command,
         args,
+        argv0,
         cwd,
         env,
         shell,
@@ -1393,16 +1397,35 @@ class _SecureExecCompletedProcess:
         self.stdout = stdout
         self.stderr = stderr
 
-def _agentos_subprocess_run(args, *, capture_output=False, check=False, cwd=None, env=None, input=None, shell=False, text=False, encoding="utf-8", errors="strict", stdout=None, stderr=None, timeout=None, **kwargs):
+def _agentos_subprocess_run(args, *, capture_output=False, check=False, cwd=None, env=None, input=None, shell=False, executable=None, text=False, encoding="utf-8", errors="strict", stdout=None, stderr=None, timeout=None, **kwargs):
     del kwargs, stdout, stderr, timeout
     if isinstance(args, (str, bytes)):
-        command = args.decode("utf-8") if isinstance(args, bytes) else args
-        argv = []
+        original_command = args.decode("utf-8") if isinstance(args, bytes) else args
+        values = None
     else:
         values = list(args)
         if not values:
             raise ValueError("subprocess.run args must not be empty")
-        command = str(values[0])
+        original_command = str(values[0])
+
+    bridge_shell = False
+    if shell:
+        # Python implements shell=True as shell -c command [argv...]. Invoke the
+        # shell explicitly so a string-valued executable selects the requested
+        # shell and sequence arguments retain their Linux $0/$1 positions.
+        command = str(executable) if executable is not None else "/bin/sh"
+        argv0 = command
+        if values is None:
+            argv = ["-c", original_command]
+        else:
+            argv = ["-c", original_command, *[str(value) for value in values[1:]]]
+    elif values is None:
+        command = str(executable) if executable is not None else original_command
+        argv0 = original_command
+        argv = []
+    else:
+        command = str(executable) if executable is not None else original_command
+        argv0 = original_command
         argv = [str(value) for value in values[1:]]
     merged_env = dict(env or {})
     resolved_cwd = cwd if cwd is not None else _agentos_os.environ.get("PWD")
@@ -1413,9 +1436,10 @@ def _agentos_subprocess_run(args, *, capture_output=False, check=False, cwd=None
             _agentos_rpc.subprocessRunSync(
                 command,
                 _agentos_json.dumps(argv),
+                argv0,
                 resolved_cwd,
                 _agentos_json.dumps(merged_env),
-                bool(shell),
+                bridge_shell,
             )
         )
     except Exception as error:

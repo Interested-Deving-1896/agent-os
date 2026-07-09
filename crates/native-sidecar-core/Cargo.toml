@@ -14,3 +14,7 @@ agentos-vm-config = { workspace = true }
 base64 = "0.22"
 serde_json = "1.0"
 vfs = { workspace = true }
+
+[build-dependencies]
+base64 = "=0.22.1"
+webpki-root-certs = "=1.0.8"

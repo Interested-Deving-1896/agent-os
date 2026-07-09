@@ -44,6 +44,7 @@ BUILD_DIR    := build
 NATIVE_DIR   := build/native
 SOFTWARE_DIR := ../../software
 TEST_PROGRAMS_DIR := ../test-programs
+OVERLAY_HEADERS := $(shell find include -type f -name '*.h' -print 2>/dev/null | LC_ALL=C sort)
 C_SOURCE_DIRS := $(TEST_PROGRAMS_DIR) $(wildcard $(SOFTWARE_DIR)/*/native/c)
 c_source = $(firstword $(foreach dir,$(C_SOURCE_DIRS),$(wildcard $(dir)/$(1).c)))
 
@@ -68,10 +69,10 @@ COMMANDS_DIR ?= ../target/wasm32-wasip1/release/commands
 
 # Fast real commands installed by the default software gate. Slow/heavy commands
 # (duckdb, vim) remain available through explicit parent `make cmd/<name>`.
-COMMANDS := zip unzip envsubst sqlite3 curl wget grep git git-remote-http tree ssh
+COMMANDS := zip unzip envsubst sqlite3 curl wget grep git git-remote-http tree ssh ssh-keysign ssh-sk-helper
 
 # Programs requiring patched sysroot (Tier 2+ custom host imports)
-PATCHED_PROGRAMS := http_get_test isatty_test getpid_test getppid_test getppid_verify userinfo pipe_test dup_test closefrom_test spawn_child spawn_exit_code pipeline kill_child waitpid_return waitpid_edge syscall_coverage getpwuid_test signal_tests sigaction_self sigaction_behavior delayed_tcp_echo delayed_kill pipe_edge tcp_accept_spawn tcp_echo tcp_server http_server udp_echo unix_socket signal_handler dns_lookup sqlite3 curl wget grep tree zip unzip fs_probe
+PATCHED_PROGRAMS := http_get_test isatty_test getpid_test getppid_test getppid_verify userinfo pipe_test dup_test closefrom_test spawn_child spawn_contract spawn_exit_code exec_edge exec_variants pipeline itimer_contract kill_child waitpid_return waitpid_edge syscall_coverage getpwuid_test libc_compat_contract libc_bounds_contract chown_contract signal_tests sigaction_self sigaction_behavior delayed_tcp_echo delayed_kill pipe_edge select_edge socket_flags socketpair_rights ssh_proxy_helper ssh_sk_helper_contract tcp_accept_spawn tcp_echo tcp_server http_server udp_echo unix_socket signal_handler dns_lookup getaddrinfo_connect getnameinfo_contract ppoll_contract open_flags record_lock mlock_contract sqlite3 sqlite3_mem curl wget grep tree zip unzip fs_probe
 
 # Discover all package command and test-program C source files.
 ALL_SOURCES := $(foreach dir,$(C_SOURCE_DIRS),$(wildcard $(dir)/*.c))
@@ -94,13 +95,14 @@ endif
 
 WASM_PROG_NAMES := $(sort $(basename $(notdir $(SOURCES))) $(CUSTOM_WASM_PROG_NAMES))
 NATIVE_PROG_NAMES := $(basename $(notdir $(SOURCES)))
-PROGRAM_REPORT_NAMES := $(WASM_PROG_NAMES)
+EXTRA_WASM_OUTPUTS := $(addprefix $(BUILD_DIR)/,ssh ssh-keysign ssh-sk-helper)
+PROGRAM_REPORT_NAMES := $(WASM_PROG_NAMES) $(notdir $(EXTRA_WASM_OUTPUTS)) fd_mapping_contract
+NATIVE_REPORT_NAMES := $(NATIVE_PROG_NAMES) fd_mapping_contract
 
 # Default WASM output targets
-EXTRA_WASM_OUTPUTS :=
-WASM_OUTPUTS := $(addprefix $(BUILD_DIR)/,$(WASM_PROG_NAMES)) $(EXTRA_WASM_OUTPUTS)
+WASM_OUTPUTS := $(addprefix $(BUILD_DIR)/,$(WASM_PROG_NAMES)) $(EXTRA_WASM_OUTPUTS) $(BUILD_DIR)/fd_mapping_contract
 # Native output targets
-NATIVE_OUTPUTS := $(addprefix $(NATIVE_DIR)/,$(NATIVE_PROG_NAMES))
+NATIVE_OUTPUTS := $(addprefix $(NATIVE_DIR)/,$(NATIVE_PROG_NAMES)) $(NATIVE_DIR)/fd_mapping_contract
 
 .SECONDEXPANSION:
 
@@ -185,11 +187,20 @@ GIT_VERSION := 2.55.0
 GIT_URL := https://www.kernel.org/pub/software/scm/git/git-$(GIT_VERSION).tar.xz
 GIT_UPSTREAM_BUILD_DIR := $(BUILD_DIR)/git-upstream
 GIT_PATCH_DIR := patches/git
-# OpenSSH portable — real upstream ssh client (batch/key-based), built
-# --without-openssl (internal ed25519/curve25519/chacha20-poly1305 crypto).
+# OpenSSH portable — real upstream ssh client (batch/key-based), linked with a
+# hermetic libcrypto build for the same RSA/ECDSA/DH/AES families as Linux.
 OPENSSH_VERSION := 10.4p1
 OPENSSH_URL := https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-$(OPENSSH_VERSION).tar.gz
+OPENSSH_SHA256 := ef6026dd2aea8d56059638d5d3262902c892ceba9f88395835e0d06d3fb63238
 OPENSSH_UPSTREAM_BUILD_DIR := $(BUILD_DIR)/ssh-upstream
+OPENSSH_PATCH_DIR := patches/openssh
+OPENSSL_VERSION := 3.5.7
+OPENSSL_URL := https://github.com/openssl/openssl/releases/download/openssl-$(OPENSSL_VERSION)/openssl-$(OPENSSL_VERSION).tar.gz
+OPENSSL_SHA256 := a8c0d28a529ca480f9f36cf5792e2cd21984552a3c8e4aa11a24aa31aeac98e8
+OPENSSL_UPSTREAM_BUILD_DIR := $(BUILD_DIR)/openssl-upstream
+OPENSSL_PREFIX := $(BUILD_DIR)/openssl
+OPENSSL_LIBCRYPTO := $(OPENSSL_PREFIX)/lib/libcrypto.a
+OPENSSL_HEADER := $(OPENSSL_PREFIX)/include/openssl/opensslv.h
 GREP_VERSION := 3.12
 GREP_URL := https://ftp.gnu.org/gnu/grep/grep-$(GREP_VERSION).tar.xz
 GREP_UPSTREAM_BUILD_DIR := $(BUILD_DIR)/grep-upstream
@@ -463,10 +474,18 @@ WASI_LIBC_PATCHES := $(wildcard ../std-patches/wasi-libc/*.patch)
 WASI_LIBC_OVERRIDES := $(wildcard ../std-patches/wasi-libc-overrides/*.c)
 LLVM_RUNTIME_PATCHES := $(wildcard patches/llvm-project/*.patch)
 
-$(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a: wasi-sdk ../scripts/patch-wasi-libc.sh scripts/build-llvm-runtimes.sh $(WASI_LIBC_PATCHES) $(WASI_LIBC_OVERRIDES) $(LLVM_RUNTIME_PATCHES)
+$(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a: $(WASI_SDK_DIR)/bin/clang ../scripts/patch-wasi-libc.sh scripts/build-llvm-runtimes.sh $(WASI_LIBC_PATCHES) $(WASI_LIBC_OVERRIDES) $(LLVM_RUNTIME_PATCHES)
 	../scripts/patch-wasi-libc.sh
 
 sysroot: $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a
+
+# Patched fixtures must relink whenever the owned libc changes. Without this
+# edge, make can leave an older host-import ABI embedded in an otherwise
+# up-to-date test binary after a sysroot rebuild.
+PATCHED_WASM_OUTPUTS := $(addprefix $(BUILD_DIR)/,$(PATCHED_PROGRAMS))
+$(PATCHED_WASM_OUTPUTS): $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a
+$(PATCHED_WASM_OUTPUTS): WASM_CFLAGS := --target=wasm32-wasip1 --sysroot=$(PATCHED_SYSROOT) -O2 -flto -I include/
+$(BUILD_DIR)/select_edge: WASM_CFLAGS += -DFD_SETSIZE=8192
 
 # --- wasm-opt check ---
 
@@ -498,6 +517,9 @@ $(BUILD_DIR)/%: $$(call c_source,$$*) $(WASI_SDK_DIR)/bin/clang
 	fi
 	@rm -f $@.wasm
 
+$(BUILD_DIR)/fd_mapping_contract: $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a
+	$(MAKE) -C .. fd-mapping-contract-wasm
+
 # --- Per-program override rules for multi-file compilation ---
 # Add overrides here for programs that link vendored libraries.
 
@@ -519,17 +541,17 @@ $(NATIVE_DIR)/json_parse: $(call c_source,json_parse) libs/cjson/cJSON.c
 # sqlite3_mem: links SQLite amalgamation
 SQLITE_COMMON  := -DSQLITE_OMIT_WAL -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 \
                   -DSQLITE_OMIT_LOCALTIME
-SQLITE_WASM    := -DSQLITE_OS_OTHER $(SQLITE_COMMON) -lwasi-emulated-signal -lwasi-emulated-mman
+SQLITE_WASM    := -DSQLITE_OS_OTHER $(SQLITE_COMMON) -lwasi-emulated-mman
 SQLITE_NATIVE  := $(SQLITE_COMMON)
 SQLITE_SHELL_COMMON := -DSQLITE_OMIT_WAL -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 \
                        -DSQLITE_OMIT_LOCALTIME -DSQLITE_NOHAVE_SYSTEM -DHAVE_READLINE=0
 SQLITE_SHELL_WASM := $(SQLITE_SHELL_COMMON) -D_WASI_EMULATED_PROCESS_CLOCKS \
-                     -lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-process-clocks
+                     -lwasi-emulated-mman -lwasi-emulated-process-clocks
 SQLITE_SHELL_NATIVE := $(SQLITE_SHELL_COMMON)
 
 $(BUILD_DIR)/sqlite3_mem: $(call c_source,sqlite3_mem) libs/sqlite3/sqlite3.c $(WASI_SDK_DIR)/bin/clang
 	@mkdir -p $(BUILD_DIR)
-	$(CC) --target=wasm32-wasip1 --sysroot=$(SYSROOT) -Os -I include/ \
+	$(CC) --target=wasm32-wasip1 --sysroot=$(PATCHED_SYSROOT) -Os -I include/ \
 	    $(SQLITE_WASM) -Ilibs/sqlite3 -Wl,--initial-memory=16777216 -o $@ \
 	    $(call c_source,sqlite3_mem) libs/sqlite3/sqlite3.c
 
@@ -544,7 +566,7 @@ $(NATIVE_DIR)/sqlite3_mem: $(call c_source,sqlite3_mem) libs/sqlite3/sqlite3.c
 # Uses --initial-memory=16777216 (16MB) for SQLite's malloc requirements.
 $(BUILD_DIR)/sqlite3: libs/sqlite3/shell.c libs/sqlite3/sqlite3.c $(WASI_SDK_DIR)/bin/clang
 	@mkdir -p $(BUILD_DIR)
-	$(CC) --target=wasm32-wasip1 --sysroot=$(SYSROOT) -Os -I include/ \
+	$(CC) --target=wasm32-wasip1 --sysroot=$(PATCHED_SYSROOT) -Os -I include/ \
 	    $(SQLITE_SHELL_WASM) -Ilibs/sqlite3 -Wl,--initial-memory=16777216 \
 	    -o $@ libs/sqlite3/shell.c libs/sqlite3/sqlite3.c
 
@@ -566,7 +588,7 @@ $(LIBS_CACHE)/zlib-$(ZLIB_VERSION)/zlib.h:
 $(ZLIB_BUILD_DIR)/libz.a: $(LIBS_CACHE)/zlib-$(ZLIB_VERSION)/zlib.h $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a $(WASI_SDK_DIR)/bin/clang
 	@mkdir -p $(ZLIB_BUILD_DIR)
 	@for src in adler32.c crc32.c deflate.c infback.c inffast.c inflate.c inftrees.c trees.c zutil.c compress.c uncompr.c gzclose.c gzlib.c gzread.c gzwrite.c; do \
-		$(CC) --target=wasm32-wasip1 --sysroot=$(SYSROOT) -O2 -DHAVE_UNISTD_H \
+		$(CC) --target=wasm32-wasip1 --sysroot=$(PATCHED_SYSROOT) -O2 -DHAVE_UNISTD_H \
 			-I$(LIBS_CACHE)/zlib-$(ZLIB_VERSION) \
 			-c "$(LIBS_CACHE)/zlib-$(ZLIB_VERSION)/$$src" \
 			-o "$(ZLIB_BUILD_DIR)/$${src%.c}.o"; \
@@ -589,9 +611,10 @@ $(MBEDTLS_SRC_DIR)/library/ssl_tls.c:
 .PHONY: mbedtls
 mbedtls: $(MBEDTLS_LIBS)
 
-$(MBEDTLS_LIBS): $(MBEDTLS_SRC_DIR)/library/ssl_tls.c \
+$(MBEDTLS_LIBS) &: $(MBEDTLS_SRC_DIR)/library/ssl_tls.c \
                 $(MBEDTLS_CONFIG_DIR)/wasi_user_config.h \
                 $(MBEDTLS_CONFIG_DIR)/mbedtls_wasi_entropy.c \
+                $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a \
                 $(WASI_SDK_DIR)/bin/clang
 	@echo "=== Building mbedTLS $(MBEDTLS_VERSION) for wasm32-wasip1 ==="
 	@mkdir -p $(MBEDTLS_BUILD_DIR)/crypto $(MBEDTLS_BUILD_DIR)/x509 $(MBEDTLS_BUILD_DIR)/tls
@@ -602,7 +625,7 @@ $(MBEDTLS_LIBS): $(MBEDTLS_SRC_DIR)/library/ssl_tls.c \
 			ssl_*|ssl|mps_*|debug|net_sockets) grp=tls ;; \
 			*) grp=crypto ;; \
 		esac; \
-		$(CC) --target=wasm32-wasip1 --sysroot=$(SYSROOT) -O2 \
+		$(CC) --target=wasm32-wasip1 --sysroot=$(PATCHED_SYSROOT) -O2 \
 			-I$(MBEDTLS_SRC_DIR)/include -I$(MBEDTLS_CONFIG_DIR) \
 			-DMBEDTLS_USER_CONFIG_FILE='"wasi_user_config.h"' \
 			-c "$$src" -o "$(MBEDTLS_BUILD_DIR)/$$grp/$$name.o" || exit 1; \
@@ -638,17 +661,19 @@ $(BROTLI_SRC_DIR)/c/dec/decode.c:
 .PHONY: brotli
 brotli: $(BROTLI_LIBS)
 
-$(BROTLI_LIBS): $(BROTLI_SRC_DIR)/c/dec/decode.c $(WASI_SDK_DIR)/bin/clang
+$(BROTLI_LIBS) &: $(BROTLI_SRC_DIR)/c/dec/decode.c \
+                  $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a \
+                  $(WASI_SDK_DIR)/bin/clang
 	@echo "=== Building brotli $(BROTLI_VERSION) (dec) for wasm32-wasip1 ==="
 	@mkdir -p $(BROTLI_BUILD_DIR)/common $(BROTLI_BUILD_DIR)/dec
 	@for src in $(BROTLI_COMMON_SRCS); do \
-		$(CC) --target=wasm32-wasip1 --sysroot=$(SYSROOT) -O2 \
+		$(CC) --target=wasm32-wasip1 --sysroot=$(PATCHED_SYSROOT) -O2 \
 			-I$(BROTLI_INCLUDE_DIR) \
 			-c "$(BROTLI_SRC_DIR)/c/common/$$src" \
 			-o "$(BROTLI_BUILD_DIR)/common/$${src%.c}.o" || exit 1; \
 	done
 	@for src in $(BROTLI_DEC_SRCS); do \
-		$(CC) --target=wasm32-wasip1 --sysroot=$(SYSROOT) -O2 \
+		$(CC) --target=wasm32-wasip1 --sysroot=$(PATCHED_SYSROOT) -O2 \
 			-I$(BROTLI_INCLUDE_DIR) \
 			-c "$(BROTLI_SRC_DIR)/c/dec/$$src" \
 			-o "$(BROTLI_BUILD_DIR)/dec/$${src%.c}.o" || exit 1; \
@@ -685,12 +710,14 @@ $(ZSTD_SRC_DIR)/lib/zstd.h:
 .PHONY: zstd
 zstd: $(ZSTD_LIB)
 
-$(ZSTD_LIB): $(ZSTD_SRC_DIR)/lib/zstd.h $(WASI_SDK_DIR)/bin/clang
+$(ZSTD_LIB): $(ZSTD_SRC_DIR)/lib/zstd.h \
+             $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a \
+             $(WASI_SDK_DIR)/bin/clang
 	@echo "=== Building zstd $(ZSTD_VERSION) (decompress) for wasm32-wasip1 ==="
 	@mkdir -p $(ZSTD_BUILD_DIR)/obj
 	@for src in $(ZSTD_SRC_DIR)/lib/common/*.c $(ZSTD_SRC_DIR)/lib/decompress/*.c; do \
 		name=$$(basename "$${src%.c}"); \
-		$(CC) --target=wasm32-wasip1 --sysroot=$(SYSROOT) $(ZSTD_CFLAGS) \
+		$(CC) --target=wasm32-wasip1 --sysroot=$(PATCHED_SYSROOT) $(ZSTD_CFLAGS) \
 			-c "$$src" -o "$(ZSTD_BUILD_DIR)/obj/$$name.o" || exit 1; \
 	done
 	@rm -f $(ZSTD_LIB)
@@ -704,7 +731,7 @@ $(NATIVE_DIR)/sqlite3_cli: $(NATIVE_DIR)/sqlite3
 # tree: upstream Steve Baker tree compiled from pinned C source.
 $(BUILD_DIR)/tree: $(TREE_FILES) $(WASI_SDK_DIR)/bin/clang $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a
 	@mkdir -p $(BUILD_DIR)
-	$(CC) --target=wasm32-wasip1 --sysroot=$(SYSROOT) -O2 -I include/ \
+	$(CC) --target=wasm32-wasip1 --sysroot=$(PATCHED_SYSROOT) -O2 -I include/ \
 	    $(TREE_WASM_FLAGS) -I$(LIBS_DIR)/tree -o $@ \
 	    $(addprefix $(LIBS_DIR)/tree/,$(TREE_SOURCES))
 
@@ -722,7 +749,7 @@ $(BUILD_DIR)/zip: scripts/build-infozip-upstream.sh $(PATCHED_SYSROOT)/lib/wasm3
 		--url "$(INFOZIP_ZIP_URL)" \
 		--cache-dir "$(abspath $(LIBS_CACHE))" \
 		--build-dir "$(abspath $(INFOZIP_ZIP_BUILD_DIR))" \
-		--cc "$(abspath $(CC)) --target=wasm32-wasip1 --sysroot=$(abspath $(SYSROOT))" \
+		--cc "$(abspath $(CC)) --target=wasm32-wasip1 --sysroot=$(abspath $(PATCHED_SYSROOT))" \
 		--output "$(abspath $@)"
 
 $(BUILD_DIR)/unzip: scripts/build-infozip-upstream.sh $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a $(WASI_SDK_DIR)/bin/clang
@@ -733,10 +760,10 @@ $(BUILD_DIR)/unzip: scripts/build-infozip-upstream.sh $(PATCHED_SYSROOT)/lib/was
 		--url "$(INFOZIP_UNZIP_URL)" \
 		--cache-dir "$(abspath $(LIBS_CACHE))" \
 		--build-dir "$(abspath $(INFOZIP_UNZIP_BUILD_DIR))" \
-		--cc "$(abspath $(CC)) --target=wasm32-wasip1 --sysroot=$(abspath $(SYSROOT))" \
+		--cc "$(abspath $(CC)) --target=wasm32-wasip1 --sysroot=$(abspath $(PATCHED_SYSROOT))" \
 		--output "$(abspath $@)"
 
-$(BUILD_DIR)/git: scripts/build-git-upstream.sh $(CURL_LIBCURL_ARTIFACT) $(MBEDTLS_LIBS) $(BROTLI_LIBS) $(ZSTD_LIB) $(ZLIB_BUILD_DIR)/libz.a $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a $(WASI_SDK_DIR)/bin/clang
+$(BUILD_DIR)/git: scripts/build-git-upstream.sh $(wildcard $(GIT_PATCH_DIR)/*.patch) $(CURL_LIBCURL_ARTIFACT) $(MBEDTLS_LIBS) $(BROTLI_LIBS) $(ZSTD_LIB) $(ZLIB_BUILD_DIR)/libz.a $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a $(WASI_SDK_DIR)/bin/clang
 	@mkdir -p $(BUILD_DIR)
 	bash scripts/build-git-upstream.sh \
 		--version "$(GIT_VERSION)" \
@@ -753,7 +780,7 @@ $(BUILD_DIR)/git: scripts/build-git-upstream.sh $(CURL_LIBCURL_ARTIFACT) $(MBEDT
 		--cc "$(abspath $(CC))" \
 		--ar "$(abspath $(WASI_SDK_DIR)/bin/llvm-ar)" \
 		--ranlib "$(abspath $(WASI_SDK_DIR)/bin/llvm-ranlib)" \
-		--sysroot "$(abspath $(SYSROOT))" \
+		--sysroot "$(abspath $(PATCHED_SYSROOT))" \
 		--remote-http-output "$(abspath $(BUILD_DIR)/git-remote-http)" \
 		--output "$(abspath $@)"
 
@@ -761,32 +788,52 @@ $(BUILD_DIR)/git: scripts/build-git-upstream.sh $(CURL_LIBCURL_ARTIFACT) $(MBEDT
 $(BUILD_DIR)/git-remote-http: $(BUILD_DIR)/git
 	@test -f $@ || { echo "Error: git-remote-http missing at $@ (git build did not produce it)"; exit 1; }
 
-# ssh: upstream OpenSSH client built --without-openssl against the patched
-# sysroot (closefrom/socketpair stubs live in wasi-libc-overrides). Also
-# lights up git-over-ssh: git's connect.c execs `ssh` from PATH.
-$(BUILD_DIR)/ssh: scripts/build-ssh-upstream.sh $(ZLIB_BUILD_DIR)/libz.a $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a $(WASI_SDK_DIR)/bin/clang
+# OpenSSL is private to OpenSSH. curl, wget, and git continue to use mbedTLS.
+$(OPENSSL_LIBCRYPTO) $(OPENSSL_HEADER) &: scripts/build-openssl-upstream.sh $(OVERLAY_HEADERS) $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a $(WASI_SDK_DIR)/bin/clang
+	@mkdir -p $(BUILD_DIR)
+	bash scripts/build-openssl-upstream.sh \
+		--version "$(OPENSSL_VERSION)" \
+		--url "$(OPENSSL_URL)" \
+		--sha256 "$(OPENSSL_SHA256)" \
+		--cache-dir "$(abspath $(LIBS_CACHE))" \
+		--build-dir "$(abspath $(OPENSSL_UPSTREAM_BUILD_DIR))" \
+		--prefix "$(abspath $(OPENSSL_PREFIX))" \
+		--overlay-include-dir "$(abspath include)" \
+		--cc "$(abspath $(CC)) --target=wasm32-wasip1 --sysroot=$(abspath $(PATCHED_SYSROOT))" \
+		--ar "$(abspath $(WASI_SDK_DIR)/bin/llvm-ar)" \
+		--ranlib "$(abspath $(WASI_SDK_DIR)/bin/llvm-ranlib)"
+
+# ssh and its client-side helpers: upstream OpenSSH linked with libcrypto against the patched
+# sysroot (closefrom/socketpair implementations live in the owned libc/kernel
+# layers). Also lights up git-over-ssh: git's connect.c execs `ssh` from PATH.
+$(BUILD_DIR)/ssh $(BUILD_DIR)/ssh-keysign $(BUILD_DIR)/ssh-sk-helper &: scripts/build-ssh-upstream.sh $(wildcard $(OPENSSH_PATCH_DIR)/*.patch) $(OVERLAY_HEADERS) $(OPENSSL_LIBCRYPTO) $(OPENSSL_HEADER) $(ZLIB_BUILD_DIR)/libz.a $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a $(WASI_SDK_DIR)/bin/clang
 	@mkdir -p $(BUILD_DIR)
 	bash scripts/build-ssh-upstream.sh \
 		--version "$(OPENSSH_VERSION)" \
 		--url "$(OPENSSH_URL)" \
+		--sha256 "$(OPENSSH_SHA256)" \
 		--cache-dir "$(abspath $(LIBS_CACHE))" \
 		--build-dir "$(abspath $(OPENSSH_UPSTREAM_BUILD_DIR))" \
+		--patch-dir "$(abspath $(OPENSSH_PATCH_DIR))" \
 		--zlib-include "$(abspath $(LIBS_CACHE)/zlib-$(ZLIB_VERSION))" \
 		--zlib-libdir "$(abspath $(ZLIB_BUILD_DIR))" \
+		--openssl-prefix "$(abspath $(OPENSSL_PREFIX))" \
 		--overlay-include-dir "$(abspath include)" \
-		--cc "$(abspath $(CC)) --target=wasm32-wasip1 --sysroot=$(abspath $(SYSROOT))" \
+		--cc "$(abspath $(CC)) --target=wasm32-wasip1 --sysroot=$(abspath $(PATCHED_SYSROOT))" \
 		--ar "$(abspath $(WASI_SDK_DIR)/bin/llvm-ar)" \
 		--ranlib "$(abspath $(WASI_SDK_DIR)/bin/llvm-ranlib)" \
-		--output "$(abspath $@)"
+		--output "$(abspath $(BUILD_DIR)/ssh)" \
+		--keysign-output "$(abspath $(BUILD_DIR)/ssh-keysign)" \
+		--sk-helper-output "$(abspath $(BUILD_DIR)/ssh-sk-helper)"
 
 # curl_test: links libcurl (HTTP/HTTPS build for WASM via host_net + host_tls)
 CURL_SRCS := $(wildcard libs/curl/lib/*.c) $(wildcard libs/curl/lib/vauth/*.c) \
              $(wildcard libs/curl/lib/vtls/*.c) $(wildcard libs/curl/lib/vquic/*.c) \
              $(wildcard libs/curl/lib/vssh/*.c)
 CURL_INCLUDES := -Ilibs/curl/include -Ilibs/curl/lib -include libs/curl/lib/curl_setup.h -include libs/curl/lib/curl_printf.h
-CURL_LIB_DEFS := -DHAVE_CONFIG_H -DBUILDING_LIBCURL -D_WASI_EMULATED_SIGNAL -DHAVE_BASENAME -DHAVE_LIBGEN_H
+CURL_LIB_DEFS := -DHAVE_CONFIG_H -DBUILDING_LIBCURL -DHAVE_BASENAME -DHAVE_LIBGEN_H
 
-$(BUILD_DIR)/curl: scripts/build-curl-upstream.sh $(CURL_UPSTREAM_OVERLAY_FILES) $(MBEDTLS_LIBS) $(ZLIB_BUILD_DIR)/libz.a $(BROTLI_LIBS) $(ZSTD_LIB) $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a $(WASI_SDK_DIR)/bin/clang
+$(BUILD_DIR)/curl $(CURL_LIBCURL_ARTIFACT) &: scripts/build-curl-upstream.sh $(CURL_UPSTREAM_OVERLAY_FILES) $(MBEDTLS_LIBS) $(ZLIB_BUILD_DIR)/libz.a $(BROTLI_LIBS) $(ZSTD_LIB) $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a $(WASI_SDK_DIR)/bin/clang
 	@mkdir -p $(BUILD_DIR)
 	bash scripts/build-curl-upstream.sh \
 		--version "$(CURL_RELEASE_VERSION)" \
@@ -795,7 +842,7 @@ $(BUILD_DIR)/curl: scripts/build-curl-upstream.sh $(CURL_UPSTREAM_OVERLAY_FILES)
 		--cache-dir "$(abspath $(LIBS_CACHE))" \
 		--build-dir "$(abspath $(CURL_UPSTREAM_BUILD_DIR))" \
 		--overlay-dir "$(abspath $(CURL_UPSTREAM_OVERLAY_DIR))" \
-		--cc "$(abspath $(CC)) --target=wasm32-wasip1 --sysroot=$(abspath $(SYSROOT))" \
+		--cc "$(abspath $(CC)) --target=wasm32-wasip1 --sysroot=$(abspath $(PATCHED_SYSROOT))" \
 		--ar "$(abspath $(WASI_SDK_DIR)/bin/llvm-ar)" \
 		--ranlib "$(abspath $(WASI_SDK_DIR)/bin/llvm-ranlib)" \
 		--mbedtls-include "$(abspath $(MBEDTLS_SRC_DIR)/include)" \
@@ -808,12 +855,7 @@ $(BUILD_DIR)/curl: scripts/build-curl-upstream.sh $(CURL_UPSTREAM_OVERLAY_FILES)
 		--zstd-libdir "$(abspath $(ZSTD_BUILD_DIR))" \
 		--ca-bundle "/etc/ssl/certs/ca-certificates.crt" \
 		--install-prefix "$(abspath $(CURL_LIBCURL_PREFIX))" \
-		--output "$(abspath $@)"
-
-# The libcurl install artifact is produced as a side effect of the curl build.
-# Declare it so git can depend on it; verify it exists after the curl target ran.
-$(CURL_LIBCURL_ARTIFACT): $(BUILD_DIR)/curl
-	@test -f $@ || { echo "Error: libcurl artifact missing at $@ (curl build did not install it)"; exit 1; }
+		--output "$(abspath $(BUILD_DIR)/curl)"
 
 $(BUILD_DIR)/wget: scripts/build-wget-upstream.sh $(WGET_UPSTREAM_OVERLAY_FILES) $(MBEDTLS_LIBS) $(ZLIB_BUILD_DIR)/libz.a $(PATCHED_SYSROOT)/lib/wasm32-wasi/libc.a $(WASI_SDK_DIR)/bin/clang
 	@mkdir -p $(BUILD_DIR)
@@ -828,7 +870,7 @@ $(BUILD_DIR)/wget: scripts/build-wget-upstream.sh $(WGET_UPSTREAM_OVERLAY_FILES)
 		--mbedtls-libdir "$(abspath $(MBEDTLS_BUILD_DIR))" \
 		--zlib-include "$(abspath $(LIBS_CACHE)/zlib-$(ZLIB_VERSION))" \
 		--zlib-libdir "$(abspath $(ZLIB_BUILD_DIR))" \
-		--cc "$(abspath $(CC)) --target=wasm32-wasip1 --sysroot=$(abspath $(SYSROOT))" \
+		--cc "$(abspath $(CC)) --target=wasm32-wasip1 --sysroot=$(abspath $(PATCHED_SYSROOT))" \
 		--ar "$(abspath $(WASI_SDK_DIR)/bin/llvm-ar)" \
 		--ranlib "$(abspath $(WASI_SDK_DIR)/bin/llvm-ranlib)" \
 		--output "$(abspath $@)"
@@ -840,7 +882,7 @@ $(BUILD_DIR)/grep: scripts/build-grep-upstream.sh $(PATCHED_SYSROOT)/lib/wasm32-
 		--url "$(GREP_URL)" \
 		--cache-dir "$(abspath $(LIBS_CACHE))" \
 		--build-dir "$(abspath $(GREP_UPSTREAM_BUILD_DIR))" \
-		--cc "$(abspath $(CC)) --target=wasm32-wasip1 --sysroot=$(abspath $(SYSROOT))" \
+		--cc "$(abspath $(CC)) --target=wasm32-wasip1 --sysroot=$(abspath $(PATCHED_SYSROOT))" \
 		--ar "$(abspath $(WASI_SDK_DIR)/bin/llvm-ar)" \
 		--ranlib "$(abspath $(WASI_SDK_DIR)/bin/llvm-ranlib)" \
 		--output "$(abspath $@)"
@@ -864,13 +906,16 @@ $(BUILD_DIR)/duckdb: libs/duckdb/CMakeLists.txt $(PATCHED_SYSROOT)/lib/wasm32-wa
 native: $(NATIVE_OUTPUTS)
 	@echo ""
 	@echo "=== Native Build Report ==="
-	@echo "Programs: $(words $(NATIVE_PROG_NAMES)) compiled"
+	@echo "Programs: $(words $(NATIVE_REPORT_NAMES)) compiled"
 	@echo "Output:   $(NATIVE_DIR)/"
 	@echo "=== Build complete ==="
 
 $(NATIVE_DIR)/%: $$(call c_source,$$*)
 	@mkdir -p $(NATIVE_DIR)
 	$(NATIVE_CC) $(NATIVE_CFLAGS) -o $@ $<
+
+$(NATIVE_DIR)/fd_mapping_contract:
+	$(MAKE) -C .. fd-mapping-contract-native
 
 # --- Install opted-in commands to COMMANDS_DIR ---
 

@@ -20,7 +20,7 @@ import {
 import type { Kernel } from '@agentos/test-harness';
 import { existsSync } from 'node:fs';
 import { writeFile as fsWriteFile, readFile as fsReadFile, mkdtemp, rm, mkdir as fsMkdir } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createServer as createTcpServer } from 'node:net';
@@ -66,6 +66,83 @@ function runNative(
   });
 }
 
+function runNativeWithHosts(
+  name: string,
+  hostsFile: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return new Promise((res) => {
+    const proc = spawn('unshare', [
+      '-Urm',
+      'sh',
+      '-c',
+      'mount --bind "$1" /etc/hosts && exec "$2"',
+      'sh',
+      hostsFile,
+      join(NATIVE_DIR, name),
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+    proc.on('close', (code) => res({ exitCode: code ?? 0, stdout, stderr }));
+  });
+}
+
+function runNativeWithNetworkFiles(
+  name: string,
+  hostsFile: string,
+  servicesFile: string,
+  args: string[],
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return new Promise((res) => {
+    const proc = spawn('unshare', [
+      '-Urm',
+      'sh',
+      '-c',
+      'mount --bind "$1" /etc/hosts && mount --bind "$2" /etc/services && binary=$3 && shift 3 && exec "$binary" "$@"',
+      'sh',
+      hostsFile,
+      servicesFile,
+      join(NATIVE_DIR, name),
+      ...args,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+    proc.on('close', (code) => res({ exitCode: code ?? 0, stdout, stderr }));
+  });
+}
+
+function runNativeWithLibcFiles(
+  name: string,
+  hostsFile: string,
+  servicesFile: string,
+  passwdFile: string,
+  args: string[],
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  return new Promise((res) => {
+    const proc = spawn('unshare', [
+      '-Urm',
+      'sh',
+      '-c',
+      'mount --bind "$1" /etc/hosts && mount --bind "$2" /etc/services && mount --bind "$3" /etc/passwd && binary=$4 && shift 4 && exec "$binary" "$@"',
+      'sh',
+      hostsFile,
+      servicesFile,
+      passwdFile,
+      join(NATIVE_DIR, name),
+      ...args,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+    proc.on('close', (code) => res({ exitCode: code ?? 0, stdout, stderr }));
+  });
+}
+
 // Strip kernel-level diagnostic WARN lines from WASM stderr (not program output)
 function normalizeStderr(stderr: string): string {
   return stderr
@@ -93,6 +170,13 @@ class SimpleVFS {
   private files = new Map<string, Uint8Array>();
   private dirs = new Set<string>(['/']);
   private symlinks = new Map<string, string>();
+  private metadata = new Map<string, { mode: number; uid: number; gid: number }>();
+
+  private resolve(path: string): string {
+    const target = this.symlinks.get(path);
+    if (!target) return path;
+    return target.startsWith('/') ? target : join(path, '..', target);
+  }
 
   async readFile(path: string): Promise<Uint8Array> {
     const data = this.files.get(path);
@@ -133,6 +217,9 @@ class SimpleVFS {
   async writeFile(path: string, content: string | Uint8Array): Promise<void> {
     const data = typeof content === 'string' ? new TextEncoder().encode(content) : content;
     this.files.set(path, new Uint8Array(data));
+    if (!this.metadata.has(path)) {
+      this.metadata.set(path, { mode: 0o100644, uid: 1000, gid: 1000 });
+    }
     const parts = path.split('/').filter(Boolean);
     for (let i = 1; i < parts.length; i++) {
       this.dirs.add('/' + parts.slice(0, i).join('/'));
@@ -144,12 +231,23 @@ class SimpleVFS {
     return this.files.has(path) || this.dirs.has(path) || this.symlinks.has(path);
   }
   async stat(path: string) {
+    return this.statEntry(this.resolve(path));
+  }
+  async lstat(path: string) {
+    return this.statEntry(path);
+  }
+  private async statEntry(path: string) {
     const isDir = this.dirs.has(path);
     const isSymlink = this.symlinks.has(path);
     const data = this.files.get(path);
     if (!isDir && !isSymlink && !data) throw new Error(`ENOENT: ${path}`);
-    return {
+    const metadata = this.metadata.get(path) ?? {
       mode: isSymlink ? 0o120777 : (isDir ? 0o40755 : 0o100644),
+      uid: 1000,
+      gid: 1000,
+    };
+    return {
+      mode: metadata.mode,
       size: data?.length ?? 0,
       isDirectory: isDir,
       isSymbolicLink: isSymlink,
@@ -159,19 +257,44 @@ class SimpleVFS {
       birthtimeMs: Date.now(),
       ino: 0,
       nlink: 1,
-      uid: 1000,
-      gid: 1000,
+      uid: metadata.uid,
+      gid: metadata.gid,
     };
   }
-  async chmod() {}
+  async chmod(path: string, mode: number) {
+    const resolved = this.resolve(path);
+    const stat = await this.statEntry(resolved);
+    this.metadata.set(resolved, {
+      mode: (stat.mode & 0o170000) | (mode & 0o7777),
+      uid: stat.uid,
+      gid: stat.gid,
+    });
+  }
+  async chown(
+    path: string,
+    uid: number,
+    gid: number,
+    options?: { followSymlinks?: boolean },
+  ) {
+    const resolved = options?.followSymlinks === false ? path : this.resolve(path);
+    const stat = await this.statEntry(resolved);
+    this.metadata.set(resolved, { mode: stat.mode, uid, gid });
+  }
   async rename(from: string, to: string) {
     const data = this.files.get(from);
     if (data) { this.files.set(to, data); this.files.delete(from); }
+    const metadata = this.metadata.get(from);
+    if (metadata) { this.metadata.set(to, metadata); this.metadata.delete(from); }
   }
-  async unlink(path: string) { this.files.delete(path); this.symlinks.delete(path); }
+  async unlink(path: string) {
+    this.files.delete(path);
+    this.symlinks.delete(path);
+    this.metadata.delete(path);
+  }
   async rmdir(path: string) { this.dirs.delete(path); }
   async symlink(target: string, linkPath: string) {
     this.symlinks.set(linkPath, target);
+    this.metadata.set(linkPath, { mode: 0o120777, uid: 1000, gid: 1000 });
     const parts = linkPath.split('/').filter(Boolean);
     for (let i = 1; i < parts.length; i++) {
       this.dirs.add('/' + parts.slice(0, i).join('/'));
@@ -399,7 +522,7 @@ describeIf(!skipReason(), 'C parity: native vs WASM', { timeout: 30_000 }, () =>
     expect(wasm.exitCode).toBe(native.exitCode);
     expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
     // Verify format for both
-    const format = /^uid=\d+\ngid=\d+\neuid=\d+\negid=\d+\n$/;
+    const format = /^uid=\d+\ngid=\d+\neuid=\d+\negid=\d+\nsetgroups_unprivileged_eperm=yes\n$/;
     expect(wasm.stdout).toMatch(format);
     expect(native.stdout).toMatch(format);
     // WASM kernel returns uid/gid = 1000 (sandbox user)
@@ -407,6 +530,7 @@ describeIf(!skipReason(), 'C parity: native vs WASM', { timeout: 30_000 }, () =>
     expect(wasm.stdout).toContain('gid=1000');
     expect(wasm.stdout).toContain('euid=1000');
     expect(wasm.stdout).toContain('egid=1000');
+    expect(wasm.stdout).toContain('setgroups_unprivileged_eperm=yes');
   });
 
   itIf(!tier2Skip, 'getpwuid_test: passwd entry fields valid', async () => {
@@ -426,6 +550,137 @@ describeIf(!skipReason(), 'C parity: native vs WASM', { timeout: 30_000 }, () =>
     expect(native.stdout).toContain('getpwuid: ok');
     expect(native.stdout).toContain('pw_name_nonempty: yes');
     expect(native.stdout).toContain('pw_uid_match: yes');
+  });
+
+  itIf(!tier2Skip, 'libc compatibility: live databases, shell pipes, and syslog match Linux', async () => {
+    // The parity harness intentionally starts with an empty injected VFS.
+    // Populate the two identity databases and verify libc reads them live.
+    await vfs.writeFile('/etc/passwd', 'root:x:0:0:root:/root:/bin/sh\n');
+    await vfs.writeFile('/etc/group', 'root:x:0:root\n');
+    const native = await runNative('libc_compat_contract');
+    const wasm = await kernel.exec('libc_compat_contract');
+    const normalizeSyslogPid = (value: string) =>
+      normalizeStderr(value)
+        .replace(/^\[agentos\] WASM open fd usage .*\n/gm, '')
+        .replace(/libc-compat\[\d+\]/g, 'libc-compat[pid]');
+
+    expect(wasm.exitCode, `${wasm.stderr}\n${wasm.stdout}`).toBe(native.exitCode);
+    expect(wasm.exitCode, `${wasm.stderr}\n${wasm.stdout}`).toBe(0);
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(normalizeSyslogPid(wasm.stderr)).toBe(normalizeSyslogPid(native.stderr));
+    expect(wasm.stdout).toContain('host_lookup=yes');
+    expect(wasm.stdout).toContain('service_lookup=yes');
+    expect(wasm.stdout).toContain('passwd_lookup=yes');
+    expect(wasm.stdout).toContain('group_lookup=yes');
+    expect(wasm.stdout).toContain('group_enumeration=yes');
+    expect(wasm.stdout).toContain('system_shell=yes');
+    expect(wasm.stdout).toContain('popen_read=yes');
+    expect(wasm.stdout).toContain('popen_write=yes');
+    expect(wasm.stdout).toContain('pclose_close_error=yes');
+    expect(wasm.stdout).toContain('setrlimit_truthful=yes');
+    expect(wasm.stdout).toContain('setrlimit_hard_raise_denied=yes');
+    expect(wasm.stderr).toContain('syslog-visible=17');
+  });
+
+  itIf(!tier2Skip, 'libc bounds: fd limit, large host sets, and oversized databases fail explicitly', async () => {
+    const hosts = Array.from(
+      { length: 20 },
+      (_, index) => `198.51.100.${index + 1} many.test`,
+    ).join('\n') + '\n';
+    const services = `oversvc 12345/tcp ${'alias'.repeat(240)}\n`;
+    const passwd = `oversuser:x:123:456:${'gecos'.repeat(240)}:/home/oversuser:/bin/sh\n`;
+    await vfs.writeFile('/etc/hosts', hosts);
+    await vfs.writeFile('/etc/services', services);
+    await vfs.writeFile('/etc/passwd', passwd);
+
+    const wasm = await kernel.exec('libc_bounds_contract many.test oversvc oversuser');
+    expect(wasm.exitCode, `${wasm.stderr}\n${wasm.stdout}`).toBe(0);
+    expect(wasm.stderr).toBe('');
+    expect(wasm.stdout).toContain('nofile_soft=256\n');
+    expect(wasm.stdout).toContain('nofile_hard=256\n');
+    expect(wasm.stdout).toContain('host_addresses=20\n');
+    expect(wasm.stdout).toContain('service_found=no\nservice_erange=yes\n');
+    expect(wasm.stdout).toContain('passwd_found=no\npasswd_erange=yes\n');
+
+    const overflowHosts = Array.from(
+      { length: 65 },
+      (_, index) => `203.0.113.${(index % 254) + 1} overflow.test`,
+    ).join('\n') + '\n';
+    await vfs.writeFile('/etc/hosts', overflowHosts);
+    const overflow = await kernel.exec(
+      'libc_bounds_contract overflow.test oversvc oversuser',
+    );
+    expect(overflow.exitCode, `${overflow.stderr}\n${overflow.stdout}`).toBe(0);
+    expect(overflow.stderr).toBe('');
+    expect(overflow.stdout).toContain(
+      'host_addresses=error\nhost_erange=yes\nhost_no_recovery=yes\n',
+    );
+
+    const nativeDir = await mkdtemp(join(tmpdir(), 'agentos-libc-bounds-'));
+    const nativeHosts = join(nativeDir, 'hosts');
+    const nativeServices = join(nativeDir, 'services');
+    const nativePasswd = join(nativeDir, 'passwd');
+    try {
+      await fsWriteFile(nativeHosts, hosts);
+      await fsWriteFile(nativeServices, services);
+      await fsWriteFile(nativePasswd, passwd);
+      const probe = spawnSync('unshare', [
+        '-Urm', 'sh', '-c',
+        'mount --bind "$1" /etc/hosts && mount --bind "$2" /etc/services && mount --bind "$3" /etc/passwd',
+        'sh', nativeHosts, nativeServices, nativePasswd,
+      ], { stdio: 'ignore' });
+      if (probe.status === 0) {
+        const native = await runNativeWithLibcFiles(
+          'libc_bounds_contract',
+          nativeHosts,
+          nativeServices,
+          nativePasswd,
+          ['many.test', 'oversvc', 'oversuser'],
+        );
+        expect(native.exitCode, `${native.stderr}\n${native.stdout}`).toBe(0);
+        expect(native.stderr).toBe('');
+        expect(native.stdout).toContain('host_addresses=20\n');
+        expect(native.stdout).toContain('service_found=yes\nservice_erange=no\n');
+        expect(native.stdout).toContain('passwd_found=yes\npasswd_erange=no\n');
+
+        await fsWriteFile(nativeHosts, overflowHosts);
+        const nativeOverflow = await runNativeWithLibcFiles(
+          'libc_bounds_contract',
+          nativeHosts,
+          nativeServices,
+          nativePasswd,
+          ['overflow.test', 'oversvc', 'oversuser'],
+        );
+        expect(
+          nativeOverflow.exitCode,
+          `${nativeOverflow.stderr}\n${nativeOverflow.stdout}`,
+        ).toBe(0);
+        expect(nativeOverflow.stderr).toBe('');
+        expect(nativeOverflow.stdout).toContain('host_addresses=65\n');
+      }
+    } finally {
+      await rm(nativeDir, { recursive: true, force: true });
+    }
+  });
+
+  itIf(!tier2Skip, 'chown family matches Linux ownership, fd, and symlink semantics', async () => {
+    const native = await runNative('chown_contract');
+    const wasm = await kernel.exec('chown_contract');
+
+    expect(wasm.exitCode, `${wasm.stderr}\n${wasm.stdout}`).toBe(native.exitCode);
+    expect(wasm.exitCode, `${wasm.stderr}\n${wasm.stdout}`).toBe(0);
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toContain('lchown_preserved_target=yes');
+    expect(wasm.stdout).toContain('chown_followed_target=yes');
+    expect(wasm.stdout).toContain('unchanged_ids_preserved=yes');
+    expect(wasm.stdout).toContain('nonexec_setgid_preserved=yes');
+    expect(wasm.stdout).toContain('foreign_uid_eperm=yes');
+    expect(wasm.stdout).toContain('fchownat_empty_path=yes');
+    expect(wasm.stdout).toContain('detached_directory_fchmod=yes');
+    expect(wasm.stdout).toContain('pipe_fchmod=yes');
+    expect(wasm.stdout).toContain('socket_fchmod=yes');
+    expect(wasm.stdout).toContain('fchownat_invalid_flags=yes');
   });
 
   itIf(!tier2Skip, 'pipe_test: write through pipe and read back matches', async () => {
@@ -488,6 +743,266 @@ describeIf(!skipReason(), 'C parity: native vs WASM', { timeout: 30_000 }, () =>
     expect(wasm.stdout).toContain('child_stdout: hello');
     expect(wasm.stdout).toContain('child_exit: 0');
     expect(wasm.stdout).toContain('custom_argv0=custom-argv0');
+    expect(wasm.stdout).toContain('empty_len=0 tail=tail');
+    expect(wasm.stdout).toContain('spawn_bare_enoent: yes');
+    expect(wasm.stdout).toContain('spawn_empty_enoent: yes');
+  });
+
+  itIf(!tier3Skip, 'spawn_contract: ordered file actions, inherited descriptions, and signal semantics match Linux', async () => {
+    const native = await runNative('spawn_contract');
+    const wasm = await kernel.exec('spawn_contract');
+
+    expect(wasm.exitCode, `WASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`).toBe(native.exitCode);
+    expect(wasm.exitCode).toBe(0);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toContain('spawn_actions_ordered=yes');
+    expect(wasm.stdout).toContain('spawn_actions_parent_unchanged=yes');
+    expect(wasm.stdout).toContain('spawn_closefrom_ordered=yes');
+    expect(wasm.stdout).toContain('spawn_closefrom_public_preopen_hidden=yes');
+    expect(wasm.stdout).toContain('spawn_inherit_shared_description=yes');
+    expect(wasm.stdout).toContain('spawn_same_fd_dup2_clears_cloexec=yes');
+    expect(wasm.stdout).toContain('spawn_live_cwd_inherited=yes');
+    expect(wasm.stdout).toContain('spawn_chdir_symlink_relative_open=yes');
+    expect(wasm.stdout).toContain('spawn_fchdir_symlink_relative_open=yes');
+    expect(wasm.stdout).toContain('spawnp_path_actions_once=yes');
+    expect(wasm.stdout).toContain('spawnp_empty_path_current_directory=yes');
+    expect(wasm.stdout).toContain('signal_mask_unmaskable=yes');
+    expect(wasm.stdout).toContain('signal_mask_pending_coalesced=yes');
+    expect(wasm.stdout).toContain('spawn_signal_masks=yes');
+    expect(wasm.stdout).toContain('spawn_signal_defaults=yes');
+    expect(wasm.stdout).toContain('signal_handler_mask_and_reset=yes');
+    expect(wasm.stdout).toContain('spawn_pgroup=yes');
+    expect(wasm.stdout).toContain('spawn_resetids=yes');
+    expect(wasm.stdout).toContain('spawn_setsid=yes');
+    expect(wasm.stdout).toContain('spawn_scheduler_attrs=yes');
+    expect(wasm.stdout).toContain('spawn_bidirectional_pipes=yes');
+    expect(wasm.stdout).toContain('waitpid_schedules_sibling=yes');
+    expect(wasm.stdout).toContain('spawn_closefrom_pipe_writer_eof=yes');
+    expect(wasm.stdout).toContain('spawn_retained_writer_not_inherited=yes');
+    expect(wasm.stdout).toContain('spawn_borrows_parent_stdout=yes');
+    expect(wasm.stdout).toContain('spawn_closed_stdout_ebadf=yes');
+    expect(wasm.stdout).toContain('stdio_close_restore=yes');
+    expect(wasm.stdout).toContain('spawn_contract=ok');
+  });
+
+  const hasOpenFlagsContract =
+    existsSync(join(C_BUILD_DIR, 'open_flags')) &&
+    existsSync(join(NATIVE_DIR, 'open_flags'));
+  itIf(
+    hasOpenFlagsContract,
+    'open_flags: directory and nofollow failures match Linux without side effects',
+    async () => {
+      const native = await runNative('open_flags');
+      const wasm = await kernel.exec('open_flags');
+
+      expect(
+        wasm.exitCode,
+        `native stdout:\n${native.stdout}\nnative stderr:\n${native.stderr}\nWASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`,
+      ).toBe(native.exitCode);
+      expect(wasm.exitCode).toBe(0);
+      expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+      expect(wasm.stdout).toBe(native.stdout);
+      expect(wasm.stdout).toContain('open_directory_truncate_enotdir=yes');
+      expect(wasm.stdout).toContain('open_nofollow_truncate_eloop=yes');
+      expect(wasm.stdout).toContain('open_directory_create_einval=yes');
+      expect(wasm.stdout).toContain('open_failure_side_effects_absent=yes');
+      expect(wasm.stdout).toContain('umask_applies_to_kernel_create=yes');
+      expect(wasm.stdout).toContain('open_flags=ok');
+    },
+  );
+
+  const hasReaddirContract =
+    existsSync(join(C_BUILD_DIR, 'readdir_contract')) &&
+    existsSync(join(NATIVE_DIR, 'readdir_contract'));
+  itIf(
+    hasReaddirContract,
+    'readdir_contract: dot entries, inodes, and multi-page cookies match Linux',
+    async () => {
+      const native = await runNative('readdir_contract');
+      const wasm = await kernel.exec('readdir_contract');
+
+      expect(
+        wasm.exitCode,
+        `native stdout:\n${native.stdout}\nnative stderr:\n${native.stderr}\nWASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`,
+      ).toBe(native.exitCode);
+      expect(wasm.exitCode).toBe(0);
+      expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+      expect(wasm.stdout).toBe(native.stdout);
+      expect(wasm.stdout).toContain('readdir_dots=yes');
+      expect(wasm.stdout).toContain('readdir_nonzero_ino=yes');
+      expect(wasm.stdout).toContain('readdir_ino_matches_stat=yes');
+      expect(wasm.stdout).toContain('readdir_seekdir_resume=yes');
+      expect(wasm.stdout).toContain('readdir_short_buffer_cookie=yes');
+      expect(wasm.stdout).toContain('readdir_stable_ino=yes');
+      expect(wasm.stdout).toContain('readdir_detached_directory=yes');
+      expect(wasm.stdout).toContain('proc_deleted_file=yes');
+      expect(wasm.stdout).toContain('readdir_renamed_directory=yes');
+      expect(wasm.stdout).toContain('readdir_fdopendir_first_read_and_eof=yes');
+      expect(wasm.stdout).toContain('readdir_count=222');
+      expect(wasm.stdout).toContain('readdir_contract=ok');
+    },
+  );
+
+  const hasRecordLockContract =
+    existsSync(join(C_BUILD_DIR, 'record_lock')) &&
+    existsSync(join(NATIVE_DIR, 'record_lock'));
+
+  const hasMlockContract =
+    existsSync(join(C_BUILD_DIR, 'mlock_contract')) &&
+    existsSync(join(NATIVE_DIR, 'mlock_contract'));
+  itIf(
+    hasMlockContract,
+    'madvise_contract: advisory hints and validation match Linux',
+    async () => {
+      const native = await runNative('mlock_contract');
+      const wasm = await kernel.exec('mlock_contract');
+
+      expect(
+        wasm.exitCode,
+        `native stdout:\n${native.stdout}\nnative stderr:\n${native.stderr}\nWASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`,
+      ).toBe(native.exitCode);
+      expect(wasm.exitCode).toBe(0);
+      expect(wasm.stdout).toBe(native.stdout);
+      expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+      expect(wasm.stdout).toContain('madvise_unmapped_tail_enomem=yes');
+      expect(wasm.stdout).toContain('madvise_hints_and_validation=yes');
+      expect(wasm.stdout).toContain('memory_lock_range_validation=yes');
+      expect(wasm.stdout).toContain('madvise_contract=ok');
+    },
+  );
+
+  itIf(
+    hasMlockContract,
+    'mlock_contract: unsupported WASM residency operations fail explicitly',
+    async () => {
+      const native = await runNative('mlock_contract', ['--linux-specific']);
+      const wasm = await kernel.exec('mlock_contract --wasm-specific');
+
+      expect(native.exitCode, native.stderr).toBe(0);
+      expect(native.stdout).toContain('mlock_linux=yes');
+      expect(native.stdout).toContain('mlockall_future_linux=yes');
+      expect(native.stdout).toContain('madvise_dontneed_linux=yes');
+      expect(wasm.exitCode, wasm.stderr).toBe(0);
+      expect(wasm.stdout).toContain('memory_locking_unsupported=yes');
+      expect(wasm.stdout).toContain('madvise_dontneed_unsupported=yes');
+    },
+  );
+
+  itIf(
+    hasRecordLockContract,
+    'record_lock: POSIX conflicts, byte ranges, and close/exit release match Linux',
+    async () => {
+      const native = await runNative('record_lock');
+      const wasm = await kernel.exec('record_lock');
+
+      expect(
+        wasm.exitCode,
+        `native stdout:\n${native.stdout}\nnative stderr:\n${native.stderr}\nWASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`,
+      ).toBe(native.exitCode);
+      expect(wasm.exitCode).toBe(0);
+      expect(wasm.stdout).toBe(native.stdout);
+      expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+      expect(wasm.stdout).toContain('record_lock_conflict_and_ranges=yes');
+      expect(wasm.stdout).toContain('record_lock_any_close_releases=yes');
+      expect(wasm.stdout).toContain('record_lock_exit_releases=yes');
+      expect(wasm.stdout).toContain('record_lock_setlkw_immediate=yes');
+      expect(wasm.stdout).toContain('record_lock_setlkw_deadlock=yes');
+      expect(wasm.stdout).toContain('record_lock_setlkw_wakeup=yes');
+      expect(wasm.stdout).toContain('record_lock_setlkw_eintr=yes');
+      expect(wasm.stdout).toContain('record_lock_setlkw_sibling_wakeup=yes');
+      expect(wasm.stdout).toContain('record_lock=ok');
+    },
+  );
+
+  itIf(!tier3Skip, 'spawn_contract: bidirectional POSIX pipes deliver repeated reads and final EOF', async () => {
+    const native = await runNative('spawn_contract', ['--bidirectional-parent']);
+    const wasm = await kernel.exec('spawn_contract --bidirectional-parent');
+
+    expect(wasm.exitCode, `WASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`).toBe(
+      native.exitCode,
+    );
+    expect(wasm.exitCode).toBe(0);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toBe('spawn_bidirectional_pipes=yes\n');
+  });
+
+  itIf(!tier3Skip, 'spawn_contract: waitpid keeps non-selected siblings scheduled', async () => {
+    const native = await runNative('spawn_contract', ['--waitpid-sibling-parent']);
+    const wasm = await kernel.exec('spawn_contract --waitpid-sibling-parent');
+
+    expect(wasm.exitCode, `WASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`).toBe(
+      native.exitCode,
+    );
+    expect(wasm.exitCode).toBe(0);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toBe('waitpid_schedules_sibling=yes\n');
+  });
+
+  itIf(!tier3Skip, 'spawn_contract: closefrom closes unrelated pipe writers in a later child', async () => {
+    const native = await runNative('spawn_contract', ['--closefrom-pipe-parent']);
+    const wasm = await kernel.exec('spawn_contract --closefrom-pipe-parent');
+
+    expect(wasm.exitCode, `WASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`).toBe(
+      native.exitCode,
+    );
+    expect(wasm.exitCode).toBe(0);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toBe('spawn_closefrom_pipe_writer_eof=yes\n');
+  });
+
+  itIf(!tier3Skip, 'spawn_contract: retained writers owned by older children are not inherited', async () => {
+    const native = await runNative('spawn_contract', ['--retained-pipe-parent']);
+    const wasm = await kernel.exec('spawn_contract --retained-pipe-parent');
+
+    expect(wasm.exitCode, `WASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`).toBe(
+      native.exitCode,
+    );
+    expect(wasm.exitCode).toBe(0);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toBe('spawn_retained_writer_not_inherited=yes\n');
+  });
+
+  const hasPpollContract =
+    existsSync(join(C_BUILD_DIR, 'ppoll_contract')) &&
+    existsSync(join(NATIVE_DIR, 'ppoll_contract'));
+  itIf(
+    hasPpollContract,
+    'ppoll_contract: temporary masks, EINTR, ready results, and restoration match Linux',
+    async () => {
+      const native = await runNative('ppoll_contract');
+      const wasm = await kernel.exec('ppoll_contract');
+
+      expect(wasm.exitCode, `WASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`).toBe(native.exitCode);
+      expect(wasm.exitCode).toBe(0);
+      expect(wasm.stdout).toBe(native.stdout);
+      expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+      expect(wasm.stdout).toContain('poll_linux_abi=yes');
+      expect(wasm.stdout).toContain('poll_normal_aliases=yes');
+      expect(wasm.stdout).toContain('ppoll_pending_unblocked_eintr=yes');
+      expect(wasm.stdout).toContain('ppoll_temporary_block_ready=yes');
+      expect(wasm.stdout).toContain('ppoll_error_mask_restore=yes');
+      expect(wasm.stdout).toContain('ppoll_contract=ok');
+    },
+  );
+
+  itIf(!tier3Skip, 'fd_mapping_contract: sequential collisions, swaps, duplicate targets, and CLOEXEC match Linux', async () => {
+    const native = await runNative('fd_mapping_contract');
+    const wasm = await kernel.exec('fd_mapping_contract');
+
+    expect(
+      wasm.exitCode,
+      `native stdout:\n${native.stdout}\nnative stderr:\n${native.stderr}\nWASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`,
+    ).toBe(native.exitCode);
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(
+      'sequential_collision=ok\nswap_cycle=ok\nduplicate_target=ok\n',
+    );
   });
 
   itIf(!tier3Skip, 'spawn_exit_code: child exits non-zero, verify via waitpid', async () => {
@@ -664,6 +1179,47 @@ describeIf(!skipReason(), 'C parity: native vs WASM', { timeout: 30_000 }, () =>
     expect(wasm.stdout).toContain('test4_signaled: no');
     expect(wasm.stdout).toContain('test4: ok');
     expect(native.stdout).toContain('test4: ok');
+    // Test 5: waitpid(-1) returns the child that is ready first.
+    expect(wasm.stdout).toContain('test5_first_ready: yes');
+    expect(wasm.stdout).toContain('test5: ok');
+    expect(native.stdout).toContain('test5: ok');
+    // Test 6: pid=0 selects the caller's process group.
+    expect(wasm.stdout).toContain('test6_pid_zero_group: yes');
+    expect(wasm.stdout).toContain('test6: ok');
+    // Test 7: pid<-1 selects an explicit process group.
+    expect(wasm.stdout).toContain('test7_negative_group: yes');
+    expect(wasm.stdout).toContain('test7: ok');
+    // Test 8: WUNTRACED/WCONTINUED preserve raw Linux state transitions.
+    expect(wasm.stdout).toContain('test8_stopped: yes');
+    expect(wasm.stdout).toContain('test8_continued: yes');
+    expect(wasm.stdout).toContain('test8_terminated: yes');
+    expect(wasm.stdout).toContain('test8: ok');
+    // Test 9: invalid options are typed and do not consume the child.
+    expect(wasm.stdout).toContain('test9_invalid_options: yes');
+    expect(wasm.stdout).toContain('test9_child_preserved: yes');
+    expect(wasm.stdout).toContain('test9: ok');
+    // Test 10: SIGCHLD from a non-selected sibling interrupts waitpid(pid).
+    expect(wasm.stdout).toContain('test10_sigchld_handler: yes');
+    expect(wasm.stdout).toContain('test10_waitpid_eintr: yes');
+    expect(wasm.stdout).toContain('test10_children_cleaned: yes');
+    expect(wasm.stdout).toContain('test10: ok');
+    expect(native.stdout).toContain('test10: ok');
+  });
+
+  itIf(!tier3Skip, 'itimer_contract: real timer timing, masking, and selector policy match Linux', async () => {
+    const native = await runNative('itimer_contract');
+    const wasm = await kernel.exec('itimer_contract');
+
+    expect(wasm.exitCode).toBe(native.exitCode);
+    expect(wasm.exitCode).toBe(0);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toContain('itimer_real_remaining=yes');
+    expect(wasm.stdout).toContain('alarm_rounding=yes');
+    expect(wasm.stdout).toContain('itimer_masked_coalesced=yes');
+    expect(wasm.stdout).toContain('itimer_selector_policy=yes');
+    expect(wasm.stdout).toContain('alarm_default_termination=yes');
+    expect(wasm.stdout).toContain('itimer_contract=ok');
   });
 
   itIf(!tier3Skip, 'pipe_edge: large write, broken pipe, EOF, close-both', async () => {
@@ -694,6 +1250,218 @@ describeIf(!skipReason(), 'C parity: native vs WASM', { timeout: 30_000 }, () =>
     expect(wasm.stdout).toContain('close_both: ok');
     expect(native.stdout).toContain('close_both: ok');
   });
+
+  itIf(!tier3Skip, 'select_edge: one descriptor ready in multiple sets counts each ready bit', async () => {
+    const native = await runNative('select_edge');
+    const wasm = await kernel.exec('select_edge');
+
+    expect(wasm.exitCode).toBe(native.exitCode);
+    expect(wasm.exitCode).toBe(0);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toContain('select_ready_count: 2');
+    expect(wasm.stdout).toContain('select_read_ready: yes');
+    expect(wasm.stdout).toContain('select_write_ready: yes');
+    expect(wasm.stdout).toContain('select_large_fdset: yes');
+    expect(wasm.stdout).toContain('select_high_fd: yes');
+    expect(wasm.stdout).toContain('select_cloexec_fd: yes');
+    expect(wasm.stdout).toContain('select_fd_ceiling_einval: yes');
+    expect(wasm.stdout).toContain('select_timeout_normalized: yes');
+    expect(wasm.stdout).toContain('select_timeout_expired: yes');
+    expect(wasm.stdout).toContain('select_invalid_timeout: yes');
+    expect(wasm.stdout).toContain('select_invalid_nfds: yes');
+    expect(wasm.stdout).toContain('select_above_nfds_ignored: yes');
+    expect(wasm.stdout).toContain('select_ebadf: yes');
+    expect(wasm.stdout).toContain('select_huge_empty: yes');
+    expect(wasm.stdout).toContain('select_huge_sparse: yes');
+    expect(wasm.stdout).toContain('select_multi_set: ok');
+  });
+
+  const hasProcessAbiCommands =
+    existsSync(join(COMMANDS_DIR, 'bash')) && existsSync(join(COMMANDS_DIR, 'git'));
+
+  itIf(
+    hasProcessAbiCommands,
+    'process ABI: current git and legacy sh/bash retain spawn/wait compatibility',
+    async () => {
+      // sh/bash use the older split exec-path/wait-status ABI while the rebuilt
+      // Git artifact uses the current ordered-actions/raw-status ABI. Exercise
+      // both generations as parent processes.
+      const gitHigh = await kernel.exec(`git -c 'alias.legacy=!exit 137' legacy`);
+      expect(gitHigh.exitCode,
+        `git-high stdout:\n${gitHigh.stdout}\ngit-high stderr:\n${gitHigh.stderr}`).toBe(137);
+
+      const git = await kernel.exec(
+        `git -c 'alias.legacy=!f() { test "$1" = argv-ok && test "$LEGACY_ENV" = env-ok && cat; return 23; }; f' legacy argv-ok`,
+        { env: { LEGACY_ENV: 'env-ok' }, stdin: 'legacy-stdio' },
+      );
+      expect(git.exitCode,
+        `git stdout:\n${git.stdout}\ngit stderr:\n${git.stderr}`).toBe(23);
+      expect(git.stdout).toBe('legacy-stdio');
+
+      const gitSignal = await kernel.exec(
+        `git -c 'alias.legacy=!kill -TERM $$' legacy`,
+      );
+      expect(gitSignal.exitCode,
+        `git-signal stdout:\n${gitSignal.stdout}\ngit-signal stderr:\n${gitSignal.stderr}`).toBe(143);
+
+      const sh = await kernel.exec(`sh -c 'exit 137'`);
+      expect(sh.exitCode, `sh stdout:\n${sh.stdout}\nsh stderr:\n${sh.stderr}`).toBe(137);
+
+      const bashLow = await kernel.exec(`bash -c 'sh -c "exit 23"; exit $?'`);
+      expect(bashLow.exitCode,
+        `bash-low stdout:\n${bashLow.stdout}\nbash-low stderr:\n${bashLow.stderr}`).toBe(23);
+
+      const bash = await kernel.exec(`bash -c 'sh -c "exit 137"; exit $?'`);
+      expect(bash.exitCode, `bash stdout:\n${bash.stdout}\nbash stderr:\n${bash.stderr}`).toBe(137);
+    },
+  );
+
+  itIf(!tier3Skip, 'socket_flags: socket and accept4 creation flags and errnos match Linux', async () => {
+    const native = await runNative('socket_flags');
+    const wasm = await kernel.exec('socket_flags');
+
+    expect(wasm.exitCode).toBe(native.exitCode);
+    expect(wasm.exitCode).toBe(0);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toContain('socket_nonblock=yes');
+    expect(wasm.stdout).toContain('socket_cloexec=yes');
+    expect(wasm.stdout).toContain('socket_invalid_flag_einval=yes');
+    expect(wasm.stdout).toContain('accept4_badfd_ebadf=yes');
+    expect(wasm.stdout).toContain('accept4_invalid_flag_einval=yes');
+    expect(wasm.stdout).toContain('accept4_nonblock=yes');
+    expect(wasm.stdout).toContain('accept4_cloexec=yes');
+    expect(wasm.stdout).toContain('socket_dup_shared_ofd=yes');
+    expect(wasm.stdout).toContain('socket_dup2_exact=yes');
+    expect(wasm.stdout).toContain('socket_f_dupfd_min=yes');
+    expect(wasm.stdout).toContain('socket_dup_independent_close=yes');
+    expect(wasm.stdout).toContain('socket_flags=ok');
+  });
+
+  itIf(!tier3Skip, 'unix_socket: abstract bind/connect and byte transfer match Linux', async () => {
+    const native = await runNative('unix_socket', ['--abstract-contract']);
+    const wasm = await kernel.exec('unix_socket --abstract-contract');
+
+    expect(
+      wasm.exitCode,
+      `native stdout:\n${native.stdout}\nWASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`,
+    ).toBe(native.exitCode);
+    expect(wasm.exitCode).toBe(0);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toBe('abstract_unix_namespace=ok\n');
+  });
+
+  itIf(!tier3Skip, 'unix_socket: partial reads, MSG_PEEK, and blocking wakeups match Linux', async () => {
+    const native = await runNative('unix_socket', ['--stream-read-contract']);
+    const wasm = await kernel.exec('unix_socket --stream-read-contract');
+
+    expect(
+      wasm.exitCode,
+      `native stdout:\n${native.stdout}\nnative stderr:\n${native.stderr}\nWASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`,
+    ).toBe(native.exitCode);
+    expect(wasm.exitCode).toBe(0);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toBe('unix_stream_read_contract=ok\n');
+  });
+
+  itIf(!tier3Skip, 'unix_socket: sockaddr lengths, pointer ordering, and lifecycle match Linux', async () => {
+    const native = await runNative('unix_socket', ['--parity-contract']);
+    await vfs.createDir('/tmp');
+    const wasm = await kernel.exec('unix_socket --parity-contract');
+
+    expect(
+      wasm.exitCode,
+      `native stdout:\n${native.stdout}\nnative stderr:\n${native.stderr}\nWASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`,
+    ).toBe(native.exitCode);
+    expect(wasm.exitCode).toBe(0);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toContain('unix_family_only_autobind=yes');
+    expect(wasm.stdout).toContain('unix_max_pathname_length=yes');
+    expect(wasm.stdout).toContain('accept_null_len_consumes_connection=yes');
+    expect(wasm.stdout).toContain('unix_second_bind_einval=yes');
+    expect(wasm.stdout).toContain('unix_repeated_listen=yes');
+    expect(wasm.stdout).toContain('unix_second_connect_eisconn=yes');
+    expect(wasm.stdout).toContain('unix_socket_parity=ok');
+  });
+
+  itIf(!tier3Skip, 'unix_socket: stream-only compatibility exception is explicit', async () => {
+    const native = await runNative('unix_socket', ['--socket-type-contract']);
+    const wasm = await kernel.exec('unix_socket --socket-type-contract');
+
+    expect(native.exitCode, native.stderr).toBe(0);
+    expect(wasm.exitCode, wasm.stderr).toBe(0);
+    expect(native.stdout).toBe('unix_dgram=supported\nunix_seqpacket=supported\n');
+    expect(wasm.stdout).toBe('unix_dgram=unsupported\nunix_seqpacket=unsupported\n');
+  });
+
+  itIf(!tier3Skip, 'socketpair_rights: duplex I/O, spawn inheritance, and SCM_RIGHTS match Linux', async () => {
+    const native = await runNative('socketpair_rights');
+    const wasm = await kernel.exec('socketpair_rights');
+
+    expect(
+      wasm.exitCode,
+      `native stdout:\n${native.stdout}\nWASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`,
+    ).toBe(native.exitCode);
+    expect(wasm.exitCode).toBe(0);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toContain('socketpair_nonblock=yes');
+    expect(wasm.stdout).toContain('socketpair_cloexec=yes');
+    expect(wasm.stdout).toContain('socketpair_poll=yes');
+    expect(wasm.stdout).toContain('socketpair_bidirectional=yes');
+    expect(wasm.stdout).toContain('socketpair_shutdown_eof=yes');
+    expect(wasm.stdout).toContain('socketpair_recvmsg_flags=yes');
+    expect(wasm.stdout).toContain('scm_rights_cross_process=yes');
+    expect(wasm.stdout).toContain('scm_rights_cloexec=yes');
+    expect(wasm.stdout).toContain('scm_rights_pending_tcp_socket=yes');
+    expect(wasm.stdout).toContain('scm_rights_tcp_listener_connection=yes');
+    expect(wasm.stdout).toContain('scm_rights_hostnet_peek_shared=yes');
+    expect(wasm.stdout).toContain('scm_rights_udp_socket=yes');
+    expect(wasm.stdout).toContain('socketpair_rights=ok');
+  });
+
+  itIf(!tier3Skip, 'exec_edge: replacement preserves argv and closes only CLOEXEC fds', async () => {
+    const native = await runNative('exec_edge');
+    const wasm = await kernel.exec('exec_edge');
+
+    expect(wasm.exitCode).toBe(native.exitCode);
+    expect(wasm.exitCode).toBe(0);
+    expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+    expect(wasm.stdout).toBe(native.stdout);
+    expect(wasm.stdout).toContain('exec_argv0: yes');
+    expect(wasm.stdout).toContain('exec_empty_arg: yes');
+    expect(wasm.stdout).toContain('exec_keep_fd: yes');
+    expect(wasm.stdout).toContain('exec_cloexec_closed: yes');
+    expect(wasm.stdout).toContain('exec_fd_io: yes');
+    expect(wasm.stdout).toContain('exec_proc_cmdline: yes');
+    expect(wasm.stdout).toContain('exec_proc_environ: yes');
+    expect(wasm.stdout).toContain('exec_replacement: ok');
+  });
+
+  for (const [mode, marker] of [
+    ['execle', 'execle: ok'],
+    ['execvpe', 'execvpe: ok'],
+    ['execve-shebang', 'execve_shebang: ok'],
+    ['shell-fallback', 'shell_fallback: ok'],
+    ['fexecve', 'fexecve_unlinked_cloexec: ok'],
+    ['fexecve-script', 'fexecve_script_unlinked: ok'],
+    ['fexecve-script-cloexec', 'fexecve_script_cloexec_enoent: ok'],
+  ] as const) {
+    itIf(!tier3Skip, `exec_variants ${mode}: matches Linux replacement behavior`, async () => {
+      const native = await runNative('exec_variants', [mode]);
+      const wasm = await kernel.exec(`exec_variants ${mode}`);
+
+      expect(wasm.exitCode).toBe(native.exitCode);
+      expect(wasm.exitCode).toBe(0);
+      expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+      expect(wasm.stdout).toBe(native.stdout);
+      expect(wasm.stdout).toContain(marker);
+    });
+  }
 
   // --- Capstone: syscall coverage (all tiers, patched sysroot) ---
 
@@ -992,4 +1760,131 @@ describeIf(!skipReason(), 'C parity: native vs WASM', { timeout: 30_000 }, () =>
     expect(wasm.stdout).toContain('host: localhost');
     expect(wasm.stdout).toContain('ip: 127.0.0.1');
   });
+
+  const hasGetaddrinfoConnect =
+    existsSync(join(C_BUILD_DIR, 'getaddrinfo_connect')) &&
+    existsSync(join(NATIVE_DIR, 'getaddrinfo_connect'));
+  itIf(
+    hasGetaddrinfoConnect,
+    'getaddrinfo: live hosts alias and services name connect like Linux',
+    async () => {
+      const server = createTcpServer((socket) => socket.end());
+      await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+      const port = (server.address() as import('node:net').AddressInfo).port;
+      await recreateKernel({ loopbackExemptPorts: [port] });
+      const hosts = '127.0.0.1 servicebox service-alias\n';
+      const services = `agentos-parity ${port}/tcp\n`;
+      await vfs.writeFile('/etc/hosts', hosts);
+      await vfs.writeFile('/etc/services', services);
+      try {
+        const wasm = await kernel.exec('getaddrinfo_connect service-alias agentos-parity');
+        expect(wasm.exitCode, wasm.stderr).toBe(0);
+        expect(wasm.stdout).toBe('getaddrinfo_live_hosts_service_connect=yes\n');
+
+        const nativeDir = await mkdtemp(join(tmpdir(), 'agentos-netdb-'));
+        const nativeHosts = join(nativeDir, 'hosts');
+        const nativeServices = join(nativeDir, 'services');
+        await fsWriteFile(nativeHosts, hosts);
+        await fsWriteFile(nativeServices, services);
+        const probe = spawnSync('unshare', [
+          '-Urm', 'sh', '-c',
+          'mount --bind "$1" /etc/hosts && mount --bind "$2" /etc/services',
+          'sh', nativeHosts, nativeServices,
+        ], { stdio: 'ignore' });
+        if (probe.status === 0) {
+          const native = await runNativeWithNetworkFiles(
+            'getaddrinfo_connect', nativeHosts, nativeServices,
+            ['service-alias', 'agentos-parity'],
+          );
+          expect(native).toEqual(wasm);
+        }
+        await rm(nativeDir, { recursive: true, force: true });
+      } finally {
+        server.close();
+      }
+    },
+  );
+
+  const hasGetnameinfoContract =
+    existsSync(join(C_BUILD_DIR, 'getnameinfo_contract')) &&
+    existsSync(join(NATIVE_DIR, 'getnameinfo_contract'));
+  itIf(
+    hasGetnameinfoContract,
+    'getnameinfo_contract: Linux flags, PTR fallback, scopes, and services database match',
+    async () => {
+	  const hosts = [
+		'127.0.0.1 localhost localhost.localdomain',
+		'::1 localhost localhost.localdomain ip6-localhost ip6-loopback',
+		'203.0.113.9 custombox.example.test custombox aliases',
+		'fe80::1234%lo scopedbox',
+		'',
+	  ].join('\n');
+      await vfs.writeFile(
+        '/etc/services',
+        [
+          'ssh 22/tcp',
+          'smtp 25/tcp mail',
+          'shell 514/tcp cmd',
+          'syslog 514/udp',
+          '',
+        ].join('\n'),
+      );
+	  await vfs.writeFile('/etc/hosts', hosts);
+	  const nativeHostsDir = await mkdtemp(join(tmpdir(), 'agentos-hosts-'));
+	  const nativeHostsFile = join(nativeHostsDir, 'hosts');
+	  await fsWriteFile(nativeHostsFile, hosts);
+	  const mountProbe = spawnSync('unshare', [
+		'-Urm',
+		'sh',
+		'-c',
+		'mount --bind "$1" /etc/hosts',
+		'sh',
+		nativeHostsFile,
+	  ], { stdio: 'ignore' });
+	  const native = mountProbe.status === 0
+		? await runNativeWithHosts('getnameinfo_contract', nativeHostsFile)
+		: await runNative('getnameinfo_contract', ['--common']);
+	  const wasm = await kernel.exec('getnameinfo_contract');
+	  await rm(nativeHostsDir, { recursive: true, force: true });
+
+      expect(wasm.exitCode, `WASM stdout:\n${wasm.stdout}\nWASM stderr:\n${wasm.stderr}`).toBe(native.exitCode);
+      expect(wasm.exitCode).toBe(0);
+      const targetSpecific = (output: string) => output
+        .split('\n')
+        .filter((line) =>
+          !line.includes('musl_accepts_numericscope_flag') &&
+          !line.includes('glibc_rejects_numericscope_flag') &&
+          !line.includes('ipv6_forced_numeric_scope') &&
+          !line.includes('mapped_ipv6_live_hosts') &&
+		  !line.includes('live_hosts_precedes_dns') &&
+		  !line.includes('musl_nofqdn_noop') &&
+		  !line.includes('scoped_hosts_') &&
+		  !line.includes('forward_scoped_hosts') &&
+		  !line.includes('forward_hosts_alias_service_canonname') &&
+          !line.includes('getnameinfo_contract='),
+        )
+        .join('\n');
+      expect(targetSpecific(wasm.stdout)).toBe(targetSpecific(native.stdout));
+      expect(normalizeStderr(wasm.stderr)).toBe(normalizeStderr(native.stderr));
+      expect(wasm.stdout).toContain('getnameinfo_ptr_miss_prefilled_numeric_fallback=yes');
+      expect(wasm.stdout).toContain('getnameinfo_services_database=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_live_hosts_precedes_dns=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_musl_nofqdn_noop=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_mapped_ipv6_live_hosts=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_musl_accepts_numericscope_flag=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_ipv6_named_scope=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_ipv6_forced_numeric_scope=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_ipv6_unknown_scope_numeric_fallback=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_ipv6_global_scope_stays_numeric=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_loopback_name_to_index=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_loopback_index_to_name=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_loopback_getifaddrs=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_loopback_nameindex_list=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_scoped_hosts_match=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_scoped_hosts_mismatch=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_forward_hosts_alias_service_canonname=yes');
+	  expect(wasm.stdout).toContain('getnameinfo_forward_scoped_hosts=yes');
+      expect(wasm.stdout).toContain('getnameinfo_contract=ok');
+    },
+  );
 });

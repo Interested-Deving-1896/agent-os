@@ -41,6 +41,58 @@ pub enum SessionCommand {
     SetModuleReader(Box<dyn crate::execution::GuestModuleReader>),
 }
 
+#[derive(Default)]
+struct SessionPauseState {
+    paused: bool,
+    shutdown: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct SessionPauseControl {
+    state: Mutex<SessionPauseState>,
+    resumed: Condvar,
+}
+
+impl SessionPauseControl {
+    fn pause(&self) {
+        self.state
+            .lock()
+            .expect("session pause lock poisoned")
+            .paused = true;
+    }
+
+    fn resume(&self) {
+        let mut state = self.state.lock().expect("session pause lock poisoned");
+        state.paused = false;
+        self.resumed.notify_all();
+    }
+
+    fn shutdown(&self) {
+        let mut state = self.state.lock().expect("session pause lock poisoned");
+        state.shutdown = true;
+        state.paused = false;
+        self.resumed.notify_all();
+    }
+
+    fn wait_while_paused(&self) {
+        let mut state = self.state.lock().expect("session pause lock poisoned");
+        while state.paused && !state.shutdown {
+            state = self
+                .resumed
+                .wait(state)
+                .expect("session pause lock poisoned while waiting");
+        }
+    }
+}
+
+#[cfg(not(test))]
+extern "C" fn pause_isolate_interrupt(_isolate: &mut v8::Isolate, data: *mut std::ffi::c_void) {
+    // SAFETY: pause_session passes one Arc strong reference with into_raw for
+    // this callback. V8 invokes each accepted interrupt exactly once.
+    let control = unsafe { Arc::from_raw(data.cast::<SessionPauseControl>()) };
+    control.wait_while_paused();
+}
+
 #[cfg(not(test))]
 type SharedIsolateHandle = Arc<Mutex<Option<v8::IsolateHandle>>>;
 #[cfg(test)]
@@ -98,6 +150,7 @@ struct SessionAssignment {
     snapshot_cache: Arc<SnapshotCache>,
     isolate_handle: SharedIsolateHandle,
     execution_abort: SharedExecutionAbort,
+    pause_control: Arc<SessionPauseControl>,
     session_id: String,
     output_generation: Option<u64>,
 }
@@ -490,6 +543,7 @@ struct SessionEntry {
     isolate_handle: SharedIsolateHandle,
     /// Current execution abort handle used to wake sync bridge waits.
     execution_abort: SharedExecutionAbort,
+    pause_control: Arc<SessionPauseControl>,
 }
 
 /// Deferred shutdown work for a session that has already been removed from
@@ -703,6 +757,7 @@ impl SessionManager {
         let (tx, rx) = crossbeam_channel::bounded(SESSION_COMMAND_CHANNEL_CAPACITY);
         let isolate_handle = Arc::new(Mutex::new(None));
         let execution_abort = new_execution_abort();
+        let pause_control = Arc::new(SessionPauseControl::default());
         let assignment = SessionAssignment {
             heap_limit_mb,
             cpu_time_limit_ms,
@@ -716,6 +771,7 @@ impl SessionManager {
             snapshot_cache: Arc::clone(&self.snapshot_cache),
             isolate_handle: Arc::clone(&isolate_handle),
             execution_abort: execution_abort.clone(),
+            pause_control: Arc::clone(&pause_control),
             session_id: session_id.clone(),
             output_generation,
         };
@@ -747,6 +803,7 @@ impl SessionManager {
                 join_handle: Some(join_handle),
                 isolate_handle,
                 execution_abort,
+                pause_control,
             },
         );
 
@@ -850,6 +907,7 @@ impl SessionManager {
             .sessions
             .get(session_id)
             .ok_or_else(|| format!("session {} does not exist", session_id))?;
+        entry.pause_control.shutdown();
 
         #[cfg(not(test))]
         if let Some(handle) = entry
@@ -891,6 +949,7 @@ impl SessionManager {
             .sessions
             .remove(session_id)
             .expect("checked session exists");
+        entry.pause_control.shutdown();
 
         #[cfg(not(test))]
         if let Some(handle) = entry
@@ -997,6 +1056,41 @@ impl SessionManager {
             .get(session_id)
             .map(|entry| entry.tx.clone())
             .ok_or_else(|| format!("session {} does not exist", session_id))
+    }
+
+    /// Pause a session at the V8 execution boundary. A running synchronous
+    /// script is interrupted on its isolate thread and remains parked with its
+    /// JavaScript stack intact until `resume_session` is called.
+    pub fn pause_session(&self, session_id: &str) -> Result<(), String> {
+        let entry = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| format!("session {} does not exist", session_id))?;
+        entry.pause_control.pause();
+        #[cfg(not(test))]
+        if let Some(handle) = entry
+            .isolate_handle
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+        {
+            let raw = Arc::into_raw(Arc::clone(&entry.pause_control)) as *mut std::ffi::c_void;
+            if !handle.request_interrupt(pause_isolate_interrupt, raw) {
+                // SAFETY: V8 rejected the interrupt, so it did not consume the
+                // strong reference transferred above.
+                unsafe { drop(Arc::from_raw(raw.cast::<SessionPauseControl>())) };
+            }
+        }
+        Ok(())
+    }
+
+    pub fn resume_session(&self, session_id: &str) -> Result<(), String> {
+        let entry = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| format!("session {} does not exist", session_id))?;
+        entry.pause_control.resume();
+        Ok(())
     }
 
     /// Send a message to a session. Blocks on the session command channel, so
@@ -1217,6 +1311,7 @@ fn session_thread(
         snapshot_cache,
         isolate_handle,
         execution_abort,
+        pause_control,
         session_id,
         output_generation,
     } = assignment;
@@ -1230,6 +1325,7 @@ fn session_thread(
         snapshot_cache,
         isolate_handle,
         execution_abort,
+        pause_control,
     );
 
     // Acquire concurrency slot, but keep polling the session channel so a queued
@@ -1346,6 +1442,7 @@ fn session_thread(
             rx.recv()
         };
 
+        pause_control.wait_while_paused();
         match next_command {
             Ok(SessionCommand::Shutdown) | Err(_) => break,
             Ok(SessionCommand::SetModuleReader(reader)) => {
@@ -1579,6 +1676,7 @@ fn session_thread(
                             rx.clone(),
                             abort_rx.clone(),
                             Arc::clone(&deferred_queue),
+                            Arc::clone(&pause_control),
                         );
                         let bridge_ctx = BridgeCallContext::with_receiver(
                             Box::new(ChannelRuntimeEventSender::new(
@@ -1867,6 +1965,7 @@ fn session_thread(
                                 &pending,
                                 Some(&abort_rx),
                                 Some(&deferred_queue),
+                                Some(&pause_control),
                             )
                         } else {
                             EventLoopStatus::Completed
@@ -1941,6 +2040,7 @@ fn session_thread(
                                     &pending,
                                     Some(&abort_rx),
                                     Some(&deferred_queue),
+                                    Some(&pause_control),
                                 );
 
                                 if matches!(event_loop_status, EventLoopStatus::Terminated) {
@@ -2199,12 +2299,13 @@ pub fn reset_pending_promises(pending: &mut crate::bridge::PendingPromises) {
 ///
 /// Returns true if execution completed normally, false if terminated.
 #[doc(hidden)]
-pub fn run_event_loop(
+pub(crate) fn run_event_loop(
     scope: &mut v8::HandleScope,
     rx: &Receiver<SessionCommand>,
     pending: &crate::bridge::PendingPromises,
     abort_rx: Option<&crossbeam_channel::Receiver<()>>,
     deferred: Option<&DeferredQueue>,
+    pause_control: Option<&SessionPauseControl>,
 ) -> EventLoopStatus {
     while !pending.is_empty()
         || execution::pending_module_evaluation_needs_wait(scope)
@@ -2215,6 +2316,9 @@ pub fn run_event_loop(
             .map(|dq| !dq.lock().unwrap().is_empty())
             .unwrap_or(false)
     {
+        if let Some(control) = pause_control {
+            control.wait_while_paused();
+        }
         pump_v8_message_loop(scope);
 
         // Drain deferred messages queued by sync bridge calls before blocking
@@ -2317,6 +2421,9 @@ pub fn run_event_loop(
             };
             if let Some(cmd) = recv_result {
                 break cmd;
+            }
+            if let Some(control) = pause_control {
+                control.wait_while_paused();
             }
             // No command received — flush microtasks and check deferred queue
             scope.perform_microtask_checkpoint();
@@ -2549,6 +2656,7 @@ pub(crate) struct ChannelResponseReceiver {
     rx: Receiver<SessionCommand>,
     abort_rx: Option<crossbeam_channel::Receiver<()>>,
     deferred: DeferredQueue,
+    pause_control: Option<Arc<SessionPauseControl>>,
 }
 
 impl ChannelResponseReceiver {
@@ -2558,6 +2666,7 @@ impl ChannelResponseReceiver {
             rx,
             abort_rx: None,
             deferred,
+            pause_control: None,
         }
     }
 
@@ -2565,11 +2674,13 @@ impl ChannelResponseReceiver {
         rx: Receiver<SessionCommand>,
         abort_rx: crossbeam_channel::Receiver<()>,
         deferred: DeferredQueue,
+        pause_control: Arc<SessionPauseControl>,
     ) -> Self {
         ChannelResponseReceiver {
             rx,
             abort_rx: Some(abort_rx),
             deferred,
+            pause_control: Some(pause_control),
         }
     }
 }
@@ -2600,6 +2711,9 @@ impl crate::host_call::BridgeResponseReceiver for ChannelResponseReceiver {
                     if let SessionMessage::BridgeResponse(response) = &frame {
                         let call_id = response.call_id;
                         if call_id == expected_call_id {
+                            if let Some(control) = &self.pause_control {
+                                control.wait_while_paused();
+                            }
                             crate::host_call::record_sync_bridge_response_channel_received(call_id);
                             return Ok(response.clone());
                         }
@@ -3042,7 +3156,12 @@ mod tests {
         let deferred = new_deferred_queue();
         let execution_abort = new_execution_abort();
         let (_active_abort, abort_rx) = ActiveExecutionAbort::arm(&execution_abort);
-        let receiver = ChannelResponseReceiver::with_abort(rx, abort_rx, deferred);
+        let receiver = ChannelResponseReceiver::with_abort(
+            rx,
+            abort_rx,
+            deferred,
+            Arc::new(SessionPauseControl::default()),
+        );
 
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let join_handle = std::thread::spawn(move || {

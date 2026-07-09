@@ -1,9 +1,9 @@
 Provide group lookup compatibility entry points in AgentOS wasi-libc.
 
-Tree links getgrgid() for optional `-g` group-name output. AgentOS VMs expose
-numeric gid/getgroups behavior but do not project a group database, so group
-name lookups should fail deterministically and let callers fall back to numeric
-gids.
+Tree links getgrgid() for optional `-g` group-name output. AgentOS projects a
+live /etc/group database, so lookups must observe guest edits instead of using
+fixed runtime stubs. The parser lives in the shared libc override and these
+entry points provide the standard reentrant and non-reentrant surfaces.
 
 diff --git a/libc-bottom-half/sources/host_resource_user.c b/libc-bottom-half/sources/host_resource_user.c
 index 8d91a2f..aa78a47 100644
@@ -23,36 +23,36 @@ index 8d91a2f..aa78a47 100644
      return 1;
  }
  
++int __agentos_group_lookup(const char *, gid_t, int, struct group *, char *,
++                           size_t, struct group **);
++
++static struct group group_entry;
++static char group_buffer[4096];
++
 +struct group *getgrgid(gid_t gid) {
-+    (void)gid;
-+    errno = 0;
-+    return NULL;
++    struct group *result = NULL;
++    int error = __agentos_group_lookup(NULL, gid, 0, &group_entry,
++        group_buffer, sizeof(group_buffer), &result);
++    errno = error;
++    return error == 0 ? result : NULL;
 +}
 +
 +struct group *getgrnam(const char *name) {
-+    (void)name;
-+    errno = 0;
-+    return NULL;
++    struct group *result = NULL;
++    int error = __agentos_group_lookup(name, 0, 1, &group_entry,
++        group_buffer, sizeof(group_buffer), &result);
++    errno = error;
++    return error == 0 ? result : NULL;
 +}
 +
 +int getgrgid_r(gid_t gid, struct group *grp, char *buf, size_t buflen,
 +               struct group **result) {
-+    (void)gid;
-+    (void)grp;
-+    (void)buf;
-+    (void)buflen;
-+    *result = NULL;
-+    return 0;
++    return __agentos_group_lookup(NULL, gid, 0, grp, buf, buflen, result);
 +}
 +
 +int getgrnam_r(const char *name, struct group *grp, char *buf, size_t buflen,
 +               struct group **result) {
-+    (void)name;
-+    (void)grp;
-+    (void)buf;
-+    (void)buflen;
-+    *result = NULL;
-+    return 0;
++    return __agentos_group_lookup(name, 0, 1, grp, buf, buflen, result);
 +}
 +
  int getrlimit(int resource, struct rlimit *rlim) {

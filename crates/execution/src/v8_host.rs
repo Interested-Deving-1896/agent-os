@@ -288,6 +288,16 @@ impl V8SessionHandle {
         self.inner.terminate()
     }
 
+    /// Suspend guest execution while preserving the V8 stack and session state.
+    pub fn pause(&self) -> io::Result<()> {
+        self.inner.pause()
+    }
+
+    /// Resume a session previously suspended with [`Self::pause`].
+    pub fn resume(&self) -> io::Result<()> {
+        self.inner.resume()
+    }
+
     /// Destroy this session in the embedded runtime and remove its receiver.
     pub fn destroy(&self) -> io::Result<()> {
         let _ = self.inner.terminate();

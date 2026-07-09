@@ -31,8 +31,8 @@ import {
 	exposeMutableRuntimeStateGlobal,
 	getIsolateRuntimeSource,
 	getRequireSetupCode,
+	getRuntimePolyfillCode,
 	isESM,
-	POLYFILL_CODE_MAP,
 	transformDynamicImport,
 } from "./runtime.js";
 import {
@@ -2039,9 +2039,7 @@ async function initRuntime(payload: BrowserWorkerInitPayload): Promise<void> {
 	exposeCustomGlobal(
 		"_loadPolyfill",
 		makeApplySync((moduleName: string) => {
-			const name = moduleName.replace(/^node:/, "");
-			const polyfillMap = POLYFILL_CODE_MAP as Record<string, string>;
-			return polyfillMap[name] ?? null;
+			return getRuntimePolyfillCode(moduleName, payload.processLimits);
 		}),
 	);
 
@@ -2418,7 +2416,10 @@ async function initRuntime(payload: BrowserWorkerInitPayload): Promise<void> {
 	exposeCustomGlobal(
 		"_childProcessKill",
 		makeApplySync((sessionId: number, signal: number) => {
-			syncBridge.requestVoid("child_process.kill", [sessionId, signal]);
+			return syncBridge.requestJson<boolean>("child_process.kill", [
+				sessionId,
+				signal,
+			]);
 		}),
 	);
 

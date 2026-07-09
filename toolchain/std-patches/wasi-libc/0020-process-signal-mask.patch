@@ -9,59 +9,100 @@ new file mode 100644
 index 0000000..7e5a037
 --- /dev/null
 +++ b/libc-bottom-half/sources/host_sigprocmask.c
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,102 @@
 +// Process signal mask compatibility for AgentOS WASI commands.
 +
 +#include <errno.h>
++#include <stdint.h>
 +#include <signal.h>
 +
-+static sigset_t process_signal_mask;
++#define WASM_IMPORT(mod, fn) \
++    __attribute__((__import_module__(mod), __import_name__(fn)))
 +
-+static int copy_sigset(sigset_t *dst, const sigset_t *src) {
-+    if (dst == NULL || src == NULL) {
-+        errno = EINVAL;
-+        return -1;
++WASM_IMPORT("host_process", "proc_signal_mask_v2")
++uint32_t __host_proc_signal_mask_v2(uint32_t how, uint32_t set_lo,
++    uint32_t set_hi, uint32_t *ret_old_lo, uint32_t *ret_old_hi);
++
++#define HOST_SIGMASK_QUERY 3
++
++static int sigset_to_words(const sigset_t *set, uint32_t *lo, uint32_t *hi) {
++    *lo = 0;
++    *hi = 0;
++    if (set == NULL)
++        return 0;
++    for (int signal = 1; signal < NSIG; signal++) {
++        int member = sigismember(set, signal);
++        if (member < 0)
++            return EINVAL;
++        if (!member)
++            continue;
++        if (signal <= 32)
++            *lo |= UINT32_C(1) << (signal - 1);
++        else if (signal <= 64)
++            *hi |= UINT32_C(1) << (signal - 33);
++        else
++            return EINVAL;
 +    }
-+    *dst = *src;
 +    return 0;
 +}
 +
-+int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset) {
-+    sigset_t next_mask;
-+
-+    if (oldset != NULL) {
-+        *oldset = process_signal_mask;
-+    }
-+
-+    if (set == NULL) {
++static int words_to_sigset(uint32_t lo, uint32_t hi, sigset_t *set) {
++    if (set == NULL)
 +        return 0;
++    if (sigemptyset(set) != 0)
++        return errno;
++    for (int signal = 1; signal <= 64; signal++) {
++        uint32_t word = signal <= 32 ? lo : hi;
++        unsigned bit = (unsigned)(signal <= 32 ? signal - 1 : signal - 33);
++        if ((word & (UINT32_C(1) << bit)) != 0 &&
++            sigaddset(set, signal) != 0)
++            return errno;
 +    }
++    return 0;
++}
 +
-+    next_mask = process_signal_mask;
-+    switch (how) {
-+    case SIG_BLOCK:
-+        for (int signum = 1; signum < NSIG; signum++) {
-+            if (sigismember(set, signum) == 1) {
-+                sigaddset(&next_mask, signum);
-+            }
-+        }
-+        break;
-+    case SIG_UNBLOCK:
-+        for (int signum = 1; signum < NSIG; signum++) {
-+            if (sigismember(set, signum) == 1) {
-+                sigdelset(&next_mask, signum);
-+            }
-+        }
-+        break;
-+    case SIG_SETMASK:
-+        if (copy_sigset(&next_mask, set) != 0) return -1;
-+        break;
-+    default:
-+        errno = EINVAL;
++int __agentos_get_current_sigmask(uint32_t *lo, uint32_t *hi) {
++    uint32_t ignored_lo = 0;
++    uint32_t ignored_hi = 0;
++    uint32_t error = __host_proc_signal_mask_v2(HOST_SIGMASK_QUERY, 0, 0,
++        &ignored_lo, &ignored_hi);
++    if (error != 0)
++        return (int)error;
++    *lo = ignored_lo;
++    *hi = ignored_hi;
++    return 0;
++}
++
++__attribute__((export_name("__agentos_set_initial_sigmask")))
++uint32_t __agentos_set_initial_sigmask(uint32_t lo, uint32_t hi) {
++    uint32_t ignored_lo = 0;
++    uint32_t ignored_hi = 0;
++    return __host_proc_signal_mask_v2(SIG_SETMASK, lo, hi,
++        &ignored_lo, &ignored_hi);
++}
++
++int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset) {
++    uint32_t set_lo = 0;
++    uint32_t set_hi = 0;
++    uint32_t old_lo = 0;
++    uint32_t old_hi = 0;
++    int conversion_error = sigset_to_words(set, &set_lo, &set_hi);
++    if (conversion_error != 0) {
++        errno = conversion_error;
 +        return -1;
 +    }
-+
-+    process_signal_mask = next_mask;
++    uint32_t operation = set == NULL ? HOST_SIGMASK_QUERY : (uint32_t)how;
++    uint32_t error = __host_proc_signal_mask_v2(operation, set_lo, set_hi,
++        &old_lo, &old_hi);
++    if (error != 0) {
++        errno = (int)error;
++        return -1;
++    }
++    conversion_error = words_to_sigset(old_lo, old_hi, oldset);
++    if (conversion_error != 0) {
++        errno = conversion_error;
++        return -1;
++    }
 +    return 0;
 +}
 +

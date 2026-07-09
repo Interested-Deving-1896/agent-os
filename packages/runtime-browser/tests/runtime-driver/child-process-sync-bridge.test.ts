@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { BrowserChildProcessSpawnRequest } from "../../src/child-process-bridge.js";
 import { BrowserRuntimeDriver } from "../../src/runtime-driver.js";
-import { fakeConvergedFactoryOptions } from "./fake-converged-sidecar.js";
+import {
+	FAKE_CONVERGED_CONFIG,
+	fakeConvergedFactoryOptions,
+} from "./fake-converged-sidecar.js";
 import type {
 	CommandExecutor,
 	VirtualFileSystem,
@@ -30,6 +33,10 @@ type InitMessage = {
 	id: number;
 	type: "init";
 	payload: {
+		processLimits?: {
+			maxSpawnFileActions?: number;
+			maxSpawnFileActionBytes?: number;
+		};
 		syncBridge: {
 			signalBuffer: SharedArrayBuffer;
 			dataBuffer: SharedArrayBuffer;
@@ -58,14 +65,15 @@ class FakeWorker {
 	static syncArgs: unknown[] = [
 		{
 			command: "echo",
-			args: ["hi"],
-			options: { cwd: "/work", env: { HELLO: "world" } },
+			args: ["", "hi"],
+			options: { argv0: "", cwd: "/work", env: { HELLO: "world" } },
 		} satisfies BrowserChildProcessSpawnRequest,
 	];
 
 	onmessage: WorkerHandler | null = null;
 	onerror: WorkerHandler | null = null;
 	syncResponse: unknown;
+	initPayload: InitMessage["payload"] | null = null;
 	private syncBridge: InitMessage["payload"]["syncBridge"] | null = null;
 
 	constructor() {
@@ -74,6 +82,7 @@ class FakeWorker {
 
 	postMessage(message: InitMessage | ExecMessage): void {
 		if (message.type === "init") {
+			this.initPayload = message.payload;
 			this.syncBridge = message.payload.syncBridge;
 			queueMicrotask(() => {
 				this.onmessage?.({
@@ -192,10 +201,41 @@ describe("browser child_process sync bridge", () => {
 		FakeWorker.syncArgs = [
 			{
 				command: "echo",
-				args: ["hi"],
-				options: { cwd: "/work", env: { HELLO: "world" } },
+				args: ["", "hi"],
+				options: { argv0: "", cwd: "/work", env: { HELLO: "world" } },
 			} satisfies BrowserChildProcessSpawnRequest,
 		];
+	});
+
+	it("propagates trusted converged VM process limits into worker policy", () => {
+		Object.defineProperty(globalThis, "Worker", {
+			value: FakeWorker,
+			configurable: true,
+			writable: true,
+		});
+		const factoryOptions = fakeConvergedFactoryOptions();
+		factoryOptions.convergedSidecar.config = {
+			...FAKE_CONVERGED_CONFIG,
+			limits: {
+				process: {
+					maxSpawnFileActions: 7,
+					maxSpawnFileActionBytes: 321,
+				},
+			},
+		} as typeof factoryOptions.convergedSidecar.config;
+		const driver = new BrowserRuntimeDriver(
+			createOptions({
+				spawn() {
+					throw new Error("unexpected spawn");
+				},
+			}),
+			factoryOptions,
+		);
+		expect(FakeWorker.instances[0]?.initPayload?.processLimits).toEqual({
+			maxSpawnFileActions: 7,
+			maxSpawnFileActionBytes: 321,
+		});
+		driver.dispose();
 	});
 
 	it("runs browser child_process requests through the driver command executor", async () => {
@@ -207,6 +247,7 @@ describe("browser child_process sync bridge", () => {
 		const spawns: Array<{
 			command: string;
 			args: string[];
+			argv0?: string;
 			cwd?: string;
 			env?: Record<string, string>;
 		}> = [];
@@ -215,6 +256,7 @@ describe("browser child_process sync bridge", () => {
 				spawns.push({
 					command,
 					args,
+					argv0: options?.argv0,
 					cwd: options?.cwd,
 					env: options?.env,
 				});
@@ -240,7 +282,8 @@ describe("browser child_process sync bridge", () => {
 		expect(spawns).toEqual([
 			{
 				command: "echo",
-				args: ["hi"],
+				args: ["", "hi"],
+				argv0: "",
 				cwd: "/work",
 				env: { HELLO: "world" },
 			},
@@ -270,6 +313,7 @@ describe("browser child_process sync bridge", () => {
 				command: "cat",
 				args: [],
 				options: {
+					argv0: "reader",
 					cwd: "/work",
 					input: { __agentOSType: "bytes", base64: "c3RkaW4=" },
 				},
@@ -282,11 +326,12 @@ describe("browser child_process sync bridge", () => {
 			spawn(command, args, options) {
 				expect(command).toBe("cat");
 				expect(args).toEqual([]);
+				expect(options?.argv0).toBe("reader");
 				expect(options?.cwd).toBe("/work");
 				options?.onStdout?.(encoder.encode("stdout"));
 				return {
 					async wait() {
-						return 0;
+						return { exitCode: null, signal: 9 };
 					},
 					writeStdin(data) {
 						stdinChunks.push(decoder.decode(data as Uint8Array));
@@ -307,6 +352,12 @@ describe("browser child_process sync bridge", () => {
 
 		expect(stdinChunks).toEqual(["stdin"]);
 		expect(closed).toBe(true);
+		expect(
+			JSON.parse(String(FakeWorker.instances[0]?.syncResponse)),
+		).toMatchObject({
+			code: null,
+			signal: 9,
+		});
 		driver.dispose();
 	});
 

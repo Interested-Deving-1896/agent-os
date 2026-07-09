@@ -1,8 +1,8 @@
 use agentos_kernel::fd_table::{
     FdResult, FdTableManager, FileDescription, FileLockManager, FileLockTarget, FlockOperation,
-    FD_CLOEXEC, FILETYPE_CHARACTER_DEVICE, FILETYPE_REGULAR_FILE, F_DUPFD, F_GETFD, F_GETFL,
-    F_SETFD, F_SETFL, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN, MAX_FDS_PER_PROCESS, O_APPEND,
-    O_NONBLOCK, O_RDONLY, O_WRONLY,
+    RecordLock, RecordLockType, FD_CLOEXEC, FILETYPE_CHARACTER_DEVICE, FILETYPE_REGULAR_FILE,
+    F_DUPFD, F_GETFD, F_GETFL, F_SETFD, F_SETFL, LOCK_EX, LOCK_NB, LOCK_SH, LOCK_UN,
+    MAX_FDS_PER_PROCESS, O_APPEND, O_NONBLOCK, O_RDONLY, O_WRONLY,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -419,7 +419,7 @@ fn flock_operation_parser_accepts_supported_modes() {
 #[test]
 fn flock_manager_enforces_shared_and_exclusive_conflicts() {
     let locks = FileLockManager::new();
-    let target = FileLockTarget::new(42);
+    let target = FileLockTarget::new(1, 42);
 
     locks
         .apply(1, target, FlockOperation::Shared { nonblocking: false })
@@ -445,7 +445,7 @@ fn flock_manager_enforces_shared_and_exclusive_conflicts() {
 #[test]
 fn flock_manager_treats_reacquire_on_same_description_as_non_conflicting() {
     let locks = FileLockManager::new();
-    let target = FileLockTarget::new(7);
+    let target = FileLockTarget::new(1, 7);
 
     locks
         .apply(99, target, FlockOperation::Exclusive { nonblocking: false })
@@ -459,4 +459,121 @@ fn flock_manager_treats_reacquire_on_same_description_as_non_conflicting() {
 
     let shared = locks.apply(100, target, FlockOperation::Shared { nonblocking: true });
     shared.expect("downgrade should allow other shared holders");
+}
+
+#[test]
+fn lock_manager_distinguishes_equal_inodes_on_different_devices() {
+    let locks = FileLockManager::new();
+    let first = FileLockTarget::new(1, 42);
+    let second = FileLockTarget::new(2, 42);
+
+    locks
+        .apply(1, first, FlockOperation::Exclusive { nonblocking: true })
+        .expect("lock inode on first device");
+    locks
+        .apply(2, second, FlockOperation::Exclusive { nonblocking: true })
+        .expect("same inode number on another device must not conflict");
+
+    locks
+        .set_record_lock(
+            first,
+            RecordLock::new(RecordLockType::Write, 0, 0, 10).expect("first record lock"),
+        )
+        .expect("record lock inode on first device");
+    locks
+        .set_record_lock(
+            second,
+            RecordLock::new(RecordLockType::Write, 0, 0, 20).expect("second record lock"),
+        )
+        .expect("record lock on equal inode from another device must not conflict");
+}
+
+#[test]
+fn record_lock_wait_graph_detects_cycles_and_clears_cancelled_waits() {
+    let locks = FileLockManager::new();
+    let first = FileLockTarget::new(1, 100);
+    let second = FileLockTarget::new(1, 200);
+    let write = |target, pid| {
+        RecordLock::new(RecordLockType::Write, 0, 8, pid)
+            .map(|request| (target, request))
+            .expect("valid record lock")
+    };
+
+    let (target, request) = write(first, 10);
+    locks
+        .set_record_lock(target, request)
+        .expect("first process locks first file");
+    let (target, request) = write(second, 20);
+    locks
+        .set_record_lock(target, request)
+        .expect("second process locks second file");
+
+    let (target, request) = write(second, 10);
+    assert_error_code(
+        locks.set_blocking_record_lock(target, request),
+        "EWOULDBLOCK",
+    );
+    let (target, request) = write(first, 20);
+    assert_error_code(locks.set_blocking_record_lock(target, request), "EDEADLK");
+
+    assert!(locks.cancel_record_lock_wait(10));
+    let (target, request) = write(first, 20);
+    assert_error_code(
+        locks.set_blocking_record_lock(target, request),
+        "EWOULDBLOCK",
+    );
+}
+
+#[test]
+fn record_lock_wait_graph_refreshes_after_unlock_and_success() {
+    let locks = FileLockManager::new();
+    let first = FileLockTarget::new(1, 300);
+    let second = FileLockTarget::new(1, 400);
+    let request =
+        |lock_type, pid| RecordLock::new(lock_type, 0, 8, pid).expect("valid record lock");
+
+    locks
+        .set_record_lock(first, request(RecordLockType::Write, 10))
+        .expect("first process locks first file");
+    locks
+        .set_record_lock(second, request(RecordLockType::Write, 20))
+        .expect("second process locks second file");
+    assert_error_code(
+        locks.set_blocking_record_lock(second, request(RecordLockType::Write, 10)),
+        "EWOULDBLOCK",
+    );
+
+    locks
+        .set_record_lock(second, request(RecordLockType::Unlock, 20))
+        .expect("second process unlocks second file");
+    locks
+        .set_blocking_record_lock(second, request(RecordLockType::Write, 10))
+        .expect("first process acquires released lock");
+
+    assert_error_code(
+        locks.set_blocking_record_lock(first, request(RecordLockType::Write, 20)),
+        "EWOULDBLOCK",
+    );
+    assert!(locks.release_process_target(20, first));
+    assert!(!locks.cancel_record_lock_wait(20));
+}
+
+#[test]
+fn record_lock_wait_graph_enforces_its_bounded_capacity() {
+    let locks = FileLockManager::with_record_lock_limit(1);
+    let target = FileLockTarget::new(1, 500);
+    let request =
+        |pid| RecordLock::new(RecordLockType::Write, 0, 8, pid).expect("valid record lock");
+
+    locks
+        .set_record_lock(target, request(10))
+        .expect("owner acquires lock");
+    assert_error_code(
+        locks.set_blocking_record_lock(target, request(20)),
+        "EWOULDBLOCK",
+    );
+    assert_error_code(
+        locks.set_blocking_record_lock(target, request(30)),
+        "ENOLCK",
+    );
 }

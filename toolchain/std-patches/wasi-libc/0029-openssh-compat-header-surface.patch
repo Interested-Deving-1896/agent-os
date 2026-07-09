@@ -46,10 +46,10 @@ index eecb482..bc35d70 100644
 +/* OpenBSD getrrsetbyname(3) surface (also on FreeBSD/NetBSD libc): DNS RRset
 + * query API used by OpenSSH's dns.c for SSHFP host-key verification
 + * (VerifyHostKeyDNS, RFC 4255). Struct layout and constants match OpenBSD
-+ * <netdb.h>. The agentOS sysroot has no DNS resolver library (lookups route
-+ * through the host getaddrinfo import), so the libc definition
-+ * (std-patches/wasi-libc-overrides/openssh_compat.c) always fails with
-+ * ERRSET_FAIL and callers degrade to a normal "DNS lookup error" path. */
++ * <netdb.h>. The libc definition uses a bounded host_net SSHFP RR query and
++ * returns the real RRset/TTL. RRSET_VALIDATED is set only when the runtime
++ * supplies authenticated DNSSEC proof; unauthenticated answers never receive
++ * that flag. */
 +struct rdatainfo {
 +	unsigned int		rdi_length;	/* length of data */
 +	unsigned char		*rdi_data;	/* record data */
@@ -87,17 +87,14 @@ diff --git a/libc-top-half/musl/include/sys/socket.h b/libc-top-half/musl/includ
 index b1957d4..1233b7d 100644
 --- a/libc-top-half/musl/include/sys/socket.h
 +++ b/libc-top-half/musl/include/sys/socket.h
-@@ -400,9 +400,13 @@ struct sockaddr_storage {
+@@ -400,9 +400,10 @@ struct sockaddr_storage {
  
  int socket (int, int, int);
  
 -#ifdef __wasilibc_unmodified_upstream /* WASI has no socketpair */
-+/* Declared unconditionally for the agentOS sysroot: POSIX socketpair(3p)
-+ * (POSIX.1-2024, XSH). The kernel has no socketpair syscall, so the libc
-+ * definition (std-patches/wasi-libc-overrides/openssh_compat.c) fails with
-+ * ENOSYS; the declaration exists so ported tools such as OpenSSH that
-+ * reference socketpair() on cold paths (e.g. ProxyUseFdpass in sshconnect.c)
-+ * compile and link against the honest ENOSYS stub. */
++/* Declared unconditionally for the AgentOS sysroot: POSIX socketpair(3p).
++ * The libc definition routes AF_UNIX stream pairs through kernel-backed
++ * process descriptors so endpoints survive spawn and support SCM_RIGHTS. */
  int socketpair (int, int, int, int [2]);
 -#endif
  
@@ -113,10 +110,10 @@ index 8b8d692..490d57c 100644
  int posix_close(int, int);
 +/* closefrom(2) as on Solaris/FreeBSD/OpenBSD (close all fds >= lowfd) and
 + * glibc >= 2.34. Declared unconditionally in the agentOS sysroot; the
-+ * definition (std-patches/wasi-libc-overrides/openssh_compat.c) is a
-+ * deliberate NO-OP because WASI preopened directory capabilities start at
-+ * fd 3 and closing them would sever all path resolution. See OpenSSH
-+ * ssh.c:main() which calls closefrom(STDERR_FILENO + 1) at startup. */
++ * definition (std-patches/wasi-libc-overrides/openssh_compat.c) closes every
++ * guest-visible descriptor at or above lowfd through the host descriptor
++ * table. Private tagged directory capabilities remain available solely for
++ * path resolution and are not observable as inherited Linux descriptors. */
 +void closefrom(int);
  int dup(int);
  int dup2(int, int);
@@ -184,7 +181,7 @@ index 8813360..9a740ad 100755
 -    "shadow.h" "mntent.h" "resolv.h" "pty.h" "ulimit.h" "sys/xattr.h" \
 +    "shadow.h" "mntent.h" "pty.h" "ulimit.h" "sys/xattr.h" \
      "wordexp.h" "sys/membarrier.h" "sys/signalfd.h" \
-     "net/if.h" "net/if_arp.h" \
+     "net/if_arp.h" \
      "net/ethernet.h" "net/route.h" "netinet/if_ether.h" "netinet/ether.h" \
      "sys/timerfd.h" "libintl.h" "sys/sysmacros.h" "aio.h")
 +# NOTE: resolv.h un-omitted by the agentOS 0029-openssh-compat patch — musl's

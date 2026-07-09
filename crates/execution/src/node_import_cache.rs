@@ -15,7 +15,7 @@ const NODE_IMPORT_CACHE_PATH_ENV: &str = "AGENTOS_NODE_IMPORT_CACHE_PATH";
 const NODE_IMPORT_CACHE_LOADER_PATH_ENV: &str = "AGENTOS_NODE_IMPORT_CACHE_LOADER_PATH";
 const NODE_IMPORT_CACHE_SCHEMA_VERSION: &str = "1";
 const NODE_IMPORT_CACHE_LOADER_VERSION: &str = "8";
-const NODE_IMPORT_CACHE_ASSET_VERSION: &str = "98";
+const NODE_IMPORT_CACHE_ASSET_VERSION: &str = "104";
 const NODE_IMPORT_CACHE_DIR_PREFIX: &str = "agentos-node-import-cache";
 const DEFAULT_NODE_IMPORT_CACHE_MATERIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
 const PYODIDE_DIST_DIR: &str = "pyodide-dist";
@@ -4093,6 +4093,7 @@ function createRpcBackedChildProcessModule(fromGuestDir = '/') {
           : fromGuestDir,
       env: normalizeChildProcessEnv(options?.env),
       internalBootstrapEnv: createChildProcessInternalBootstrapEnv(),
+      argv0: options?.argv0 == null ? undefined : String(options.argv0),
       shell:
         shell ||
         options?.shell === true ||
@@ -4187,15 +4188,16 @@ function createRpcBackedChildProcessModule(fromGuestDir = '/') {
     let exitCode = null;
     let signal = null;
     let error = null;
+    let timedOut = false;
     while (exitCode == null && signal == null) {
       if (
+        !timedOut &&
         normalizedOptions.timeout != null &&
         Date.now() - startedAt > normalizedOptions.timeout
       ) {
         callKill(child.childId, normalizedOptions.killSignal);
-        signal = normalizedOptions.killSignal;
+        timedOut = true;
         error = createSpawnSyncTimeoutError(command);
-        break;
       }
 
       const event = callPoll(child.childId, RPC_POLL_WAIT_MS);
@@ -4263,8 +4265,11 @@ function createRpcBackedChildProcessModule(fromGuestDir = '/') {
     stream.push(null);
   };
   const emitChildLifecycleEvents = (child) => {
+    child.emit('exit', child.exitCode, child.signalCode);
+    // stdout/stderr have already received their EOF marker. Defer close one
+    // microtask so stream end/close observers run after exit, matching Node's
+    // exit -> stdio EOF -> close lifecycle without a timing-based quiet period.
     queueMicrotask(() => {
-      child.emit('exit', child.exitCode, child.signalCode);
       child.emit('close', child.exitCode, child.signalCode);
     });
   };

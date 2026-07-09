@@ -389,6 +389,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uucore 0.4.0",
+ "wasi-ext",
 ]
 
 [[package]]
@@ -958,6 +959,13 @@ name = "cmd-jq"
 version = "0.1.0"
 dependencies = [
  "secureexec-jq",
+]
+
+[[package]]
+name = "cmd-kill"
+version = "0.1.0"
+dependencies = [
+ "uu_kill",
 ]
 
 [[package]]
@@ -5239,6 +5247,19 @@ dependencies = [
  "memchr",
  "thiserror 2.0.18",
  "uucore 0.7.0",
+]
+
+[[package]]
+name = "uu_kill"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0b4beed0ffa73d1433cc678eb49bce51a69f5576b21f7945af0c8b3f2fa3da5"
+dependencies = [
+ "clap",
+ "fluent",
+ "nix 0.30.1",
+ "uucore 0.7.0",
+ "wasi-ext",
 ]
 
 [[package]]

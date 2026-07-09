@@ -9,6 +9,16 @@
 #define IF_NAMESIZE IFNAMSIZ
 #endif
 
+struct if_nameindex {
+	unsigned int if_index;
+	char *if_name;
+};
+
+unsigned int if_nametoindex(const char *name);
+char *if_indextoname(unsigned int index, char *name);
+struct if_nameindex *if_nameindex(void);
+void if_freenameindex(struct if_nameindex *indexes);
+
 /* Interface flag bits, values as in Linux <net/if.h> (netdevice(7)) and musl.
  * The runtime's getifaddrs() (see ifaddrs.h in this overlay) reports a
  * loopback-only interface set; ported tools (e.g. OpenSSH's BindInterface

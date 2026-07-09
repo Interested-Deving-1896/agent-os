@@ -2669,16 +2669,105 @@ fn validate_requirement(
 // JavaScript sync-RPC request types (deserialized from guest Node.js processes)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct JavascriptPosixSpawnFileAction {
+    pub command: u32,
+    #[serde(rename = "guestFd", default)]
+    pub guest_fd: Option<i32>,
+    pub fd: i32,
+    #[serde(rename = "sourceFd")]
+    pub source_fd: i32,
+    #[serde(rename = "guestSourceFd", default)]
+    pub guest_source_fd: Option<i32>,
+    pub oflag: i32,
+    pub mode: u32,
+    pub path: String,
+    /// Runner-local public guest descriptors selected by closefrom. These do
+    /// not have kernel mappings, but the child bootstrap must still suppress
+    /// their untagged aliases while retaining private tagged preopens.
+    #[serde(rename = "closeFromGuestFds", default)]
+    pub close_from_guest_fds: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JavascriptSpawnHostNetFd {
+    pub guest_fd: u32,
+    #[serde(default)]
+    pub close_on_exec: bool,
+    #[serde(default)]
+    pub socket_id: Option<String>,
+    #[serde(default)]
+    pub server_id: Option<String>,
+    #[serde(default)]
+    pub udp_socket_id: Option<String>,
+    /// Runner-visible socket metadata needed to reconstruct the libc-facing
+    /// descriptor in the child. Resource ownership is never trusted from this
+    /// object: the sidecar resolves and clones the named parent resource.
+    #[serde(default)]
+    pub metadata: Value,
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct JavascriptChildProcessSpawnOptions {
     #[serde(default)]
     pub argv0: Option<String>,
+    /// Guest descriptors marked FD_CLOEXEC in libc's runner-local descriptor
+    /// table. Native exec applies these at the same commit point as the kernel
+    /// table; runner-local handles are closed by the in-place image swap.
+    #[serde(rename = "cloexecFds", default)]
+    pub cloexec_fds: Vec<u32>,
+    /// The sidecar-managed WASM runner has already validated the replacement
+    /// module and will swap images in place after the sidecar commits kernel
+    /// metadata. Other process.exec callers use the separate-execution path.
+    #[serde(rename = "localReplacement", default)]
+    pub local_replacement: bool,
+    /// Runner-private executable descriptor used only by the dedicated
+    /// process.exec_fd_image_commit route. Generic guest process.exec requests
+    /// cannot turn this into an FD-backed replacement.
+    #[serde(rename = "executableFd", default)]
+    pub executable_fd: Option<u32>,
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     #[serde(rename = "internalBootstrapEnv", default)]
     pub internal_bootstrap_env: BTreeMap<String, String>,
+    /// POSIX spawn attributes already validated by the WASM host-import
+    /// boundary. The sidecar validates them again before applying attributes
+    /// that belong to the kernel process table.
+    #[serde(rename = "spawnAttrFlags", default)]
+    pub spawn_attr_flags: u32,
+    /// Exact `posix_spawn` bypasses PATH lookup, including for bare names.
+    #[serde(rename = "spawnExactPath", default)]
+    pub spawn_exact_path: bool,
+    /// `posix_spawnp` uses the caller's PATH, which can differ from envp.
+    #[serde(rename = "spawnSearchPath", default)]
+    pub spawn_search_path: Option<String>,
+    #[serde(rename = "spawnSchedPolicy", default)]
+    pub spawn_sched_policy: Option<i32>,
+    #[serde(rename = "spawnSchedPriority", default)]
+    pub spawn_sched_priority: Option<i32>,
+    #[serde(rename = "spawnPgroup", default)]
+    pub spawn_pgroup: Option<i32>,
+    #[serde(rename = "spawnSignalDefaults", default)]
+    pub spawn_signal_defaults: Vec<u32>,
+    #[serde(rename = "spawnSignalMask", default)]
+    pub spawn_signal_mask: Vec<u32>,
+    #[serde(rename = "spawnFileActions", default)]
+    pub spawn_file_actions: Vec<JavascriptPosixSpawnFileAction>,
+    /// Guest-to-kernel descriptor namespace captured by the WASM runner at
+    /// spawn time. WASI preopens occupy guest descriptors that do not exist in
+    /// the kernel table, so file actions cannot safely assume the two numeric
+    /// namespaces are identical.
+    #[serde(rename = "spawnFdMappings", default)]
+    pub spawn_fd_mappings: Vec<[u32; 2]>,
+    /// Host-network descriptors occupy the guest fd namespace but are backed
+    /// by sidecar-owned socket descriptions rather than kernel fd-table slots.
+    /// They must therefore be inherited explicitly instead of being coerced
+    /// into the private kernel descriptor namespace.
+    #[serde(rename = "spawnHostNetFds", default)]
+    pub spawn_host_net_fds: Vec<JavascriptSpawnHostNetFd>,
     #[serde(default)]
     pub input: Option<Value>,
     #[serde(default)]
@@ -2710,12 +2799,28 @@ pub struct JavascriptNetConnectRequest {
     pub port: Option<u16>,
     #[serde(default)]
     pub path: Option<String>,
+    #[serde(rename = "abstractPathHex", default)]
+    pub abstract_path_hex: Option<String>,
+    #[serde(rename = "boundServerId", default)]
+    pub bound_server_id: Option<String>,
     #[serde(rename = "localAddress", default)]
     pub local_address: Option<String>,
     #[serde(rename = "localPort", default)]
     pub local_port: Option<u16>,
     #[serde(rename = "localReservation", default)]
     pub local_reservation: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JavascriptNetBindConnectedUnixRequest {
+    #[serde(rename = "socketId")]
+    pub socket_id: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(rename = "abstractPathHex", default)]
+    pub abstract_path_hex: Option<String>,
+    #[serde(default)]
+    pub autobind: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2734,6 +2839,12 @@ pub struct JavascriptNetListenRequest {
     pub port: Option<u16>,
     #[serde(default)]
     pub path: Option<String>,
+    #[serde(rename = "abstractPathHex", default)]
+    pub abstract_path_hex: Option<String>,
+    #[serde(rename = "boundServerId", default)]
+    pub bound_server_id: Option<String>,
+    #[serde(default)]
+    pub autobind: bool,
     #[serde(default)]
     pub backlog: Option<u32>,
     #[serde(rename = "localReservation", default)]

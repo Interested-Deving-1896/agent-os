@@ -49,7 +49,7 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 
  #ifdef __wasilibc_unmodified_upstream /* WASI has no socketpair */
  int socketpair (int, int, int, int [2]);
-@@ -408,35 +406,27 @@
+@@ -408,35 +406,25 @@
 
  int shutdown (int, int);
 
@@ -73,10 +73,10 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
  ssize_t sendto (int, const void *, size_t, int, const struct sockaddr *, socklen_t);
  ssize_t recvfrom (int, void *__restrict, size_t, int, struct sockaddr *__restrict, socklen_t *__restrict);
 -#endif
- #ifdef __wasilibc_unmodified_upstream /* WASI has no sendmsg/recvmsg */
+-#ifdef __wasilibc_unmodified_upstream /* WASI has no sendmsg/recvmsg */
  ssize_t sendmsg (int, const struct msghdr *, int);
  ssize_t recvmsg (int, struct msghdr *, int);
- #endif
+-#endif
 
  int getsockopt (int, int, int, void *__restrict, socklen_t *__restrict);
 -#if (defined __wasilibc_unmodified_upstream) || (defined __wasilibc_use_wasip2)
@@ -85,6 +85,27 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
 
  #ifdef __wasilibc_unmodified_upstream /* WASI has no sockatmark */
  int sockatmark (int);
+
+--- a/libc-top-half/musl/include/sys/socket.h
++++ b/libc-top-half/musl/include/sys/socket.h
+@@ -49,6 +49,17 @@
+ #else
+ #include <__struct_msghdr.h>
+ #endif
++
++/*
++ * wasi-libc's p1 header supplies struct msghdr, but unlike the upstream
++ * musl branch it omitted the POSIX ancillary-data header. Keep the musl
++ * layout so CMSG_* buffers and SCM_RIGHTS match native Linux.
++ */
++struct cmsghdr {
++	socklen_t cmsg_len;
++	int cmsg_level;
++	int cmsg_type;
++};
+ 
+ #ifdef _GNU_SOURCE
+ struct ucred {
 
 --- a/libc-bottom-half/headers/public/__struct_sockaddr_un.h
 +++ b/libc-bottom-half/headers/public/__struct_sockaddr_un.h
@@ -96,12 +117,26 @@ Import signatures match wasmvm/crates/wasi-ext/src/lib.rs exactly.
  };
 
  #endif
+--- a/libc-bottom-half/headers/public/__struct_sockaddr_storage.h
++++ b/libc-bottom-half/headers/public/__struct_sockaddr_storage.h
+@@ -5,7 +5,10 @@
+ 
+ struct sockaddr_storage {
+     __attribute__((aligned(__BIGGEST_ALIGNMENT__))) sa_family_t ss_family;
+-    char __ss_data[32];
++    /* POSIX requires this type to hold every supported socket address.
++     * Match Linux's 128-byte ABI so a full 108-byte sockaddr_un plus the
++     * kernel-appended pathname terminator fits in getsockname(2) output. */
++    char __ss_data[126];
+ };
+ 
+ #endif
 diff --git a/libc-bottom-half/sources/host_socket.c b/libc-bottom-half/sources/host_socket.c
 new file mode 100644
 index 0000000..975e62a
 --- /dev/null
 +++ b/libc-bottom-half/sources/host_socket.c
-@@ -0,0 +1,765 @@
+@@ -0,0 +1,1195 @@
 +// Socket API via wasmVM host_net imports.
 +//
 +// Replaces wasi-libc's ENOSYS stubs with calls to our custom WASM imports:
@@ -126,16 +161,21 @@ index 0000000..975e62a
 +
 +#include <sys/socket.h>
 +#include <sys/select.h>
++#include <sys/resource.h>
 +#include <netinet/in.h>
 +#include <netdb.h>
 +#include <poll.h>
 +#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stddef.h>
 +#include <stdint.h>
 +#include <string.h>
 +#include <stdlib.h>
 +#include <stdio.h>
 +#include <arpa/inet.h>
 +#include <unistd.h>
++#include <wasi/api.h>
 +
 +// AF_UNIX support — define sockaddr_un if sys/un.h is not available
 +#ifdef __has_include
@@ -218,6 +258,14 @@ index 0000000..975e62a
 +WASM_IMPORT("host_net", "net_accept")
 +uint32_t __host_net_accept(uint32_t fd, uint32_t *ret_fd, uint8_t *ret_addr, uint32_t *ret_addr_len);
 +
++// host_net.net_validate_socket(fd) -> errno without mutating socket state
++WASM_IMPORT("host_net", "net_validate_socket")
++uint32_t __host_net_validate_socket(uint32_t fd);
++
++// host_net.net_validate_accept(fd) -> errno without consuming a connection
++WASM_IMPORT("host_net", "net_validate_accept")
++uint32_t __host_net_validate_accept(uint32_t fd);
++
 +// host_net.net_poll(fds_ptr, nfds, timeout_ms, ret_ready) -> errno
 +WASM_IMPORT("host_net", "net_poll")
 +uint32_t __host_net_poll(uint8_t *fds_ptr, uint32_t nfds, int32_t timeout_ms,
@@ -242,13 +290,29 @@ index 0000000..975e62a
 +// Returns length written (not counting NUL), or -1 on error.
 +static int sockaddr_to_string(const struct sockaddr *addr, socklen_t addrlen,
 +                              char *buf, size_t buflen) {
++    if (addrlen < (socklen_t)sizeof(addr->sa_family)) {
++        errno = EINVAL;
++        return -1;
++    }
++    if (addr == NULL) {
++        errno = EFAULT;
++        return -1;
++    }
 +    if (addr->sa_family == AF_INET) {
++        if (addrlen < (socklen_t)sizeof(struct sockaddr_in)) {
++            errno = EINVAL;
++            return -1;
++        }
 +        const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
 +        char ip[INET_ADDRSTRLEN];
 +        inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip));
 +        unsigned int port = ntohs(sin->sin_port);
 +        return snprintf(buf, buflen, "%s:%u", ip, port);
 +    } else if (addr->sa_family == AF_INET6) {
++        if (addrlen < (socklen_t)sizeof(struct sockaddr_in6)) {
++            errno = EINVAL;
++            return -1;
++        }
 +        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
 +        char ip[INET6_ADDRSTRLEN];
 +        inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip));
@@ -256,18 +320,68 @@ index 0000000..975e62a
 +        return snprintf(buf, buflen, "%s:%u", ip, port);
 +    } else if (addr->sa_family == AF_UNIX) {
 +        const struct sockaddr_un *sun = (const struct sockaddr_un *)addr;
-+        // Path length: addrlen - offsetof(sockaddr_un, sun_path), or strlen
-+        size_t pathlen = addrlen > (socklen_t)__builtin_offsetof(struct sockaddr_un, sun_path)
-+            ? (size_t)(addrlen - __builtin_offsetof(struct sockaddr_un, sun_path))
-+            : strlen(sun->sun_path);
-+        // Trim trailing NUL if present
-+        if (pathlen > 0 && sun->sun_path[pathlen - 1] == '\0') pathlen--;
-+        static const char prefix[] = "unix:";
-+        if (sizeof(prefix) - 1 + pathlen >= buflen) return -1;
-+        memcpy(buf, prefix, sizeof(prefix) - 1);
-+        memcpy(buf + sizeof(prefix) - 1, sun->sun_path, pathlen);
-+        buf[sizeof(prefix) - 1 + pathlen] = '\0';
-+        return (int)(sizeof(prefix) - 1 + pathlen);
++        const size_t path_offset = __builtin_offsetof(struct sockaddr_un, sun_path);
++        if (addrlen < (socklen_t)path_offset) {
++            errno = EINVAL;
++            return -1;
++        }
++        size_t supplied = (size_t)addrlen - path_offset;
++        if (supplied > sizeof(sun->sun_path)) {
++            /* wasi-libc aligns sockaddr_un to 16 bytes, leaving two bytes of
++             * tail padding after sun_path. Linux accepts callers (including
++             * OpenSSH unix_listener) that pass sizeof(sockaddr_un); ignore
++             * only that ABI padding while still rejecting every genuinely
++             * overlong addrlen. */
++            if (addrlen == (socklen_t)sizeof(*sun))
++                supplied = sizeof(sun->sun_path);
++            else {
++                errno = EINVAL;
++                return -1;
++            }
++        }
++        if (supplied == 0) {
++            static const char autobind[] = "unix-autobind";
++            if (sizeof(autobind) > buflen) {
++                errno = EINVAL;
++                return -1;
++            }
++            memcpy(buf, autobind, sizeof(autobind));
++            return (int)(sizeof(autobind) - 1);
++        }
++        /* Linux pathname sockets stop at the first NUL even when callers pass
++         * sizeof(sockaddr_un), as OpenSSH's ControlMaster does. Do not forward
++         * the struct's zero padding as part of the virtual path. */
++        if (sun->sun_path[0] == '\0') {
++            static const char abstract_prefix[] = "unix-abstract:";
++            static const char hex[] = "0123456789abcdef";
++            size_t name_len = supplied - 1;
++            size_t output_len = sizeof(abstract_prefix) - 1 + name_len * 2;
++            if (output_len >= buflen) {
++                errno = EINVAL;
++                return -1;
++            }
++            memcpy(buf, abstract_prefix, sizeof(abstract_prefix) - 1);
++            for (size_t i = 0; i < name_len; i++) {
++                unsigned char byte = (unsigned char)sun->sun_path[i + 1];
++                buf[sizeof(abstract_prefix) - 1 + i * 2] = hex[byte >> 4];
++                buf[sizeof(abstract_prefix) + i * 2] = hex[byte & 0x0f];
++            }
++            buf[output_len] = '\0';
++            return (int)output_len;
++        }
++        size_t pathlen = strnlen(sun->sun_path, supplied);
++        static const char path_prefix[] = "unix-path-hex:";
++        static const char hex[] = "0123456789abcdef";
++        size_t output_len = sizeof(path_prefix) - 1 + pathlen * 2;
++        if (output_len >= buflen) return -1;
++        memcpy(buf, path_prefix, sizeof(path_prefix) - 1);
++        for (size_t i = 0; i < pathlen; i++) {
++            unsigned char byte = (unsigned char)sun->sun_path[i];
++            buf[sizeof(path_prefix) - 1 + i * 2] = hex[byte >> 4];
++            buf[sizeof(path_prefix) + i * 2] = hex[byte & 0x0f];
++        }
++        buf[output_len] = '\0';
++        return (int)output_len;
 +    }
 +    return -1; // unsupported family
 +}
@@ -277,16 +391,58 @@ index 0000000..975e62a
 +// Returns the actual sockaddr size, or 0 on error.
 +static socklen_t string_to_sockaddr(const char *str, struct sockaddr *addr,
 +                                    socklen_t addrlen) {
++    const socklen_t path_offset =
++        (socklen_t)__builtin_offsetof(struct sockaddr_un, sun_path);
++    if (strcmp(str, "unix-unnamed") == 0) {
++        struct sockaddr_un sun;
++        memset(&sun, 0, sizeof(sun));
++        sun.sun_family = AF_UNIX;
++        socklen_t copy_len = addrlen < path_offset ? addrlen : path_offset;
++        memcpy(addr, &sun, copy_len);
++        return path_offset;
++    }
++    if (strncmp(str, "unix-abstract:", 14) == 0) {
++        const char *hex = str + 14;
++        size_t hex_len = strlen(hex);
++        if ((hex_len & 1) != 0 || hex_len / 2 > sizeof(((struct sockaddr_un *)0)->sun_path) - 1)
++            return 0;
++        struct sockaddr_un sun;
++        memset(&sun, 0, sizeof(sun));
++        sun.sun_family = AF_UNIX;
++        size_t name_len = hex_len / 2;
++        for (size_t i = 0; i < name_len; i++) {
++            unsigned int value = 0;
++            for (size_t nibble = 0; nibble < 2; nibble++) {
++                unsigned char ch = (unsigned char)hex[i * 2 + nibble];
++                unsigned int digit;
++                if (ch >= '0' && ch <= '9') digit = ch - '0';
++                else if (ch >= 'a' && ch <= 'f') digit = ch - 'a' + 10;
++                else if (ch >= 'A' && ch <= 'F') digit = ch - 'A' + 10;
++                else return 0;
++                value = value * 16 + digit;
++            }
++            sun.sun_path[i + 1] = (char)value;
++        }
++        socklen_t actual = path_offset + 1 + (socklen_t)name_len;
++        socklen_t copy_len = addrlen < actual ? addrlen : actual;
++        memcpy(addr, &sun, copy_len);
++        return actual;
++    }
 +    if (strncmp(str, "unix:", 5) == 0) {
 +        struct sockaddr_un sun;
 +        memset(&sun, 0, sizeof(sun));
 +        sun.sun_family = AF_UNIX;
 +        size_t pathlen = strlen(str + 5);
-+        if (pathlen >= sizeof(sun.sun_path)) return 0;
-+        memcpy(sun.sun_path, str + 5, pathlen + 1);
-+        socklen_t copy_len = addrlen < (socklen_t)sizeof(sun) ? addrlen : (socklen_t)sizeof(sun);
++        if (pathlen > sizeof(sun.sun_path)) return 0;
++        memcpy(sun.sun_path, str + 5, pathlen);
++        if (pathlen < sizeof(sun.sun_path)) sun.sun_path[pathlen] = '\0';
++        socklen_t actual = path_offset + (socklen_t)pathlen + 1;
++        socklen_t materialized = actual < (socklen_t)sizeof(sun) ? actual : (socklen_t)sizeof(sun);
++        socklen_t copy_len = addrlen < materialized ? addrlen : materialized;
 +        memcpy(addr, &sun, copy_len);
-+        return (socklen_t)sizeof(sun);
++        if (pathlen == sizeof(sun.sun_path) && addrlen > (socklen_t)sizeof(sun))
++            ((unsigned char *)addr)[sizeof(sun)] = '\0';
++        return actual;
 +    }
 +
 +    // Legacy unprefixed strings without a colon remain Unix paths for wire compatibility.
@@ -297,12 +453,16 @@ index 0000000..975e62a
 +        memset(&sun, 0, sizeof(sun));
 +        sun.sun_family = AF_UNIX;
 +        size_t pathlen = strlen(str);
-+        if (pathlen >= sizeof(sun.sun_path)) pathlen = sizeof(sun.sun_path) - 1;
++        if (pathlen > sizeof(sun.sun_path)) pathlen = sizeof(sun.sun_path);
 +        memcpy(sun.sun_path, str, pathlen);
-+        sun.sun_path[pathlen] = '\0';
-+        socklen_t copy_len = addrlen < (socklen_t)sizeof(sun) ? addrlen : (socklen_t)sizeof(sun);
++        if (pathlen < sizeof(sun.sun_path)) sun.sun_path[pathlen] = '\0';
++        socklen_t actual = path_offset + (socklen_t)pathlen + 1;
++        socklen_t materialized = actual < (socklen_t)sizeof(sun) ? actual : (socklen_t)sizeof(sun);
++        socklen_t copy_len = addrlen < materialized ? addrlen : materialized;
 +        memcpy(addr, &sun, copy_len);
-+        return (socklen_t)sizeof(sun);
++        if (pathlen == sizeof(sun.sun_path) && addrlen > (socklen_t)sizeof(sun))
++            ((unsigned char *)addr)[sizeof(sun)] = '\0';
++        return actual;
 +    }
 +
 +    // Parse host and port
@@ -342,19 +502,46 @@ index 0000000..975e62a
 +
 +int socket(int domain, int type, int protocol) {
 +    uint32_t fd;
++    /* Linux accepts creation flags in the type word, but rejects every bit
++     * outside the low socket-type nibble and SOCK_{NONBLOCK,CLOEXEC}. Keep
++     * that validation in libc so unsupported flags fail before a host fd is
++     * allocated. */
++    if (type & ~(0x0f | SOCK_NONBLOCK | SOCK_CLOEXEC)) {
++        errno = EINVAL;
++        return -1;
++    }
 +    uint32_t err = __host_net_socket((uint32_t)domain, (uint32_t)type, (uint32_t)protocol, &fd);
 +    if (err != 0) {
 +        errno = (int)err;
++        return -1;
++    }
++    /* The host sees SOCK_NONBLOCK in the original type and initializes the
++     * socket accordingly. FD_CLOEXEC is libc-owned state used by execve(),
++     * so record it through fcntl just like Linux's atomic socket flag. */
++    if ((type & SOCK_CLOEXEC) && fcntl((int)fd, F_SETFD, FD_CLOEXEC) < 0) {
++        int saved_errno = errno;
++        close((int)fd);
++        errno = saved_errno;
 +        return -1;
 +    }
 +    return (int)fd;
 +}
 +
 +int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
++    uint32_t validation_err = __host_net_validate_socket((uint32_t)sockfd);
++    if (validation_err != 0) {
++        errno = (int)validation_err;
++        return -1;
++    }
 +    char buf[256];
++    errno = 0;
 +    int len = sockaddr_to_string(addr, addrlen, buf, sizeof(buf));
 +    if (len < 0 || (size_t)len >= sizeof(buf)) {
-+        errno = (len < 0) ? EAFNOSUPPORT : EINVAL;
++        if (len >= 0 || errno == 0) errno = (len < 0) ? EAFNOSUPPORT : EINVAL;
++        return -1;
++    }
++    if (strcmp(buf, "unix-autobind") == 0) {
++        errno = EINVAL;
 +        return -1;
 +    }
 +
@@ -367,10 +554,16 @@ index 0000000..975e62a
 +}
 +
 +int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
++    uint32_t validation_err = __host_net_validate_socket((uint32_t)sockfd);
++    if (validation_err != 0) {
++        errno = (int)validation_err;
++        return -1;
++    }
 +    char buf[256];
++    errno = 0;
 +    int len = sockaddr_to_string(addr, addrlen, buf, sizeof(buf));
 +    if (len < 0 || (size_t)len >= sizeof(buf)) {
-+        errno = (len < 0) ? EAFNOSUPPORT : EINVAL;
++        if (len >= 0 || errno == 0) errno = (len < 0) ? EAFNOSUPPORT : EINVAL;
 +        return -1;
 +    }
 +
@@ -392,6 +585,11 @@ index 0000000..975e62a
 +}
 +
 +int accept(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrlen) {
++    uint32_t validation_err = __host_net_validate_accept((uint32_t)sockfd);
++    if (validation_err != 0) {
++        errno = (int)validation_err;
++        return -1;
++    }
 +    uint32_t new_fd;
 +    uint8_t addr_buf[256];
 +    uint32_t addr_buf_len = sizeof(addr_buf) - 1;
@@ -399,6 +597,15 @@ index 0000000..975e62a
 +    uint32_t err = __host_net_accept((uint32_t)sockfd, &new_fd, addr_buf, &addr_buf_len);
 +    if (err != 0) {
 +        errno = (int)err;
++        return -1;
++    }
++    /* Linux dequeues the connection before copyout discovers a NULL
++     * addrlen paired with a non-NULL addr. Close the newly accepted fd so
++     * the failed call consumes exactly one pending connection without
++     * leaking its socket description. */
++    if (addr != NULL && addrlen == NULL) {
++        close((int)new_fd);
++        errno = EFAULT;
 +        return -1;
 +    }
 +
@@ -413,13 +620,39 @@ index 0000000..975e62a
 +}
 +
 +int accept4(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrlen, int flags) {
++    /* Linux resolves the source descriptor before validating creation flags:
++     * accept4(-1, ..., bad_flags) reports EBADF, not EINVAL. */
++    if (fcntl(sockfd, F_GETFD) < 0)
++        return -1;
 +    if (flags & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) {
 +        errno = EINVAL;
 +        return -1;
 +    }
 +
-+    // CLOEXEC is ignored by wasi-libc today; preserve NONBLOCK validation parity.
-+    return accept(sockfd, addr, addrlen);
++    int accepted = accept(sockfd, addr, addrlen);
++    if (accepted < 0)
++        return -1;
++
++    /* accept4 applies both flags to the returned descriptor. The runtime is
++     * single-threaded, so applying them immediately after accept is
++     * observably equivalent to Linux's atomic creation semantics. */
++    if (flags & SOCK_NONBLOCK) {
++        int status_flags = fcntl(accepted, F_GETFL);
++        if (status_flags < 0 ||
++            fcntl(accepted, F_SETFL, status_flags | O_NONBLOCK) < 0)
++            goto flag_error;
++    }
++    if ((flags & SOCK_CLOEXEC) &&
++        fcntl(accepted, F_SETFD, FD_CLOEXEC) < 0)
++        goto flag_error;
++    return accepted;
++
++flag_error: {
++        int saved_errno = errno;
++        close(accepted);
++        errno = saved_errno;
++        return -1;
++    }
 +}
 +
 +ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
@@ -450,9 +683,10 @@ index 0000000..975e62a
 +    }
 +
 +    char addr_str[256];
++    errno = 0;
 +    int slen = sockaddr_to_string(dest_addr, addrlen, addr_str, sizeof(addr_str));
 +    if (slen < 0 || (size_t)slen >= sizeof(addr_str)) {
-+        errno = (slen < 0) ? EAFNOSUPPORT : EINVAL;
++        if (slen >= 0 || errno == 0) errno = (slen < 0) ? EAFNOSUPPORT : EINVAL;
 +        return -1;
 +    }
 +
@@ -524,16 +758,15 @@ index 0000000..975e62a
 +}
 +
 +int getsockname(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrlen) {
-+    if (addr == NULL || addrlen == NULL) {
-+        errno = EINVAL;
-+        return -1;
-+    }
-+
 +    uint8_t addr_buf[256];
 +    uint32_t addr_buf_len = sizeof(addr_buf) - 1;
 +    uint32_t err = __host_net_getsockname((uint32_t)sockfd, addr_buf, &addr_buf_len);
 +    if (err != 0) {
 +        errno = (int)err;
++        return -1;
++    }
++    if (addr == NULL || addrlen == NULL) {
++        errno = EFAULT;
 +        return -1;
 +    }
 +
@@ -548,16 +781,15 @@ index 0000000..975e62a
 +}
 +
 +int getpeername(int sockfd, struct sockaddr *restrict addr, socklen_t *restrict addrlen) {
-+    if (addr == NULL || addrlen == NULL) {
-+        errno = EINVAL;
-+        return -1;
-+    }
-+
 +    uint8_t addr_buf[256];
 +    uint32_t addr_buf_len = sizeof(addr_buf) - 1;
 +    uint32_t err = __host_net_getpeername((uint32_t)sockfd, addr_buf, &addr_buf_len);
 +    if (err != 0) {
 +        errno = (int)err;
++        return -1;
++    }
++    if (addr == NULL || addrlen == NULL) {
++        errno = EFAULT;
 +        return -1;
 +    }
 +
@@ -594,6 +826,22 @@ index 0000000..975e62a
 +    return port;
 +}
 +
++struct agentos_hosts_address {
++    int family;
++    uint32_t scope_id;
++    char text[64];
++};
++
++extern int __agentos_service_port(const char *, int, int);
++extern int __agentos_hosts_lookup_forward(const char *, int,
++    struct agentos_hosts_address *, size_t, size_t *, char *, size_t);
++
++static int resolve_service(const char *service, int socktype, int protocol) {
++    int port = parse_port(service);
++    return port >= 0 ? port :
++        __agentos_service_port(service, socktype, protocol);
++}
++
 +// Skip whitespace in JSON parsing
 +static const char *skip_ws(const char *p) {
 +    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
@@ -616,8 +864,12 @@ index 0000000..975e62a
 +}
 +
 +// Allocate and populate one addrinfo entry
-+static struct addrinfo *make_addrinfo(const char *addr_str, int family, int port, int socktype) {
++static struct addrinfo *make_addrinfo(const char *addr_str, int family,
++                                      uint32_t scope_id, int port,
++                                      int socktype, int protocol,
++                                      const char *canonical) {
 +    size_t sa_len;
++    size_t canonical_len = canonical ? strlen(canonical) + 1 : 0;
 +    if (family == AF_INET)
 +        sa_len = sizeof(struct sockaddr_in);
 +    else if (family == AF_INET6)
@@ -625,14 +877,19 @@ index 0000000..975e62a
 +    else
 +        return NULL;
 +
-+    struct addrinfo *ai = calloc(1, sizeof(struct addrinfo) + sa_len);
++    struct addrinfo *ai = calloc(1, sizeof(struct addrinfo) + sa_len + canonical_len);
 +    if (!ai) return NULL;
 +
 +    ai->ai_family = family;
 +    ai->ai_socktype = socktype ? socktype : SOCK_STREAM;
-+    ai->ai_protocol = (ai->ai_socktype == SOCK_STREAM) ? IPPROTO_TCP : IPPROTO_UDP;
++    ai->ai_protocol = protocol ? protocol :
++        ((ai->ai_socktype == SOCK_STREAM) ? IPPROTO_TCP : IPPROTO_UDP);
 +    ai->ai_addrlen = sa_len;
 +    ai->ai_addr = (struct sockaddr *)((char *)ai + sizeof(struct addrinfo));
++    if (canonical != NULL) {
++        ai->ai_canonname = (char *)ai->ai_addr + sa_len;
++        memcpy(ai->ai_canonname, canonical, canonical_len);
++    }
 +
 +    if (family == AF_INET) {
 +        struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
@@ -643,9 +900,42 @@ index 0000000..975e62a
 +        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ai->ai_addr;
 +        sin6->sin6_family = AF_INET6;
 +        sin6->sin6_port = htons((uint16_t)port);
++        sin6->sin6_scope_id = scope_id;
 +        inet_pton(AF_INET6, addr_str, &sin6->sin6_addr);
 +    }
 +    return ai;
++}
++
++static int hosts_addrinfo(const char *host, int requested_family, int port,
++                          int socktype, int protocol, int want_canon,
++                          struct addrinfo **result) {
++    /* One overflow sentinel lets gethostbyname reject >64 answers explicitly
++     * instead of having this lower layer silently truncate at its boundary. */
++    struct agentos_hosts_address addresses[65];
++    char canonical[256];
++    struct addrinfo *head = NULL, *tail = NULL, *entry;
++    size_t count = 0, index;
++    int lookup;
++
++    *result = NULL;
++    lookup = __agentos_hosts_lookup_forward(host, requested_family,
++        addresses, sizeof(addresses) / sizeof(addresses[0]), &count,
++        canonical, sizeof(canonical));
++    if (lookup < 0) return -1;
++    for (index = 0; index < count; index++) {
++        entry = make_addrinfo(addresses[index].text, addresses[index].family,
++            addresses[index].scope_id, port, socktype, protocol,
++            want_canon && index == 0 ? canonical : NULL);
++        if (entry == NULL) {
++            freeaddrinfo(head);
++            return -1;
++        }
++        if (tail != NULL) tail->ai_next = entry;
++        else head = entry;
++        tail = entry;
++    }
++    *result = head;
++    return (int)count;
 +}
 +
 +int getaddrinfo(const char *restrict host, const char *restrict serv,
@@ -655,13 +945,22 @@ index 0000000..975e62a
 +    const char *host_str = host ? host : "";
 +    const char *port_str = serv ? serv : "0";
 +
-+    int port = parse_port(port_str);
 +    int socktype = hints ? hints->ai_socktype : 0;
++    int protocol = hints ? hints->ai_protocol : 0;
++    int port = resolve_service(port_str, socktype, protocol);
++    if (port < 0) return EAI_SERVICE;
 +    int family = hints ? hints->ai_family : AF_UNSPEC;
 +    uint32_t query_family = 0;
 +    if (family == AF_INET) query_family = 4;
 +    else if (family == AF_INET6) query_family = 6;
 +    else if (family != AF_UNSPEC) return EAI_FAMILY;
++
++    if (host != NULL && *host != '\0') {
++        int hosts_count = hosts_addrinfo(host, family, port, socktype,
++            protocol, hints != NULL && (hints->ai_flags & AI_CANONNAME), res);
++        if (hosts_count < 0) return EAI_MEMORY;
++        if (hosts_count > 0) return 0;
++    }
 +
 +    // Call host bridge for DNS resolution
 +    uint8_t buf[4096];
@@ -738,7 +1037,8 @@ index 0000000..975e62a
 +        if (hints && hints->ai_family != AF_UNSPEC && hints->ai_family != family)
 +            continue;
 +
-+        struct addrinfo *ai = make_addrinfo(addr_str, family, port, socktype);
++        struct addrinfo *ai = make_addrinfo(addr_str, family, 0, port, socktype,
++            protocol, NULL);
 +        if (!ai) { freeaddrinfo(head); return EAI_MEMORY; }
 +
 +        if (tail) { tail->ai_next = ai; tail = ai; }
@@ -795,12 +1095,16 @@ index 0000000..975e62a
 +    return (int)ready;
 +}
 +
-+static int host_fd_isset(int fd, const fd_set *set) {
-+    if (!set) return 0;
-+    for (size_t i = 0; i < set->__nfds; i++) {
-+        if (set->__fds[i] == fd) return 1;
-+    }
-+    return 0;
++/* FD_SETSIZE is overrideable per application translation unit. Access the
++ * list payload through its stable prefix layout rather than imposing this
++ * libc object's separately compiled array bound. */
++static const int *host_fd_entries_const(const fd_set *set) {
++    return (const int *)((const unsigned char *)set +
++                         offsetof(fd_set, __fds));
++}
++
++static int *host_fd_entries(fd_set *set) {
++    return (int *)((unsigned char *)set + offsetof(fd_set, __fds));
 +}
 +
 +static void host_fd_zero(fd_set *set) {
@@ -809,40 +1113,197 @@ index 0000000..975e62a
 +
 +static void host_fd_set(int fd, fd_set *set) {
 +    if (!set) return;
++    int *entries = host_fd_entries(set);
 +    for (size_t i = 0; i < set->__nfds; i++) {
-+        if (set->__fds[i] == fd) return;
++        if (entries[i] == fd) return;
 +    }
-+    if (set->__nfds < FD_SETSIZE) {
-+        set->__fds[set->__nfds++] = fd;
++    /* select() only restores bits that were present in this caller-owned set,
++     * so its output cannot exceed the caller's original allocation. Do not
++     * impose libc's separately compiled FD_SETSIZE on an overrideable caller. */
++    entries[set->__nfds++] = fd;
++}
++
++static int host_pollfd_add_set(struct pollfd *pfds, size_t *count,
++                               int nfds, const fd_set *set, short event,
++                               size_t set_entry_limit) {
++    if (!set) return 0;
++    if (set->__nfds > set_entry_limit) {
++        errno = EINVAL;
++        return -1;
 +    }
++
++    const int *entries = host_fd_entries_const(set);
++    for (size_t i = 0; i < set->__nfds; i++) {
++        int fd = entries[i];
++        /* Linux only examines descriptors below nfds. */
++        if (fd < 0 || fd >= nfds) continue;
++
++        size_t j = 0;
++        while (j < *count && pfds[j].fd != fd) j++;
++        if (j == *count) {
++            pfds[j].fd = fd;
++            (*count)++;
++        }
++        pfds[j].events |= event;
++    }
++    return 0;
 +}
 +
 +int select(int nfds, fd_set *restrict readfds, fd_set *restrict writefds,
 +           fd_set *restrict exceptfds, struct timeval *restrict timeout) {
-+    // Convert fd_sets to pollfd array, call poll(), then scatter results back
-+    struct pollfd pfds[FD_SETSIZE];
-+    int count = 0;
-+    int fd_map[FD_SETSIZE]; // maps pfds index -> original fd
-+
-+    for (int fd = 0; fd < nfds && count < FD_SETSIZE; fd++) {
-+        short events = 0;
-+        if (host_fd_isset(fd, readfds)) events |= POLLIN;
-+        if (host_fd_isset(fd, writefds)) events |= POLLOUT;
-+        if (events == 0 && !host_fd_isset(fd, exceptfds)) continue;
-+        pfds[count].fd = fd;
-+        pfds[count].events = events;
-+        pfds[count].revents = 0;
-+        fd_map[count] = fd;
-+        count++;
++    if (nfds < 0) {
++        errno = EINVAL;
++        return -1;
 +    }
 +
++    /* Bound the sparse fd_set list lengths by the process descriptor limit.
++     * Linux accepts a numeric nfds above RLIMIT_NOFILE when the actual sets
++     * are sparse, so nfds itself must not drive iteration or allocation. */
++    struct rlimit nofile;
++    if (getrlimit(RLIMIT_NOFILE, &nofile) < 0)
++        return -1;
++    size_t set_entry_limit = nofile.rlim_cur > (rlim_t)SIZE_MAX
++        ? SIZE_MAX : (size_t)nofile.rlim_cur;
++
++    uint64_t timeout_seconds = 0;
++    uint64_t timeout_microseconds = 0;
++    __wasi_timestamp_t timeout_started = 0;
 +    int timeout_ms = -1;
 +    if (timeout) {
-+        timeout_ms = (int)(timeout->tv_sec * 1000 + timeout->tv_usec / 1000);
++        if (timeout->tv_sec < 0 || timeout->tv_usec < 0) {
++            errno = EINVAL;
++            return -1;
++        }
++
++        timeout_seconds = (uint64_t)timeout->tv_sec;
++        timeout_microseconds = (uint64_t)timeout->tv_usec;
++        uint64_t extra_seconds = timeout_microseconds / 1000000;
++        timeout_microseconds %= 1000000;
++        if (extra_seconds > (uint64_t)INT64_MAX - timeout_seconds) {
++            errno = EINVAL;
++            return -1;
++        }
++        timeout_seconds += extra_seconds;
++
++        __wasi_errno_t clock_error = __wasi_clock_time_get(
++            __WASI_CLOCKID_MONOTONIC, 1000, &timeout_started);
++        if (clock_error != 0) {
++            errno = clock_error;
++            return -1;
++        }
 +    }
 +
-+    int ret = poll(pfds, (nfds_t)count, timeout_ms);
-+    if (ret < 0) return -1;
++    /* Keep the array on the heap and bounded by the three input list lengths.
++     * Iterate sparse caller lists rather than every integer below nfds. */
++    size_t capacity = 0;
++    const fd_set *sets[] = { readfds, writefds, exceptfds };
++    for (size_t i = 0; i < sizeof(sets) / sizeof(sets[0]); i++) {
++        if (!sets[i]) continue;
++        if (sets[i]->__nfds > set_entry_limit ||
++            capacity > SIZE_MAX - sets[i]->__nfds) {
++            errno = EINVAL;
++            return -1;
++        }
++        capacity += sets[i]->__nfds;
++    }
++
++    struct pollfd *pfds = NULL;
++    if (capacity != 0) {
++        pfds = calloc(capacity, sizeof(*pfds));
++        if (!pfds) {
++            errno = ENOMEM;
++            return -1;
++        }
++    }
++
++    size_t count = 0;
++    if (host_pollfd_add_set(pfds, &count, nfds, readfds, POLLIN,
++                            set_entry_limit) < 0 ||
++        host_pollfd_add_set(pfds, &count, nfds, writefds, POLLOUT,
++                            set_entry_limit) < 0 ||
++        host_pollfd_add_set(pfds, &count, nfds, exceptfds, POLLPRI,
++                            set_entry_limit) < 0) {
++        free(pfds);
++        return -1;
++    }
++
++    int ret;
++    for (;;) {
++        if (timeout) {
++            uint64_t milliseconds;
++            if (timeout_seconds > (uint64_t)INT_MAX / 1000) {
++                milliseconds = INT_MAX;
++            } else {
++                milliseconds = timeout_seconds * 1000 +
++                    (timeout_microseconds + 999) / 1000;
++                if (milliseconds > INT_MAX)
++                    milliseconds = INT_MAX;
++            }
++            timeout_ms = (int)milliseconds;
++        }
++
++        ret = poll(pfds, (nfds_t)count, timeout_ms);
++        if (ret < 0) {
++            free(pfds);
++            return -1;
++        }
++        if (!timeout)
++            break;
++
++        __wasi_timestamp_t now;
++        __wasi_errno_t clock_error = __wasi_clock_time_get(
++            __WASI_CLOCKID_MONOTONIC, 1000, &now);
++        if (clock_error != 0) {
++            free(pfds);
++            errno = clock_error;
++            return -1;
++        }
++
++        uint64_t elapsed_microseconds =
++            now >= timeout_started ? (now - timeout_started) / 1000 : 0;
++        uint64_t elapsed_seconds = elapsed_microseconds / 1000000;
++        elapsed_microseconds %= 1000000;
++
++        uint64_t original_seconds = (uint64_t)timeout->tv_sec +
++            (uint64_t)timeout->tv_usec / 1000000;
++        uint64_t original_microseconds =
++            (uint64_t)timeout->tv_usec % 1000000;
++        if (elapsed_seconds > original_seconds ||
++            (elapsed_seconds == original_seconds &&
++             elapsed_microseconds >= original_microseconds)) {
++            timeout_seconds = 0;
++            timeout_microseconds = 0;
++        } else {
++            timeout_seconds = original_seconds - elapsed_seconds;
++            if (elapsed_microseconds > original_microseconds) {
++                timeout_seconds--;
++                timeout_microseconds =
++                    1000000 + original_microseconds - elapsed_microseconds;
++            } else {
++                timeout_microseconds =
++                    original_microseconds - elapsed_microseconds;
++            }
++        }
++
++        if (ret != 0 ||
++            (timeout_seconds == 0 && timeout_microseconds == 0))
++            break;
++    }
++
++    /* poll() reports invalid descriptors per entry; select() reports EBADF
++     * for the whole call and leaves the input sets unspecified. */
++    for (size_t i = 0; i < count; i++) {
++        if (pfds[i].revents & POLLNVAL) {
++            free(pfds);
++            errno = EBADF;
++            return -1;
++        }
++    }
++
++    if (timeout) {
++        timeout->tv_sec = (time_t)timeout_seconds;
++        timeout->tv_usec = (suseconds_t)timeout_microseconds;
++    }
 +
 +    // Clear fd_sets and scatter results
 +    host_fd_zero(readfds);
@@ -850,20 +1311,24 @@ index 0000000..975e62a
 +    host_fd_zero(exceptfds);
 +
 +    int ready = 0;
-+    for (int i = 0; i < count; i++) {
-+        int fd = fd_map[i];
-+        if (readfds && (pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) {
++    for (size_t i = 0; i < count; i++) {
++        int fd = pfds[i].fd;
++        if (readfds && (pfds[i].events & POLLIN) &&
++            (pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) {
 +            host_fd_set(fd, readfds);
 +            ready++;
 +        }
-+        if (writefds && (pfds[i].revents & POLLOUT)) {
++        if (writefds && (pfds[i].events & POLLOUT) &&
++            (pfds[i].revents & (POLLOUT | POLLERR))) {
 +            host_fd_set(fd, writefds);
 +            ready++;
 +        }
-+        if (exceptfds && (pfds[i].revents & (POLLERR | POLLNVAL))) {
++        if (exceptfds && (pfds[i].events & POLLPRI) &&
++            (pfds[i].revents & POLLPRI)) {
 +            host_fd_set(fd, exceptfds);
 +            ready++;
 +        }
 +    }
++    free(pfds);
 +    return ready;
 +}

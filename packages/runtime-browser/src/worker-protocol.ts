@@ -39,6 +39,10 @@ export type BrowserWorkerExtensionResponse = {
 
 export type BrowserWorkerInitPayload = {
 	processConfig?: ProcessConfig;
+	processLimits?: {
+		maxSpawnFileActions?: number;
+		maxSpawnFileActionBytes?: number;
+	};
 	osConfig?: OSConfig;
 	filesystem?: "opfs" | "memory";
 	networkEnabled?: boolean;

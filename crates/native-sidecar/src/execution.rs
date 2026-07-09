@@ -14,13 +14,14 @@ use crate::protocol::{
     GuestKernelResultResponse, GuestRuntimeKind, JavascriptChildProcessSpawnOptions,
     JavascriptChildProcessSpawnRequest, JavascriptDgramBindRequest,
     JavascriptDgramCreateSocketRequest, JavascriptDgramSendRequest, JavascriptDnsLookupRequest,
-    JavascriptDnsResolveRequest, JavascriptNetConnectRequest, JavascriptNetListenRequest,
-    JavascriptNetReserveTcpPortRequest, KillProcessRequest, OwnershipScope, ProcessExitedEvent,
-    ProcessOutputEvent, ProcessSnapshotEntry, ProcessSnapshotStatus, PtyResizedResponse,
-    QueueSnapshotEntry, RequestFrame, ResizePtyRequest, ResourceSnapshotResponse, ResponseFrame,
-    ResponsePayload, SidecarRequestPayload, SignalDispositionAction, SignalHandlerRegistration,
-    SocketStateEntry, StreamChannel, VmFetchRequest, VmFetchResponse, WasmPermissionTier,
-    WriteStdinRequest,
+    JavascriptDnsResolveRequest, JavascriptNetBindConnectedUnixRequest,
+    JavascriptNetConnectRequest, JavascriptNetListenRequest, JavascriptNetReserveTcpPortRequest,
+    JavascriptPosixSpawnFileAction, JavascriptSpawnHostNetFd, KillProcessRequest, OwnershipScope,
+    ProcessExitedEvent, ProcessOutputEvent, ProcessSnapshotEntry, ProcessSnapshotStatus,
+    PtyResizedResponse, QueueSnapshotEntry, RequestFrame, ResizePtyRequest,
+    ResourceSnapshotResponse, ResponseFrame, ResponsePayload, SidecarRequestPayload,
+    SignalDispositionAction, SignalHandlerRegistration, SocketStateEntry, StreamChannel,
+    VmFetchRequest, VmFetchResponse, WasmPermissionTier, WriteStdinRequest,
 };
 use crate::service::{
     audit_fields, dirname, emit_security_audit_event, emit_structured_event, javascript_error,
@@ -31,23 +32,29 @@ use crate::service::{
 use crate::state::{
     ActiveCipherSession, ActiveDhSession, ActiveDiffieHellmanSession, ActiveEcdhSession,
     ActiveExecution, ActiveExecutionEvent, ActiveHttp2Server, ActiveHttp2Session,
-    ActiveHttp2Stream, ActiveHttpServer, ActiveMappedHostFd, ActiveProcess, ActiveSqliteDatabase,
-    ActiveSqliteStatement, ActiveTcpListener, ActiveTcpSocket, ActiveTlsState, ActiveTlsStream,
-    ActiveUdpSocket, ActiveUnixListener, ActiveUnixSocket, BridgeError, ExitedProcessSnapshot,
-    Http2BridgeEvent, Http2RuntimeSnapshot, Http2SessionCommand, Http2SessionSnapshot,
-    Http2SocketSnapshot, JavascriptHttpLoopbackTarget, JavascriptSocketEventPusher,
-    JavascriptSocketFamily, JavascriptSocketPathContext, JavascriptTcpListenerEvent,
-    JavascriptTcpSocketEvent, JavascriptTlsBridgeOptions, JavascriptTlsClientHello,
-    JavascriptTlsDataValue, JavascriptTlsMaterial, JavascriptUdpFamily, JavascriptUdpSocketEvent,
+    ActiveHttp2Stream, ActiveHttpServer, ActiveMappedHostFd, ActiveProcess,
+    ActiveRealIntervalTimer, ActiveSqliteDatabase, ActiveSqliteStatement, ActiveTcpListener,
+    ActiveTcpSocket, ActiveTlsState, ActiveTlsStream, ActiveUdpSocket, ActiveUnixListener,
+    ActiveUnixSocket, BridgeError, ExitedProcessSnapshot, GuestUnixAddress,
+    GuestUnixAddressRegistry, GuestUnixAddressRegistryEntry, GuestUnixConnectionState,
+    HostNetTransferDescription, HostNetTransferDescriptionRegistry, Http2BridgeEvent,
+    Http2RuntimeSnapshot, Http2SessionCommand, Http2SessionSnapshot, Http2SocketSnapshot,
+    JavascriptHttpLoopbackTarget, JavascriptSocketEventPusher, JavascriptSocketFamily,
+    JavascriptSocketPathContext, JavascriptTcpListenerEvent, JavascriptTcpSocketEvent,
+    JavascriptTlsBridgeOptions, JavascriptTlsClientHello, JavascriptTlsDataValue,
+    JavascriptTlsMaterial, JavascriptUdpFamily, JavascriptUdpSocketEvent,
     JavascriptUnixListenerEvent, KernelSocketReadinessEvent, KernelSocketReadinessRegistry,
     KernelSocketReadinessTarget, LoopbackTlsPendingWriteHandle, LoopbackTlsPendingWriteState,
-    NetworkResourceCounts, PendingKernelStdin, PendingTcpSocket, PendingUnixSocket, ProcNetEntry,
-    ProcessEventEnvelope, PythonHostSocket, ResolvedChildProcessExecution, ResolvedTcpConnectAddr,
-    SharedBridge, SharedSidecarRequestClient, SidecarKernel, SocketQueryKind, ToolExecution,
-    VmDnsConfig, VmListenPolicy, VmState, DEFAULT_JAVASCRIPT_NET_BACKLOG, EXECUTION_DRIVER_NAME,
+    NetworkResourceCounts, PendingKernelStdin, PendingTcpSocket, PendingUnixConnectionGuard,
+    PendingUnixSocket, ProcNetEntry, ProcessEventEnvelope, PythonHostSocket,
+    ResolvedChildProcessExecution, ResolvedTcpConnectAddr, ShadowNodeType,
+    ShadowSyncInventoryEntry, SharedBridge, SharedSidecarRequestClient, SidecarKernel,
+    SocketQueryKind, ToolExecution, UnixSocketReadState, VmDnsConfig, VmListenPolicy,
+    VmPendingByteBudget, VmState, DEFAULT_JAVASCRIPT_NET_BACKLOG, EXECUTION_DRIVER_NAME,
     EXECUTION_SANDBOX_ROOT_ENV, JAVASCRIPT_COMMAND, LOOPBACK_EXEMPT_PORTS_ENV,
     MAPPED_HOST_FD_START, PYTHON_COMMAND, TOOL_DRIVER_NAME,
-    VM_LISTEN_ALLOW_PRIVILEGED_METADATA_KEY, WASM_COMMAND, WASM_STDIO_SYNC_RPC_ENV,
+    VM_LISTEN_ALLOW_PRIVILEGED_METADATA_KEY, WASM_COMMAND, WASM_EXEC_COMMIT_RPC_ENV,
+    WASM_STDIO_SYNC_RPC_ENV,
 };
 use crate::tools::{
     format_tool_failure_output, is_tool_command, normalized_tool_command_name,
@@ -100,7 +107,10 @@ use agentos_execution::{
 use agentos_kernel::dns::{
     DnsLookupPolicy, DnsRecordResolution, DnsResolutionSource as KernelDnsResolutionSource,
 };
-use agentos_kernel::kernel::{KernelProcessHandle, SpawnOptions, VirtualProcessOptions};
+use agentos_kernel::fd_table::TransferredFd;
+use agentos_kernel::kernel::{
+    FdTransferRequest, KernelProcessHandle, ReceivedFdRight, SpawnOptions, VirtualProcessOptions,
+};
 pub(crate) use agentos_kernel::network_policy::format_tcp_resource;
 use agentos_kernel::network_policy::{
     is_loopback_ip, loopback_cidr, restricted_non_loopback_ip_range,
@@ -109,13 +119,17 @@ use agentos_kernel::permissions::NetworkOperation;
 use agentos_kernel::poll::{PollEvents, PollFd, PollTargetEntry, POLLERR, POLLHUP, POLLIN};
 use agentos_kernel::process_table::{ProcessStatus, WaitPidFlags, SIGKILL, SIGTERM};
 use agentos_kernel::pty::MAX_PTY_BUFFER_BYTES;
-use agentos_kernel::resource_accounting::ResourceLimits;
+use agentos_kernel::resource_accounting::{
+    ResourceLimits, DEFAULT_BLOCKING_READ_TIMEOUT_MS, DEFAULT_MAX_SOCKET_BUFFERED_BYTES,
+};
 use agentos_kernel::root_fs::RootFilesystemMode;
 use agentos_kernel::socket_table::{
     reset_socket_read_trace, set_socket_read_trace_enabled, socket_read_trace_snapshot,
     InetSocketAddress, SocketDomain, SocketId, SocketShutdown as KernelSocketShutdown, SocketSpec,
     SocketState, SocketType,
 };
+use agentos_kernel::vfs::{VirtualTimeSpec, VirtualUtimeSpec};
+use agentos_native_sidecar_core::ca::CA_CERTIFICATES_GUEST_PATH;
 use agentos_native_sidecar_core::{
     apply_process_signal_state_update, bound_udp_snapshot_response, bridge_buffer_value,
     decode_base64, decode_bridge_buffer_value, decode_encoded_bytes_value, encoded_bytes_value,
@@ -128,6 +142,9 @@ use agentos_native_sidecar_core::{
     tcp_socket_info_value, unix_socket_info_value, zombie_timer_count_response,
     SharedProcessSnapshotEntry, SharedProcessSnapshotStatus, SidecarCoreError,
     VM_FETCH_BUFFER_LIMIT_BYTES,
+};
+use nix::sys::socket::{
+    bind as bind_socket, connect as connect_socket, send as send_socket, MsgFlags, UnixAddr,
 };
 use rusqlite::types::ValueRef as SqliteValueRef;
 use rusqlite::{
@@ -145,7 +162,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha1::Sha1;
 use sha2::{digest::Digest, Sha224, Sha256, Sha384, Sha512};
-use socket2::{SockRef, TcpKeepalive};
+use socket2::{Domain, SockAddr, SockRef, Socket, TcpKeepalive, Type};
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -155,14 +172,16 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
     UdpSocket,
 };
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -179,12 +198,18 @@ const PYTHON_PYODIDE_CACHE_GUEST_ROOT: &str = "/__agentos_pyodide_cache";
 const TCP_SOCKET_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOOPBACK_TLS_HANDSHAKE_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+// Descendant WASM processes share one cooperative event dispatcher. Batch a
+// small, bounded run of invisible sync RPCs before returning to the parent
+// pump: yielding after every syscall makes process-heavy tools unusably slow,
+// while an unbounded batch can starve a sibling that must make the child
+// runnable. The time bound models a short scheduler quantum; the count bound
+// also guarantees fairness when individual RPCs are exceptionally cheap.
+const DESCENDANT_INTERNAL_RPC_QUANTUM: Duration = Duration::from_millis(10);
+const MAX_DESCENDANT_INTERNAL_RPCS_PER_POLL: usize = 1024;
 const LOOPBACK_TLS_PENDING_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const LOOPBACK_TLS_PENDING_WRITE_WARNING_BYTES: usize =
     LOOPBACK_TLS_PENDING_WRITE_BUFFER_BYTES * 4 / 5;
 const HTTP_LOOPBACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const PROCESS_EXIT_DRAIN_INITIAL_QUIET: Duration = Duration::from_millis(1);
-const PROCESS_EXIT_DRAIN_TRAILING_QUIET: Duration = Duration::from_millis(25);
 
 struct NetTcpTraceCounters {
     socket_read_calls: AtomicU64,
@@ -286,25 +311,57 @@ fn http_loopback_request_timeout() -> Duration {
 /// stall as the fixed sleeps this replaced, and only acceptable because the
 /// guest net path always polls with wait == 0. Keep deadlines bounded and do
 /// not add wait > 0 callers on paths that service concurrent VM traffic.
-fn wait_fd_readable_until(fd: BorrowedFd<'_>, deadline: Instant) -> bool {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return false;
-    }
+fn wait_fd_readable_until(fd: BorrowedFd<'_>, deadline: Instant) -> std::io::Result<bool> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
 
-    let timeout_ms = remaining.as_millis().saturating_add(u128::from(
-        !remaining.subsec_nanos().is_multiple_of(1_000_000),
-    ));
-    let timeout =
-        PollTimeout::try_from(timeout_ms.min(i32::MAX as u128)).unwrap_or(PollTimeout::MAX);
-    let mut fds = [NixPollFd::new(fd, PollFlags::POLLIN)];
-    match poll(&mut fds, timeout) {
-        Ok(0) => false,
-        Ok(_) => fds[0]
-            .revents()
-            .unwrap_or_else(PollFlags::empty)
-            .intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR),
-        Err(_) => true,
+        let timeout_ms = remaining.as_millis().saturating_add(u128::from(
+            !remaining.subsec_nanos().is_multiple_of(1_000_000),
+        ));
+        let timeout =
+            PollTimeout::try_from(timeout_ms.min(i32::MAX as u128)).unwrap_or(PollTimeout::MAX);
+        let mut fds = [NixPollFd::new(fd, PollFlags::POLLIN)];
+        match poll(&mut fds, timeout) {
+            Ok(0) => return Ok(false),
+            Ok(_) => {
+                return Ok(fds[0]
+                    .revents()
+                    .unwrap_or_else(PollFlags::empty)
+                    .intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR));
+            }
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => return Err(std::io::Error::from_raw_os_error(error as i32)),
+        }
+    }
+}
+
+fn wait_fd_writable_until(fd: BorrowedFd<'_>, deadline: Instant) -> std::io::Result<bool> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+
+        let timeout_ms = remaining.as_millis().saturating_add(u128::from(
+            !remaining.subsec_nanos().is_multiple_of(1_000_000),
+        ));
+        let timeout =
+            PollTimeout::try_from(timeout_ms.min(i32::MAX as u128)).unwrap_or(PollTimeout::MAX);
+        let mut fds = [NixPollFd::new(fd, PollFlags::POLLOUT)];
+        match poll(&mut fds, timeout) {
+            Ok(0) => return Ok(false),
+            Ok(_) => {
+                return Ok(fds[0]
+                    .revents()
+                    .unwrap_or_else(PollFlags::empty)
+                    .intersects(PollFlags::POLLOUT | PollFlags::POLLHUP | PollFlags::POLLERR));
+            }
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => return Err(std::io::Error::from_raw_os_error(error as i32)),
+        }
     }
 }
 
@@ -460,6 +517,51 @@ impl ServerCertVerifier for InsecureTlsVerifier {
     }
 }
 
+/// Ownership of VM-wide retained-byte accounting for an event temporarily
+/// removed from a process queue. Keeping this reservation alive across a
+/// capacity check prevents a concurrent producer from consuming the bytes an
+/// already-accepted event needs if that event must be put back.
+#[derive(Debug)]
+struct PendingExecutionEventReservation {
+    budget: Arc<VmPendingByteBudget>,
+    bytes: usize,
+}
+
+impl PendingExecutionEventReservation {
+    fn transfer_to_queue(mut self) {
+        self.bytes = 0;
+    }
+}
+
+impl Drop for PendingExecutionEventReservation {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+#[derive(Debug)]
+struct PolledExecutionEvent {
+    event: ActiveExecutionEvent,
+    reservation: Option<PendingExecutionEventReservation>,
+}
+
+impl PolledExecutionEvent {
+    fn unreserved(event: ActiveExecutionEvent) -> Self {
+        Self {
+            event,
+            reservation: None,
+        }
+    }
+
+    fn event(&self) -> &ActiveExecutionEvent {
+        &self.event
+    }
+
+    fn into_event(self) -> ActiveExecutionEvent {
+        self.event
+    }
+}
+
 impl ActiveProcess {
     pub(crate) fn new(
         kernel_pid: u32,
@@ -467,11 +569,20 @@ impl ActiveProcess {
         runtime: GuestRuntimeKind,
         execution: ActiveExecution,
     ) -> Self {
+        let start_real_timer = runtime == GuestRuntimeKind::WebAssembly;
         Self {
             kernel_pid,
             kernel_handle,
             kernel_stdin_writer_fd: None,
             pending_kernel_stdin: PendingKernelStdin::default(),
+            pending_kernel_stdin_gauge: queue_tracker::register_queue(
+                queue_tracker::TrackedLimit::PendingKernelStdinBytes,
+                agentos_native_sidecar_core::limits::DEFAULT_PROCESS_PENDING_STDIN_BYTES,
+            ),
+            vm_pending_stdin_bytes_budget: VmPendingByteBudget::new(
+                agentos_native_sidecar_core::limits::DEFAULT_PROCESS_PENDING_STDIN_BYTES,
+                queue_tracker::TrackedLimit::PendingKernelStdinBytes,
+            ),
             tty_master_fd: None,
             runtime,
             detached: false,
@@ -483,8 +594,32 @@ impl ActiveProcess {
             mapped_host_fds: BTreeMap::new(),
             next_mapped_host_fd: MAPPED_HOST_FD_START,
             pending_execution_events: VecDeque::new(),
+            pending_execution_event_bytes: 0,
+            pending_execution_event_count_limit:
+                agentos_native_sidecar_core::limits::DEFAULT_PROCESS_PENDING_EVENT_COUNT,
+            pending_execution_event_bytes_limit:
+                agentos_native_sidecar_core::limits::DEFAULT_PROCESS_PENDING_EVENT_BYTES,
+            pending_execution_event_count_gauge: queue_tracker::register_queue(
+                queue_tracker::TrackedLimit::PendingExecutionEvents,
+                agentos_native_sidecar_core::limits::DEFAULT_PROCESS_PENDING_EVENT_COUNT,
+            ),
+            pending_execution_event_bytes_gauge: queue_tracker::register_queue(
+                queue_tracker::TrackedLimit::PendingExecutionEventBytes,
+                agentos_native_sidecar_core::limits::DEFAULT_PROCESS_PENDING_EVENT_BYTES,
+            ),
+            vm_pending_event_bytes_budget: VmPendingByteBudget::new(
+                agentos_native_sidecar_core::limits::DEFAULT_PROCESS_PENDING_EVENT_BYTES,
+                queue_tracker::TrackedLimit::PendingExecutionEventBytes,
+            ),
             pending_self_signal_exit: None,
-            pending_wasm_signals: VecDeque::new(),
+            exit_signal: None,
+            exit_core_dumped: false,
+            pending_wasm_signals: BTreeSet::new(),
+            pending_wasm_signals_gauge: queue_tracker::register_queue(
+                queue_tracker::TrackedLimit::PendingWasmSignals,
+                64,
+            ),
+            real_interval_timer: ActiveRealIntervalTimer::new(start_real_timer),
             child_processes: BTreeMap::new(),
             next_child_process_id: 0,
             http_servers: BTreeMap::new(),
@@ -523,18 +658,245 @@ impl ActiveProcess {
         &mut self,
         event: ActiveExecutionEvent,
     ) -> Result<(), SidecarError> {
-        if self.pending_execution_events.len() >= MAX_PROCESS_EVENT_QUEUE {
-            return Err(process_event_queue_overflow_error());
+        self.try_queue_pending_execution_event(event)
+            .map_err(|(error, _event)| error)
+    }
+
+    fn try_queue_pending_execution_event(
+        &mut self,
+        event: ActiveExecutionEvent,
+    ) -> Result<(), (SidecarError, ActiveExecutionEvent)> {
+        let event_bytes = event.retained_bytes();
+        if self.pending_execution_events.len() >= self.pending_execution_event_count_limit {
+            return Err((
+                SidecarError::InvalidState(format!(
+                    "process execution event queue exceeded {} events (limits.process.pendingEventCount); raise limits.process.pendingEventCount",
+                    self.pending_execution_event_count_limit
+                )),
+                event,
+            ));
         }
+        if self
+            .pending_execution_event_bytes
+            .saturating_add(event_bytes)
+            > self.pending_execution_event_bytes_limit
+        {
+            return Err((
+                SidecarError::InvalidState(format!(
+                    "process execution event queue exceeded {} retained bytes (limits.process.pendingEventBytes); raise limits.process.pendingEventBytes",
+                    self.pending_execution_event_bytes_limit
+                )),
+                event,
+            ));
+        }
+        if !self.vm_pending_event_bytes_budget.try_reserve(event_bytes) {
+            return Err((
+                SidecarError::InvalidState(format!(
+                    "VM process execution event queues exceeded {} retained bytes \
+                     (limits.process.pendingEventBytes); raise limits.process.pendingEventBytes",
+                    self.vm_pending_event_bytes_budget.limit()
+                )),
+                event,
+            ));
+        }
+        self.pending_execution_event_bytes = self
+            .pending_execution_event_bytes
+            .saturating_add(event_bytes);
         self.pending_execution_events.push_back(event);
+        self.pending_execution_event_count_gauge
+            .observe_depth(self.pending_execution_events.len());
+        self.pending_execution_event_bytes_gauge
+            .observe_depth(self.pending_execution_event_bytes);
         Ok(())
     }
 
-    pub(crate) fn queue_pending_wasm_signal(&mut self, signal: i32) -> Result<(), SidecarError> {
-        if self.pending_wasm_signals.len() >= MAX_PROCESS_EVENT_QUEUE {
-            return Err(process_event_queue_overflow_error());
+    fn try_queue_pending_execution_envelope(
+        &mut self,
+        envelope: ProcessEventEnvelope,
+    ) -> Result<(), (SidecarError, ProcessEventEnvelope)> {
+        let ProcessEventEnvelope {
+            connection_id,
+            session_id,
+            vm_id,
+            process_id,
+            event,
+        } = envelope;
+        self.try_queue_pending_execution_event(event)
+            .map_err(|(error, event)| {
+                (
+                    error,
+                    ProcessEventEnvelope {
+                        connection_id,
+                        session_id,
+                        vm_id,
+                        process_id,
+                        event,
+                    },
+                )
+            })
+    }
+
+    fn lease_pending_execution_event(&mut self) -> Option<PolledExecutionEvent> {
+        let event = self.pending_execution_events.pop_front()?;
+        let event_bytes = event.retained_bytes();
+        self.pending_execution_event_bytes = self
+            .pending_execution_event_bytes
+            .saturating_sub(event_bytes);
+        self.pending_execution_event_count_gauge
+            .observe_depth(self.pending_execution_events.len());
+        self.pending_execution_event_bytes_gauge
+            .observe_depth(self.pending_execution_event_bytes);
+        Some(PolledExecutionEvent {
+            event,
+            reservation: Some(PendingExecutionEventReservation {
+                budget: Arc::clone(&self.vm_pending_event_bytes_budget),
+                bytes: event_bytes,
+            }),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pop_pending_execution_event(&mut self) -> Option<ActiveExecutionEvent> {
+        self.lease_pending_execution_event()
+            .map(PolledExecutionEvent::into_event)
+    }
+
+    fn requeue_pending_execution_event(
+        &mut self,
+        polled: PolledExecutionEvent,
+    ) -> Result<(), SidecarError> {
+        let PolledExecutionEvent { event, reservation } = polled;
+        let event_bytes = event.retained_bytes();
+        if self.pending_execution_events.len() >= self.pending_execution_event_count_limit {
+            return Err(SidecarError::InvalidState(format!(
+                "process execution event queue exceeded {} events (limits.process.pendingEventCount); raise limits.process.pendingEventCount",
+                self.pending_execution_event_count_limit
+            )));
         }
-        self.pending_wasm_signals.push_back(signal);
+        if self
+            .pending_execution_event_bytes
+            .saturating_add(event_bytes)
+            > self.pending_execution_event_bytes_limit
+        {
+            return Err(SidecarError::InvalidState(format!(
+                "process execution event queue exceeded {} retained bytes (limits.process.pendingEventBytes); raise limits.process.pendingEventBytes",
+                self.pending_execution_event_bytes_limit
+            )));
+        }
+
+        let reservation = match reservation {
+            Some(reservation) => {
+                if reservation.bytes != event_bytes
+                    || !Arc::ptr_eq(&reservation.budget, &self.vm_pending_event_bytes_budget)
+                {
+                    return Err(SidecarError::InvalidState(String::from(
+                        "process execution event reservation no longer matches its VM queue; event requeue aborted",
+                    )));
+                }
+                Some(reservation)
+            }
+            None => {
+                if !self.vm_pending_event_bytes_budget.try_reserve(event_bytes) {
+                    return Err(SidecarError::InvalidState(format!(
+                        "VM process execution event queues exceeded {} retained bytes \
+                         (limits.process.pendingEventBytes); raise limits.process.pendingEventBytes",
+                        self.vm_pending_event_bytes_budget.limit()
+                    )));
+                }
+                None
+            }
+        };
+
+        self.pending_execution_event_bytes = self
+            .pending_execution_event_bytes
+            .saturating_add(event_bytes);
+        self.pending_execution_events.push_front(event);
+        self.pending_execution_event_count_gauge
+            .observe_depth(self.pending_execution_events.len());
+        self.pending_execution_event_bytes_gauge
+            .observe_depth(self.pending_execution_event_bytes);
+        if let Some(reservation) = reservation {
+            reservation.transfer_to_queue();
+        }
+        Ok(())
+    }
+
+    async fn poll_execution_event(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<PolledExecutionEvent>, SidecarError> {
+        if let ActiveExecution::Tool(execution) = &mut self.execution {
+            return poll_tool_process_event_leased(execution);
+        }
+        self.execution
+            .poll_event(timeout)
+            .await
+            .map(|event| event.map(PolledExecutionEvent::unreserved))
+    }
+
+    fn poll_execution_event_blocking(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<PolledExecutionEvent>, SidecarError> {
+        if let ActiveExecution::Tool(execution) = &mut self.execution {
+            return poll_tool_process_event_leased(execution);
+        }
+        self.execution
+            .poll_event_blocking(timeout)
+            .map(|event| event.map(PolledExecutionEvent::unreserved))
+    }
+
+    pub(crate) fn with_process_event_limits(
+        mut self,
+        limits: &agentos_native_sidecar_core::limits::ProcessLimits,
+    ) -> Self {
+        self.pending_execution_event_count_limit = limits.pending_event_count;
+        self.pending_execution_event_bytes_limit = limits.pending_event_bytes;
+        if let ActiveExecution::Tool(execution) = &self.execution {
+            execution
+                .pending_event_count_limit
+                .store(limits.pending_event_count, Ordering::Release);
+            execution
+                .pending_event_bytes_limit
+                .store(limits.pending_event_bytes, Ordering::Release);
+        }
+        self.pending_kernel_stdin_gauge = queue_tracker::register_queue(
+            queue_tracker::TrackedLimit::PendingKernelStdinBytes,
+            limits.pending_stdin_bytes,
+        );
+        self.pending_execution_event_count_gauge = queue_tracker::register_queue(
+            queue_tracker::TrackedLimit::PendingExecutionEvents,
+            limits.pending_event_count,
+        );
+        self.pending_execution_event_bytes_gauge = queue_tracker::register_queue(
+            queue_tracker::TrackedLimit::PendingExecutionEventBytes,
+            limits.pending_event_bytes,
+        );
+        self
+    }
+
+    pub(crate) fn with_vm_pending_byte_budgets(
+        mut self,
+        stdin: Arc<VmPendingByteBudget>,
+        events: Arc<VmPendingByteBudget>,
+    ) -> Self {
+        debug_assert_eq!(self.pending_kernel_stdin.total, 0);
+        debug_assert_eq!(self.pending_execution_event_bytes, 0);
+        self.vm_pending_stdin_bytes_budget = stdin;
+        self.vm_pending_event_bytes_budget = Arc::clone(&events);
+        if let ActiveExecution::Tool(execution) = &mut self.execution {
+            if !Arc::ptr_eq(&execution.vm_pending_event_bytes_budget, &events) {
+                debug_assert_eq!(execution.pending_event_bytes.load(Ordering::Acquire), 0);
+                execution.vm_pending_event_bytes_budget = events;
+            }
+        }
+        self
+    }
+
+    pub(crate) fn queue_pending_wasm_signal(&mut self, signal: i32) -> Result<(), SidecarError> {
+        self.pending_wasm_signals.insert(signal);
+        self.pending_wasm_signals_gauge
+            .observe_depth(self.pending_wasm_signals.len());
         Ok(())
     }
 
@@ -647,87 +1009,380 @@ impl ActiveProcess {
         format!("udp-socket-{}", self.next_udp_socket_id)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn network_resource_counts(&self) -> NetworkResourceCounts {
-        let mut counts = NetworkResourceCounts {
-            sockets: self.http_servers.len()
-                + self.tcp_listeners.len()
-                + self.tcp_sockets.len()
-                + self.unix_listeners.len()
-                + self.unix_sockets.len()
-                + self.udp_sockets.len()
-                + self.python_sockets.len(),
-            connections: self.tcp_sockets.len() + self.unix_sockets.len(),
-        };
-        if let Ok(http2) = self.http2.shared.lock() {
-            counts.sockets += http2.servers.len() + http2.sessions.len();
-            counts.connections += http2.sessions.len();
-        }
-
-        for child in self.child_processes.values() {
-            let child_counts = child.network_resource_counts();
-            counts.sockets += child_counts.sockets;
-            counts.connections += child_counts.connections;
-        }
-
+        let mut counts = NetworkResourceCounts::default();
+        let mut descriptions = BTreeMap::new();
+        self.collect_network_resource_counts(false, &mut descriptions, &mut counts);
+        add_host_net_description_counts(&descriptions, &mut counts);
         counts
     }
 
-    fn sidecar_only_network_resource_counts(&self) -> NetworkResourceCounts {
-        let mut counts = NetworkResourceCounts {
-            sockets: self.http_servers.len()
-                + self
-                    .tcp_listeners
-                    .values()
-                    .filter(|listener| listener.kernel_socket_id.is_none())
-                    .count()
-                + self
-                    .tcp_sockets
-                    .values()
-                    .filter(|socket| socket.kernel_socket_id.is_none())
-                    .count()
-                + self.unix_listeners.len()
-                + self.unix_sockets.len()
-                + self
-                    .udp_sockets
-                    .values()
-                    .filter(|socket| socket.kernel_socket_id.is_none())
-                    .count()
-                + self.python_sockets.len(),
-            connections: self
-                .tcp_sockets
-                .values()
-                .filter(|socket| socket.kernel_socket_id.is_none())
-                .count()
-                + self.unix_sockets.len(),
-        };
-        if let Ok(http2) = self.http2.shared.lock() {
-            counts.sockets += http2.servers.len() + http2.sessions.len();
-            counts.connections += http2.sessions.len();
-        }
+    fn collect_network_resource_counts(
+        &self,
+        sidecar_only: bool,
+        descriptions: &mut BTreeMap<usize, bool>,
+        counts: &mut NetworkResourceCounts,
+    ) {
+        counts.sockets += self.http_servers.len() + self.python_sockets.len();
+        let http2 = self
+            .http2
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        counts.sockets += http2.servers.len() + http2.sessions.len();
+        counts.connections += http2.sessions.len();
+        drop(http2);
 
+        for listener in self.tcp_listeners.values() {
+            if !sidecar_only || listener.kernel_socket_id.is_none() {
+                descriptions
+                    .entry(Arc::as_ptr(&listener.description_handles) as usize)
+                    .or_insert(false);
+            }
+        }
+        for socket in self.tcp_sockets.values() {
+            if !sidecar_only || socket.kernel_socket_id.is_none() {
+                descriptions.insert(Arc::as_ptr(&socket.description_handles) as usize, true);
+            }
+        }
+        for listener in self.unix_listeners.values() {
+            descriptions
+                .entry(Arc::as_ptr(&listener.description_handles) as usize)
+                .or_insert(false);
+        }
+        for socket in self.unix_sockets.values() {
+            descriptions.insert(Arc::as_ptr(&socket.description_handles) as usize, true);
+        }
+        for socket in self.udp_sockets.values() {
+            if !sidecar_only || socket.kernel_socket_id.is_none() {
+                descriptions
+                    .entry(Arc::as_ptr(&socket.description_handles) as usize)
+                    .or_insert(false);
+            }
+        }
         for child in self.child_processes.values() {
-            let child_counts = child.sidecar_only_network_resource_counts();
-            counts.sockets += child_counts.sockets;
-            counts.connections += child_counts.connections;
+            child.collect_network_resource_counts(sidecar_only, descriptions, counts);
         }
+    }
+}
 
-        counts
+impl Drop for ActiveProcess {
+    fn drop(&mut self) {
+        let pending_stdin_bytes = self.pending_kernel_stdin.total;
+        self.vm_pending_stdin_bytes_budget
+            .release(pending_stdin_bytes);
+        self.pending_kernel_stdin.clear();
+        self.pending_kernel_stdin_gauge.observe_depth(0);
+
+        self.vm_pending_event_bytes_budget
+            .release(self.pending_execution_event_bytes);
+        self.pending_execution_events.clear();
+        self.pending_execution_event_bytes = 0;
+        self.pending_execution_event_count_gauge.observe_depth(0);
+        self.pending_execution_event_bytes_gauge.observe_depth(0);
+    }
+}
+
+#[cfg(test)]
+mod pending_event_reservation_tests {
+    use super::{
+        queue_tracker, send_tool_process_event, ActiveExecution, ActiveExecutionEvent,
+        ActiveProcess, GuestRuntimeKind, SidecarKernel, SignalDispositionAction,
+        SignalHandlerRegistration, ToolExecution, VmPendingByteBudget, EXECUTION_DRIVER_NAME,
+        WASM_COMMAND,
+    };
+    use agentos_kernel::command_registry::CommandDriver;
+    use agentos_kernel::kernel::{KernelVmConfig, SpawnOptions};
+    use agentos_kernel::mount_table::MountTable;
+    use agentos_kernel::permissions::Permissions;
+    use agentos_kernel::vfs::MemoryFileSystem;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn checked_out_event_keeps_vm_bytes_reserved_until_requeue_or_consumption() {
+        let event = ActiveExecutionEvent::Stdout(vec![0x5a; 32]);
+        let event_bytes = event.retained_bytes();
+        let budget = VmPendingByteBudget::new(
+            event_bytes,
+            queue_tracker::TrackedLimit::PendingExecutionEventBytes,
+        );
+
+        let mut config = KernelVmConfig::new("vm-pending-event-reservation");
+        config.permissions = Permissions::allow_all();
+        let mut kernel = SidecarKernel::new(MountTable::new(MemoryFileSystem::new()), config);
+        kernel
+            .register_driver(CommandDriver::new(EXECUTION_DRIVER_NAME, [WASM_COMMAND]))
+            .expect("register execution driver");
+        let handle = kernel
+            .spawn_process(
+                WASM_COMMAND,
+                Vec::new(),
+                SpawnOptions {
+                    requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                    ..SpawnOptions::default()
+                },
+            )
+            .expect("spawn process");
+        let mut process = ActiveProcess::new(
+            handle.pid(),
+            handle,
+            GuestRuntimeKind::WebAssembly,
+            ActiveExecution::Tool(ToolExecution::default()),
+        )
+        .with_vm_pending_byte_budgets(
+            VmPendingByteBudget::new(
+                event_bytes,
+                queue_tracker::TrackedLimit::PendingKernelStdinBytes,
+            ),
+            Arc::clone(&budget),
+        );
+
+        process
+            .queue_pending_execution_event(event)
+            .expect("initial event fits the VM aggregate");
+        let checked_out = process
+            .lease_pending_execution_event()
+            .expect("pop accepted event with its reservation");
+
+        let sibling_budget = Arc::clone(&budget);
+        let sibling = thread::spawn(move || sibling_budget.try_reserve(event_bytes));
+        assert!(
+            !sibling.join().expect("sibling producer thread"),
+            "a sibling producer must not steal a checked-out event's reservation"
+        );
+
+        process
+            .requeue_pending_execution_event(checked_out)
+            .expect("requeue must reuse the existing reservation");
+        let consumed = process
+            .pop_pending_execution_event()
+            .expect("requeued event remains available");
+        assert!(matches!(consumed, ActiveExecutionEvent::Stdout(bytes) if bytes == vec![0x5a; 32]));
+
+        assert!(
+            budget.try_reserve(event_bytes),
+            "real consumption must release the VM aggregate reservation"
+        );
+        budget.release(event_bytes);
+
+        let ActiveExecution::Tool(tool) = &process.execution else {
+            panic!("test process must use the tool event queue");
+        };
+        assert!(send_tool_process_event(
+            &tool.cancelled,
+            &tool.pending_events,
+            &tool.event_overflow_reason,
+            &tool.pending_event_bytes,
+            &tool.pending_event_count_limit,
+            &tool.pending_event_bytes_limit,
+            &tool.vm_pending_event_bytes_budget,
+            ActiveExecutionEvent::Stdout(vec![0x6b; 32]),
+        ));
+        let checked_out = process
+            .poll_execution_event_blocking(std::time::Duration::ZERO)
+            .expect("poll tool event queue")
+            .expect("tool event available with its reservation");
+        let sibling_budget = Arc::clone(&budget);
+        let sibling = thread::spawn(move || sibling_budget.try_reserve(event_bytes));
+        assert!(
+            !sibling.join().expect("second sibling producer thread"),
+            "polling the tool queue must also retain its aggregate reservation"
+        );
+        process
+            .requeue_pending_execution_event(checked_out)
+            .expect("tool event requeue must transfer its existing reservation");
+        assert!(matches!(
+            process.pop_pending_execution_event(),
+            Some(ActiveExecutionEvent::Stdout(bytes)) if bytes == vec![0x6b; 32]
+        ));
+        assert!(budget.try_reserve(event_bytes));
+        budget.release(event_bytes);
+
+        // Detached internal events are consumed by a handler that can resume
+        // the guest immediately. The lease conversion must free the current
+        // event before that handler lets the producer enqueue its response.
+        let internal_event = ActiveExecutionEvent::SignalState {
+            signal: 10,
+            registration: SignalHandlerRegistration {
+                action: SignalDispositionAction::User,
+                mask: Vec::new(),
+                flags: 0,
+            },
+        };
+        let internal_bytes = internal_event.retained_bytes();
+        let internal_budget = VmPendingByteBudget::new(
+            internal_bytes,
+            queue_tracker::TrackedLimit::PendingExecutionEventBytes,
+        );
+        process = process.with_vm_pending_byte_budgets(
+            VmPendingByteBudget::new(
+                internal_bytes,
+                queue_tracker::TrackedLimit::PendingKernelStdinBytes,
+            ),
+            Arc::clone(&internal_budget),
+        );
+        process
+            .queue_pending_execution_event(internal_event)
+            .expect("internal event fills aggregate budget");
+        let consumed_internal = process
+            .lease_pending_execution_event()
+            .expect("lease internal event")
+            .into_event();
+        assert!(matches!(
+            consumed_internal,
+            ActiveExecutionEvent::SignalState { signal: 10, .. }
+        ));
+        assert!(
+            internal_budget.try_reserve(internal_bytes),
+            "consuming an internal event must release before its handler resumes the producer"
+        );
+        internal_budget.release(internal_bytes);
+
+        process.kernel_handle.finish(0);
+        kernel.waitpid(process.kernel_pid).expect("reap process");
+    }
+}
+
+impl ToolExecution {
+    pub(crate) fn with_vm_pending_event_bytes_budget(
+        mut self,
+        budget: Arc<VmPendingByteBudget>,
+    ) -> Self {
+        debug_assert_eq!(self.pending_event_bytes.load(Ordering::Acquire), 0);
+        debug_assert!(self
+            .pending_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+        self.vm_pending_event_bytes_budget = budget;
+        self
+    }
+}
+
+impl Drop for ToolExecution {
+    fn drop(&mut self) {
+        // Stop a background callback producer before reclaiming the queue. The
+        // producer checks this flag while holding the same queue lock, so it
+        // cannot enqueue after the retained-byte total is released here.
+        self.cancelled.store(true, Ordering::Release);
+        let mut pending_events = self
+            .pending_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending_events.clear();
+        let pending_bytes = self.pending_event_bytes.swap(0, Ordering::AcqRel);
+        self.vm_pending_event_bytes_budget.release(pending_bytes);
+    }
+}
+
+fn add_host_net_description_counts(
+    descriptions: &BTreeMap<usize, bool>,
+    counts: &mut NetworkResourceCounts,
+) {
+    counts.sockets += descriptions.len();
+    counts.connections += descriptions
+        .values()
+        .filter(|connected| **connected)
+        .count();
+}
+
+fn add_live_host_net_transfer_descriptions(
+    registry: &HostNetTransferDescriptionRegistry,
+    descriptions: &mut BTreeMap<usize, bool>,
+) {
+    let mut transfers = registry.lock().unwrap_or_else(|error| error.into_inner());
+    transfers.retain(|description_id, transfer| {
+        let alive = transfer.handles.upgrade().is_some();
+        if alive {
+            descriptions
+                .entry(*description_id)
+                .and_modify(|connected| *connected |= transfer.connected)
+                .or_insert(transfer.connected);
+        }
+        alive
+    });
+}
+
+fn process_network_resource_counts_with_transfers(
+    kernel: &SidecarKernel,
+    process: &ActiveProcess,
+    registry: &HostNetTransferDescriptionRegistry,
+) -> NetworkResourceCounts {
+    let snapshot = kernel.resource_snapshot();
+    let mut counts = NetworkResourceCounts {
+        sockets: snapshot.sockets,
+        connections: snapshot.socket_connections,
+    };
+    let mut descriptions = BTreeMap::new();
+    process.collect_network_resource_counts(true, &mut descriptions, &mut counts);
+    add_live_host_net_transfer_descriptions(registry, &mut descriptions);
+    add_host_net_description_counts(&descriptions, &mut counts);
+    counts
+}
+
+impl ActiveExecutionEvent {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Stdout(bytes) | Self::Stderr(bytes) => {
+                std::mem::size_of::<Self>().saturating_add(bytes.len())
+            }
+            // Internal RPC events are serviced eagerly rather than retained;
+            // account a conservative fixed envelope if they are briefly
+            // deferred. Their wire payload is independently frame-bounded.
+            Self::JavascriptSyncRpcRequest(_) | Self::PythonVfsRpcRequest(_) => 4 * 1024,
+            Self::SignalState { .. } | Self::Exited(_) => std::mem::size_of::<Self>(),
+        }
+    }
+}
+
+impl ProcessEventEnvelope {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.connection_id
+            .len()
+            .saturating_add(self.session_id.len())
+            .saturating_add(self.vm_id.len())
+            .saturating_add(self.process_id.len())
+            .saturating_add(self.event.retained_bytes())
     }
 }
 
 fn poll_tool_process_event(
     execution: &ToolExecution,
 ) -> Result<Option<ActiveExecutionEvent>, SidecarError> {
+    poll_tool_process_event_leased(execution)
+        .map(|event| event.map(PolledExecutionEvent::into_event))
+}
+
+fn poll_tool_process_event_leased(
+    execution: &ToolExecution,
+) -> Result<Option<PolledExecutionEvent>, SidecarError> {
     let event = execution
         .pending_events
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .pop_front();
-    if event.is_some() {
-        return Ok(event);
+    if let Some(event) = event {
+        let event_bytes = event.retained_bytes();
+        execution
+            .pending_event_bytes
+            .fetch_sub(event_bytes, Ordering::AcqRel);
+        return Ok(Some(PolledExecutionEvent {
+            event,
+            reservation: Some(PendingExecutionEventReservation {
+                budget: Arc::clone(&execution.vm_pending_event_bytes_budget),
+                bytes: event_bytes,
+            }),
+        }));
     }
-    if execution.events_overflowed.load(Ordering::Relaxed) {
-        return Err(process_event_queue_overflow_error());
+    if let Some(reason) = execution
+        .event_overflow_reason
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return Err(SidecarError::InvalidState(reason));
     }
     Ok(None)
 }
@@ -740,23 +1395,11 @@ fn descendant_pending_execution_event_capacity(
     for child_process_id in child_path {
         child = child.child_processes.get(*child_process_id)?;
     }
-    Some(MAX_PROCESS_EVENT_QUEUE.saturating_sub(child.pending_execution_events.len()))
-}
-
-fn poll_child_execution_after_exit(
-    child: &mut ActiveProcess,
-    wait: Duration,
-) -> Result<Option<ActiveExecutionEvent>, SidecarError> {
-    match child.execution.poll_event_blocking(wait) {
-        Ok(event) => Ok(event),
-        Err(SidecarError::Execution(message))
-            if child.runtime == GuestRuntimeKind::WebAssembly
-                && message == WasmExecutionError::EventChannelClosed.to_string() =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
+    Some(
+        child
+            .pending_execution_event_count_limit
+            .saturating_sub(child.pending_execution_events.len()),
+    )
 }
 
 fn closed_javascript_event_channel(message: &str) -> bool {
@@ -820,6 +1463,26 @@ fn is_javascript_child_process_gone_error(error: &SidecarError) -> bool {
         error,
         SidecarError::Execution(message) if guest_errno_code(message) == Some("ECHILD")
     )
+}
+
+fn missing_javascript_child_kill_result(
+    next_child_process_id: usize,
+    child_process_id: &str,
+) -> Result<(), SidecarError> {
+    let previously_allocated = child_process_id
+        .strip_prefix("child-")
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|sequence| {
+            sequence != 0
+                && sequence <= next_child_process_id
+                && child_process_id == format!("child-{sequence}")
+        });
+    if previously_allocated {
+        return Ok(());
+    }
+    Err(SidecarError::InvalidState(format!(
+        "unknown child process {child_process_id} during kill"
+    )))
 }
 
 fn loopback_tls_transport_registry(
@@ -956,12 +1619,17 @@ impl LoopbackTlsPendingWriteHandle {
     }
 
     fn failure_error(&self) -> SidecarError {
-        let message = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|state| state.failure_message.clone())
-            .unwrap_or_else(|| String::from("loopback TLS pending write failed"));
+        let message = match self.state.lock() {
+            Ok(state) => state
+                .failure_message
+                .clone()
+                .unwrap_or_else(|| String::from("loopback TLS pending write failed")),
+            Err(_) => {
+                return SidecarError::InvalidState(String::from(
+                    "loopback TLS pending write state lock poisoned",
+                ));
+            }
+        };
         SidecarError::Execution(message)
     }
 
@@ -1487,6 +2155,975 @@ struct JavascriptHttp2SyncRpcServiceRequest<'a, B> {
     network_counts: NetworkResourceCounts,
 }
 
+#[derive(Debug)]
+enum TransferredHostNetSocket {
+    Tcp {
+        socket: ActiveTcpSocket,
+        metadata: TransferredHostNetMetadata,
+    },
+    TcpListener {
+        listener: ActiveTcpListener,
+        metadata: TransferredHostNetMetadata,
+    },
+    Udp {
+        socket: ActiveUdpSocket,
+        metadata: TransferredHostNetMetadata,
+    },
+    Unix {
+        socket: ActiveUnixSocket,
+        metadata: TransferredHostNetMetadata,
+    },
+    UnixListener {
+        listener: ActiveUnixListener,
+        metadata: TransferredHostNetMetadata,
+    },
+    Pending {
+        metadata: TransferredHostNetMetadata,
+        description_handles: Arc<()>,
+    },
+}
+
+impl TransferredHostNetSocket {
+    fn class(&self) -> &'static str {
+        match self {
+            Self::Tcp { .. } => "tcp",
+            Self::TcpListener { .. } => "listener",
+            Self::Udp { .. } => "udp",
+            Self::Unix { .. } => "unix",
+            Self::UnixListener { .. } => "unix-listener",
+            Self::Pending { .. } => "pending",
+        }
+    }
+
+    fn metadata(&self) -> &TransferredHostNetMetadata {
+        match self {
+            Self::Tcp { metadata, .. }
+            | Self::TcpListener { metadata, .. }
+            | Self::Udp { metadata, .. }
+            | Self::Unix { metadata, .. }
+            | Self::UnixListener { metadata, .. }
+            | Self::Pending { metadata, .. } => metadata,
+        }
+    }
+
+    fn description_identity(&self) -> (&Arc<()>, bool, bool) {
+        match self {
+            Self::Tcp { socket, .. } => (
+                &socket.description_handles,
+                true,
+                socket.kernel_socket_id.is_some(),
+            ),
+            Self::TcpListener { listener, .. } => (
+                &listener.description_handles,
+                false,
+                listener.kernel_socket_id.is_some(),
+            ),
+            Self::Udp { socket, .. } => (
+                &socket.description_handles,
+                false,
+                socket.kernel_socket_id.is_some(),
+            ),
+            Self::Unix { socket, .. } => (&socket.description_handles, true, false),
+            Self::UnixListener { listener, .. } => (&listener.description_handles, false, false),
+            Self::Pending {
+                description_handles,
+                ..
+            } => (description_handles, false, false),
+        }
+    }
+
+    fn clone_for_fd_transfer(&self) -> Result<Self, SidecarError> {
+        match self {
+            Self::Tcp { socket, metadata } => Ok(Self::Tcp {
+                socket: socket.clone_for_fd_transfer(),
+                metadata: metadata.clone(),
+            }),
+            Self::TcpListener { listener, metadata } => Ok(Self::TcpListener {
+                listener: listener.clone_for_fd_transfer()?,
+                metadata: metadata.clone(),
+            }),
+            Self::Udp { socket, metadata } => Ok(Self::Udp {
+                socket: socket.clone_for_fd_transfer()?,
+                metadata: metadata.clone(),
+            }),
+            Self::Unix { socket, metadata } => Ok(Self::Unix {
+                socket: socket.clone_for_fd_transfer(),
+                metadata: metadata.clone(),
+            }),
+            Self::UnixListener { listener, metadata } => Ok(Self::UnixListener {
+                listener: listener.clone_for_fd_transfer()?,
+                metadata: metadata.clone(),
+            }),
+            Self::Pending {
+                metadata,
+                description_handles,
+            } => Ok(Self::Pending {
+                metadata: metadata.clone(),
+                description_handles: Arc::clone(description_handles),
+            }),
+        }
+    }
+}
+
+fn register_host_net_transfer_description(
+    registry: &HostNetTransferDescriptionRegistry,
+    resource: &TransferredHostNetSocket,
+) {
+    let (handles, connected, kernel_backed) = resource.description_identity();
+    // Adopted kernel sockets remain present in the kernel resource snapshot
+    // while queued. Only sidecar-only descriptions need this weak queue lease.
+    if kernel_backed {
+        return;
+    }
+    let description_id = Arc::as_ptr(handles) as usize;
+    let mut descriptions = registry.lock().unwrap_or_else(|error| error.into_inner());
+    descriptions.retain(|_, description| description.handles.upgrade().is_some());
+    descriptions
+        .entry(description_id)
+        .and_modify(|description| description.connected |= connected)
+        .or_insert_with(|| HostNetTransferDescription {
+            handles: Arc::downgrade(handles),
+            connected,
+        });
+}
+
+#[derive(Debug, Clone)]
+struct TransferredHostNetMetadata {
+    domain: u32,
+    socket_type: u32,
+    protocol: u32,
+    nonblocking: bool,
+    recv_timeout_ms: Option<u64>,
+    bind_options: Option<Value>,
+    local_info: Option<Value>,
+    local_unix_address: Option<String>,
+    local_reservation: Option<String>,
+    remote_info: Option<Value>,
+    remote_unix_address: Option<String>,
+    listening: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostNetOpenDescriptionOptions {
+    nonblocking: bool,
+    recv_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SpawnHostNetSource {
+    Tcp(String),
+    TcpListener(String),
+    Udp(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResolvedHostNetSourceClass {
+    Tcp,
+    Unix,
+    TcpListener,
+    UnixListener,
+    Udp,
+}
+
+#[derive(Debug)]
+struct PreparedSpawnHostNetDescription {
+    guest_fds: Vec<u32>,
+    resource: TransferredHostNetSocket,
+    metadata: Value,
+}
+
+#[derive(Debug, Default)]
+struct PreparedSpawnHostNetFds {
+    descriptions: Vec<PreparedSpawnHostNetDescription>,
+    kernel_actions: Vec<JavascriptPosixSpawnFileAction>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SpawnHostNetFdState {
+    description: usize,
+    close_on_exec: bool,
+}
+
+const HOST_NET_AF_INET: u32 = 1;
+const HOST_NET_AF_INET6: u32 = 2;
+const HOST_NET_AF_UNIX: u32 = 3;
+const HOST_NET_SOCK_DGRAM: u32 = 5;
+const HOST_NET_SOCK_STREAM: u32 = 6;
+const HOST_NET_SOCKET_TYPE_MASK: u32 = 0x0f;
+const HOST_NET_SOCK_CLOEXEC: u32 = 0x2000;
+const HOST_NET_SOCK_NONBLOCK: u32 = 0x4000;
+const HOST_NET_IPPROTO_TCP: u32 = 6;
+const HOST_NET_IPPROTO_UDP: u32 = 17;
+const HOST_NET_METADATA_MAX_BYTES: usize = 16 * 1024;
+const HOST_NET_METADATA_MAX_STRING_BYTES: usize = 4 * 1024;
+const HOST_NET_RECV_TIMEOUT_MAX_MS: u64 = u32::MAX as u64;
+const LINUX_SCM_MAX_FD: usize = 253;
+
+fn validate_host_net_metadata_size(value: &Value, label: &str) -> Result<(), SidecarError> {
+    let encoded_len = serde_json::to_vec(value)
+        .map_err(|error| {
+            SidecarError::InvalidState(format!("EINVAL: invalid {label} metadata: {error}"))
+        })?
+        .len();
+    if encoded_len > HOST_NET_METADATA_MAX_BYTES {
+        return Err(SidecarError::InvalidState(format!(
+            "E2BIG: {label} metadata is {encoded_len} bytes, exceeding the {HOST_NET_METADATA_MAX_BYTES}-byte limit"
+        )));
+    }
+    fn validate_strings(value: &Value, label: &str) -> Result<(), SidecarError> {
+        match value {
+            Value::String(value) if value.len() > HOST_NET_METADATA_MAX_STRING_BYTES => {
+                Err(SidecarError::InvalidState(format!(
+                    "ENAMETOOLONG: {label} metadata string exceeds {HOST_NET_METADATA_MAX_STRING_BYTES} bytes"
+                )))
+            }
+            Value::Array(values) => {
+                for value in values {
+                    validate_strings(value, label)?;
+                }
+                Ok(())
+            }
+            Value::Object(values) => {
+                for (key, value) in values {
+                    if key.len() > HOST_NET_METADATA_MAX_STRING_BYTES {
+                        return Err(SidecarError::InvalidState(format!(
+                            "ENAMETOOLONG: {label} metadata key exceeds {HOST_NET_METADATA_MAX_STRING_BYTES} bytes"
+                        )));
+                    }
+                    validate_strings(value, label)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    validate_strings(value, label)
+}
+
+fn host_net_open_description_options(
+    value: &Value,
+    label: &str,
+) -> Result<HostNetOpenDescriptionOptions, SidecarError> {
+    validate_host_net_metadata_size(value, label)?;
+    let object = value.as_object().ok_or_else(|| {
+        SidecarError::InvalidState(String::from(
+            "EINVAL: host-network metadata must be an object",
+        ))
+    })?;
+    let nonblocking = match object.get("nonblocking") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(SidecarError::InvalidState(format!(
+                "EINVAL: {label} metadata nonblocking must be boolean"
+            )))
+        }
+    };
+    let recv_timeout_ms = match object.get("recvTimeoutMs") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let timeout = value.as_u64().ok_or_else(|| {
+                SidecarError::InvalidState(format!(
+                    "EINVAL: {label} metadata recvTimeoutMs must be a non-negative integer or null"
+                ))
+            })?;
+            if timeout > HOST_NET_RECV_TIMEOUT_MAX_MS {
+                return Err(SidecarError::InvalidState(format!(
+                    "EINVAL: {label} metadata recvTimeoutMs exceeds {HOST_NET_RECV_TIMEOUT_MAX_MS}"
+                )));
+            }
+            Some(timeout)
+        }
+    };
+    Ok(HostNetOpenDescriptionOptions {
+        nonblocking,
+        recv_timeout_ms,
+    })
+}
+
+fn host_net_domain(address: &SocketAddr) -> u32 {
+    if address.is_ipv4() {
+        HOST_NET_AF_INET
+    } else {
+        HOST_NET_AF_INET6
+    }
+}
+
+fn host_net_address_info(address: SocketAddr) -> Value {
+    json!({
+        "address": address.ip().to_string(),
+        "port": address.port(),
+    })
+}
+
+fn host_net_bind_options(address: SocketAddr) -> Value {
+    json!({
+        "host": address.ip().to_string(),
+        "port": address.port(),
+    })
+}
+
+fn host_net_unix_options(path: Option<&str>, abstract_path_hex: Option<&str>) -> Option<Value> {
+    if let Some(abstract_path_hex) = abstract_path_hex {
+        Some(json!({ "abstractPathHex": abstract_path_hex }))
+    } else {
+        path.map(|path| json!({ "path": path }))
+    }
+}
+
+fn host_net_unix_address(path: Option<&str>, abstract_path_hex: Option<&str>) -> String {
+    if let Some(abstract_path_hex) = abstract_path_hex {
+        format!("unix-abstract:{}", abstract_path_hex.to_ascii_lowercase())
+    } else if let Some(path) = path {
+        format!("unix:{path}")
+    } else {
+        String::from("unix-unnamed")
+    }
+}
+
+impl TransferredHostNetMetadata {
+    fn tcp_socket(socket: &ActiveTcpSocket, options: HostNetOpenDescriptionOptions) -> Self {
+        Self {
+            domain: host_net_domain(&socket.guest_remote_addr),
+            socket_type: HOST_NET_SOCK_STREAM,
+            protocol: HOST_NET_IPPROTO_TCP,
+            nonblocking: options.nonblocking,
+            recv_timeout_ms: options.recv_timeout_ms,
+            bind_options: None,
+            local_info: Some(host_net_address_info(socket.guest_local_addr)),
+            local_unix_address: None,
+            local_reservation: None,
+            remote_info: Some(host_net_address_info(socket.guest_remote_addr)),
+            remote_unix_address: None,
+            listening: false,
+        }
+    }
+
+    fn tcp_listener(listener: &ActiveTcpListener, options: HostNetOpenDescriptionOptions) -> Self {
+        let local = listener.guest_local_addr();
+        Self {
+            domain: host_net_domain(&local),
+            socket_type: HOST_NET_SOCK_STREAM,
+            protocol: HOST_NET_IPPROTO_TCP,
+            nonblocking: options.nonblocking,
+            recv_timeout_ms: options.recv_timeout_ms,
+            bind_options: Some(host_net_bind_options(local)),
+            local_info: Some(host_net_address_info(local)),
+            local_unix_address: None,
+            local_reservation: None,
+            remote_info: None,
+            remote_unix_address: None,
+            listening: true,
+        }
+    }
+
+    fn udp_socket(socket: &ActiveUdpSocket, options: HostNetOpenDescriptionOptions) -> Self {
+        let domain = match socket.family {
+            JavascriptUdpFamily::Ipv4 => HOST_NET_AF_INET,
+            JavascriptUdpFamily::Ipv6 => HOST_NET_AF_INET6,
+        };
+        Self {
+            domain,
+            socket_type: HOST_NET_SOCK_DGRAM,
+            protocol: HOST_NET_IPPROTO_UDP,
+            nonblocking: options.nonblocking,
+            recv_timeout_ms: options.recv_timeout_ms,
+            bind_options: socket.guest_local_addr.map(host_net_bind_options),
+            local_info: socket.guest_local_addr.map(host_net_address_info),
+            local_unix_address: None,
+            local_reservation: None,
+            remote_info: None,
+            remote_unix_address: None,
+            listening: false,
+        }
+    }
+
+    fn unix_socket(socket: &ActiveUnixSocket, options: HostNetOpenDescriptionOptions) -> Self {
+        Self {
+            domain: HOST_NET_AF_UNIX,
+            socket_type: HOST_NET_SOCK_STREAM,
+            protocol: 0,
+            nonblocking: options.nonblocking,
+            recv_timeout_ms: options.recv_timeout_ms,
+            bind_options: host_net_unix_options(
+                socket.local_path.as_deref(),
+                socket.local_abstract_path_hex.as_deref(),
+            ),
+            local_info: None,
+            local_unix_address: Some(host_net_unix_address(
+                socket.local_path.as_deref(),
+                socket.local_abstract_path_hex.as_deref(),
+            )),
+            local_reservation: None,
+            remote_info: None,
+            remote_unix_address: Some(host_net_unix_address(
+                socket.remote_path.as_deref(),
+                socket.remote_abstract_path_hex.as_deref(),
+            )),
+            listening: false,
+        }
+    }
+
+    fn unix_listener(
+        listener: &ActiveUnixListener,
+        options: HostNetOpenDescriptionOptions,
+    ) -> Self {
+        Self {
+            domain: HOST_NET_AF_UNIX,
+            socket_type: HOST_NET_SOCK_STREAM,
+            protocol: 0,
+            nonblocking: options.nonblocking,
+            recv_timeout_ms: options.recv_timeout_ms,
+            bind_options: host_net_unix_options(
+                Some(listener.path.as_str()),
+                listener.abstract_path_hex.as_deref(),
+            ),
+            local_info: None,
+            local_unix_address: Some(host_net_unix_address(
+                Some(listener.path.as_str()),
+                listener.abstract_path_hex.as_deref(),
+            )),
+            local_reservation: None,
+            remote_info: None,
+            remote_unix_address: None,
+            listening: listener.listener.is_some(),
+        }
+    }
+
+    fn pending(
+        value: &Value,
+        options: HostNetOpenDescriptionOptions,
+        label: &str,
+    ) -> Result<Self, SidecarError> {
+        let object = value
+            .as_object()
+            .expect("open-description options validated object");
+        let domain = required_host_net_u32(object, "domain", label)?;
+        let raw_socket_type = required_host_net_u32(object, "socketType", label)?;
+        if raw_socket_type
+            & !(HOST_NET_SOCKET_TYPE_MASK | HOST_NET_SOCK_NONBLOCK | HOST_NET_SOCK_CLOEXEC)
+            != 0
+        {
+            return Err(SidecarError::InvalidState(format!(
+                "EINVAL: {label} metadata socketType contains unsupported flags"
+            )));
+        }
+        let socket_type = raw_socket_type & HOST_NET_SOCKET_TYPE_MASK;
+        let requested_protocol = required_host_net_u32(object, "protocol", label)?;
+        let protocol = match (domain, socket_type, requested_protocol) {
+            (HOST_NET_AF_INET | HOST_NET_AF_INET6, HOST_NET_SOCK_STREAM, 0 | HOST_NET_IPPROTO_TCP) => {
+                HOST_NET_IPPROTO_TCP
+            }
+            (HOST_NET_AF_INET | HOST_NET_AF_INET6, HOST_NET_SOCK_DGRAM, 0 | HOST_NET_IPPROTO_UDP) => {
+                HOST_NET_IPPROTO_UDP
+            }
+            (HOST_NET_AF_UNIX, HOST_NET_SOCK_STREAM, 0) => 0,
+            _ => {
+                return Err(SidecarError::InvalidState(format!(
+                    "EPROTONOSUPPORT: {label} metadata does not describe a supported unconnected socket"
+                )))
+            }
+        };
+        let metadata = Self {
+            domain,
+            socket_type,
+            protocol,
+            nonblocking: options.nonblocking,
+            recv_timeout_ms: options.recv_timeout_ms,
+            bind_options: None,
+            local_info: None,
+            local_unix_address: (domain == HOST_NET_AF_UNIX).then(|| String::from("unix-unnamed")),
+            local_reservation: None,
+            remote_info: None,
+            remote_unix_address: None,
+            listening: false,
+        };
+        validate_host_net_metadata(value, &metadata, "pending", label)?;
+        Ok(metadata)
+    }
+
+    fn as_value(&self) -> Value {
+        json!({
+            "domain": self.domain,
+            "socketType": self.socket_type,
+            "protocol": self.protocol,
+            "nonblocking": self.nonblocking,
+            "recvTimeoutMs": self.recv_timeout_ms,
+            "bindOptions": self.bind_options,
+            "localInfo": self.local_info,
+            "localUnixAddress": self.local_unix_address,
+            "localReservation": self.local_reservation,
+            "remoteInfo": self.remote_info,
+            "remoteUnixAddress": self.remote_unix_address,
+            "listening": self.listening,
+        })
+    }
+}
+
+fn required_host_net_u32(
+    object: &Map<String, Value>,
+    name: &str,
+    label: &str,
+) -> Result<u32, SidecarError> {
+    object
+        .get(name)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            SidecarError::InvalidState(format!("EINVAL: {label} metadata field {name} must be u32"))
+        })
+}
+
+fn validate_host_net_metadata(
+    value: &Value,
+    expected: &TransferredHostNetMetadata,
+    expected_class: &str,
+    label: &str,
+) -> Result<(), SidecarError> {
+    let options = host_net_open_description_options(value, label)?;
+    if options.nonblocking != expected.nonblocking
+        || options.recv_timeout_ms != expected.recv_timeout_ms
+    {
+        return Err(host_net_metadata_mismatch(label, "open-description state"));
+    }
+    let object = value.as_object().ok_or_else(|| {
+        SidecarError::InvalidState(format!("EINVAL: {label} metadata must be an object"))
+    })?;
+    let domain = required_host_net_u32(object, "domain", label)?;
+    if domain != expected.domain {
+        return Err(host_net_metadata_mismatch(label, "domain"));
+    }
+    let socket_type = required_host_net_u32(object, "socketType", label)?;
+    if socket_type & !(HOST_NET_SOCKET_TYPE_MASK | HOST_NET_SOCK_NONBLOCK | HOST_NET_SOCK_CLOEXEC)
+        != 0
+        || socket_type & HOST_NET_SOCKET_TYPE_MASK != expected.socket_type
+    {
+        return Err(host_net_metadata_mismatch(label, "socketType"));
+    }
+    let protocol = required_host_net_u32(object, "protocol", label)?;
+    if protocol != 0 && protocol != expected.protocol {
+        return Err(host_net_metadata_mismatch(label, "protocol"));
+    }
+    if let Some(class) = object.get("class") {
+        if class.as_str() != Some(expected_class) {
+            return Err(host_net_metadata_mismatch(label, "class"));
+        }
+    }
+    let expected_value = expected.as_value();
+    let expected_object = expected_value
+        .as_object()
+        .expect("canonical host-network metadata is an object");
+    for name in [
+        "bindOptions",
+        "localInfo",
+        "localUnixAddress",
+        "localReservation",
+        "remoteInfo",
+        "remoteUnixAddress",
+        "listening",
+    ] {
+        let actual = object.get(name).unwrap_or(&Value::Null);
+        let canonical = expected_object.get(name).unwrap_or(&Value::Null);
+        if actual != canonical {
+            return Err(host_net_metadata_mismatch(label, name));
+        }
+    }
+    Ok(())
+}
+
+fn host_net_metadata_mismatch(label: &str, field: &str) -> SidecarError {
+    SidecarError::InvalidState(format!(
+        "EINVAL: {label} metadata {field} does not match the sidecar-owned socket"
+    ))
+}
+
+fn spawn_host_net_source(
+    fd: &JavascriptSpawnHostNetFd,
+) -> Result<SpawnHostNetSource, SidecarError> {
+    let mut sources = Vec::new();
+    if let Some(id) = fd.socket_id.as_deref().filter(|id| !id.is_empty()) {
+        validate_host_net_resource_id(id, "inherited socket id")?;
+        sources.push(SpawnHostNetSource::Tcp(id.to_owned()));
+    }
+    if let Some(id) = fd.server_id.as_deref().filter(|id| !id.is_empty()) {
+        validate_host_net_resource_id(id, "inherited listener id")?;
+        sources.push(SpawnHostNetSource::TcpListener(id.to_owned()));
+    }
+    if let Some(id) = fd.udp_socket_id.as_deref().filter(|id| !id.is_empty()) {
+        validate_host_net_resource_id(id, "inherited UDP socket id")?;
+        sources.push(SpawnHostNetSource::Udp(id.to_owned()));
+    }
+    if sources.len() != 1 {
+        return Err(SidecarError::InvalidState(String::from(
+            "EINVAL: inherited host-network fd requires exactly one resource id",
+        )));
+    }
+    Ok(sources.pop().expect("one source checked"))
+}
+
+fn validate_host_net_resource_id(id: &str, label: &str) -> Result<(), SidecarError> {
+    if id.len() > 256 {
+        return Err(SidecarError::InvalidState(format!(
+            "ENAMETOOLONG: {label} exceeds 256 bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn scm_rights_host_net_source(value: &Value) -> Result<Option<SpawnHostNetSource>, SidecarError> {
+    validate_host_net_metadata_size(value, "SCM_RIGHTS host-network")?;
+    let object = value.as_object().ok_or_else(|| {
+        SidecarError::InvalidState(String::from(
+            "EINVAL: SCM_RIGHTS host-network entry must be an object",
+        ))
+    })?;
+    let mut sources = Vec::new();
+    for (name, source) in [("socketId", 0u8), ("serverId", 1u8), ("udpSocketId", 2u8)] {
+        let Some(value) = object.get(name) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let id = value.as_str().filter(|id| !id.is_empty()).ok_or_else(|| {
+            SidecarError::InvalidState(format!(
+                "EINVAL: SCM_RIGHTS host-network {name} must be a non-empty string or null"
+            ))
+        })?;
+        validate_host_net_resource_id(id, name)?;
+        sources.push(match source {
+            0 => SpawnHostNetSource::Tcp(id.to_owned()),
+            1 => SpawnHostNetSource::TcpListener(id.to_owned()),
+            2 => SpawnHostNetSource::Udp(id.to_owned()),
+            _ => unreachable!(),
+        });
+    }
+    if sources.len() > 1 {
+        return Err(SidecarError::InvalidState(String::from(
+            "EINVAL: SCM_RIGHTS host-network entry requires at most one resource id",
+        )));
+    }
+    Ok(sources.pop())
+}
+
+fn posix_spawn_action_guest_fd(
+    action: &JavascriptPosixSpawnFileAction,
+    label: &str,
+) -> Result<u32, SidecarError> {
+    u32::try_from(action.guest_fd.unwrap_or(action.fd)).map_err(|_| {
+        SidecarError::InvalidState(format!(
+            "EBADF: invalid posix_spawn {label} fd {}",
+            action.guest_fd.unwrap_or(action.fd)
+        ))
+    })
+}
+
+fn posix_spawn_action_guest_source_fd(
+    action: &JavascriptPosixSpawnFileAction,
+) -> Result<u32, SidecarError> {
+    u32::try_from(action.guest_source_fd.unwrap_or(action.source_fd)).map_err(|_| {
+        SidecarError::InvalidState(format!(
+            "EBADF: invalid posix_spawn dup2 source {}",
+            action.guest_source_fd.unwrap_or(action.source_fd)
+        ))
+    })
+}
+
+impl PreparedSpawnHostNetFds {
+    fn inherited_fd_count(&self) -> usize {
+        self.descriptions
+            .iter()
+            .map(|description| description.guest_fds.len())
+            .sum()
+    }
+
+    fn bootstrap_json(&self) -> Value {
+        Value::Array(
+            self.descriptions
+                .iter()
+                .enumerate()
+                .map(|(index, description)| {
+                    let mut value = json!({
+                        "guestFds": description.guest_fds,
+                        "metadata": description.metadata,
+                    });
+                    let object = value
+                        .as_object_mut()
+                        .expect("spawn host-network bootstrap value is an object");
+                    let (key, id) = match description.resource {
+                        TransferredHostNetSocket::Tcp { .. } => {
+                            ("socketId", format!("spawn-tcp-{index}"))
+                        }
+                        TransferredHostNetSocket::TcpListener { .. } => {
+                            ("serverId", format!("spawn-listener-{index}"))
+                        }
+                        TransferredHostNetSocket::Udp { .. } => {
+                            ("udpSocketId", format!("spawn-udp-{index}"))
+                        }
+                        TransferredHostNetSocket::Unix { .. } => {
+                            ("socketId", format!("spawn-unix-{index}"))
+                        }
+                        TransferredHostNetSocket::UnixListener { .. } => {
+                            ("serverId", format!("spawn-unix-listener-{index}"))
+                        }
+                        TransferredHostNetSocket::Pending { .. } => unreachable!(
+                            "pending host-network descriptions are rejected before spawn"
+                        ),
+                    };
+                    object.insert(key.to_owned(), Value::String(id));
+                    value
+                })
+                .collect(),
+        )
+    }
+
+    fn install(self, child: &mut ActiveProcess) {
+        for (index, description) in self.descriptions.into_iter().enumerate() {
+            match description.resource {
+                TransferredHostNetSocket::Tcp { mut socket, .. } => {
+                    socket.listener_id = None;
+                    child
+                        .tcp_sockets
+                        .insert(format!("spawn-tcp-{index}"), socket);
+                }
+                TransferredHostNetSocket::TcpListener { listener, .. } => {
+                    child
+                        .tcp_listeners
+                        .insert(format!("spawn-listener-{index}"), listener);
+                }
+                TransferredHostNetSocket::Udp { socket, .. } => {
+                    child
+                        .udp_sockets
+                        .insert(format!("spawn-udp-{index}"), socket);
+                }
+                TransferredHostNetSocket::Unix { mut socket, .. } => {
+                    socket.listener_id = None;
+                    child
+                        .unix_sockets
+                        .insert(format!("spawn-unix-{index}"), socket);
+                }
+                TransferredHostNetSocket::UnixListener { listener, .. } => {
+                    child
+                        .unix_listeners
+                        .insert(format!("spawn-unix-listener-{index}"), listener);
+                }
+                TransferredHostNetSocket::Pending { .. } => {
+                    unreachable!("pending host-network descriptions are rejected before spawn")
+                }
+            }
+        }
+    }
+}
+
+fn transferred_hostnet_value(
+    class: &str,
+    metadata: TransferredHostNetMetadata,
+    id: Option<(&str, String)>,
+    local: Option<SocketAddr>,
+    remote: Option<SocketAddr>,
+) -> Value {
+    let mut value = json!({
+        "kind": "hostNet",
+        "class": class,
+        "domain": metadata.domain,
+        "socketType": metadata.socket_type,
+        "protocol": metadata.protocol,
+        "nonblocking": metadata.nonblocking,
+        "recvTimeoutMs": metadata.recv_timeout_ms,
+        "bindOptions": metadata.bind_options,
+        "localInfo": metadata.local_info,
+        "localUnixAddress": metadata.local_unix_address,
+        "localReservation": metadata.local_reservation,
+        "remoteInfo": metadata.remote_info,
+        "remoteUnixAddress": metadata.remote_unix_address,
+        "listening": metadata.listening,
+    });
+    let object = value
+        .as_object_mut()
+        .expect("transferred host-net value is an object");
+    if let Some((key, id)) = id {
+        object.insert(key.to_owned(), Value::String(id));
+    }
+    if let Some(local) = local {
+        object.insert(
+            String::from("localAddress"),
+            Value::String(local.ip().to_string()),
+        );
+        object.insert(String::from("localPort"), Value::from(local.port()));
+    }
+    if let Some(remote) = remote {
+        object.insert(
+            String::from("remoteAddress"),
+            Value::String(remote.ip().to_string()),
+        );
+        object.insert(String::from("remotePort"), Value::from(remote.port()));
+    }
+    value
+}
+
+fn adopt_kernel_socket_transfer_guard(
+    kernel: &mut SidecarKernel,
+    pid: u32,
+    socket_id: SocketId,
+    nonblocking: bool,
+) -> Result<agentos_kernel::fd_table::TransferredFd, SidecarError> {
+    let flags = if nonblocking {
+        agentos_kernel::fd_table::O_NONBLOCK
+    } else {
+        0
+    };
+    kernel
+        .fd_adopt_socket_transfer(EXECUTION_DRIVER_NAME, pid, socket_id, flags)
+        .map_err(kernel_error)
+}
+
+fn prepare_transferred_host_net_resource(
+    kernel: &mut SidecarKernel,
+    process: &mut ActiveProcess,
+    source: &SpawnHostNetSource,
+    value: &Value,
+    label: &str,
+) -> Result<TransferredHostNetSocket, SidecarError> {
+    // Resolve the sidecar-owned resource before reading any guest-controlled
+    // metadata. Metadata may describe open-description flags, but it never
+    // selects the resource class or lifecycle.
+    let resolved_class = match source {
+        SpawnHostNetSource::Tcp(socket_id) if process.tcp_sockets.contains_key(socket_id) => {
+            ResolvedHostNetSourceClass::Tcp
+        }
+        SpawnHostNetSource::Tcp(socket_id) if process.unix_sockets.contains_key(socket_id) => {
+            ResolvedHostNetSourceClass::Unix
+        }
+        SpawnHostNetSource::Tcp(socket_id) => {
+            return Err(SidecarError::InvalidState(format!(
+                "EBADF: unknown transferable socket {socket_id}"
+            )))
+        }
+        SpawnHostNetSource::TcpListener(listener_id)
+            if process.tcp_listeners.contains_key(listener_id) =>
+        {
+            ResolvedHostNetSourceClass::TcpListener
+        }
+        SpawnHostNetSource::TcpListener(listener_id)
+            if process.unix_listeners.contains_key(listener_id) =>
+        {
+            ResolvedHostNetSourceClass::UnixListener
+        }
+        SpawnHostNetSource::TcpListener(listener_id) => {
+            return Err(SidecarError::InvalidState(format!(
+                "EBADF: unknown transferable listener {listener_id}"
+            )))
+        }
+        SpawnHostNetSource::Udp(socket_id) if process.udp_sockets.contains_key(socket_id) => {
+            ResolvedHostNetSourceClass::Udp
+        }
+        SpawnHostNetSource::Udp(socket_id) => {
+            return Err(SidecarError::InvalidState(format!(
+                "EBADF: unknown transferable UDP socket {socket_id}"
+            )))
+        }
+    };
+    let options = host_net_open_description_options(value, label)?;
+    let resource = match (source, resolved_class) {
+        (SpawnHostNetSource::Tcp(socket_id), ResolvedHostNetSourceClass::Tcp) => {
+            let socket = process
+                .tcp_sockets
+                .get_mut(socket_id)
+                .expect("resolved TCP socket remains present");
+            let metadata = TransferredHostNetMetadata::tcp_socket(socket, options);
+            validate_host_net_metadata(value, &metadata, "tcp", label)?;
+            if socket.kernel_transfer_guard.is_none() {
+                if let Some(kernel_socket_id) = socket.kernel_socket_id {
+                    socket.kernel_transfer_guard = Some(adopt_kernel_socket_transfer_guard(
+                        kernel,
+                        process.kernel_pid,
+                        kernel_socket_id,
+                        options.nonblocking,
+                    )?);
+                }
+            }
+            TransferredHostNetSocket::Tcp {
+                socket: socket.clone_for_fd_transfer(),
+                metadata,
+            }
+        }
+        (SpawnHostNetSource::Tcp(socket_id), ResolvedHostNetSourceClass::Unix) => {
+            let socket = process
+                .unix_sockets
+                .get(socket_id)
+                .expect("resolved Unix socket remains present");
+            let metadata = TransferredHostNetMetadata::unix_socket(socket, options);
+            validate_host_net_metadata(value, &metadata, "unix", label)?;
+            TransferredHostNetSocket::Unix {
+                socket: socket.clone_for_fd_transfer(),
+                metadata,
+            }
+        }
+        (SpawnHostNetSource::TcpListener(listener_id), ResolvedHostNetSourceClass::TcpListener) => {
+            let listener = process
+                .tcp_listeners
+                .get_mut(listener_id)
+                .expect("resolved TCP listener remains present");
+            let metadata = TransferredHostNetMetadata::tcp_listener(listener, options);
+            validate_host_net_metadata(value, &metadata, "listener", label)?;
+            if listener.kernel_transfer_guard.is_none() {
+                if let Some(kernel_socket_id) = listener.kernel_socket_id {
+                    listener.kernel_transfer_guard = Some(adopt_kernel_socket_transfer_guard(
+                        kernel,
+                        process.kernel_pid,
+                        kernel_socket_id,
+                        options.nonblocking,
+                    )?);
+                }
+            }
+            TransferredHostNetSocket::TcpListener {
+                listener: listener.clone_for_fd_transfer()?,
+                metadata,
+            }
+        }
+        (
+            SpawnHostNetSource::TcpListener(listener_id),
+            ResolvedHostNetSourceClass::UnixListener,
+        ) => {
+            let listener = process
+                .unix_listeners
+                .get(listener_id)
+                .expect("resolved Unix listener remains present");
+            let metadata = TransferredHostNetMetadata::unix_listener(listener, options);
+            validate_host_net_metadata(value, &metadata, "unix-listener", label)?;
+            TransferredHostNetSocket::UnixListener {
+                listener: listener.clone_for_fd_transfer()?,
+                metadata,
+            }
+        }
+        (SpawnHostNetSource::Udp(socket_id), ResolvedHostNetSourceClass::Udp) => {
+            let socket = process.udp_sockets.get_mut(socket_id).ok_or_else(|| {
+                SidecarError::InvalidState(format!(
+                    "EBADF: unknown transferable UDP socket {socket_id}"
+                ))
+            })?;
+            let metadata = TransferredHostNetMetadata::udp_socket(socket, options);
+            validate_host_net_metadata(value, &metadata, "udp", label)?;
+            if socket.kernel_transfer_guard.is_none() {
+                if let Some(kernel_socket_id) = socket.kernel_socket_id {
+                    socket.kernel_transfer_guard = Some(adopt_kernel_socket_transfer_guard(
+                        kernel,
+                        process.kernel_pid,
+                        kernel_socket_id,
+                        options.nonblocking,
+                    )?);
+                }
+            }
+            TransferredHostNetSocket::Udp {
+                socket: socket.clone_for_fd_transfer()?,
+                metadata,
+            }
+        }
+        _ => unreachable!("resource source and resolved class must agree"),
+    };
+    Ok(resource)
+}
+
 impl ActiveTcpSocket {
     fn connect<B>(request: ActiveTcpConnectRequest<'_, B>) -> Result<Self, SidecarError>
     where
@@ -1611,7 +3248,7 @@ impl ActiveTcpSocket {
         Ok(Self {
             stream: Some(stream),
             pending_read_stream: Some(pending_read_stream),
-            events: Some(events),
+            events: Some(Arc::new(Mutex::new(events))),
             event_sender: Some(sender),
             event_pusher: Arc::new(Mutex::new(None)),
             kernel_socket_id: None,
@@ -1628,6 +3265,9 @@ impl ActiveTcpSocket {
             saw_local_shutdown,
             saw_remote_end,
             close_notified,
+            read_buffer: Arc::new(Mutex::new(VecDeque::new())),
+            description_handles: Arc::new(()),
+            kernel_transfer_guard: None,
         })
     }
 
@@ -1641,7 +3281,7 @@ impl ActiveTcpSocket {
         Self {
             stream: None,
             pending_read_stream: None,
-            events: Some(events),
+            events: Some(Arc::new(Mutex::new(events))),
             event_sender: Some(sender),
             event_pusher: Arc::new(Mutex::new(None)),
             kernel_socket_id: Some(socket_id),
@@ -1658,15 +3298,46 @@ impl ActiveTcpSocket {
             saw_local_shutdown: Arc::new(AtomicBool::new(false)),
             saw_remote_end: Arc::new(AtomicBool::new(false)),
             close_notified: Arc::new(AtomicBool::new(false)),
+            read_buffer: Arc::new(Mutex::new(VecDeque::new())),
+            description_handles: Arc::new(()),
+            kernel_transfer_guard: None,
         }
     }
 
+    fn clone_for_fd_transfer(&self) -> Self {
+        Self {
+            stream: self.stream.as_ref().map(Arc::clone),
+            pending_read_stream: self.pending_read_stream.as_ref().map(Arc::clone),
+            events: self.events.as_ref().map(Arc::clone),
+            event_sender: self.event_sender.clone(),
+            event_pusher: Arc::clone(&self.event_pusher),
+            kernel_socket_id: self.kernel_socket_id,
+            no_delay: self.no_delay,
+            keep_alive: self.keep_alive,
+            keep_alive_initial_delay_secs: self.keep_alive_initial_delay_secs,
+            guest_local_addr: self.guest_local_addr,
+            guest_remote_addr: self.guest_remote_addr,
+            listener_id: self.listener_id.clone(),
+            tls_mode: Arc::clone(&self.tls_mode),
+            tls_stream: Arc::clone(&self.tls_stream),
+            tls_state: Arc::clone(&self.tls_state),
+            loopback_tls_pending_write: Arc::clone(&self.loopback_tls_pending_write),
+            saw_local_shutdown: Arc::clone(&self.saw_local_shutdown),
+            saw_remote_end: Arc::clone(&self.saw_remote_end),
+            close_notified: Arc::clone(&self.close_notified),
+            read_buffer: Arc::clone(&self.read_buffer),
+            description_handles: Arc::clone(&self.description_handles),
+            kernel_transfer_guard: self.kernel_transfer_guard.clone(),
+        }
+    }
+
+    fn is_final_description_handle(&self) -> bool {
+        Arc::strong_count(&self.description_handles) == 1
+    }
+
     fn set_event_pusher(&self, session: Option<V8SessionHandle>, socket_id: String) {
-        let Some(session) = session else {
-            return;
-        };
         if let Ok(mut pusher) = self.event_pusher.lock() {
-            *pusher = Some(JavascriptSocketEventPusher { session, socket_id });
+            *pusher = session.map(|session| JavascriptSocketEventPusher { session, socket_id });
         }
     }
 
@@ -1684,6 +3355,10 @@ impl ActiveTcpSocket {
                 .as_ref()
                 .ok_or_else(|| {
                     SidecarError::InvalidState(String::from("TCP socket event channel missing"))
+                })?
+                .lock()
+                .map_err(|_| {
+                    SidecarError::InvalidState(String::from("TCP socket event lock poisoned"))
                 })?
                 .recv_timeout(wait)
             {
@@ -1797,11 +3472,96 @@ impl ActiveTcpSocket {
             .ok_or_else(|| {
                 SidecarError::InvalidState(String::from("TCP socket event channel missing"))
             })?
+            .lock()
+            .map_err(|_| {
+                SidecarError::InvalidState(String::from("TCP socket event lock poisoned"))
+            })?
             .recv_timeout(wait)
         {
             Ok(event) => Ok(Some(event)),
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => Ok(None),
+        }
+    }
+
+    fn buffered_read_event(
+        &self,
+        max_bytes: usize,
+        peek: bool,
+    ) -> Result<Option<JavascriptTcpSocketEvent>, SidecarError> {
+        let mut buffer = self.read_buffer.lock().map_err(|_| {
+            SidecarError::InvalidState(String::from("TCP shared read buffer lock poisoned"))
+        })?;
+        if buffer.is_empty() && max_bytes != 0 {
+            return Ok(None);
+        }
+        let take = buffer.len().min(max_bytes);
+        let bytes = if peek {
+            buffer.iter().take(take).copied().collect()
+        } else {
+            buffer.drain(..take).collect()
+        };
+        Ok(Some(JavascriptTcpSocketEvent::Data(bytes)))
+    }
+
+    fn poll_readable(
+        &mut self,
+        kernel: &mut SidecarKernel,
+        kernel_pid: u32,
+        wait: Duration,
+        max_bytes: usize,
+        peek: bool,
+        trace_enabled: bool,
+    ) -> Result<Option<JavascriptTcpSocketEvent>, SidecarError> {
+        if let Some(event) = self.buffered_read_event(max_bytes, peek)? {
+            return Ok(Some(event));
+        }
+        match self.poll(kernel, kernel_pid, wait, trace_enabled)? {
+            Some(JavascriptTcpSocketEvent::Data(bytes)) => {
+                self.read_buffer
+                    .lock()
+                    .map_err(|_| {
+                        SidecarError::InvalidState(String::from(
+                            "TCP shared read buffer lock poisoned",
+                        ))
+                    })?
+                    .extend(bytes);
+                self.buffered_read_event(max_bytes, peek)
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn poll_readiness(
+        &mut self,
+        kernel: &mut SidecarKernel,
+        kernel_pid: u32,
+        wait: Duration,
+        trace_enabled: bool,
+    ) -> Result<Option<JavascriptTcpSocketEvent>, SidecarError> {
+        if !self
+            .read_buffer
+            .lock()
+            .map_err(|_| {
+                SidecarError::InvalidState(String::from("TCP shared read buffer lock poisoned"))
+            })?
+            .is_empty()
+        {
+            return Ok(Some(JavascriptTcpSocketEvent::Data(Vec::new())));
+        }
+        match self.poll(kernel, kernel_pid, wait, trace_enabled)? {
+            Some(JavascriptTcpSocketEvent::Data(bytes)) => {
+                self.read_buffer
+                    .lock()
+                    .map_err(|_| {
+                        SidecarError::InvalidState(String::from(
+                            "TCP shared read buffer lock poisoned",
+                        ))
+                    })?
+                    .extend(bytes);
+                Ok(Some(JavascriptTcpSocketEvent::Data(Vec::new())))
+            }
+            other => Ok(other),
         }
     }
 
@@ -1893,7 +3653,7 @@ impl ActiveTcpSocket {
     fn upgrade_tls(
         &self,
         vm_id: &str,
-        kernel: &SidecarKernel,
+        kernel: &mut SidecarKernel,
         options: JavascriptTlsBridgeOptions,
     ) -> Result<(), SidecarError> {
         if self.tls_mode.load(Ordering::SeqCst) {
@@ -1906,6 +3666,7 @@ impl ActiveTcpSocket {
             None
         };
 
+        let default_ca_bundle = vm_default_ca_bundle_for_tls_options(kernel, &options)?;
         let (tls_stream, loopback_pending_write) = if let Some(socket_id) = self.kernel_socket_id {
             let peer_socket_id = wait_for_loopback_peer_socket_id(kernel, socket_id)
                 .ok_or_else(|| {
@@ -1921,7 +3682,9 @@ impl ActiveTcpSocket {
                 )?)
             } else {
                 ActiveTlsStream::LoopbackClient(build_client_loopback_tls_stream(
-                    endpoint, &options,
+                    endpoint,
+                    &options,
+                    &default_ca_bundle,
                 )?)
             };
             (tls_stream, Some(pending_write))
@@ -1956,7 +3719,11 @@ impl ActiveTcpSocket {
                 )
             } else {
                 (
-                    ActiveTlsStream::Client(build_client_tls_stream(cloned, &options)?),
+                    ActiveTlsStream::Client(build_client_tls_stream(
+                        cloned,
+                        &options,
+                        &default_ca_bundle,
+                    )?),
                     None,
                 )
             }
@@ -2345,6 +4112,51 @@ fn unregister_kernel_readiness_target(
     }
 }
 
+fn rebind_process_runtime_event_targets(
+    process: &mut ActiveProcess,
+    kernel_readiness: &KernelSocketReadinessRegistry,
+) {
+    let session = process.execution.javascript_v8_session_handle();
+
+    for (socket_id, socket) in &process.tcp_sockets {
+        socket.set_event_pusher(session.clone(), socket_id.clone());
+        unregister_kernel_readiness_target(kernel_readiness, socket.kernel_socket_id);
+        register_kernel_readiness_target(
+            kernel_readiness,
+            socket.kernel_socket_id,
+            session.clone(),
+            socket_id.clone(),
+            KernelSocketReadinessEvent::Data,
+        );
+    }
+    for (socket_id, socket) in &process.unix_sockets {
+        socket.set_event_pusher(session.clone(), socket_id.clone());
+    }
+    for (listener_id, listener) in &process.tcp_listeners {
+        unregister_kernel_readiness_target(kernel_readiness, listener.kernel_socket_id);
+        register_kernel_readiness_target(
+            kernel_readiness,
+            listener.kernel_socket_id,
+            session.clone(),
+            listener_id.clone(),
+            KernelSocketReadinessEvent::Accept,
+        );
+    }
+    for (socket_id, socket) in &process.udp_sockets {
+        unregister_kernel_readiness_target(kernel_readiness, socket.kernel_socket_id);
+        register_kernel_readiness_target(
+            kernel_readiness,
+            socket.kernel_socket_id,
+            session.clone(),
+            socket_id.clone(),
+            KernelSocketReadinessEvent::Datagram,
+        );
+    }
+    if let Ok(mut http2) = process.http2.shared.lock() {
+        http2.event_session = session;
+    }
+}
+
 fn release_tcp_socket_handle(
     process: &mut ActiveProcess,
     socket_id: &str,
@@ -2352,26 +4164,52 @@ fn release_tcp_socket_handle(
     kernel: &mut SidecarKernel,
     kernel_readiness: &KernelSocketReadinessRegistry,
 ) {
+    if !socket.is_final_description_handle() {
+        return;
+    }
     unregister_kernel_readiness_target(kernel_readiness, socket.kernel_socket_id);
     if let Some(listener_id) = socket.listener_id.as_deref() {
         if let Some(listener) = process.tcp_listeners.get_mut(listener_id) {
             listener.release_connection(socket_id);
         }
     }
-    let _ = socket.close(kernel, process.kernel_pid);
+    if let Err(error) = socket.close(kernel, process.kernel_pid) {
+        eprintln!("failed to close TCP socket {socket_id}: {error}");
+    }
 }
 
 fn release_unix_socket_handle(
     process: &mut ActiveProcess,
     socket_id: &str,
-    socket: ActiveUnixSocket,
+    mut socket: ActiveUnixSocket,
+    socket_paths: &JavascriptSocketPathContext,
 ) {
+    if !socket.is_final_description_handle() {
+        return;
+    }
+    if socket.listener_id.is_some() {
+        if let Err(error) = socket.cache_remote_peer_metadata(&socket_paths.unix_bound_addresses) {
+            eprintln!("failed to cache Unix peer metadata for {socket_id}: {error}");
+        }
+        if let Some(state) = socket.connection_state.as_ref() {
+            state.accepted_peer_open.store(false, Ordering::SeqCst);
+        }
+    }
     if let Some(listener_id) = socket.listener_id.as_deref() {
         if let Some(listener) = process.unix_listeners.get_mut(listener_id) {
             listener.release_connection(socket_id);
         }
     }
-    let _ = socket.close();
+    if let Err(error) = socket.close() {
+        eprintln!("failed to close Unix socket {socket_id}: {error}");
+    }
+    if let Some(binding_id) = socket.local_registry_binding_id.as_deref() {
+        if let Err(error) =
+            release_guest_unix_binding(&socket_paths.unix_bound_addresses, binding_id)
+        {
+            eprintln!("failed to release Unix address metadata for {socket_id}: {error}");
+        }
+    }
 }
 
 impl ActiveTlsStream {
@@ -2510,10 +4348,480 @@ impl ActiveTlsStream {
 
 // Unix socket types moved to crate::state
 
+fn decode_abstract_unix_name(hex: &str) -> Result<Vec<u8>, SidecarError> {
+    if hex.len() % 2 != 0 || hex.len() > 214 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(SidecarError::InvalidState(String::from(
+            "abstract Unix socket names must be at most 107 bytes of hexadecimal data",
+        )));
+    }
+    hex.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16).expect("validated hex digit");
+            let low = (pair[1] as char).to_digit(16).expect("validated hex digit");
+            Ok(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
+fn abstract_unix_node_path(name: &[u8]) -> String {
+    let mut path = String::with_capacity(1 + name.len());
+    path.push('\0');
+    path.push_str(&String::from_utf8_lossy(name));
+    path
+}
+
+fn abstract_unix_name_hex(name: &[u8]) -> String {
+    let mut hex = String::with_capacity(name.len() * 2);
+    for byte in name {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    hex
+}
+
+fn abstract_unix_host_address_key(name: &[u8]) -> String {
+    format!("abstract:{}", abstract_unix_name_hex(name))
+}
+
+fn pathname_unix_host_address_key(path: &Path) -> String {
+    format!("pathname:{}", path.to_string_lossy())
+}
+
+fn unix_host_address_key(address: &UnixSocketAddr) -> Option<String> {
+    if let Some(path) = address.as_pathname() {
+        return Some(pathname_unix_host_address_key(path));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(name) = address.as_abstract_name() {
+        return Some(abstract_unix_host_address_key(name));
+    }
+    None
+}
+
+static NEXT_GUEST_UNIX_BINDING_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn guest_unix_binding_id(kernel_pid: u32, local_id: &str) -> String {
+    format!("{kernel_pid}:{local_id}")
+}
+
+fn register_guest_unix_binding(
+    registry: &GuestUnixAddressRegistry,
+    binding_id: &str,
+    host_address_key: &str,
+    address: GuestUnixAddress,
+    guest_device_inode: Option<(u64, u64)>,
+    host_path: Option<PathBuf>,
+) -> Result<(), SidecarError> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
+    if registry.contains_key(binding_id) {
+        return Err(SidecarError::InvalidState(format!(
+            "duplicate Unix binding id {binding_id}"
+        )));
+    }
+    registry.insert(
+        binding_id.to_owned(),
+        GuestUnixAddressRegistryEntry {
+            host_address_key: host_address_key.to_owned(),
+            address,
+            guest_device_inode,
+            host_path,
+            generation: NEXT_GUEST_UNIX_BINDING_GENERATION.fetch_add(1, Ordering::Relaxed),
+            active_bindings: 1,
+            queued_by_target: BTreeMap::new(),
+            pending_connections: VecDeque::new(),
+        },
+    );
+    Ok(())
+}
+
+fn guest_unix_path_target(
+    context: &JavascriptSocketPathContext,
+    guest_device_inode: (u64, u64),
+) -> Result<Option<(PathBuf, String, GuestUnixAddress)>, SidecarError> {
+    let registry = context
+        .unix_bound_addresses
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
+    Ok(registry.iter().find_map(|(binding_id, entry)| {
+        (entry.active_bindings > 0 && entry.guest_device_inode == Some(guest_device_inode)).then(
+            || {
+                entry
+                    .host_path
+                    .clone()
+                    .map(|path| (path, binding_id.clone(), entry.address.clone()))
+            },
+        )?
+    }))
+}
+
+fn guest_unix_address_for_host_key(
+    registry: &GuestUnixAddressRegistry,
+    host_address_key: &str,
+) -> Result<Option<GuestUnixAddress>, SidecarError> {
+    let registry = registry
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
+    Ok(registry
+        .values()
+        .filter(|entry| entry.host_address_key == host_address_key)
+        .max_by_key(|entry| entry.generation)
+        .map(|entry| entry.address.clone()))
+}
+
+fn guest_unix_binding_for_host_key(
+    registry: &GuestUnixAddressRegistry,
+    host_address_key: &str,
+) -> Result<Option<(String, GuestUnixAddress)>, SidecarError> {
+    let registry = registry
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
+    Ok(registry
+        .iter()
+        .filter(|(_, entry)| {
+            entry.active_bindings > 0 && entry.host_address_key == host_address_key
+        })
+        .max_by_key(|(_, entry)| entry.generation)
+        .map(|(binding_id, entry)| (binding_id.clone(), entry.address.clone())))
+}
+
+fn queue_guest_unix_peer(
+    registry: &GuestUnixAddressRegistry,
+    source_binding_id: &str,
+    target_binding_id: &str,
+) -> Result<(), SidecarError> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
+    let entry = registry.get_mut(source_binding_id).ok_or_else(|| {
+        SidecarError::InvalidState(format!(
+            "missing bound Unix address metadata for {source_binding_id}"
+        ))
+    })?;
+    let queued = entry
+        .queued_by_target
+        .entry(target_binding_id.to_owned())
+        .or_default();
+    *queued = queued.saturating_add(1);
+    Ok(())
+}
+
+fn register_guest_unix_connection(
+    registry: &GuestUnixAddressRegistry,
+    target_binding_id: &str,
+) -> Result<Arc<GuestUnixConnectionState>, SidecarError> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
+    let target = registry.get_mut(target_binding_id).ok_or_else(|| {
+        SidecarError::InvalidState(format!(
+            "missing target Unix address metadata for {target_binding_id}"
+        ))
+    })?;
+    let state = Arc::new(GuestUnixConnectionState {
+        accepted_peer_open: AtomicBool::new(true),
+    });
+    target.pending_connections.push_back(Arc::clone(&state));
+    Ok(state)
+}
+
+fn accept_guest_unix_connection(
+    registry: &GuestUnixAddressRegistry,
+    target_binding_id: &str,
+) -> Result<Arc<GuestUnixConnectionState>, SidecarError> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
+    registry
+        .get_mut(target_binding_id)
+        .and_then(|target| target.pending_connections.pop_front())
+        .ok_or_else(|| {
+            SidecarError::InvalidState(format!(
+                "missing pending Unix connection metadata for {target_binding_id}"
+            ))
+        })
+}
+
+fn close_pending_guest_unix_connections(
+    registry: &GuestUnixAddressRegistry,
+    target_binding_id: &str,
+) -> Result<(), SidecarError> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
+    if let Some(target) = registry.get_mut(target_binding_id) {
+        for state in target.pending_connections.drain(..) {
+            state.accepted_peer_open.store(false, Ordering::SeqCst);
+        }
+    }
+    Ok(())
+}
+
+fn guest_unix_connection_peer_open(state: Option<&Arc<GuestUnixConnectionState>>) -> bool {
+    state.is_some_and(|state| state.accepted_peer_open.load(Ordering::SeqCst))
+}
+
+fn consume_guest_unix_peer(
+    registry: &GuestUnixAddressRegistry,
+    source_host_address_key: &str,
+    target_binding_id: &str,
+) -> Result<Option<GuestUnixAddress>, SidecarError> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
+    let source_binding_id = registry
+        .iter()
+        .filter(|(_, entry)| {
+            entry.host_address_key == source_host_address_key
+                && entry
+                    .queued_by_target
+                    .get(target_binding_id)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0
+        })
+        .max_by_key(|(_, entry)| entry.generation)
+        .map(|(binding_id, _)| binding_id.clone());
+    let Some(source_binding_id) = source_binding_id else {
+        return Ok(None);
+    };
+    let entry = registry
+        .get_mut(&source_binding_id)
+        .expect("selected Unix binding remains registered");
+    let address = entry.address.clone();
+    if let Some(queued) = entry.queued_by_target.get_mut(target_binding_id) {
+        *queued = queued.saturating_sub(1);
+        if *queued == 0 {
+            entry.queued_by_target.remove(target_binding_id);
+        }
+    }
+    if entry.active_bindings == 0 && entry.queued_by_target.is_empty() {
+        registry.remove(&source_binding_id);
+    }
+    Ok(Some(address))
+}
+
+fn release_guest_unix_binding(
+    registry: &GuestUnixAddressRegistry,
+    binding_id: &str,
+) -> Result<(), SidecarError> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
+    let Some(entry) = registry.get_mut(binding_id) else {
+        return Ok(());
+    };
+    entry.active_bindings = entry.active_bindings.saturating_sub(1);
+    if entry.active_bindings == 0 && entry.queued_by_target.is_empty() {
+        registry.remove(binding_id);
+    }
+    Ok(())
+}
+
+fn rollback_guest_unix_binding(
+    registry: &GuestUnixAddressRegistry,
+    binding_id: &str,
+) -> Result<(), SidecarError> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
+    registry.remove(binding_id);
+    Ok(())
+}
+
+fn rollback_guest_unix_path_binding(
+    registry: &GuestUnixAddressRegistry,
+    binding_id: &str,
+    kernel: &mut SidecarKernel,
+    guest_path: &str,
+    host_path: &Path,
+) -> Result<(), SidecarError> {
+    let registry_error = rollback_guest_unix_binding(registry, binding_id).err();
+    cleanup_private_unix_socket_path(host_path);
+    let marker_error = kernel.remove_file(guest_path).err().map(kernel_error);
+    match (registry_error, marker_error) {
+        (None, None) => Ok(()),
+        (Some(error), None) | (None, Some(error)) => Err(error),
+        (Some(registry_error), Some(marker_error)) => Err(SidecarError::Execution(format!(
+            "failed to roll back Unix socket metadata: {registry_error}; \
+             failed to remove Unix socket node {guest_path}: {marker_error}"
+        ))),
+    }
+}
+
+fn purge_guest_unix_target(
+    registry: &GuestUnixAddressRegistry,
+    target_binding_id: &str,
+) -> Result<(), SidecarError> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
+    registry.retain(|_, entry| {
+        entry.queued_by_target.remove(target_binding_id);
+        entry.active_bindings != 0 || !entry.queued_by_target.is_empty()
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod guest_unix_metadata_tests {
+    use super::*;
+
+    fn registry() -> GuestUnixAddressRegistry {
+        Arc::new(Mutex::new(BTreeMap::new()))
+    }
+
+    fn register_abstract(registry: &GuestUnixAddressRegistry, binding_id: &str, host_key: &str) {
+        register_guest_unix_binding(
+            registry,
+            binding_id,
+            host_key,
+            GuestUnixAddress {
+                path: format!("\0{binding_id}"),
+                abstract_path_hex: Some(String::from("61")),
+            },
+            None,
+            None,
+        )
+        .expect("register Unix address");
+    }
+
+    #[test]
+    fn pending_connection_guard_closes_rejected_peer() {
+        let state = Arc::new(GuestUnixConnectionState {
+            accepted_peer_open: AtomicBool::new(true),
+        });
+        {
+            let _guard = PendingUnixConnectionGuard {
+                state: Some(Arc::clone(&state)),
+            };
+        }
+        assert!(!guest_unix_connection_peer_open(Some(&state)));
+    }
+
+    #[test]
+    fn listener_close_marks_unaccepted_connections_closed() {
+        let registry = registry();
+        register_abstract(&registry, "target", "abstract:target");
+        let state = register_guest_unix_connection(&registry, "target")
+            .expect("register pending connection");
+        close_pending_guest_unix_connections(&registry, "target")
+            .expect("close pending connections");
+        assert!(!guest_unix_connection_peer_open(Some(&state)));
+        assert!(registry
+            .lock()
+            .expect("registry")
+            .get("target")
+            .expect("target")
+            .pending_connections
+            .is_empty());
+    }
+
+    #[test]
+    fn consumed_late_peer_metadata_returns_registry_to_baseline() {
+        let registry = registry();
+        register_abstract(&registry, "target", "abstract:target");
+        register_abstract(&registry, "source", "abstract:source");
+        queue_guest_unix_peer(&registry, "source", "target").expect("queue peer metadata");
+        release_guest_unix_binding(&registry, "source").expect("release source binding");
+
+        let address = consume_guest_unix_peer(&registry, "abstract:source", "target")
+            .expect("consume peer metadata");
+        assert!(address.is_some());
+        let registry = registry.lock().expect("registry");
+        assert!(registry.contains_key("target"));
+        assert!(!registry.contains_key("source"));
+    }
+}
+
+fn host_abstract_unix_name(context: &JavascriptSocketPathContext, guest_name: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"agentos-unix-abstract-v1\0");
+    digest.update(context.unix_abstract_namespace);
+    digest.update(guest_name);
+    digest.finalize().into()
+}
+
+fn guest_autobind_unix_name(kernel_pid: u32, listener_id: &str, nonce: u32) -> [u8; 5] {
+    let digest = Sha256::digest(format!(
+        "agentos-unix-autobind-v1\0{kernel_pid}\0{listener_id}\0{nonce}"
+    ));
+    let value =
+        ((u32::from(digest[0]) << 12) | (u32::from(digest[1]) << 4) | (u32::from(digest[2]) >> 4))
+            & 0x000f_ffff;
+    let encoded = format!("{value:05x}");
+    encoded
+        .as_bytes()
+        .try_into()
+        .expect("five hexadecimal digits")
+}
+
 impl ActiveUnixSocket {
-    fn connect(host_path: &Path, guest_path: &str) -> Result<Self, SidecarError> {
-        let stream = UnixStream::connect(host_path).map_err(sidecar_net_error)?;
-        Self::from_stream(stream, None, None, Some(guest_path.to_owned()))
+    fn connect(
+        host_path: &Path,
+        guest_path: &str,
+        max_buffered_bytes: usize,
+    ) -> Result<Self, SidecarError> {
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).map_err(sidecar_net_error)?;
+        socket.set_nonblocking(true).map_err(sidecar_net_error)?;
+        let address = SockAddr::unix(host_path).map_err(sidecar_net_error)?;
+        socket
+            .connect(&address)
+            .map_err(nonblocking_unix_connect_error)?;
+        socket.set_nonblocking(false).map_err(sidecar_net_error)?;
+        let stream: UnixStream = socket.into();
+        Self::from_stream(
+            stream,
+            None,
+            None,
+            Some(guest_path.to_owned()),
+            None,
+            None,
+            None,
+            None,
+            max_buffered_bytes,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn connect_abstract(
+        host_name: &[u8],
+        guest_name: &[u8],
+        max_buffered_bytes: usize,
+    ) -> Result<Self, SidecarError> {
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).map_err(sidecar_net_error)?;
+        socket.set_nonblocking(true).map_err(sidecar_net_error)?;
+        let address = UnixAddr::new_abstract(host_name)
+            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
+        connect_socket(socket.as_raw_fd(), &address).map_err(|error| {
+            nonblocking_unix_connect_error(std::io::Error::from_raw_os_error(error as i32))
+        })?;
+        socket.set_nonblocking(false).map_err(sidecar_net_error)?;
+        let stream: UnixStream = socket.into();
+        Self::from_stream(
+            stream,
+            None,
+            None,
+            Some(abstract_unix_node_path(guest_name)),
+            None,
+            Some(abstract_unix_name_hex(guest_name)),
+            None,
+            None,
+            max_buffered_bytes,
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn connect_abstract(
+        _host_name: &[u8],
+        _guest_name: &[u8],
+        _max_buffered_bytes: usize,
+    ) -> Result<Self, SidecarError> {
+        Err(SidecarError::Unsupported(String::from(
+            "abstract Unix sockets require a Linux sidecar host",
+        )))
     }
 
     fn from_stream(
@@ -2521,17 +4829,31 @@ impl ActiveUnixSocket {
         listener_id: Option<String>,
         local_path: Option<String>,
         remote_path: Option<String>,
+        local_abstract_path_hex: Option<String>,
+        remote_abstract_path_hex: Option<String>,
+        local_registry_binding_id: Option<String>,
+        private_host_path: Option<PathBuf>,
+        max_buffered_bytes: usize,
     ) -> Result<Self, SidecarError> {
         let read_stream = stream.try_clone().map_err(sidecar_net_error)?;
         let stream = Arc::new(Mutex::new(stream));
-        let (sender, events) = mpsc::channel();
+        let read_state = Arc::new((
+            Mutex::new(UnixSocketReadState {
+                bytes: VecDeque::new(),
+                terminal_events: VecDeque::new(),
+                max_buffered_bytes: max_buffered_bytes.max(1),
+                warned_near_limit: false,
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
         let event_pusher = Arc::new(Mutex::new(None));
         let saw_local_shutdown = Arc::new(AtomicBool::new(false));
         let saw_remote_end = Arc::new(AtomicBool::new(false));
         let close_notified = Arc::new(AtomicBool::new(false));
         spawn_unix_socket_reader(
             read_stream,
-            sender.clone(),
+            Arc::clone(&read_state),
             Arc::clone(&event_pusher),
             Arc::clone(&saw_local_shutdown),
             Arc::clone(&saw_remote_end),
@@ -2540,46 +4862,338 @@ impl ActiveUnixSocket {
 
         Ok(Self {
             stream,
-            events,
-            event_sender: sender,
+            read_state,
             event_pusher,
             listener_id,
             local_path,
             remote_path,
+            local_abstract_path_hex,
+            remote_abstract_path_hex,
+            local_registry_binding_id,
+            remote_registry_binding_id: None,
+            connection_state: None,
+            private_host_path,
             saw_local_shutdown,
             saw_remote_end,
             close_notified,
+            description_handles: Arc::new(()),
         })
     }
 
+    fn clone_for_fd_transfer(&self) -> Self {
+        Self {
+            stream: Arc::clone(&self.stream),
+            read_state: Arc::clone(&self.read_state),
+            event_pusher: Arc::clone(&self.event_pusher),
+            listener_id: self.listener_id.clone(),
+            local_path: self.local_path.clone(),
+            remote_path: self.remote_path.clone(),
+            local_abstract_path_hex: self.local_abstract_path_hex.clone(),
+            remote_abstract_path_hex: self.remote_abstract_path_hex.clone(),
+            local_registry_binding_id: self.local_registry_binding_id.clone(),
+            remote_registry_binding_id: self.remote_registry_binding_id.clone(),
+            connection_state: self.connection_state.clone(),
+            private_host_path: self.private_host_path.clone(),
+            saw_local_shutdown: Arc::clone(&self.saw_local_shutdown),
+            saw_remote_end: Arc::clone(&self.saw_remote_end),
+            close_notified: Arc::clone(&self.close_notified),
+            description_handles: Arc::clone(&self.description_handles),
+        }
+    }
+
+    fn is_final_description_handle(&self) -> bool {
+        Arc::strong_count(&self.description_handles) == 1
+    }
+
     fn set_event_pusher(&self, session: Option<V8SessionHandle>, socket_id: String) {
-        let Some(session) = session else {
-            return;
-        };
         if let Ok(mut pusher) = self.event_pusher.lock() {
-            *pusher = Some(JavascriptSocketEventPusher { session, socket_id });
+            *pusher = session.map(|session| JavascriptSocketEventPusher { session, socket_id });
         }
     }
 
-    fn poll(&mut self, wait: Duration) -> Result<Option<JavascriptTcpSocketEvent>, SidecarError> {
-        match self.events.recv_timeout(wait) {
-            Ok(event) => Ok(Some(event)),
-            Err(RecvTimeoutError::Timeout) => Ok(None),
-            Err(RecvTimeoutError::Disconnected) => Ok(None),
+    fn poll_readable(
+        &mut self,
+        wait: Duration,
+        max_bytes: usize,
+        peek: bool,
+    ) -> Result<Option<JavascriptTcpSocketEvent>, SidecarError> {
+        let deadline = Instant::now() + wait;
+        let (state_lock, ready) = &*self.read_state;
+        let mut state = state_lock.lock().map_err(|_| {
+            SidecarError::InvalidState(String::from("Unix socket read state lock poisoned"))
+        })?;
+        loop {
+            if max_bytes == 0 || !state.bytes.is_empty() {
+                let take = state.bytes.len().min(max_bytes);
+                let bytes = if peek {
+                    state.bytes.iter().take(take).copied().collect()
+                } else {
+                    let bytes = state.bytes.drain(..take).collect();
+                    ready.notify_all();
+                    bytes
+                };
+                return Ok(Some(JavascriptTcpSocketEvent::Data(bytes)));
+            }
+            if let Some(event) = state.terminal_events.pop_front() {
+                return Ok(Some(event));
+            }
+            if wait.is_zero() {
+                return Ok(None);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let (next_state, timeout) = ready.wait_timeout(state, remaining).map_err(|_| {
+                SidecarError::InvalidState(String::from("Unix socket read state lock poisoned"))
+            })?;
+            state = next_state;
+            if timeout.timed_out() && state.bytes.is_empty() && state.terminal_events.is_empty() {
+                return Ok(None);
+            }
         }
     }
 
-    fn socket_info(&self) -> Value {
-        unix_socket_info_value(self.local_path.as_deref(), self.remote_path.as_deref())
+    fn poll_readiness(
+        &mut self,
+        wait: Duration,
+    ) -> Result<Option<JavascriptTcpSocketEvent>, SidecarError> {
+        let deadline = Instant::now() + wait;
+        let (state_lock, ready) = &*self.read_state;
+        let mut state = state_lock.lock().map_err(|_| {
+            SidecarError::InvalidState(String::from("Unix socket read state lock poisoned"))
+        })?;
+        loop {
+            if !state.bytes.is_empty() {
+                return Ok(Some(JavascriptTcpSocketEvent::Data(Vec::new())));
+            }
+            if let Some(event) = state.terminal_events.pop_front() {
+                return Ok(Some(event));
+            }
+            if wait.is_zero() {
+                return Ok(None);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let (next_state, timeout) = ready.wait_timeout(state, remaining).map_err(|_| {
+                SidecarError::InvalidState(String::from("Unix socket read state lock poisoned"))
+            })?;
+            state = next_state;
+            if timeout.timed_out() && state.bytes.is_empty() && state.terminal_events.is_empty() {
+                return Ok(None);
+            }
+        }
     }
 
-    fn write_all(&self, contents: &[u8]) -> Result<usize, SidecarError> {
-        let mut stream = self
+    fn socket_info(&mut self, registry: &GuestUnixAddressRegistry) -> Result<Value, SidecarError> {
+        let stream = self
             .stream
             .lock()
             .map_err(|_| SidecarError::InvalidState(String::from("Unix socket lock poisoned")))?;
-        stream.write_all(contents).map_err(sidecar_net_error)?;
-        Ok(contents.len())
+        let local_address = stream.local_addr().map_err(sidecar_net_error)?;
+        let live_local = local_address
+            .as_pathname()
+            .map(pathname_unix_host_address_key)
+            .or_else(|| {
+                #[cfg(target_os = "linux")]
+                {
+                    local_address
+                        .as_abstract_name()
+                        .map(abstract_unix_host_address_key)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    None
+                }
+            });
+        let remote_address = stream.peer_addr().map_err(sidecar_net_error)?;
+        let live_remote = remote_address
+            .as_pathname()
+            .map(pathname_unix_host_address_key)
+            .or_else(|| {
+                #[cfg(target_os = "linux")]
+                {
+                    remote_address
+                        .as_abstract_name()
+                        .map(abstract_unix_host_address_key)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    None
+                }
+            });
+        drop(stream);
+        let local = live_local
+            .as_deref()
+            .map(|key| guest_unix_address_for_host_key(registry, key))
+            .transpose()?
+            .flatten();
+        let remote = if let (Some(key), Some(target_binding_id)) = (
+            live_remote.as_deref(),
+            self.remote_registry_binding_id.as_deref(),
+        ) {
+            consume_guest_unix_peer(registry, key, target_binding_id)?
+                .or(guest_unix_address_for_host_key(registry, key)?)
+        } else {
+            live_remote
+                .as_deref()
+                .map(|key| guest_unix_address_for_host_key(registry, key))
+                .transpose()?
+                .flatten()
+        };
+        if let Some(address) = remote.as_ref() {
+            self.remote_path = Some(address.path.clone());
+            self.remote_abstract_path_hex = address.abstract_path_hex.clone();
+        }
+        let local_path = local
+            .as_ref()
+            .map(|address| address.path.as_str())
+            .or(self.local_path.as_deref());
+        let remote_path = remote
+            .as_ref()
+            .map(|address| address.path.as_str())
+            .or(self.remote_path.as_deref());
+        let mut info = unix_socket_info_value(local_path, remote_path);
+        if let Some(object) = info.as_object_mut() {
+            object.insert(
+                String::from("localAbstractPathHex"),
+                json!(local
+                    .as_ref()
+                    .and_then(|address| address.abstract_path_hex.as_deref())
+                    .or(self.local_abstract_path_hex.as_deref())),
+            );
+            object.insert(
+                String::from("remoteAbstractPathHex"),
+                json!(remote
+                    .as_ref()
+                    .and_then(|address| address.abstract_path_hex.as_deref())
+                    .or(self.remote_abstract_path_hex.as_deref())),
+            );
+        }
+        Ok(info)
+    }
+
+    fn cache_remote_peer_metadata(
+        &mut self,
+        registry: &GuestUnixAddressRegistry,
+    ) -> Result<(), SidecarError> {
+        if self.remote_registry_binding_id.is_none() || self.remote_path.is_some() {
+            return Ok(());
+        }
+        self.socket_info(registry)?;
+        Ok(())
+    }
+
+    fn bind_path(
+        &mut self,
+        host_path: &Path,
+        guest_path: &str,
+        binding_id: &str,
+    ) -> Result<(), SidecarError> {
+        if let Some(parent) = host_path.parent() {
+            fs::create_dir_all(parent).map_err(sidecar_net_error)?;
+        }
+        let stream = self
+            .stream
+            .lock()
+            .map_err(|_| SidecarError::InvalidState(String::from("Unix socket lock poisoned")))?;
+        let address = UnixAddr::new(host_path)
+            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
+        bind_socket(stream.as_raw_fd(), &address)
+            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
+        drop(stream);
+        self.local_path = Some(guest_path.to_owned());
+        self.local_abstract_path_hex = None;
+        self.local_registry_binding_id = Some(binding_id.to_owned());
+        self.private_host_path = Some(host_path.to_path_buf());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bind_abstract(
+        &mut self,
+        host_name: &[u8],
+        guest_name: &[u8],
+        binding_id: &str,
+    ) -> Result<(), SidecarError> {
+        let stream = self
+            .stream
+            .lock()
+            .map_err(|_| SidecarError::InvalidState(String::from("Unix socket lock poisoned")))?;
+        let address = UnixAddr::new_abstract(host_name)
+            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
+        bind_socket(stream.as_raw_fd(), &address)
+            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
+        drop(stream);
+        self.local_path = Some(abstract_unix_node_path(guest_name));
+        self.local_abstract_path_hex = Some(abstract_unix_name_hex(guest_name));
+        self.local_registry_binding_id = Some(binding_id.to_owned());
+        Ok(())
+    }
+
+    fn write(
+        &self,
+        contents: &[u8],
+        nonblocking: bool,
+        max_wait: Duration,
+    ) -> Result<usize, SidecarError> {
+        if contents.is_empty() {
+            return Ok(0);
+        }
+        let stream = self
+            .stream
+            .lock()
+            .map_err(|_| SidecarError::InvalidState(String::from("Unix socket lock poisoned")))?;
+        let started = Instant::now();
+        let deadline = started + max_wait;
+        let warning_at = started + max_wait.mul_f64(0.8);
+        let mut warned = false;
+        loop {
+            let mut flags = MsgFlags::MSG_DONTWAIT;
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            {
+                flags |= MsgFlags::MSG_NOSIGNAL;
+            }
+            match send_socket(stream.as_raw_fd(), contents, flags) {
+                Ok(written) => return Ok(written),
+                Err(error) => {
+                    let error = std::io::Error::from_raw_os_error(error as i32);
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    if error.kind() != std::io::ErrorKind::WouldBlock {
+                        return Err(sidecar_net_error(error));
+                    }
+                }
+            }
+            if nonblocking {
+                return Err(sidecar_net_error(std::io::Error::from_raw_os_error(
+                    libc::EAGAIN,
+                )));
+            }
+
+            let now = Instant::now();
+            if !warned && now >= warning_at {
+                warned = true;
+                eprintln!(
+                    "[agentos] blocking AF_UNIX write is nearing limits.resources.maxBlockingReadMs ({} ms)",
+                    max_wait.as_millis()
+                );
+            }
+            if now >= deadline {
+                eprintln!(
+                    "[agentos] blocking AF_UNIX write exceeded limits.resources.maxBlockingReadMs ({} ms); raise limits.resources.maxBlockingReadMs if needed",
+                    max_wait.as_millis()
+                );
+                return Err(sidecar_net_error(std::io::Error::from_raw_os_error(
+                    libc::ETIMEDOUT,
+                )));
+            }
+            let poll_deadline = deadline.min(now + JAVASCRIPT_NET_POLL_MAX_WAIT);
+            wait_fd_writable_until(stream.as_fd(), poll_deadline).map_err(sidecar_net_error)?;
+        }
     }
 
     fn shutdown_write(&self) -> Result<(), SidecarError> {
@@ -2594,14 +5208,26 @@ impl ActiveUnixSocket {
         if self.saw_remote_end.load(Ordering::SeqCst)
             && !self.close_notified.swap(true, Ordering::SeqCst)
         {
-            let _ = self
-                .event_sender
-                .send(JavascriptTcpSocketEvent::Close { had_error: false });
+            let (state_lock, ready) = &*self.read_state;
+            let mut state = state_lock.lock().map_err(|_| {
+                SidecarError::InvalidState(String::from("Unix socket read state lock poisoned"))
+            })?;
+            state
+                .terminal_events
+                .push_back(JavascriptTcpSocketEvent::Close { had_error: false });
+            ready.notify_all();
         }
         Ok(())
     }
 
     fn close(&self) -> Result<(), SidecarError> {
+        let (state_lock, ready) = &*self.read_state;
+        let mut state = state_lock.lock().map_err(|_| {
+            SidecarError::InvalidState(String::from("Unix socket read state lock poisoned"))
+        })?;
+        state.closed = true;
+        ready.notify_all();
+        drop(state);
         let stream = self
             .stream
             .lock()
@@ -2610,55 +5236,313 @@ impl ActiveUnixSocket {
     }
 }
 
+#[cfg(test)]
+mod unix_socket_io_safeguard_tests {
+    use super::ActiveUnixSocket;
+    use socket2::SockRef;
+    use std::time::Duration;
+
+    #[test]
+    #[ignore = "expensive saturation safeguard: fills a host AF_UNIX send buffer"]
+    fn stalled_unix_peer_times_out_instead_of_blocking_the_sync_rpc_forever() {
+        let (stream, peer) = std::os::unix::net::UnixStream::pair().expect("Unix stream pair");
+        SockRef::from(&stream)
+            .set_send_buffer_size(4 * 1024)
+            .expect("shrink send buffer");
+        let socket = ActiveUnixSocket::from_stream(
+            stream,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            64 * 1024,
+        )
+        .expect("active Unix socket");
+        let payload = vec![0xa5; 4 * 1024 * 1024];
+        let mut offset = 0;
+        let mut timeout = None;
+        while offset < payload.len() {
+            match socket.write(&payload[offset..], false, Duration::from_millis(20)) {
+                Ok(0) => panic!("AF_UNIX write made no progress"),
+                Ok(written) => offset += written,
+                Err(error) => {
+                    timeout = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        assert!(
+            timeout
+                .as_deref()
+                .is_some_and(|error| error.starts_with("ETIMEDOUT:")),
+            "stalled write must surface typed ETIMEDOUT, got {timeout:?} after {offset} bytes"
+        );
+        socket.close().expect("close saturated socket");
+        drop(peer);
+    }
+}
+
 // ActiveUnixListener moved to crate::state
 
 impl ActiveUnixListener {
+    fn bind_unlistened(host_path: &Path, guest_path: &str) -> Result<Self, SidecarError> {
+        if let Some(parent) = host_path.parent() {
+            fs::create_dir_all(parent).map_err(sidecar_net_error)?;
+        }
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).map_err(sidecar_net_error)?;
+        let address = SockAddr::unix(host_path).map_err(sidecar_net_error)?;
+        socket.bind(&address).map_err(sidecar_net_error)?;
+        Ok(Self {
+            listener: None,
+            bound_socket: Some(socket),
+            path: guest_path.to_owned(),
+            abstract_path_hex: None,
+            registry_binding_id: String::new(),
+            private_host_path: None,
+            guest_node_path: None,
+            backlog: DEFAULT_JAVASCRIPT_NET_BACKLOG as usize,
+            active_connection_ids: BTreeSet::new(),
+            description_handles: Arc::new(()),
+        })
+    }
+
     fn bind(
         host_path: &Path,
         guest_path: &str,
         backlog: Option<u32>,
     ) -> Result<Self, SidecarError> {
-        if let Some(parent) = host_path.parent() {
-            fs::create_dir_all(parent).map_err(sidecar_net_error)?;
-        }
-        let listener = UnixListener::bind(host_path).map_err(sidecar_net_error)?;
-        listener.set_nonblocking(true).map_err(sidecar_net_error)?;
+        let mut listener = Self::bind_unlistened(host_path, guest_path)?;
+        listener.listen(backlog)?;
+        Ok(listener)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn bind_abstract_unlistened(host_name: &[u8], guest_name: &[u8]) -> Result<Self, SidecarError> {
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).map_err(sidecar_net_error)?;
+        let address = UnixAddr::new_abstract(host_name)
+            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
+        bind_socket(socket.as_raw_fd(), &address)
+            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
         Ok(Self {
-            listener,
-            path: guest_path.to_owned(),
-            backlog: usize::try_from(backlog.unwrap_or(DEFAULT_JAVASCRIPT_NET_BACKLOG))
-                .expect("default backlog fits within usize"),
+            listener: None,
+            bound_socket: Some(socket),
+            path: abstract_unix_node_path(guest_name),
+            abstract_path_hex: Some(abstract_unix_name_hex(guest_name)),
+            registry_binding_id: String::new(),
+            private_host_path: None,
+            guest_node_path: None,
+            backlog: DEFAULT_JAVASCRIPT_NET_BACKLOG as usize,
             active_connection_ids: BTreeSet::new(),
+            description_handles: Arc::new(()),
         })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn bind_abstract_unlistened(
+        _host_name: &[u8],
+        _guest_name: &[u8],
+    ) -> Result<Self, SidecarError> {
+        Err(SidecarError::Unsupported(String::from(
+            "abstract Unix sockets require a Linux sidecar host",
+        )))
+    }
+
+    fn bind_abstract(
+        host_name: &[u8],
+        guest_name: &[u8],
+        backlog: Option<u32>,
+    ) -> Result<Self, SidecarError> {
+        let mut listener = Self::bind_abstract_unlistened(host_name, guest_name)?;
+        listener.listen(backlog)?;
+        Ok(listener)
+    }
+
+    fn listen(&mut self, backlog: Option<u32>) -> Result<(), SidecarError> {
+        let backlog = usize::try_from(backlog.unwrap_or(DEFAULT_JAVASCRIPT_NET_BACKLOG))
+            .expect("default backlog fits within usize");
+        if let Some(socket) = self.bound_socket.as_ref() {
+            socket
+                .listen(i32::try_from(backlog).unwrap_or(i32::MAX))
+                .map_err(sidecar_net_error)?;
+            socket.set_nonblocking(true).map_err(sidecar_net_error)?;
+            let socket = self
+                .bound_socket
+                .take()
+                .expect("bound socket remains owned until listen succeeds");
+            self.listener = Some(socket.into());
+        } else if let Some(listener) = self.listener.as_ref() {
+            SockRef::from(listener)
+                .listen(i32::try_from(backlog).unwrap_or(i32::MAX))
+                .map_err(sidecar_net_error)?;
+        } else {
+            return Err(sidecar_net_error(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
+        }
+        self.backlog = backlog;
+        Ok(())
+    }
+
+    fn connect_bound_path(
+        &mut self,
+        host_path: &Path,
+        guest_path: &str,
+        binding_id: &str,
+        max_buffered_bytes: usize,
+    ) -> Result<ActiveUnixSocket, SidecarError> {
+        let socket = self
+            .bound_socket
+            .as_ref()
+            .ok_or_else(|| sidecar_net_error(std::io::Error::from_raw_os_error(libc::EINVAL)))?;
+        socket.set_nonblocking(true).map_err(sidecar_net_error)?;
+        let address = SockAddr::unix(host_path).map_err(sidecar_net_error)?;
+        socket
+            .connect(&address)
+            .map_err(nonblocking_unix_connect_error)?;
+        socket.set_nonblocking(false).map_err(sidecar_net_error)?;
+        let stream: UnixStream = self
+            .bound_socket
+            .take()
+            .expect("bound socket exists after successful connect")
+            .into();
+        ActiveUnixSocket::from_stream(
+            stream,
+            None,
+            Some(self.path.clone()),
+            Some(guest_path.to_owned()),
+            self.abstract_path_hex.clone(),
+            None,
+            Some(binding_id.to_owned()),
+            self.private_host_path.take(),
+            max_buffered_bytes,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn connect_bound_abstract(
+        &mut self,
+        host_name: &[u8],
+        guest_name: &[u8],
+        binding_id: &str,
+        max_buffered_bytes: usize,
+    ) -> Result<ActiveUnixSocket, SidecarError> {
+        let socket = self
+            .bound_socket
+            .as_ref()
+            .ok_or_else(|| sidecar_net_error(std::io::Error::from_raw_os_error(libc::EINVAL)))?;
+        socket.set_nonblocking(true).map_err(sidecar_net_error)?;
+        let address = UnixAddr::new_abstract(host_name)
+            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
+        connect_socket(socket.as_raw_fd(), &address).map_err(|error| {
+            nonblocking_unix_connect_error(std::io::Error::from_raw_os_error(error as i32))
+        })?;
+        socket.set_nonblocking(false).map_err(sidecar_net_error)?;
+        let stream: UnixStream = self
+            .bound_socket
+            .take()
+            .expect("bound socket exists after successful connect")
+            .into();
+        ActiveUnixSocket::from_stream(
+            stream,
+            None,
+            Some(self.path.clone()),
+            Some(abstract_unix_node_path(guest_name)),
+            self.abstract_path_hex.clone(),
+            Some(abstract_unix_name_hex(guest_name)),
+            Some(binding_id.to_owned()),
+            self.private_host_path.take(),
+            max_buffered_bytes,
+        )
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn connect_bound_abstract(
+        &mut self,
+        _host_name: &[u8],
+        _guest_name: &[u8],
+        _binding_id: &str,
+        _max_buffered_bytes: usize,
+    ) -> Result<ActiveUnixSocket, SidecarError> {
+        Err(SidecarError::Unsupported(String::from(
+            "abstract Unix sockets require a Linux sidecar host",
+        )))
     }
 
     fn path(&self) -> &str {
         &self.path
     }
 
+    fn clone_for_fd_transfer(&self) -> Result<Self, SidecarError> {
+        Ok(Self {
+            listener: self
+                .listener
+                .as_ref()
+                .map(UnixListener::try_clone)
+                .transpose()
+                .map_err(sidecar_net_error)?,
+            bound_socket: self
+                .bound_socket
+                .as_ref()
+                .map(Socket::try_clone)
+                .transpose()
+                .map_err(sidecar_net_error)?,
+            path: self.path.clone(),
+            abstract_path_hex: self.abstract_path_hex.clone(),
+            registry_binding_id: self.registry_binding_id.clone(),
+            private_host_path: self.private_host_path.clone(),
+            guest_node_path: self.guest_node_path.clone(),
+            backlog: self.backlog,
+            active_connection_ids: self.active_connection_ids.clone(),
+            description_handles: Arc::clone(&self.description_handles),
+        })
+    }
+
+    fn is_final_description_handle(&self) -> bool {
+        Arc::strong_count(&self.description_handles) == 1
+    }
+
     fn poll(
         &mut self,
         wait: Duration,
+        context: &JavascriptSocketPathContext,
+        target_binding_id: &str,
     ) -> Result<Option<JavascriptUnixListenerEvent>, SidecarError> {
+        let listener = self
+            .listener
+            .as_ref()
+            .ok_or_else(|| sidecar_net_error(std::io::Error::from_raw_os_error(libc::EINVAL)))?;
         let deadline = Instant::now() + wait;
         loop {
-            match self.listener.accept() {
+            match listener.accept() {
                 Ok((stream, remote_addr)) => {
-                    if self.active_connection_ids.len() >= self.backlog {
-                        let _ = stream.shutdown(Shutdown::Both);
-                        if wait.is_zero() || Instant::now() >= deadline {
-                            return Ok(None);
-                        }
-                        continue;
-                    }
-
+                    let connection_state = accept_guest_unix_connection(
+                        &context.unix_bound_addresses,
+                        target_binding_id,
+                    )?;
                     let local_path = Some(self.path.clone());
-                    let remote_path = unix_socket_path(&remote_addr);
+                    let remote = match unix_host_address_key(&remote_addr) {
+                        Some(key) => consume_guest_unix_peer(
+                            &context.unix_bound_addresses,
+                            &key,
+                            target_binding_id,
+                        )?,
+                        None => None,
+                    };
+                    let remote_path = remote.as_ref().map(|address| address.path.clone());
                     return Ok(Some(JavascriptUnixListenerEvent::Connection(
                         PendingUnixSocket {
                             stream,
                             local_path,
                             remote_path,
+                            local_abstract_path_hex: self.abstract_path_hex.clone(),
+                            remote_abstract_path_hex: remote
+                                .and_then(|address| address.abstract_path_hex),
+                            connection_guard: PendingUnixConnectionGuard {
+                                state: Some(connection_state),
+                            },
                         },
                     )));
                 }
@@ -2666,7 +5550,9 @@ impl ActiveUnixListener {
                     if wait.is_zero() || Instant::now() >= deadline {
                         return Ok(None);
                     }
-                    if !wait_fd_readable_until(self.listener.as_fd(), deadline) {
+                    if !wait_fd_readable_until(listener.as_fd(), deadline)
+                        .map_err(sidecar_net_error)?
+                    {
                         return Ok(None);
                     }
                 }
@@ -2697,6 +5583,52 @@ impl ActiveUnixListener {
     }
 }
 
+fn cleanup_private_unix_socket_path(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!(
+            "failed to remove private Unix socket {}: {error}",
+            path.display()
+        ),
+    }
+}
+
+impl Drop for PendingUnixConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.as_ref() {
+            state.accepted_peer_open.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for ActiveUnixSocket {
+    fn drop(&mut self) {
+        if !self.is_final_description_handle() {
+            return;
+        }
+        if self.listener_id.is_some() {
+            if let Some(state) = self.connection_state.as_ref() {
+                state.accepted_peer_open.store(false, Ordering::SeqCst);
+            }
+        }
+        if let Some(path) = self.private_host_path.as_deref() {
+            cleanup_private_unix_socket_path(path);
+        }
+    }
+}
+
+impl Drop for ActiveUnixListener {
+    fn drop(&mut self) {
+        if !self.is_final_description_handle() {
+            return;
+        }
+        if let Some(path) = self.private_host_path.as_deref() {
+            cleanup_private_unix_socket_path(path);
+        }
+    }
+}
+
 impl ActiveTcpListener {
     fn bind(
         bind_host: &str,
@@ -2717,7 +5649,31 @@ impl ActiveTcpListener {
             backlog: usize::try_from(backlog.unwrap_or(DEFAULT_JAVASCRIPT_NET_BACKLOG))
                 .expect("default backlog fits within usize"),
             active_connection_ids: BTreeSet::new(),
+            description_handles: Arc::new(()),
+            kernel_transfer_guard: None,
         })
+    }
+
+    fn clone_for_fd_transfer(&self) -> Result<Self, SidecarError> {
+        Ok(Self {
+            listener: self
+                .listener
+                .as_ref()
+                .map(TcpListener::try_clone)
+                .transpose()
+                .map_err(sidecar_net_error)?,
+            kernel_socket_id: self.kernel_socket_id,
+            local_addr: self.local_addr,
+            guest_local_addr: self.guest_local_addr,
+            backlog: self.backlog,
+            active_connection_ids: self.active_connection_ids.clone(),
+            description_handles: Arc::clone(&self.description_handles),
+            kernel_transfer_guard: self.kernel_transfer_guard.clone(),
+        })
+    }
+
+    fn is_final_description_handle(&self) -> bool {
+        Arc::strong_count(&self.description_handles) == 1
     }
 
     fn bind_kernel(
@@ -2760,6 +5716,8 @@ impl ActiveTcpListener {
             backlog: usize::try_from(backlog.unwrap_or(DEFAULT_JAVASCRIPT_NET_BACKLOG))
                 .expect("default backlog fits within usize"),
             active_connection_ids: BTreeSet::new(),
+            description_handles: Arc::new(()),
+            kernel_transfer_guard: None,
         })
     }
 
@@ -2867,7 +5825,9 @@ impl ActiveTcpListener {
             {
                 Ok((stream, remote_addr)) => {
                     if self.active_connection_ids.len() >= self.backlog {
-                        let _ = stream.shutdown(Shutdown::Both);
+                        if let Err(error) = stream.shutdown(Shutdown::Both) {
+                            eprintln!("failed to reject excess Unix socket connection: {error}");
+                        }
                         if wait.is_zero() || Instant::now() >= deadline {
                             return Ok(None);
                         }
@@ -2896,7 +5856,9 @@ impl ActiveTcpListener {
                             .expect("TCP listener checked before accept")
                             .as_fd(),
                         deadline,
-                    ) {
+                    )
+                    .map_err(sidecar_net_error)?
+                    {
                         return Ok(None);
                     }
                 }
@@ -2911,6 +5873,9 @@ impl ActiveTcpListener {
     }
 
     fn close(&self, kernel: &mut SidecarKernel, kernel_pid: u32) -> Result<(), SidecarError> {
+        if !self.is_final_description_handle() {
+            return Ok(());
+        }
         if let Some(socket_id) = self.kernel_socket_id {
             close_kernel_socket_idempotent(kernel, kernel_pid, socket_id)?;
         }
@@ -2952,7 +5917,31 @@ impl ActiveUdpSocket {
             guest_local_addr: None,
             recv_buffer_size: 0,
             send_buffer_size: 0,
+            description_handles: Arc::new(()),
+            kernel_transfer_guard: None,
         })
+    }
+
+    fn clone_for_fd_transfer(&self) -> Result<Self, SidecarError> {
+        Ok(Self {
+            family: self.family,
+            socket: self
+                .socket
+                .as_ref()
+                .map(UdpSocket::try_clone)
+                .transpose()
+                .map_err(sidecar_net_error)?,
+            kernel_socket_id: self.kernel_socket_id,
+            guest_local_addr: self.guest_local_addr,
+            recv_buffer_size: self.recv_buffer_size,
+            send_buffer_size: self.send_buffer_size,
+            description_handles: Arc::clone(&self.description_handles),
+            kernel_transfer_guard: self.kernel_transfer_guard.clone(),
+        })
+    }
+
+    fn is_final_description_handle(&self) -> bool {
+        Arc::strong_count(&self.description_handles) == 1
     }
 
     fn local_addr(&self) -> Option<SocketAddr> {
@@ -3149,7 +6138,9 @@ impl ActiveUdpSocket {
                     if wait.is_zero() || Instant::now() >= deadline {
                         return Ok(None);
                     }
-                    if !wait_fd_readable_until(socket.as_fd(), deadline) {
+                    if !wait_fd_readable_until(socket.as_fd(), deadline)
+                        .map_err(sidecar_net_error)?
+                    {
                         return Ok(None);
                     }
                 }
@@ -3163,12 +6154,17 @@ impl ActiveUdpSocket {
         }
     }
 
-    fn close(&mut self, kernel: &mut SidecarKernel, kernel_pid: u32) {
-        if let Some(socket_id) = self.kernel_socket_id {
-            let _ = close_kernel_socket_idempotent(kernel, kernel_pid, socket_id);
+    fn close(&mut self, kernel: &mut SidecarKernel, kernel_pid: u32) -> Result<(), SidecarError> {
+        if !self.is_final_description_handle() {
+            return Ok(());
         }
+        let close_result = self
+            .kernel_socket_id
+            .map(|socket_id| close_kernel_socket_idempotent(kernel, kernel_pid, socket_id))
+            .transpose();
         self.socket.take();
         self.guest_local_addr = None;
+        close_result.map(|_| ())
     }
 
     fn set_buffer_size(&mut self, which: &str, size: usize) -> Result<(), SidecarError> {
@@ -3222,6 +6218,32 @@ impl ActiveUdpSocket {
 // ActiveExecution, ActiveExecutionEvent, SocketQueryKind moved to crate::state
 
 impl ActiveExecution {
+    pub(crate) fn is_prepared_for_start(&self) -> bool {
+        match self {
+            Self::Javascript(execution) => execution.is_prepared_for_start(),
+            Self::Python(execution) => execution.is_prepared_for_start(),
+            Self::Wasm(execution) => execution.is_prepared_for_start(),
+            Self::Tool(_) => false,
+        }
+    }
+
+    pub(crate) fn start_prepared(&mut self) -> Result<(), SidecarError> {
+        match self {
+            Self::Javascript(execution) => execution
+                .start_prepared()
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Python(execution) => execution
+                .start_prepared()
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Wasm(execution) => execution
+                .start_prepared()
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Tool(_) => Err(SidecarError::InvalidState(String::from(
+                "tool execution cannot be a prepared execve image",
+            ))),
+        }
+    }
+
     pub(crate) fn uses_shared_v8_runtime(&self) -> bool {
         match self {
             Self::Javascript(execution) => execution.uses_shared_v8_runtime(),
@@ -3245,17 +6267,10 @@ impl ActiveExecution {
             Self::Javascript(execution) => execution
                 .write_stdin(chunk)
                 .map_err(|error| SidecarError::Execution(error.to_string())),
-            Self::Python(execution) => execution
-                .write_stdin(chunk)
-                .map_err(|error| SidecarError::Execution(error.to_string())),
-            // Sidecar wasm always runs with kernel-managed stdio
-            // (AGENTOS_WASI_STDIO_SYNC_RPC=1): the guest reads fd 0 via
-            // `__kernel_stdin_read`, so skip the V8 `stdin` stream event —
-            // it is never consumed and would flood the session's deferred
-            // message queue while the guest blocks in a sync read.
-            Self::Wasm(execution) => execution
-                .write_stdin_kernel_only(chunk)
-                .map_err(|error| SidecarError::Execution(error.to_string())),
+            // Sidecar Python and WASM always read fd 0 from the sidecar kernel
+            // pipe. Their in-process LocalKernelStdinBridge is not consumed in
+            // this mode; duplicating input into it creates a hidden 16 MiB cap.
+            Self::Python(_) | Self::Wasm(_) => Ok(()),
             Self::Tool(_) => Ok(()),
         }
     }
@@ -3265,12 +6280,7 @@ impl ActiveExecution {
             Self::Javascript(execution) => execution
                 .close_stdin()
                 .map_err(|error| SidecarError::Execution(error.to_string())),
-            Self::Python(execution) => execution
-                .close_stdin()
-                .map_err(|error| SidecarError::Execution(error.to_string())),
-            Self::Wasm(execution) => execution
-                .close_stdin()
-                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Python(_) | Self::Wasm(_) => Ok(()),
             Self::Tool(_) => Ok(()),
         }
     }
@@ -3347,6 +6357,36 @@ impl ActiveExecution {
         }
     }
 
+    pub(crate) fn pause(&self) -> Result<(), SidecarError> {
+        match self {
+            Self::Javascript(execution) => execution
+                .pause()
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Python(execution) => execution
+                .pause()
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Wasm(execution) => execution
+                .pause()
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Tool(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn resume(&self) -> Result<(), SidecarError> {
+        match self {
+            Self::Javascript(execution) => execution
+                .resume()
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Python(execution) => execution
+                .resume()
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Wasm(execution) => execution
+                .resume()
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Tool(_) => Ok(()),
+        }
+    }
+
     pub(crate) fn respond_javascript_sync_rpc_success(
         &mut self,
         id: u64,
@@ -3364,6 +6404,47 @@ impl ActiveExecution {
                 .map_err(|error| SidecarError::Execution(error.to_string())),
             _ => Err(SidecarError::InvalidState(String::from(
                 "only JavaScript, Python, and WebAssembly executions can service JavaScript sync RPC responses",
+            ))),
+        }
+    }
+
+    pub(crate) fn claim_javascript_sync_rpc_response(
+        &mut self,
+        id: u64,
+    ) -> Result<bool, SidecarError> {
+        match self {
+            Self::Javascript(execution) => execution
+                .claim_sync_rpc_response(id)
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Python(execution) => execution
+                .claim_javascript_sync_rpc_response(id)
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Wasm(execution) => execution
+                .claim_sync_rpc_response(id)
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            _ => Err(SidecarError::InvalidState(String::from(
+                "only JavaScript, Python, and WebAssembly executions can claim JavaScript sync RPC responses",
+            ))),
+        }
+    }
+
+    pub(crate) fn respond_claimed_javascript_sync_rpc_success(
+        &mut self,
+        id: u64,
+        result: Value,
+    ) -> Result<(), SidecarError> {
+        match self {
+            Self::Javascript(execution) => execution
+                .respond_claimed_sync_rpc_success(id, result)
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Python(execution) => execution
+                .respond_claimed_javascript_sync_rpc_success(id, result)
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Wasm(execution) => execution
+                .respond_claimed_sync_rpc_success(id, result)
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            _ => Err(SidecarError::InvalidState(String::from(
+                "only JavaScript, Python, and WebAssembly executions can service claimed JavaScript sync RPC responses",
             ))),
         }
     }
@@ -3419,6 +6500,30 @@ impl ActiveExecution {
                 .map_err(|error| SidecarError::Execution(error.to_string())),
             _ => Err(SidecarError::InvalidState(String::from(
                 "only JavaScript, Python, and WebAssembly executions can service JavaScript sync RPC responses",
+            ))),
+        }
+    }
+
+    pub(crate) fn respond_claimed_javascript_sync_rpc_error(
+        &mut self,
+        id: u64,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), SidecarError> {
+        let code = code.into();
+        let message = message.into();
+        match self {
+            Self::Javascript(execution) => execution
+                .respond_claimed_sync_rpc_error(id, code, message)
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Python(execution) => execution
+                .respond_claimed_javascript_sync_rpc_error(id, code, message)
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            Self::Wasm(execution) => execution
+                .respond_claimed_sync_rpc_error(id, code, message)
+                .map_err(|error| SidecarError::Execution(error.to_string())),
+            _ => Err(SidecarError::InvalidState(String::from(
+                "only JavaScript, Python, and WebAssembly executions can service claimed JavaScript sync RPC errors",
             ))),
         }
     }
@@ -3583,22 +6688,74 @@ struct ToolProcessEventRequest {
     tool_resolution: ToolCommandResolution,
     cancelled: Arc<AtomicBool>,
     pending_events: Arc<Mutex<VecDeque<ActiveExecutionEvent>>>,
-    events_overflowed: Arc<AtomicBool>,
+    event_overflow_reason: Arc<Mutex<Option<String>>>,
+    pending_event_bytes: Arc<AtomicUsize>,
+    pending_event_count_limit: Arc<AtomicUsize>,
+    pending_event_bytes_limit: Arc<AtomicUsize>,
+    vm_pending_event_bytes_budget: Arc<VmPendingByteBudget>,
 }
 
 pub(crate) fn send_tool_process_event(
+    cancelled: &AtomicBool,
     pending_events: &Arc<Mutex<VecDeque<ActiveExecutionEvent>>>,
-    events_overflowed: &AtomicBool,
+    event_overflow_reason: &Mutex<Option<String>>,
+    pending_event_bytes: &AtomicUsize,
+    pending_event_count_limit: &AtomicUsize,
+    pending_event_bytes_limit: &AtomicUsize,
+    vm_pending_event_bytes_budget: &VmPendingByteBudget,
     event: ActiveExecutionEvent,
 ) -> bool {
     let mut pending_events = pending_events
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if pending_events.len() >= MAX_PROCESS_EVENT_QUEUE {
-        events_overflowed.store(true, Ordering::Relaxed);
+    if cancelled.load(Ordering::Acquire) {
+        return false;
+    }
+    let count_limit = pending_event_count_limit
+        .load(Ordering::Acquire)
+        .min(MAX_PROCESS_EVENT_QUEUE);
+    let event_bytes = event.retained_bytes();
+    let bytes = pending_event_bytes.load(Ordering::Acquire);
+    if pending_events.len() >= count_limit {
+        let mut reason = event_overflow_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reason.get_or_insert_with(|| {
+            format!(
+                "process execution event queue exceeded {count_limit} events \
+                 (limits.process.pendingEventCount); raise limits.process.pendingEventCount"
+            )
+        });
+        return false;
+    }
+    let byte_limit = pending_event_bytes_limit.load(Ordering::Acquire);
+    if bytes.saturating_add(event_bytes) > byte_limit {
+        let mut reason = event_overflow_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reason.get_or_insert_with(|| {
+            format!(
+                "process execution event queue exceeded {byte_limit} bytes \
+                 (limits.process.pendingEventBytes); raise limits.process.pendingEventBytes"
+            )
+        });
+        return false;
+    }
+    if !vm_pending_event_bytes_budget.try_reserve(event_bytes) {
+        let mut reason = event_overflow_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reason.get_or_insert_with(|| {
+            format!(
+                "VM process execution event queues exceeded {} bytes \
+                 (limits.process.pendingEventBytes); raise limits.process.pendingEventBytes",
+                vm_pending_event_bytes_budget.limit()
+            )
+        });
         return false;
     }
     pending_events.push_back(event);
+    pending_event_bytes.fetch_add(event_bytes, Ordering::AcqRel);
     true
 }
 
@@ -3611,20 +6768,34 @@ fn spawn_tool_process_events(request: ToolProcessEventRequest) {
         tool_resolution,
         cancelled,
         pending_events,
-        events_overflowed,
+        event_overflow_reason,
+        pending_event_bytes,
+        pending_event_count_limit,
+        pending_event_bytes_limit,
+        vm_pending_event_bytes_budget,
     } = request;
     std::thread::spawn(move || match tool_resolution {
         ToolCommandResolution::Failure(message) => {
             if !send_tool_process_event(
+                &cancelled,
                 &pending_events,
-                &events_overflowed,
+                &event_overflow_reason,
+                &pending_event_bytes,
+                &pending_event_count_limit,
+                &pending_event_bytes_limit,
+                &vm_pending_event_bytes_budget,
                 ActiveExecutionEvent::Stderr(format_tool_failure_output(&message)),
             ) {
                 return;
             }
             let _ = send_tool_process_event(
+                &cancelled,
                 &pending_events,
-                &events_overflowed,
+                &event_overflow_reason,
+                &pending_event_bytes,
+                &pending_event_count_limit,
+                &pending_event_bytes_limit,
+                &vm_pending_event_bytes_budget,
                 ActiveExecutionEvent::Exited(1),
             );
         }
@@ -3653,15 +6824,25 @@ fn spawn_tool_process_events(request: ToolProcessEventRequest) {
                             ))
                         });
                         if !send_tool_process_event(
+                            &cancelled,
                             &pending_events,
-                            &events_overflowed,
+                            &event_overflow_reason,
+                            &pending_event_bytes,
+                            &pending_event_count_limit,
+                            &pending_event_bytes_limit,
+                            &vm_pending_event_bytes_budget,
                             ActiveExecutionEvent::Stdout(stdout),
                         ) {
                             return;
                         }
                         let _ = send_tool_process_event(
+                            &cancelled,
                             &pending_events,
-                            &events_overflowed,
+                            &event_overflow_reason,
+                            &pending_event_bytes,
+                            &pending_event_count_limit,
+                            &pending_event_bytes_limit,
+                            &vm_pending_event_bytes_budget,
                             ActiveExecutionEvent::Exited(0),
                         );
                     } else {
@@ -3669,23 +6850,38 @@ fn spawn_tool_process_events(request: ToolProcessEventRequest) {
                             .error
                             .unwrap_or_else(|| String::from("tool invocation returned no result"));
                         if !send_tool_process_event(
+                            &cancelled,
                             &pending_events,
-                            &events_overflowed,
+                            &event_overflow_reason,
+                            &pending_event_bytes,
+                            &pending_event_count_limit,
+                            &pending_event_bytes_limit,
+                            &vm_pending_event_bytes_budget,
                             ActiveExecutionEvent::Stderr(format_tool_failure_output(&message)),
                         ) {
                             return;
                         }
                         let _ = send_tool_process_event(
+                            &cancelled,
                             &pending_events,
-                            &events_overflowed,
+                            &event_overflow_reason,
+                            &pending_event_bytes,
+                            &pending_event_count_limit,
+                            &pending_event_bytes_limit,
+                            &vm_pending_event_bytes_budget,
                             ActiveExecutionEvent::Exited(1),
                         );
                     }
                 }
                 Ok(_) => {
                     if !send_tool_process_event(
+                        &cancelled,
                         &pending_events,
-                        &events_overflowed,
+                        &event_overflow_reason,
+                        &pending_event_bytes,
+                        &pending_event_count_limit,
+                        &pending_event_bytes_limit,
+                        &vm_pending_event_bytes_budget,
                         ActiveExecutionEvent::Stderr(format_tool_failure_output(
                             "unexpected sidecar tool response",
                         )),
@@ -3693,15 +6889,25 @@ fn spawn_tool_process_events(request: ToolProcessEventRequest) {
                         return;
                     }
                     let _ = send_tool_process_event(
+                        &cancelled,
                         &pending_events,
-                        &events_overflowed,
+                        &event_overflow_reason,
+                        &pending_event_bytes,
+                        &pending_event_count_limit,
+                        &pending_event_bytes_limit,
+                        &vm_pending_event_bytes_budget,
                         ActiveExecutionEvent::Exited(1),
                     );
                 }
                 Err(error) => {
                     if !send_tool_process_event(
+                        &cancelled,
                         &pending_events,
-                        &events_overflowed,
+                        &event_overflow_reason,
+                        &pending_event_bytes,
+                        &pending_event_count_limit,
+                        &pending_event_bytes_limit,
+                        &vm_pending_event_bytes_budget,
                         ActiveExecutionEvent::Stderr(format_tool_failure_output(
                             &error.to_string(),
                         )),
@@ -3709,8 +6915,13 @@ fn spawn_tool_process_events(request: ToolProcessEventRequest) {
                         return;
                     }
                     let _ = send_tool_process_event(
+                        &cancelled,
                         &pending_events,
-                        &events_overflowed,
+                        &event_overflow_reason,
+                        &pending_event_bytes,
+                        &pending_event_count_limit,
+                        &pending_event_bytes_limit,
+                        &vm_pending_event_bytes_budget,
                         ActiveExecutionEvent::Exited(1),
                     );
                 }
@@ -3737,6 +6948,9 @@ where
             .vms
             .get_mut(&vm_id)
             .ok_or_else(|| missing_vm_error(&vm_id))?;
+        let process_event_limits = vm.limits.process.clone();
+        let vm_pending_stdin_bytes_budget = Arc::clone(&vm.pending_stdin_bytes_budget);
+        let vm_pending_event_bytes_budget = Arc::clone(&vm.pending_event_bytes_budget);
         if vm.active_processes.contains_key(&payload.process_id) {
             return Err(SidecarError::InvalidState(format!(
                 "VM {vm_id} already has an active process with id {}",
@@ -3770,10 +6984,14 @@ where
                     )
                     .map_err(kernel_error)?;
                 let kernel_pid = kernel_handle.pid();
-                let tool_execution = ToolExecution::default();
+                let tool_execution = ToolExecution::default()
+                    .with_vm_pending_event_bytes_budget(Arc::clone(&vm_pending_event_bytes_budget));
                 let cancelled = tool_execution.cancelled.clone();
                 let pending_events = tool_execution.pending_events.clone();
-                let events_overflowed = tool_execution.events_overflowed.clone();
+                let event_overflow_reason = tool_execution.event_overflow_reason.clone();
+                let pending_event_bytes = tool_execution.pending_event_bytes.clone();
+                let pending_event_count_limit = tool_execution.pending_event_count_limit.clone();
+                let pending_event_bytes_limit = tool_execution.pending_event_bytes_limit.clone();
                 vm.active_processes.insert(
                     payload.process_id.clone(),
                     ActiveProcess::new(
@@ -3781,6 +6999,11 @@ where
                         kernel_handle,
                         GuestRuntimeKind::JavaScript,
                         ActiveExecution::Tool(tool_execution),
+                    )
+                    .with_process_event_limits(&process_event_limits)
+                    .with_vm_pending_byte_budgets(
+                        Arc::clone(&vm_pending_stdin_bytes_budget),
+                        Arc::clone(&vm_pending_event_bytes_budget),
                     )
                     .with_guest_cwd(guest_cwd.clone())
                     .with_host_cwd(resolve_vm_guest_path_to_host(vm, &guest_cwd)),
@@ -3794,7 +7017,11 @@ where
                     tool_resolution,
                     cancelled,
                     pending_events,
-                    events_overflowed,
+                    event_overflow_reason,
+                    pending_event_bytes,
+                    pending_event_count_limit,
+                    pending_event_bytes_limit,
+                    vm_pending_event_bytes_budget: Arc::clone(&vm_pending_event_bytes_budget),
                 });
 
                 return Ok(DispatchResult {
@@ -3837,6 +7064,7 @@ where
             // needed because the isolate never reads kernel fd 0 itself.
         } else if resolved.runtime == GuestRuntimeKind::WebAssembly {
             env.insert(String::from(WASM_STDIO_SYNC_RPC_ENV), String::from("1"));
+            env.insert(String::from(WASM_EXEC_COMMIT_RPC_ENV), String::from("1"));
         }
         let launch_entrypoint = if resolved.runtime == GuestRuntimeKind::JavaScript {
             resolve_agentos_package_javascript_launch_entrypoint(vm, &mut env)
@@ -3912,6 +7140,7 @@ where
                             bootstrap_module: None,
                             compile_cache_root: Some(self.cache_root.join("node-compile-cache")),
                         });
+                let context_id = context.context_id;
                 record_execute_phase("js_create_context", phase_start.elapsed());
                 let phase_start = Instant::now();
                 let built_reader = build_module_reader(vm, &resolved);
@@ -3923,26 +7152,26 @@ where
                     built_reader.map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
                 record_execute_phase("js_build_module_reader", phase_start.elapsed());
                 let phase_start = Instant::now();
-                let execution = self
-                    .javascript_engine
-                    .start_execution_with_module_reader(
-                        StartJavascriptExecutionRequest {
-                            guest_runtime: guest_runtime_identity(vm, None, None),
-                            vm_id: vm_id.clone(),
-                            context_id: context.context_id,
-                            argv: std::iter::once(launch_entrypoint.clone())
-                                .chain(resolved.execution_args.iter().cloned())
-                                .collect(),
-                            env: env.clone(),
-                            cwd: resolved.host_cwd.clone(),
-                            limits: javascript_execution_limits(vm),
-                            inline_code,
-                            wasm_module_bytes: None,
-                        },
-                        module_reader,
-                        guest_reader,
-                    )
-                    .map_err(javascript_error)?;
+                let execution_result = self.javascript_engine.start_execution_with_module_reader(
+                    StartJavascriptExecutionRequest {
+                        guest_runtime: guest_runtime_identity(vm, None, None),
+                        vm_id: vm_id.clone(),
+                        context_id: context_id.clone(),
+                        argv: std::iter::once(launch_entrypoint.clone())
+                            .chain(resolved.execution_args.iter().cloned())
+                            .collect(),
+                        argv0: None,
+                        env: env.clone(),
+                        cwd: resolved.host_cwd.clone(),
+                        limits: javascript_execution_limits(vm),
+                        inline_code,
+                        wasm_module_bytes: None,
+                    },
+                    module_reader,
+                    guest_reader,
+                );
+                self.javascript_engine.dispose_context(&context_id);
+                let execution = execution_result.map_err(javascript_error)?;
                 record_execute_phase("js_start_execution", phase_start.elapsed());
                 (ActiveExecution::Javascript(execution), env.clone())
             }
@@ -3999,19 +7228,21 @@ where
                         vm_id: vm_id.clone(),
                         pyodide_dist_path,
                     });
-                let execution = self
-                    .python_engine
-                    .start_execution(StartPythonExecutionRequest {
-                        vm_id: vm_id.clone(),
-                        context_id: context.context_id,
-                        code: resolved.entrypoint.clone(),
-                        file_path: python_file_path,
-                        env: env.clone(),
-                        cwd: resolved.host_cwd.clone(),
-                        limits: python_execution_limits(vm),
-                        guest_runtime: guest_runtime_identity(vm, None, None),
-                    })
-                    .map_err(python_error)?;
+                let context_id = context.context_id;
+                let execution_result =
+                    self.python_engine
+                        .start_execution(StartPythonExecutionRequest {
+                            vm_id: vm_id.clone(),
+                            context_id: context_id.clone(),
+                            code: resolved.entrypoint.clone(),
+                            file_path: python_file_path,
+                            env: env.clone(),
+                            cwd: resolved.host_cwd.clone(),
+                            limits: python_execution_limits(vm),
+                            guest_runtime: guest_runtime_identity(vm, None, None),
+                        });
+                self.python_engine.dispose_context(&context_id);
+                let execution = execution_result.map_err(python_error)?;
                 (ActiveExecution::Python(execution), env.clone())
             }
             GuestRuntimeKind::WebAssembly => {
@@ -4030,19 +7261,20 @@ where
                     vm_id: vm_id.clone(),
                     module_path: Some(resolved.entrypoint.clone()),
                 });
-                let execution = self
-                    .wasm_engine
-                    .start_execution(StartWasmExecutionRequest {
+                let context_id = context.context_id;
+                let execution_result =
+                    self.wasm_engine.start_execution(StartWasmExecutionRequest {
                         vm_id: vm_id.clone(),
-                        context_id: context.context_id,
+                        context_id: context_id.clone(),
                         argv: resolved.process_args.clone(),
                         env: env.clone(),
                         cwd: resolved.host_cwd.clone(),
                         permission_tier: execution_wasm_permission_tier(wasm_permission_tier),
                         limits: wasm_limits,
                         guest_runtime: wasm_guest_runtime,
-                    })
-                    .map_err(wasm_error)?;
+                    });
+                self.wasm_engine.dispose_context(&context_id);
+                let execution = execution_result.map_err(wasm_error)?;
                 (ActiveExecution::Wasm(Box::new(execution)), env)
             }
         };
@@ -4056,6 +7288,11 @@ where
         vm.active_processes.insert(
             payload.process_id.clone(),
             ActiveProcess::new(kernel_pid, kernel_handle, resolved.runtime, execution)
+                .with_process_event_limits(&process_event_limits)
+                .with_vm_pending_byte_budgets(
+                    vm_pending_stdin_bytes_budget,
+                    vm_pending_event_bytes_budget,
+                )
                 .with_kernel_stdin_writer_fd(kernel_stdin_writer_fd)
                 .with_tty_master_fd(tty_master_fd)
                 .with_guest_cwd(resolved.guest_cwd.clone())
@@ -4161,6 +7398,7 @@ where
             .vms
             .get_mut(&vm_id)
             .ok_or_else(|| missing_vm_error(&vm_id))?;
+        let pending_stdin_limit = vm.limits.process.pending_stdin_bytes;
         let process = vm
             .active_processes
             .get_mut(&payload.process_id)
@@ -4180,7 +7418,7 @@ where
         if !tty_js {
             process.execution.write_stdin(&payload.chunk)?;
         }
-        write_kernel_process_stdin(&mut vm.kernel, process, &payload.chunk)?;
+        write_kernel_process_stdin(&mut vm.kernel, process, &payload.chunk, pending_stdin_limit)?;
 
         Ok(DispatchResult {
             response: stdin_written_response(
@@ -4582,10 +7820,10 @@ where
                 let Some(process) = vm.active_processes.get_mut(process_id) else {
                     break;
                 };
-                if let Some(event) = process.pending_execution_events.pop_front() {
+                if let Some(event) = process.lease_pending_execution_event() {
                     Some(event)
                 } else {
-                    match process.execution.poll_event_blocking(Duration::ZERO) {
+                    match process.poll_execution_event_blocking(Duration::ZERO) {
                         Ok(event) => event,
                         Err(SidecarError::Execution(message))
                             if (process.runtime == GuestRuntimeKind::JavaScript
@@ -4606,11 +7844,14 @@ where
                 break;
             };
 
-            match event {
+            match event.event() {
                 ActiveExecutionEvent::SignalState {
                     signal,
                     registration,
                 } => {
+                    let signal = *signal;
+                    let registration = registration.clone();
+                    drop(event);
                     if let Some(vm) = self.vms.get_mut(vm_id) {
                         apply_process_signal_state_update(
                             &mut vm.signal_states,
@@ -4620,17 +7861,19 @@ where
                         );
                     }
                 }
-                other => deferred.push_back(other),
+                _ => deferred.push_back(event),
             }
         }
 
         if let Some(vm) = self.vms.get_mut(vm_id) {
             if let Some(process) = vm.active_processes.get_mut(process_id) {
                 for event in deferred.into_iter().rev() {
-                    if process.pending_execution_events.len() >= MAX_PROCESS_EVENT_QUEUE {
+                    if process.pending_execution_events.len()
+                        >= process.pending_execution_event_count_limit
+                    {
                         return Err(process_event_queue_overflow_error());
                     }
-                    process.pending_execution_events.push_front(event);
+                    process.requeue_pending_execution_event(event)?;
                 }
             }
         }
@@ -4670,6 +7913,12 @@ where
             .vms
             .get_mut(vm_id)
             .ok_or_else(|| SidecarError::InvalidState(format!("unknown sidecar VM {vm_id}")))?;
+        let signal_action = vm
+            .signal_states
+            .get(process_id)
+            .and_then(|handlers| handlers.get(&(signal as u32)))
+            .map(|registration| registration.action.clone())
+            .unwrap_or(SignalDispositionAction::Default);
         let process = vm.active_processes.get_mut(process_id).ok_or_else(|| {
             SidecarError::InvalidState(format!("VM {vm_id} has no active process {process_id}"))
         })?;
@@ -4684,6 +7933,7 @@ where
         enum KillBehavior {
             Tool,
             SharedV8StateOnly,
+            SharedV8Pause,
             SharedV8Continue,
             SharedV8Terminate,
             SharedV8DispatchOrTerminate,
@@ -4693,27 +7943,27 @@ where
 
         let behavior = match &process.execution {
             ActiveExecution::Tool(_) => KillBehavior::Tool,
-            ActiveExecution::Javascript(execution)
-                if execution.uses_shared_v8_runtime() && matches!(signal, 0 | libc::SIGSTOP) =>
-            {
+            _ if process.execution.uses_shared_v8_runtime() && signal == 0 => {
                 KillBehavior::SharedV8StateOnly
             }
-            ActiveExecution::Javascript(execution)
-                if execution.uses_shared_v8_runtime() && signal == libc::SIGCONT =>
+            _ if process.execution.uses_shared_v8_runtime()
+                && matches!(
+                    signal,
+                    libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU
+                )
+                && (signal == libc::SIGSTOP
+                    || signal_action == SignalDispositionAction::Default) =>
             {
+                KillBehavior::SharedV8Pause
+            }
+            _ if process.execution.uses_shared_v8_runtime()
+                && matches!(signal, libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU)
+                && signal_action == SignalDispositionAction::Ignore =>
+            {
+                KillBehavior::Noop
+            }
+            _ if process.execution.uses_shared_v8_runtime() && signal == libc::SIGCONT => {
                 KillBehavior::SharedV8Continue
-            }
-            ActiveExecution::Wasm(execution)
-                if execution.uses_shared_v8_runtime()
-                    && matches!(signal, 0 | libc::SIGSTOP | libc::SIGCONT) =>
-            {
-                KillBehavior::SharedV8StateOnly
-            }
-            ActiveExecution::Python(execution)
-                if execution.uses_shared_v8_runtime()
-                    && matches!(signal, 0 | libc::SIGSTOP | libc::SIGCONT) =>
-            {
-                KillBehavior::SharedV8StateOnly
             }
             ActiveExecution::Javascript(execution)
                 if execution.uses_shared_v8_runtime() && signal == SIGKILL =>
@@ -4729,6 +7979,12 @@ where
                 KillBehavior::SharedV8DispatchOrTerminate
             }
             ActiveExecution::Wasm(execution) if execution.uses_shared_v8_runtime() => {
+                KillBehavior::SharedV8DispatchOrTerminate
+            }
+            ActiveExecution::Python(execution)
+                if execution.uses_shared_v8_runtime()
+                    && signal_action != SignalDispositionAction::Default =>
+            {
                 KillBehavior::SharedV8DispatchOrTerminate
             }
             ActiveExecution::Python(execution) if execution.uses_shared_v8_runtime() => {
@@ -4747,30 +8003,52 @@ where
                 };
                 if signal != 0 {
                     execution.cancelled.store(true, Ordering::Relaxed);
+                    process.exit_signal = Some(signal);
+                    process.exit_core_dumped = false;
                     process.queue_pending_execution_event(ActiveExecutionEvent::Exited(
                         128 + signal,
                     ))?;
                 }
             }
             KillBehavior::SharedV8StateOnly => {
-                if matches!(signal, libc::SIGSTOP | libc::SIGCONT) {
-                    vm.kernel
-                        .kill_process(EXECUTION_DRIVER_NAME, kernel_pid, signal)
-                        .map_err(kernel_error)?;
-                }
-            }
-            KillBehavior::SharedV8Continue => {
                 vm.kernel
                     .kill_process(EXECUTION_DRIVER_NAME, kernel_pid, signal)
                     .map_err(kernel_error)?;
-                if signal != 0 && !dispatch_v8_process_signal(process, signal)? {
-                    process.execution.terminate()?;
+            }
+            KillBehavior::SharedV8Pause => {
+                process.execution.pause()?;
+                vm.kernel
+                    .kill_process(EXECUTION_DRIVER_NAME, kernel_pid, signal)
+                    .map_err(kernel_error)?;
+            }
+            KillBehavior::SharedV8Continue => {
+                process.execution.resume()?;
+                vm.kernel
+                    .kill_process(EXECUTION_DRIVER_NAME, kernel_pid, signal)
+                    .map_err(kernel_error)?;
+                if matches!(&process.execution, ActiveExecution::Javascript(_)) {
+                    if !dispatch_v8_process_signal(process, signal)? {
+                        return Err(SidecarError::InvalidState(format!(
+                            "unsupported guest SIGCONT handler delivery for pid {kernel_pid}"
+                        )));
+                    }
+                } else if signal_action == SignalDispositionAction::User {
+                    if matches!(&process.execution, ActiveExecution::Wasm(execution) if execution.uses_shared_v8_runtime())
+                    {
+                        process.queue_pending_wasm_signal(signal)?;
+                    } else {
+                        return Err(SidecarError::InvalidState(format!(
+                            "unsupported guest SIGCONT handler delivery for pid {kernel_pid}"
+                        )));
+                    }
                 }
             }
             KillBehavior::SharedV8Terminate => {
                 if signal != 0 && matches!(process.execution, ActiveExecution::Python(_)) {
                     close_kernel_process_stdin(&mut vm.kernel, process)?;
                 }
+                process.exit_signal = (signal != 0).then_some(signal);
+                process.exit_core_dumped = false;
                 process.execution.terminate()?;
                 let needs_synthetic_exit = matches!(process.execution, ActiveExecution::Wasm(_))
                     || (signal == SIGKILL
@@ -4803,6 +8081,8 @@ where
                                     canonical_signal_name(signal),
                                     Some("SIGWINCH" | "SIGCHLD" | "SIGURG")
                                 ) {
+                                    process.exit_signal = Some(signal);
+                                    process.exit_core_dumped = false;
                                     process.execution.terminate()?;
                                     process.queue_pending_execution_event(
                                         ActiveExecutionEvent::Exited(128 + signal),
@@ -4810,7 +8090,23 @@ where
                                 }
                             }
                         }
+                    } else if matches!(process.execution, ActiveExecution::Python(_)) {
+                        match signal_action {
+                            SignalDispositionAction::Ignore => {}
+                            SignalDispositionAction::User => {
+                                return Err(SidecarError::InvalidState(format!(
+                                    "unsupported guest signal handler delivery for pid {kernel_pid}"
+                                )));
+                            }
+                            SignalDispositionAction::Default => {
+                                process.exit_signal = Some(signal);
+                                process.exit_core_dumped = false;
+                                process.execution.terminate()?;
+                            }
+                        }
                     } else if !dispatch_v8_process_signal(process, signal)? {
+                        process.exit_signal = Some(signal);
+                        process.exit_core_dumped = false;
                         process.execution.terminate()?;
                     }
                 }
@@ -4896,7 +8192,7 @@ where
                         continue;
                     }
                     enum ProcessPollResult {
-                        Event(Box<Option<ActiveExecutionEvent>>),
+                        Event(Box<Option<PolledExecutionEvent>>),
                         RecoverClosedChannel,
                     }
                     let poll_result = {
@@ -4906,10 +8202,10 @@ where
                         let Some(process) = vm.active_processes.get_mut(&process_id) else {
                             continue;
                         };
-                        if let Some(event) = process.pending_execution_events.pop_front() {
+                        if let Some(event) = process.lease_pending_execution_event() {
                             ProcessPollResult::Event(Box::new(Some(event)))
                         } else {
-                            match process.execution.poll_event(Duration::ZERO).await {
+                            match process.poll_execution_event(Duration::ZERO).await {
                                 Ok(event) => ProcessPollResult::Event(Box::new(event)),
                                 Err(SidecarError::Execution(message))
                                     if (process.runtime == GuestRuntimeKind::JavaScript
@@ -4927,15 +8223,15 @@ where
                     };
                     let event = match poll_result {
                         ProcessPollResult::Event(event) => *event,
-                        ProcessPollResult::RecoverClosedChannel => {
-                            self.recover_closed_root_runtime_process_event(&vm_id, &process_id)?
-                        }
+                        ProcessPollResult::RecoverClosedChannel => self
+                            .recover_closed_root_runtime_process_event(&vm_id, &process_id)?
+                            .map(PolledExecutionEvent::unreserved),
                     };
 
                     let Some(event) = event else {
                         continue;
                     };
-                    if matches!(&event, ActiveExecutionEvent::Exited(_)) {
+                    if matches!(event.event(), ActiveExecutionEvent::Exited(_)) {
                         record_execute_response_to_exit_milestone(
                             "execute_response_to_exit_event_polled",
                             &vm_id,
@@ -4943,20 +8239,36 @@ where
                         );
                     }
 
-                    if Self::internal_execution_event(&event) {
+                    if Self::internal_execution_event(event.event()) {
                         // These events are sidecar work items, not client-facing
                         // process events. Handle them immediately so a sibling
                         // process can service sync RPCs while another request
                         // waits on VM-local networking.
-                        self.handle_execution_event(&vm_id, &process_id, event)?;
+                        self.handle_execution_event(&vm_id, &process_id, event.into_event())?;
                     } else {
-                        self.queue_pending_process_event(ProcessEventEnvelope {
+                        let PolledExecutionEvent { event, reservation } = event;
+                        let envelope = ProcessEventEnvelope {
                             connection_id: connection_id.clone(),
                             session_id: session_id.clone(),
                             vm_id: vm_id.clone(),
                             process_id: process_id.clone(),
                             event,
-                        })?;
+                        };
+                        if let Err(error) = self.check_pending_process_event_capacity(&envelope) {
+                            if let Some(process) = self
+                                .vms
+                                .get_mut(&vm_id)
+                                .and_then(|vm| vm.active_processes.get_mut(&process_id))
+                            {
+                                process.requeue_pending_execution_event(PolledExecutionEvent {
+                                    event: envelope.event,
+                                    reservation,
+                                })?;
+                            }
+                            return Err(error);
+                        }
+                        self.queue_pending_process_event(envelope)?;
+                        drop(reservation);
                     }
                     emitted_any = true;
                     emitted_this_pass = true;
@@ -4992,7 +8304,7 @@ where
         let Some(vm) = self.vms.get_mut(vm_id) else {
             return Ok(None);
         };
-        let Some(process) = vm.active_processes.get(process_id) else {
+        let Some(process) = vm.active_processes.get_mut(process_id) else {
             return Ok(None);
         };
         if process.execution.uses_shared_v8_runtime() {
@@ -5008,13 +8320,19 @@ where
         if runtime_child_pid == 0 {
             return Ok(None);
         }
-        if let Some(status) = runtime_child_exit_status(runtime_child_pid)? {
-            return Ok(Some(ActiveExecutionEvent::Exited(status)));
+        match runtime_child_exit_status(runtime_child_pid)? {
+            RuntimeChildStatusObservation::Exited(status) => {
+                process.exit_signal = status.signal;
+                process.exit_core_dumped = status.core_dumped;
+                return Ok(Some(ActiveExecutionEvent::Exited(status.status)));
+            }
+            RuntimeChildStatusObservation::Running => return Ok(None),
+            RuntimeChildStatusObservation::NotWaitable => {
+                return Err(SidecarError::Execution(format!(
+                    "ECHILD: guest runtime process {runtime_child_pid} exited without an observable wait status"
+                )));
+            }
         }
-        if runtime_child_is_alive(runtime_child_pid)? {
-            return Ok(None);
-        }
-        Ok(Some(ActiveExecutionEvent::Exited(0)))
     }
 
     fn active_process_by_path<'a>(
@@ -5121,7 +8439,7 @@ where
     }
 
     fn child_process_signal_key<'a>(process_id: &'a str, child_path: &[&'a str]) -> &'a str {
-        child_path.last().copied().unwrap_or(process_id)
+        process_signal_state_key(process_id, child_path)
     }
 
     fn resolve_detached_child_process_path(
@@ -5183,7 +8501,7 @@ where
             if child_path.is_empty() {
                 loop {
                     enum ProcessPollResult {
-                        Event(Box<Option<ActiveExecutionEvent>>),
+                        Event(Box<Option<PolledExecutionEvent>>),
                         RecoverClosedChannel,
                     }
                     let poll_result = {
@@ -5193,10 +8511,10 @@ where
                         let Some(process) = vm.active_processes.get_mut(&root_process_id) else {
                             break;
                         };
-                        if let Some(event) = process.pending_execution_events.pop_front() {
+                        if let Some(event) = process.lease_pending_execution_event() {
                             ProcessPollResult::Event(Box::new(Some(event)))
                         } else {
-                            match process.execution.poll_event_blocking(Duration::ZERO) {
+                            match process.poll_execution_event_blocking(Duration::ZERO) {
                                 Ok(event) => ProcessPollResult::Event(Box::new(event)),
                                 Err(SidecarError::Execution(message))
                                     if (process.runtime == GuestRuntimeKind::JavaScript
@@ -5214,14 +8532,14 @@ where
                     };
                     let event = match poll_result {
                         ProcessPollResult::Event(event) => *event,
-                        ProcessPollResult::RecoverClosedChannel => {
-                            self.recover_closed_root_runtime_process_event(vm_id, &root_process_id)?
-                        }
+                        ProcessPollResult::RecoverClosedChannel => self
+                            .recover_closed_root_runtime_process_event(vm_id, &root_process_id)?
+                            .map(PolledExecutionEvent::unreserved),
                     };
                     let Some(event) = event else {
                         break;
                     };
-                    if matches!(&event, ActiveExecutionEvent::Exited(_)) {
+                    if matches!(event.event(), ActiveExecutionEvent::Exited(_)) {
                         record_execute_response_to_exit_milestone(
                             "execute_response_to_detached_exit_event_polled",
                             vm_id,
@@ -5235,61 +8553,112 @@ where
                     else {
                         break;
                     };
+                    let PolledExecutionEvent { event, reservation } = event;
                     match event {
                         ActiveExecutionEvent::Stdout(chunk) => {
-                            self.queue_pending_process_event(ProcessEventEnvelope {
+                            let envelope = ProcessEventEnvelope {
                                 connection_id,
                                 session_id,
                                 vm_id: vm_id.to_owned(),
                                 process_id: detached_process_id.clone(),
                                 event: ActiveExecutionEvent::Stdout(chunk),
-                            })?;
+                            };
+                            if let Err(error) = self.check_pending_process_event_capacity(&envelope)
+                            {
+                                if let Some(process) = self
+                                    .vms
+                                    .get_mut(vm_id)
+                                    .and_then(|vm| vm.active_processes.get_mut(&root_process_id))
+                                {
+                                    process.requeue_pending_execution_event(
+                                        PolledExecutionEvent {
+                                            event: envelope.event,
+                                            reservation,
+                                        },
+                                    )?;
+                                }
+                                return Err(error);
+                            }
+                            self.queue_pending_process_event(envelope)?;
+                            drop(reservation);
                             emitted_any = true;
                         }
                         ActiveExecutionEvent::Stderr(chunk) => {
-                            self.queue_pending_process_event(ProcessEventEnvelope {
+                            let envelope = ProcessEventEnvelope {
                                 connection_id,
                                 session_id,
                                 vm_id: vm_id.to_owned(),
                                 process_id: detached_process_id.clone(),
                                 event: ActiveExecutionEvent::Stderr(chunk),
-                            })?;
+                            };
+                            if let Err(error) = self.check_pending_process_event_capacity(&envelope)
+                            {
+                                if let Some(process) = self
+                                    .vms
+                                    .get_mut(vm_id)
+                                    .and_then(|vm| vm.active_processes.get_mut(&root_process_id))
+                                {
+                                    process.requeue_pending_execution_event(
+                                        PolledExecutionEvent {
+                                            event: envelope.event,
+                                            reservation,
+                                        },
+                                    )?;
+                                }
+                                return Err(error);
+                            }
+                            self.queue_pending_process_event(envelope)?;
+                            drop(reservation);
                             emitted_any = true;
                         }
                         ActiveExecutionEvent::Exited(exit_code) => {
-                            if let Some(vm) = self.vms.get_mut(vm_id) {
-                                vm.detached_child_processes.remove(&detached_process_id);
-                            }
-                            self.queue_pending_process_event(ProcessEventEnvelope {
+                            let envelope = ProcessEventEnvelope {
                                 connection_id,
                                 session_id,
                                 vm_id: vm_id.to_owned(),
                                 process_id: detached_process_id.clone(),
                                 event: ActiveExecutionEvent::Exited(exit_code),
-                            })?;
+                            };
+                            if let Err(error) = self.check_pending_process_event_capacity(&envelope)
+                            {
+                                if let Some(process) = self
+                                    .vms
+                                    .get_mut(vm_id)
+                                    .and_then(|vm| vm.active_processes.get_mut(&root_process_id))
+                                {
+                                    process.requeue_pending_execution_event(
+                                        PolledExecutionEvent {
+                                            event: envelope.event,
+                                            reservation,
+                                        },
+                                    )?;
+                                }
+                                return Err(error);
+                            }
+                            if let Some(vm) = self.vms.get_mut(vm_id) {
+                                vm.detached_child_processes.remove(&detached_process_id);
+                            }
+                            self.queue_pending_process_event(envelope)?;
+                            drop(reservation);
                             emitted_any = true;
                             break;
                         }
-                        ActiveExecutionEvent::JavascriptSyncRpcRequest(request) => {
-                            self.handle_javascript_sync_rpc_request(
+                        internal @ (ActiveExecutionEvent::JavascriptSyncRpcRequest(_)
+                        | ActiveExecutionEvent::PythonVfsRpcRequest(_)
+                        | ActiveExecutionEvent::SignalState { .. }) => {
+                            // This event is now being consumed. Convert it back
+                            // through the lease API before servicing the RPC:
+                            // the handler can resume the guest, whose next
+                            // output must reserve from this same VM budget.
+                            self.handle_execution_event(
                                 vm_id,
                                 &root_process_id,
-                                request,
+                                PolledExecutionEvent {
+                                    event: internal,
+                                    reservation,
+                                }
+                                .into_event(),
                             )?;
-                        }
-                        ActiveExecutionEvent::PythonVfsRpcRequest(request) => {
-                            self.handle_python_vfs_rpc_request(vm_id, &root_process_id, *request)?;
-                        }
-                        ActiveExecutionEvent::SignalState {
-                            signal,
-                            registration,
-                        } => {
-                            if let Some(vm) = self.vms.get_mut(vm_id) {
-                                vm.signal_states
-                                    .entry(root_process_id.clone())
-                                    .or_default()
-                                    .insert(signal, registration);
-                            }
                         }
                     }
                 }
@@ -5422,14 +8791,26 @@ where
                     while let Some(deferred_envelope) = deferred.pop_back() {
                         self.pending_process_events.push_front(deferred_envelope);
                     }
+                    self.observe_pending_process_event_depth();
                     return Err(process_event_queue_overflow_error());
                 }
                 if let Some(vm) = self.vms.get_mut(vm_id) {
                     if let Some(root) = vm.active_processes.get_mut(process_id) {
                         if let Some(child) = Self::active_process_by_path_mut(root, child_path) {
-                            child.queue_pending_execution_event(envelope.event)?;
-                            child_capacity = child_capacity.map(|capacity| capacity - 1);
-                            continue;
+                            match child.try_queue_pending_execution_envelope(envelope) {
+                                Ok(()) => {
+                                    child_capacity = child_capacity.map(|capacity| capacity - 1);
+                                    continue;
+                                }
+                                Err((error, envelope)) => {
+                                    self.pending_process_events.push_front(envelope);
+                                    while let Some(deferred_envelope) = deferred.pop_back() {
+                                        self.pending_process_events.push_front(deferred_envelope);
+                                    }
+                                    self.observe_pending_process_event_depth();
+                                    return Err(error);
+                                }
+                            }
                         }
                     }
                 }
@@ -5437,8 +8818,9 @@ where
             deferred.push_back(envelope);
         }
         self.pending_process_events = deferred;
+        self.observe_pending_process_event_depth();
 
-        let mut queued = Vec::new();
+        let mut queued = VecDeque::new();
         {
             let transfer_capacity = self
                 .pending_process_event_capacity()
@@ -5451,27 +8833,41 @@ where
                     if receiver.is_empty() {
                         break;
                     }
+                    self.pending_process_events.append(&mut queued);
+                    self.observe_pending_process_event_depth();
                     return Err(process_event_queue_overflow_error());
                 }
                 match receiver.try_recv() {
-                    Ok(envelope) => queued.push(envelope),
+                    Ok(envelope) => queued.push_back(envelope),
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                 }
             }
         }
-        for envelope in queued {
+        while let Some(envelope) = queued.pop_front() {
             if envelope.vm_id == vm_id && envelope.process_id == target_process_id {
                 if let Some(vm) = self.vms.get_mut(vm_id) {
                     if let Some(root) = vm.active_processes.get_mut(process_id) {
                         if let Some(child) = Self::active_process_by_path_mut(root, child_path) {
-                            child.queue_pending_execution_event(envelope.event)?;
-                            continue;
+                            match child.try_queue_pending_execution_envelope(envelope) {
+                                Ok(()) => continue,
+                                Err((error, envelope)) => {
+                                    self.pending_process_events.push_back(envelope);
+                                    self.pending_process_events.append(&mut queued);
+                                    self.observe_pending_process_event_depth();
+                                    return Err(error);
+                                }
+                            }
                         }
                     }
                 }
             }
-            self.queue_pending_process_event(envelope)?;
+            if let Err((error, envelope)) = self.try_queue_pending_process_event(envelope) {
+                self.pending_process_events.push_back(envelope);
+                self.pending_process_events.append(&mut queued);
+                self.observe_pending_process_event_depth();
+                return Err(error);
+            }
         }
 
         Ok(())
@@ -5483,7 +8879,7 @@ where
         process_id: &str,
         event: ActiveExecutionEvent,
     ) -> Result<Option<EventFrame>, SidecarError> {
-        let Some(vm) = self.vms.get(vm_id) else {
+        let Some(vm) = self.vms.get_mut(vm_id) else {
             log_stale_process_event(&self.bridge, vm_id, process_id, "execution event dispatch");
             return Ok(None);
         };
@@ -5633,7 +9029,12 @@ where
         release_inherited_child_raw_mode(&mut vm.kernel, &process)?;
         let phase_start = Instant::now();
         let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
-        terminate_child_process_tree(&mut vm.kernel, &mut process, &kernel_readiness);
+        terminate_child_process_tree(
+            &mut vm.kernel,
+            &mut process,
+            &kernel_readiness,
+            &vm.unix_address_registry,
+        );
         record_execute_phase(
             "process_exit_cleanup_terminate_child_tree",
             phase_start.elapsed(),
@@ -5669,82 +9070,6 @@ where
         record_execute_phase("process_exit_cleanup_prune_resource", phase_start.elapsed());
 
         Ok(Some(became_idle))
-    }
-
-    pub(crate) fn drain_process_events_blocking_with_limit(
-        &mut self,
-        vm_id: &str,
-        process_id: &str,
-        max_events: usize,
-    ) -> Result<Vec<ActiveExecutionEvent>, SidecarError> {
-        let mut events = Vec::new();
-        if max_events == 0 {
-            return Ok(events);
-        }
-        let mut deadline = Instant::now() + PROCESS_EXIT_DRAIN_INITIAL_QUIET;
-
-        loop {
-            if events.len() >= max_events {
-                break;
-            }
-            let event = {
-                let Some(vm) = self.vms.get_mut(vm_id) else {
-                    break;
-                };
-                let Some(process) = vm.active_processes.get_mut(process_id) else {
-                    break;
-                };
-                if let Some(event) = process.pending_execution_events.pop_front() {
-                    Some(event)
-                } else {
-                    match process.execution.poll_event_blocking(Duration::ZERO) {
-                        Ok(event) => event,
-                        Err(SidecarError::Execution(_)) => None,
-                        Err(other) => return Err(other),
-                    }
-                }
-            };
-
-            let Some(event) = event else {
-                if Instant::now() >= deadline {
-                    break;
-                }
-                let blocking_wait = deadline.saturating_duration_since(Instant::now());
-                if blocking_wait.is_zero() {
-                    break;
-                }
-                if events.len() >= max_events {
-                    break;
-                }
-                let delayed_event = {
-                    let Some(vm) = self.vms.get_mut(vm_id) else {
-                        break;
-                    };
-                    let Some(process) = vm.active_processes.get_mut(process_id) else {
-                        break;
-                    };
-                    if let Some(event) = process.pending_execution_events.pop_front() {
-                        Some(event)
-                    } else {
-                        match process.execution.poll_event_blocking(blocking_wait) {
-                            Ok(event) => event,
-                            Err(SidecarError::Execution(_)) => None,
-                            Err(other) => return Err(other),
-                        }
-                    }
-                };
-                let Some(event) = delayed_event else {
-                    break;
-                };
-                events.push(event);
-                deadline = Instant::now() + PROCESS_EXIT_DRAIN_TRAILING_QUIET;
-                continue;
-            };
-            events.push(event);
-            deadline = Instant::now() + PROCESS_EXIT_DRAIN_TRAILING_QUIET;
-        }
-
-        Ok(events)
     }
 
     pub(crate) fn handle_python_vfs_rpc_request(
@@ -5795,7 +9120,7 @@ where
         process_id: &str,
         request: PythonVfsRpcRequest,
     ) -> Result<(), SidecarError> {
-        let Some(vm) = self.vms.get(vm_id) else {
+        let Some(vm) = self.vms.get_mut(vm_id) else {
             return Ok(());
         };
         if !vm.active_processes.contains_key(process_id) {
@@ -5863,8 +9188,18 @@ where
             };
             let headers =
                 parse_http_header_collection(&options.headers, "python httpRequest headers")?;
-            let response =
-                issue_outbound_http_request(&url, &options, &headers, &pinned_addresses)?;
+            let default_ca_bundle = if url.scheme() == "https" {
+                read_vm_default_ca_bundle(&mut vm.kernel)?
+            } else {
+                Vec::new()
+            };
+            let response = issue_outbound_http_request(
+                &url,
+                &options,
+                &headers,
+                &pinned_addresses,
+                &default_ca_bundle,
+            )?;
             let payload_json = response.as_str().ok_or_else(|| {
                 SidecarError::Execution(String::from(
                     "python httpRequest returned a non-string response payload",
@@ -6007,11 +9342,25 @@ where
                     command,
                     args: request.args.clone(),
                     options: JavascriptChildProcessSpawnOptions {
-                        argv0: None,
+                        argv0: request.argv0.clone(),
+                        cloexec_fds: Vec::new(),
+                        local_replacement: false,
+                        executable_fd: None,
                         cwd,
                         env: request.env.clone(),
                         input: None,
                         internal_bootstrap_env,
+                        spawn_attr_flags: 0,
+                        spawn_exact_path: false,
+                        spawn_search_path: None,
+                        spawn_sched_policy: None,
+                        spawn_sched_priority: None,
+                        spawn_pgroup: None,
+                        spawn_signal_defaults: Vec::new(),
+                        spawn_signal_mask: Vec::new(),
+                        spawn_file_actions: Vec::new(),
+                        spawn_fd_mappings: Vec::new(),
+                        spawn_host_net_fds: Vec::new(),
                         shell: request.shell,
                         detached: false,
                         stdio: vec![
@@ -6332,6 +9681,7 @@ where
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn resolve_javascript_child_process_execution(
         &self,
         vm: &VmState,
@@ -6340,6 +9690,32 @@ where
         parent_host_cwd: &Path,
         request: &JavascriptChildProcessSpawnRequest,
     ) -> Result<ResolvedChildProcessExecution, SidecarError> {
+        self.resolve_javascript_child_process_execution_with_mode(
+            vm,
+            parent_env,
+            parent_guest_cwd,
+            parent_host_cwd,
+            request,
+            false,
+            None,
+        )
+    }
+
+    pub(crate) fn resolve_javascript_child_process_execution_with_mode(
+        &self,
+        vm: &VmState,
+        parent_env: &BTreeMap<String, String>,
+        parent_guest_cwd: &str,
+        parent_host_cwd: &Path,
+        request: &JavascriptChildProcessSpawnRequest,
+        exact_exec_path: bool,
+        search_path_override: Option<&str>,
+    ) -> Result<ResolvedChildProcessExecution, SidecarError> {
+        if exact_exec_path && search_path_override.is_some() {
+            return Err(SidecarError::InvalidState(String::from(
+                "EINVAL: exact spawn path cannot also request PATH search",
+            )));
+        }
         let mut runtime_env = parent_env.clone();
         runtime_env.extend(request.options.internal_bootstrap_env.clone());
         let (guest_cwd, host_cwd_override) = request
@@ -6401,7 +9777,8 @@ where
 
         let (command, process_args) = if request.options.shell {
             let tokens = tokenize_shell_free_command(&request.command);
-            let requires_shell = command_requires_shell(&request.command)
+            let requires_shell = request.options.argv0.is_some()
+                || command_requires_shell(&request.command)
                 || tokens.first().is_some_and(|command| {
                     is_posix_shell_builtin(command) || shell_first_token_requires_shell(command)
                 });
@@ -6430,7 +9807,7 @@ where
             (request.command.clone(), request.args.clone())
         };
         let process_args = apply_shell_cwd_prefix(&command, process_args, &guest_cwd);
-        if is_tool_command(vm, &command) {
+        if !exact_exec_path && is_tool_command(vm, &command) {
             let command = normalized_tool_command_name(&command).unwrap_or(command);
             return Ok(ResolvedChildProcessExecution {
                 command: command.clone(),
@@ -6499,7 +9876,7 @@ where
             });
         }
 
-        if is_node_runtime_command(&command) {
+        if !exact_exec_path && is_node_runtime_command(&command) {
             if let Some(cli) = resolve_host_node_cli_entrypoint(&command) {
                 env.insert(
                     String::from("AGENTOS_NODE_EVAL"),
@@ -6635,7 +10012,7 @@ where
             });
         }
 
-        if is_python_runtime_command(&command) {
+        if !exact_exec_path && is_python_runtime_command(&command) {
             return resolve_python_command_execution(
                 vm,
                 &command,
@@ -6646,12 +10023,16 @@ where
             );
         }
 
-        let guest_entrypoint = resolve_guest_command_entrypoint(
-            vm,
-            &guest_cwd,
-            &command,
-            env.get("PATH").map(String::as_str),
-        )
+        let guest_entrypoint = if exact_exec_path {
+            resolve_exact_guest_command_entrypoint(vm, &guest_cwd, &command)
+        } else {
+            resolve_guest_command_entrypoint(
+                vm,
+                &guest_cwd,
+                &command,
+                search_path_override.or_else(|| env.get("PATH").map(String::as_str)),
+            )
+        }
         .ok_or_else(|| SidecarError::InvalidState(format!("command not found: {command}")))?;
         let host_entrypoint = resolve_vm_guest_path_to_host(vm, &guest_entrypoint);
         let wasm_permission_tier = vm.command_permissions.get(&command).copied().or_else(|| {
@@ -6722,12 +10103,14 @@ where
 
         let mut resolved = {
             let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
-            self.resolve_javascript_child_process_execution(
+            self.resolve_javascript_child_process_execution_with_mode(
                 vm,
                 parent_env,
                 parent_guest_cwd,
                 parent_host_cwd,
                 request,
+                false,
+                None,
             )?
         };
 
@@ -6749,12 +10132,14 @@ where
             }
             resolved = {
                 let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
-                self.resolve_javascript_child_process_execution(
+                self.resolve_javascript_child_process_execution_with_mode(
                     vm,
                     parent_env,
                     parent_guest_cwd,
                     parent_host_cwd,
                     request,
+                    false,
+                    None,
                 )?
             };
         }
@@ -6766,39 +10151,10 @@ where
         &mut self,
         vm_id: &str,
         process_id: &str,
-        request: JavascriptChildProcessSpawnRequest,
+        mut request: JavascriptChildProcessSpawnRequest,
     ) -> Result<Value, SidecarError> {
-        let mut request = request;
-        let total_start = Instant::now();
-        let phase_start = Instant::now();
-        let (parent_env, parent_guest_cwd, parent_host_cwd) = {
-            let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
-            let parent = vm
-                .active_processes
-                .get(process_id)
-                .ok_or_else(|| missing_process_error(vm_id, process_id))?;
-            (
-                parent.env.clone(),
-                parent.guest_cwd.clone(),
-                parent.host_cwd.clone(),
-            )
-        };
-        let mut resolved = self.resolve_javascript_child_process_with_shebang(
-            vm_id,
-            &parent_env,
-            &parent_guest_cwd,
-            &parent_host_cwd,
-            &mut request,
-        )?;
-        {
-            let vm = self
-                .vms
-                .get_mut(vm_id)
-                .ok_or_else(|| missing_vm_error(vm_id))?;
-            stage_agentos_package_command(vm, &mut resolved)?;
-        }
-        let resolved = resolved;
-        record_execute_phase("child_process_resolve_execution", phase_start.elapsed());
+        let spawn_attributes = javascript_spawn_attributes(&request.options)?;
+        let requested_pgid = spawn_attributes.process_group;
         let parent_sync_roots = {
             let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
             let parent = vm
@@ -6816,6 +10172,132 @@ where
                 .ok_or_else(|| missing_vm_error(vm_id))?;
             sync_process_host_roots_to_kernel(vm, &host_cwd, &guest_cwd)?;
         }
+        let prepared_host_net_fds = {
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            let current_network_counts = vm_spawn_host_net_resource_counts(vm);
+            let (kernel, active_processes) = (&mut vm.kernel, &mut vm.active_processes);
+            let parent = active_processes
+                .get_mut(process_id)
+                .ok_or_else(|| missing_process_error(vm_id, process_id))?;
+            prepare_spawn_host_net_fds(
+                kernel,
+                parent,
+                current_network_counts,
+                &request.options.spawn_host_net_fds,
+                &request.options.spawn_fd_mappings,
+                &request.options.spawn_file_actions,
+            )?
+        };
+        let prepared_spawn_actions = if !prepared_host_net_fds.kernel_actions.is_empty() {
+            let (parent_pid, parent_cwd) = {
+                let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
+                let parent = vm
+                    .active_processes
+                    .get(process_id)
+                    .ok_or_else(|| missing_process_error(vm_id, process_id))?;
+                let initial_cwd = request
+                    .options
+                    .cwd
+                    .as_deref()
+                    .map(|cwd| {
+                        if cwd.starts_with('/') {
+                            normalize_path(cwd)
+                        } else {
+                            normalize_path(&format!("{}/{cwd}", parent.guest_cwd))
+                        }
+                    })
+                    .unwrap_or_else(|| parent.guest_cwd.clone());
+                (parent.kernel_pid, initial_cwd)
+            };
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            Some(preapply_posix_spawn_file_actions(
+                &mut vm.kernel,
+                parent_pid,
+                &parent_cwd,
+                requested_pgid,
+                &request.options.spawn_fd_mappings,
+                &prepared_host_net_fds.kernel_actions,
+            )?)
+        } else {
+            None
+        };
+        if let Some(prepared) = prepared_spawn_actions.as_ref() {
+            request.options.cwd = Some(prepared.cwd.clone());
+        }
+        {
+            let parent_guest_cwd = self
+                .vms
+                .get(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?
+                .active_processes
+                .get(process_id)
+                .ok_or_else(|| missing_process_error(vm_id, process_id))?
+                .guest_cwd
+                .clone();
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            resolve_posix_spawn_program(vm, &parent_guest_cwd, &mut request)?;
+        }
+        let total_start = Instant::now();
+        let phase_start = Instant::now();
+        let (parent_env, parent_guest_cwd, parent_host_cwd) = {
+            let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
+            let parent = vm
+                .active_processes
+                .get(process_id)
+                .ok_or_else(|| missing_process_error(vm_id, process_id))?;
+            (
+                parent.env.clone(),
+                parent.guest_cwd.clone(),
+                parent.host_cwd.clone(),
+            )
+        };
+        let mut resolved =
+            if !request.options.spawn_exact_path && request.options.spawn_search_path.is_none() {
+                self.resolve_javascript_child_process_with_shebang(
+                    vm_id,
+                    &parent_env,
+                    &parent_guest_cwd,
+                    &parent_host_cwd,
+                    &mut request,
+                )?
+            } else {
+                let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
+                self.resolve_javascript_child_process_execution_with_mode(
+                    vm,
+                    &parent_env,
+                    &parent_guest_cwd,
+                    &parent_host_cwd,
+                    &request,
+                    request.options.spawn_exact_path,
+                    request.options.spawn_search_path.as_deref(),
+                )?
+            };
+        apply_child_process_argv0(&mut resolved, request.options.argv0.as_deref());
+        {
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            stage_agentos_package_command(vm, &mut resolved)?;
+        }
+        let resolved = resolved;
+        if prepared_host_net_fds.inherited_fd_count() != 0
+            && (resolved.runtime != GuestRuntimeKind::WebAssembly || resolved.tool_command)
+        {
+            return Err(SidecarError::InvalidState(String::from(
+                "ENOTSUP: inherited host-network fds require a WebAssembly child runtime",
+            )));
+        }
+        record_execute_phase("child_process_resolve_execution", phase_start.elapsed());
         let (parent_kernel_pid, child_process_id) = {
             let vm = self
                 .vms
@@ -6832,266 +10314,412 @@ where
             .vms
             .get_mut(vm_id)
             .ok_or_else(|| missing_vm_error(vm_id))?;
+        let vm_pending_stdin_bytes_budget = Arc::clone(&vm.pending_stdin_bytes_budget);
+        let vm_pending_event_bytes_budget = Arc::clone(&vm.pending_event_bytes_budget);
         let phase_start = Instant::now();
-        let (kernel_pid, kernel_handle, execution, kernel_stdin_writer_fd) = if resolved
-            .tool_command
-        {
-            let tool_resolution = resolve_tool_command(
-                vm,
-                &resolved.command,
-                &resolved.execution_args,
-                Some(&resolved.guest_cwd),
-            )?
-            .ok_or_else(|| {
-                SidecarError::InvalidState(format!(
-                    "tool command no longer resolves: {}",
-                    resolved.command
-                ))
-            })?;
-            let kernel_handle = vm
-                .kernel
-                .create_virtual_process(
-                    EXECUTION_DRIVER_NAME,
-                    TOOL_DRIVER_NAME,
+        let mut pending_kernel_handle = None;
+        let spawn_result = (|| {
+            let spawned = if resolved.tool_command {
+                let tool_resolution = resolve_tool_command(
+                    vm,
                     &resolved.command,
-                    resolved.process_args.clone(),
-                    VirtualProcessOptions {
-                        parent_pid: Some(parent_kernel_pid),
-                        env: resolved.env.clone(),
-                        cwd: Some(resolved.guest_cwd.clone()),
-                    },
-                )
-                .map_err(kernel_error)?;
-            let kernel_pid = kernel_handle.pid();
-            let tool_execution = ToolExecution::default();
-            let cancelled = tool_execution.cancelled.clone();
-            let pending_events = tool_execution.pending_events.clone();
-            let events_overflowed = tool_execution.events_overflowed.clone();
-            spawn_tool_process_events(ToolProcessEventRequest {
-                sidecar_requests: sidecar_requests.clone(),
-                connection_id: vm.connection_id.clone(),
-                session_id: vm.session_id.clone(),
-                vm_id: vm_id.to_owned(),
-                tool_resolution,
-                cancelled,
-                pending_events,
-                events_overflowed,
-            });
-            (
-                kernel_pid,
-                kernel_handle,
-                ActiveExecution::Tool(tool_execution),
-                None,
-            )
-        } else {
-            let kernel_command = match resolved.runtime {
-                GuestRuntimeKind::JavaScript => JAVASCRIPT_COMMAND,
-                GuestRuntimeKind::WebAssembly => WASM_COMMAND,
-                GuestRuntimeKind::Python => PYTHON_COMMAND,
-            };
-            let kernel_handle = vm
-                .kernel
-                .spawn_process(
-                    kernel_command,
-                    resolved.process_args.clone(),
-                    SpawnOptions {
-                        requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
-                        parent_pid: Some(parent_kernel_pid),
-                        env: resolved.env.clone(),
-                        cwd: Some(resolved.guest_cwd.clone()),
-                    },
-                )
-                .map_err(kernel_error)?;
-            let kernel_pid = kernel_handle.pid();
-            if request.options.detached {
-                vm.kernel
-                    .setsid(EXECUTION_DRIVER_NAME, kernel_pid)
-                    .map_err(kernel_error)?;
-            }
-            let mut execution_env = resolved.env.clone();
-            execution_env.insert(
-                String::from(EXECUTION_SANDBOX_ROOT_ENV),
-                normalize_host_path(&vm.cwd).to_string_lossy().into_owned(),
-            );
-
-            let execution = match resolved.runtime {
-                GuestRuntimeKind::JavaScript => {
-                    execution_env.extend(sanitize_javascript_child_process_internal_bootstrap_env(
-                        &request.options.internal_bootstrap_env,
-                    ));
-                    execution_env
-                        .insert(String::from("AGENTOS_KEEP_STDIN_OPEN"), String::from("1"));
-                    let launch_entrypoint = resolve_agentos_package_javascript_launch_entrypoint(
-                        vm,
-                        &mut execution_env,
+                    &resolved.execution_args,
+                    Some(&resolved.guest_cwd),
+                )?
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(format!(
+                        "tool command no longer resolves: {}",
+                        resolved.command
+                    ))
+                })?;
+                let kernel_handle = vm
+                    .kernel
+                    .create_virtual_process_with_process_group(
+                        EXECUTION_DRIVER_NAME,
+                        TOOL_DRIVER_NAME,
+                        &resolved.command,
+                        resolved.process_args.clone(),
+                        VirtualProcessOptions {
+                            parent_pid: Some(parent_kernel_pid),
+                            env: resolved.env.clone(),
+                            cwd: Some(resolved.guest_cwd.clone()),
+                        },
+                        requested_pgid,
                     )
-                    .unwrap_or_else(|| resolved.entrypoint.clone());
-                    let context =
-                        self.javascript_engine
-                            .create_context(CreateJavascriptContextRequest {
-                                vm_id: vm_id.to_owned(),
-                                bootstrap_module: None,
-                                compile_cache_root: Some(
-                                    self.cache_root.join("node-compile-cache"),
-                                ),
-                            });
-                    let inline_code = load_javascript_entrypoint_source(
-                        vm,
-                        &resolved.host_cwd,
-                        &launch_entrypoint,
-                        &execution_env,
+                    .map_err(kernel_error)?;
+                let kernel_pid = kernel_handle.pid();
+                if let Some(prepared) = prepared_spawn_actions {
+                    install_preapplied_posix_spawn_file_actions(
+                        &mut vm.kernel,
+                        &kernel_handle,
+                        prepared,
+                    )?;
+                } else {
+                    apply_posix_spawn_file_actions_or_rollback(
+                        &mut vm.kernel,
+                        &kernel_handle,
+                        &resolved.guest_cwd,
+                        &request.options.spawn_fd_mappings,
+                        &prepared_host_net_fds.kernel_actions,
+                    )?;
+                }
+                apply_spawn_session_or_rollback(
+                    &mut vm.kernel,
+                    &kernel_handle,
+                    spawn_attributes.new_session || request.options.detached,
+                )?;
+                pending_kernel_handle = Some(kernel_handle.clone());
+                let tool_execution = ToolExecution::default()
+                    .with_vm_pending_event_bytes_budget(Arc::clone(&vm_pending_event_bytes_budget));
+                let cancelled = tool_execution.cancelled.clone();
+                let pending_events = tool_execution.pending_events.clone();
+                let event_overflow_reason = tool_execution.event_overflow_reason.clone();
+                let pending_event_bytes = tool_execution.pending_event_bytes.clone();
+                let pending_event_count_limit = tool_execution.pending_event_count_limit.clone();
+                let pending_event_bytes_limit = tool_execution.pending_event_bytes_limit.clone();
+                spawn_tool_process_events(ToolProcessEventRequest {
+                    sidecar_requests: sidecar_requests.clone(),
+                    connection_id: vm.connection_id.clone(),
+                    session_id: vm.session_id.clone(),
+                    vm_id: vm_id.to_owned(),
+                    tool_resolution,
+                    cancelled,
+                    pending_events,
+                    event_overflow_reason,
+                    pending_event_bytes,
+                    pending_event_count_limit,
+                    pending_event_bytes_limit,
+                    vm_pending_event_bytes_budget: Arc::clone(&vm_pending_event_bytes_budget),
+                });
+                (
+                    kernel_pid,
+                    kernel_handle,
+                    ActiveExecution::Tool(tool_execution),
+                    None,
+                    false,
+                )
+            } else {
+                let kernel_command = match resolved.runtime {
+                    GuestRuntimeKind::JavaScript => JAVASCRIPT_COMMAND,
+                    GuestRuntimeKind::WebAssembly => WASM_COMMAND,
+                    GuestRuntimeKind::Python => PYTHON_COMMAND,
+                };
+                let kernel_handle = vm
+                    .kernel
+                    .spawn_process_with_process_group(
+                        kernel_command,
+                        resolved.process_args.clone(),
+                        SpawnOptions {
+                            requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                            parent_pid: Some(parent_kernel_pid),
+                            env: resolved.env.clone(),
+                            cwd: Some(resolved.guest_cwd.clone()),
+                        },
+                        requested_pgid,
+                    )
+                    .map_err(kernel_error)?;
+                let kernel_pid = kernel_handle.pid();
+                let applied_spawn_actions = if let Some(prepared) = prepared_spawn_actions {
+                    install_preapplied_posix_spawn_file_actions(
+                        &mut vm.kernel,
+                        &kernel_handle,
+                        prepared,
+                    )?
+                } else {
+                    apply_posix_spawn_file_actions_or_rollback(
+                        &mut vm.kernel,
+                        &kernel_handle,
+                        &resolved.guest_cwd,
+                        &request.options.spawn_fd_mappings,
+                        &prepared_host_net_fds.kernel_actions,
+                    )?
+                };
+                let posix_spawn_controls_stdin = !request.options.spawn_file_actions.is_empty()
+                    && (applied_spawn_actions
+                        .fd_mappings
+                        .iter()
+                        .any(|mapping| mapping[0] == 0)
+                        || applied_spawn_actions.closed_guest_fds.contains(&0)
+                        || prepared_host_net_fds
+                            .descriptions
+                            .iter()
+                            .any(|description| description.guest_fds.contains(&0)));
+                apply_spawn_session_or_rollback(
+                    &mut vm.kernel,
+                    &kernel_handle,
+                    spawn_attributes.new_session || request.options.detached,
+                )?;
+                pending_kernel_handle = Some(kernel_handle.clone());
+                let mut execution_env = resolved.env.clone();
+                if resolved.runtime == GuestRuntimeKind::WebAssembly {
+                    execution_env.insert(
+                        String::from("AGENTOS_WASM_INHERITED_FD_MAPPINGS"),
+                        serde_json::to_string(&applied_spawn_actions.fd_mappings).map_err(
+                            |error| {
+                                SidecarError::InvalidState(format!(
+                                    "failed to serialize inherited WASM fd mappings: {error}"
+                                ))
+                            },
+                        )?,
                     );
-                    prepare_javascript_shadow(vm, &resolved, &execution_env)?;
+                    execution_env.insert(
+                        String::from("AGENTOS_WASM_CLOSED_INHERITED_FDS"),
+                        serde_json::to_string(&applied_spawn_actions.closed_guest_fds).map_err(
+                            |error| {
+                                SidecarError::InvalidState(format!(
+                                    "failed to serialize closed inherited WASM fds: {error}"
+                                ))
+                            },
+                        )?,
+                    );
+                    execution_env.insert(
+                        String::from("AGENTOS_WASM_INHERITED_HOSTNET_FDS"),
+                        serde_json::to_string(&prepared_host_net_fds.bootstrap_json()).map_err(
+                            |error| {
+                                SidecarError::InvalidState(format!(
+                                    "failed to serialize inherited WASM host-network fds: {error}"
+                                ))
+                            },
+                        )?,
+                    );
+                }
+                execution_env.insert(
+                    String::from(EXECUTION_SANDBOX_ROOT_ENV),
+                    normalize_host_path(&vm.cwd).to_string_lossy().into_owned(),
+                );
 
-                    let built_reader = build_module_reader(vm, &resolved);
-                    let guest_reader = built_reader.clone().map(|reader| {
-                        Box::new(crate::plugins::host_dir::SessionModuleReader::new(reader))
-                            as Box<dyn GuestModuleReader>
-                    });
-                    let module_reader = built_reader
-                        .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
-                    let execution = self
-                        .javascript_engine
-                        .start_execution_with_module_reader(
-                            StartJavascriptExecutionRequest {
-                                guest_runtime: guest_runtime_identity(
-                                    vm,
-                                    Some(u64::from(kernel_pid)),
-                                    Some(u64::from(parent_kernel_pid)),
-                                ),
+                let execution = match resolved.runtime {
+                    GuestRuntimeKind::JavaScript => {
+                        execution_env.extend(
+                            sanitize_javascript_child_process_internal_bootstrap_env(
+                                &request.options.internal_bootstrap_env,
+                            ),
+                        );
+                        execution_env
+                            .insert(String::from("AGENTOS_KEEP_STDIN_OPEN"), String::from("1"));
+                        let launch_entrypoint =
+                            resolve_agentos_package_javascript_launch_entrypoint(
+                                vm,
+                                &mut execution_env,
+                            )
+                            .unwrap_or_else(|| resolved.entrypoint.clone());
+                        let inline_code = load_javascript_entrypoint_source(
+                            vm,
+                            &resolved.host_cwd,
+                            &launch_entrypoint,
+                            &execution_env,
+                        );
+                        prepare_javascript_shadow(vm, &resolved, &execution_env)?;
+
+                        let built_reader = build_module_reader(vm, &resolved);
+                        let guest_reader = built_reader.clone().map(|reader| {
+                            Box::new(crate::plugins::host_dir::SessionModuleReader::new(reader))
+                                as Box<dyn GuestModuleReader>
+                        });
+                        let module_reader = built_reader
+                            .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
+                        let context =
+                            self.javascript_engine
+                                .create_context(CreateJavascriptContextRequest {
+                                    vm_id: vm_id.to_owned(),
+                                    bootstrap_module: None,
+                                    compile_cache_root: Some(
+                                        self.cache_root.join("node-compile-cache"),
+                                    ),
+                                });
+                        let context_id = context.context_id;
+                        let execution_result =
+                            self.javascript_engine.start_execution_with_module_reader(
+                                StartJavascriptExecutionRequest {
+                                    guest_runtime: guest_runtime_identity(
+                                        vm,
+                                        Some(u64::from(kernel_pid)),
+                                        Some(u64::from(parent_kernel_pid)),
+                                    ),
+                                    vm_id: vm_id.to_owned(),
+                                    context_id: context_id.clone(),
+                                    argv: std::iter::once(launch_entrypoint)
+                                        .chain(resolved.execution_args.clone())
+                                        .collect(),
+                                    argv0: request.options.argv0.clone(),
+                                    env: execution_env,
+                                    cwd: resolved.host_cwd.clone(),
+                                    limits: javascript_execution_limits(vm),
+                                    inline_code,
+                                    wasm_module_bytes: None,
+                                },
+                                module_reader,
+                                guest_reader,
+                            );
+                        self.javascript_engine.dispose_context(&context_id);
+                        let execution = execution_result.map_err(javascript_error)?;
+                        ActiveExecution::Javascript(execution)
+                    }
+                    GuestRuntimeKind::WebAssembly => {
+                        // These values configure the trusted WASM runner, not the
+                        // guest's Linux-visible envp. The execution layer filters
+                        // every AGENTOS_* key from AGENTOS_GUEST_ENV before WASI
+                        // constructs environ, while still making the inherited
+                        // signal state available during runner bootstrap.
+                        execution_env.extend(
+                            sanitize_javascript_child_process_internal_bootstrap_env(
+                                &request.options.internal_bootstrap_env,
+                            ),
+                        );
+                        execution_env
+                            .insert(String::from(WASM_STDIO_SYNC_RPC_ENV), String::from("1"));
+                        execution_env
+                            .insert(String::from(WASM_EXEC_COMMIT_RPC_ENV), String::from("1"));
+                        let wasm_limits = wasm_execution_limits(vm);
+                        let wasm_guest_runtime = guest_runtime_identity(
+                            vm,
+                            Some(u64::from(kernel_pid)),
+                            Some(u64::from(parent_kernel_pid)),
+                        );
+                        let context = self.wasm_engine.create_context(CreateWasmContextRequest {
+                            vm_id: vm_id.to_owned(),
+                            module_path: Some(resolved.entrypoint.clone()),
+                        });
+                        let context_id = context.context_id;
+                        let execution_result =
+                            self.wasm_engine.start_execution(StartWasmExecutionRequest {
                                 vm_id: vm_id.to_owned(),
-                                context_id: context.context_id,
-                                argv: std::iter::once(launch_entrypoint)
-                                    .chain(resolved.execution_args.clone())
-                                    .collect(),
+                                context_id: context_id.clone(),
+                                argv: resolved.process_args.clone(),
                                 env: execution_env,
                                 cwd: resolved.host_cwd.clone(),
-                                limits: javascript_execution_limits(vm),
-                                inline_code,
-                                wasm_module_bytes: None,
-                            },
-                            module_reader,
-                            guest_reader,
-                        )
-                        .map_err(javascript_error)?;
-                    ActiveExecution::Javascript(execution)
-                }
-                GuestRuntimeKind::WebAssembly => {
-                    execution_env.insert(String::from(WASM_STDIO_SYNC_RPC_ENV), String::from("1"));
-                    let wasm_limits = wasm_execution_limits(vm);
-                    let wasm_guest_runtime = guest_runtime_identity(
-                        vm,
-                        Some(u64::from(kernel_pid)),
-                        Some(u64::from(parent_kernel_pid)),
-                    );
-                    let context = self.wasm_engine.create_context(CreateWasmContextRequest {
-                        vm_id: vm_id.to_owned(),
-                        module_path: Some(resolved.entrypoint.clone()),
-                    });
-                    let execution = self
-                        .wasm_engine
-                        .start_execution(StartWasmExecutionRequest {
-                            vm_id: vm_id.to_owned(),
-                            context_id: context.context_id,
-                            argv: resolved.process_args.clone(),
-                            env: execution_env,
-                            cwd: resolved.host_cwd.clone(),
-                            permission_tier: execution_wasm_permission_tier(
-                                resolved
-                                    .wasm_permission_tier
-                                    .unwrap_or(WasmPermissionTier::Full),
-                            ),
-                            limits: wasm_limits,
-                            guest_runtime: wasm_guest_runtime,
-                        })
-                        .map_err(wasm_error)?;
-                    ActiveExecution::Wasm(Box::new(execution))
-                }
-                GuestRuntimeKind::Python => {
-                    // Nested `python` child_process: set up the Pyodide context the
-                    // same way the top-level execute path does, so a guest shell or
-                    // node parent can spawn `python` exactly like `node`.
-                    let python_file_path = if execution_env.contains_key("AGENTOS_PYTHON_ARGV") {
-                        execution_env.get("AGENTOS_PYTHON_FILE").map(PathBuf::from)
-                    } else {
-                        python_file_entrypoint(&resolved.entrypoint)
-                    };
-                    let pyodide_dist_path = self
-                        .python_engine
-                        .bundled_pyodide_dist_path_for_vm(vm_id)
-                        .map_err(python_error)?;
-                    let pyodide_cache_path = pyodide_dist_path
-                        .parent()
-                        .and_then(Path::parent)
-                        .unwrap_or(pyodide_dist_path.as_path())
-                        .join("pyodide-package-cache");
-                    add_runtime_guest_path_mapping(
-                        &mut execution_env,
-                        PYTHON_PYODIDE_GUEST_ROOT,
-                        &pyodide_dist_path,
-                    );
-                    add_runtime_guest_path_mapping(
-                        &mut execution_env,
-                        PYTHON_PYODIDE_CACHE_GUEST_ROOT,
-                        &pyodide_cache_path,
-                    );
-                    add_runtime_host_access_path(
-                        &mut execution_env,
-                        "AGENTOS_EXTRA_FS_READ_PATHS",
-                        &pyodide_dist_path,
-                        true,
-                    );
-                    add_runtime_host_access_path(
-                        &mut execution_env,
-                        "AGENTOS_EXTRA_FS_READ_PATHS",
-                        &pyodide_cache_path,
-                        true,
-                    );
-                    add_runtime_host_access_path(
-                        &mut execution_env,
-                        "AGENTOS_EXTRA_FS_WRITE_PATHS",
-                        &pyodide_cache_path,
-                        false,
-                    );
-                    let context = self
-                        .python_engine
-                        .create_context(CreatePythonContextRequest {
-                            vm_id: vm_id.to_owned(),
-                            pyodide_dist_path,
-                        });
-                    let execution = self
-                        .python_engine
-                        .start_execution(StartPythonExecutionRequest {
-                            vm_id: vm_id.to_owned(),
-                            context_id: context.context_id,
-                            code: resolved.entrypoint.clone(),
-                            file_path: python_file_path,
-                            env: execution_env,
-                            cwd: resolved.host_cwd.clone(),
-                            limits: python_execution_limits(vm),
-                            guest_runtime: guest_runtime_identity(
-                                vm,
-                                Some(u64::from(kernel_pid)),
-                                Some(u64::from(parent_kernel_pid)),
-                            ),
-                        })
-                        .map_err(python_error)?;
-                    ActiveExecution::Python(execution)
-                }
-            };
-            let kernel_stdin_writer_fd = match javascript_child_process_stdin_mode(&request) {
-                "pipe" => Some(install_kernel_stdin_pipe(&mut vm.kernel, kernel_pid)?),
-                "ignore" => {
-                    vm.kernel
-                        .fd_close(EXECUTION_DRIVER_NAME, kernel_pid, 0)
-                        .map_err(kernel_error)?;
+                                permission_tier: execution_wasm_permission_tier(
+                                    resolved
+                                        .wasm_permission_tier
+                                        .unwrap_or(WasmPermissionTier::Full),
+                                ),
+                                limits: wasm_limits,
+                                guest_runtime: wasm_guest_runtime,
+                            });
+                        self.wasm_engine.dispose_context(&context_id);
+                        let execution = execution_result.map_err(wasm_error)?;
+                        ActiveExecution::Wasm(Box::new(execution))
+                    }
+                    GuestRuntimeKind::Python => {
+                        // Nested `python` child_process: set up the Pyodide context the
+                        // same way the top-level execute path does, so a guest shell or
+                        // node parent can spawn `python` exactly like `node`.
+                        let python_file_path = if execution_env.contains_key("AGENTOS_PYTHON_ARGV")
+                        {
+                            execution_env.get("AGENTOS_PYTHON_FILE").map(PathBuf::from)
+                        } else {
+                            python_file_entrypoint(&resolved.entrypoint)
+                        };
+                        let pyodide_dist_path = self
+                            .python_engine
+                            .bundled_pyodide_dist_path_for_vm(vm_id)
+                            .map_err(python_error)?;
+                        let pyodide_cache_path = pyodide_dist_path
+                            .parent()
+                            .and_then(Path::parent)
+                            .unwrap_or(pyodide_dist_path.as_path())
+                            .join("pyodide-package-cache");
+                        add_runtime_guest_path_mapping(
+                            &mut execution_env,
+                            PYTHON_PYODIDE_GUEST_ROOT,
+                            &pyodide_dist_path,
+                        );
+                        add_runtime_guest_path_mapping(
+                            &mut execution_env,
+                            PYTHON_PYODIDE_CACHE_GUEST_ROOT,
+                            &pyodide_cache_path,
+                        );
+                        add_runtime_host_access_path(
+                            &mut execution_env,
+                            "AGENTOS_EXTRA_FS_READ_PATHS",
+                            &pyodide_dist_path,
+                            true,
+                        );
+                        add_runtime_host_access_path(
+                            &mut execution_env,
+                            "AGENTOS_EXTRA_FS_READ_PATHS",
+                            &pyodide_cache_path,
+                            true,
+                        );
+                        add_runtime_host_access_path(
+                            &mut execution_env,
+                            "AGENTOS_EXTRA_FS_WRITE_PATHS",
+                            &pyodide_cache_path,
+                            false,
+                        );
+                        let context =
+                            self.python_engine
+                                .create_context(CreatePythonContextRequest {
+                                    vm_id: vm_id.to_owned(),
+                                    pyodide_dist_path,
+                                });
+                        let context_id = context.context_id;
+                        let execution_result =
+                            self.python_engine
+                                .start_execution(StartPythonExecutionRequest {
+                                    vm_id: vm_id.to_owned(),
+                                    context_id: context_id.clone(),
+                                    code: resolved.entrypoint.clone(),
+                                    file_path: python_file_path,
+                                    env: execution_env,
+                                    cwd: resolved.host_cwd.clone(),
+                                    limits: python_execution_limits(vm),
+                                    guest_runtime: guest_runtime_identity(
+                                        vm,
+                                        Some(u64::from(kernel_pid)),
+                                        Some(u64::from(parent_kernel_pid)),
+                                    ),
+                                });
+                        self.python_engine.dispose_context(&context_id);
+                        let execution = execution_result.map_err(python_error)?;
+                        ActiveExecution::Python(execution)
+                    }
+                };
+                let kernel_stdin_writer_fd = if posix_spawn_controls_stdin {
+                    // POSIX spawn file actions run after fork and before exec. If
+                    // they explicitly installed or closed fd 0, that exact final
+                    // state is authoritative; adding the generic child-process
+                    // stdin pipe here would replace it and keep an unrelated
+                    // writer alive, so the guest could never observe Linux EOF.
                     None
-                }
-                "inherit" => None,
-                _ => Some(install_kernel_stdin_pipe(&mut vm.kernel, kernel_pid)?),
+                } else {
+                    match javascript_child_process_stdin_mode(&request) {
+                        "pipe" => Some(install_kernel_stdin_pipe(&mut vm.kernel, kernel_pid)?),
+                        "ignore" => {
+                            vm.kernel
+                                .fd_close(EXECUTION_DRIVER_NAME, kernel_pid, 0)
+                                .map_err(kernel_error)?;
+                            None
+                        }
+                        "inherit" => None,
+                        _ => Some(install_kernel_stdin_pipe(&mut vm.kernel, kernel_pid)?),
+                    }
+                };
+                (
+                    kernel_pid,
+                    kernel_handle,
+                    execution,
+                    kernel_stdin_writer_fd,
+                    posix_spawn_controls_stdin,
+                )
             };
-            (kernel_pid, kernel_handle, execution, kernel_stdin_writer_fd)
-        };
+            Ok::<_, SidecarError>(spawned)
+        })();
+        let (kernel_pid, kernel_handle, mut execution, kernel_stdin_writer_fd, direct_posix_stdin) =
+            match spawn_result {
+                Ok(spawned) => spawned,
+                Err(error) => {
+                    if let Some(process) = pending_kernel_handle.take() {
+                        rollback_unregistered_spawn_child(
+                            &mut vm.kernel,
+                            &process,
+                            None,
+                            "child_process.spawn",
+                        );
+                    }
+                    return Err(error);
+                }
+            };
         record_execute_phase(
             "child_process_spawn_and_start_execution",
             phase_start.elapsed(),
@@ -7106,10 +10734,36 @@ where
             .kernel
             .isatty(EXECUTION_DRIVER_NAME, kernel_pid, 1)
             .unwrap_or(false);
-        let process = vm
-            .active_processes
-            .get(process_id)
-            .ok_or_else(|| missing_process_error(vm_id, process_id))?;
+        let child_process_group = match vm.kernel.getpgid(EXECUTION_DRIVER_NAME, kernel_pid) {
+            Ok(process_group) => process_group,
+            Err(error) => {
+                if let Some(process) = pending_kernel_handle.take() {
+                    rollback_unregistered_spawn_child(
+                        &mut vm.kernel,
+                        &process,
+                        Some(&mut execution),
+                        "child_process.spawn",
+                    );
+                }
+                return Err(kernel_error(error));
+            }
+        };
+        let process_event_limits = vm.limits.process.clone();
+        let process = match vm.active_processes.get_mut(process_id) {
+            Some(process) => process,
+            None => {
+                let error = missing_process_error(vm_id, process_id);
+                if let Some(child) = pending_kernel_handle.take() {
+                    rollback_unregistered_spawn_child(
+                        &mut vm.kernel,
+                        &child,
+                        Some(&mut execution),
+                        "child_process.spawn",
+                    );
+                }
+                return Err(error);
+            }
+        };
         let inherited_tty_master_owner = if child_fd1_is_tty {
             process
                 .tty_master_fd
@@ -7118,13 +10772,15 @@ where
         } else {
             None
         };
-        let process = vm
-            .active_processes
-            .get_mut(process_id)
-            .ok_or_else(|| missing_process_error(vm_id, process_id))?;
+        pending_kernel_handle.take();
         process.child_processes.insert(
             child_process_id.clone(),
             ActiveProcess::new(kernel_pid, kernel_handle, resolved.runtime, execution)
+                .with_process_event_limits(&process_event_limits)
+                .with_vm_pending_byte_budgets(
+                    Arc::clone(&vm_pending_stdin_bytes_budget),
+                    Arc::clone(&vm_pending_event_bytes_budget),
+                )
                 .with_detached(request.options.detached)
                 .with_guest_cwd(resolved.guest_cwd.clone())
                 .with_env(resolved.env.clone())
@@ -7134,24 +10790,639 @@ where
             let child = process
                 .child_processes
                 .get_mut(&child_process_id)
-                .ok_or_else(|| {
-                    SidecarError::InvalidState(format!(
-                        "child process {child_process_id} disappeared during spawn"
-                    ))
-                })?;
+                .expect("inserted child process exists during spawn registration");
             child.tty_master_owner = inherited_tty_master_owner;
             if let Some(kernel_stdin_writer_fd) = kernel_stdin_writer_fd {
                 child.kernel_stdin_writer_fd = Some(kernel_stdin_writer_fd);
             }
+            prepared_host_net_fds.install(child);
         }
         record_execute_phase("child_process_register", phase_start.elapsed());
         record_execute_phase("child_process_spawn_total", total_start.elapsed());
         Ok(json!({
             "childId": child_process_id,
             "pid": kernel_pid,
+            "pgid": child_process_group,
+            "directPosixStdin": direct_posix_stdin,
             "command": resolved.command,
             "args": resolved.process_args,
         }))
+    }
+
+    /// Replace a running guest process image for execve(2) without creating a
+    /// child. Resolution is deliberately performed against an empty inherited
+    /// environment: execve's supplied envp replaces the old environment rather
+    /// than being overlaid on it. The existing PID, process tree, cwd, stdio,
+    /// and non-CLOEXEC kernel descriptors remain attached to `ActiveProcess`.
+    pub(crate) fn exec_javascript_process_image(
+        &mut self,
+        vm_id: &str,
+        root_process_id: &str,
+        process_path: &[&str],
+        mut request: JavascriptChildProcessSpawnRequest,
+    ) -> Result<(), SidecarError> {
+        if request.options.executable_fd.is_some() {
+            return Err(SidecarError::InvalidState(String::from(
+                "EINVAL: executableFd is only valid for process.exec_fd_image_commit",
+            )));
+        }
+        if request.options.shell || request.options.detached {
+            return Err(SidecarError::InvalidState(String::from(
+                "EINVAL: execve does not accept shell or detached process options",
+            )));
+        }
+
+        let (guest_cwd, host_cwd, kernel_pid, parent_kernel_pid, current_runtime) = {
+            let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
+            let root = vm
+                .active_processes
+                .get(root_process_id)
+                .ok_or_else(|| missing_process_error(vm_id, root_process_id))?;
+            let process = Self::active_process_by_path(root, process_path).ok_or_else(|| {
+                SidecarError::InvalidState(format!(
+                    "unknown process path {} during execve",
+                    Self::child_process_path_label(root_process_id, process_path)
+                ))
+            })?;
+            let parent_kernel_pid = vm
+                .kernel
+                .list_processes()
+                .get(&process.kernel_pid)
+                .map(|entry| entry.ppid)
+                .unwrap_or_default();
+            (
+                process.guest_cwd.clone(),
+                process.host_cwd.clone(),
+                process.kernel_pid,
+                parent_kernel_pid,
+                process.runtime.clone(),
+            )
+        };
+
+        if request.command.is_empty() {
+            return Err(SidecarError::InvalidState(String::from(
+                "ENOENT: execve path is empty",
+            )));
+        }
+        // execve resolves a relative pathname from cwd; it never searches
+        // PATH. Making the command explicitly path-like keeps the shared child
+        // resolver from taking its spawnp/PATH branch for a bare relative name.
+        request.command = if request.command.starts_with('/') {
+            normalize_path(&request.command)
+        } else {
+            normalize_path(&format!("{guest_cwd}/{}", request.command))
+        };
+        let literal_exec_path = request.command.clone();
+        request.command = {
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            vm.kernel
+                .validate_executable_path(&literal_exec_path, &guest_cwd)
+                .map_err(kernel_error)?
+        };
+        request.options.cwd = None;
+        request.options.shell = false;
+        request.options.detached = false;
+
+        let mut resolved = {
+            let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
+            self.resolve_javascript_child_process_execution_with_mode(
+                vm,
+                &BTreeMap::new(),
+                &guest_cwd,
+                &host_cwd,
+                &request,
+                true,
+                None,
+            )?
+        };
+        apply_child_process_argv0(&mut resolved, request.options.argv0.as_deref());
+        if resolved.tool_command {
+            return Err(SidecarError::InvalidState(format!(
+                "ENOEXEC: exec format error: {}",
+                request.command
+            )));
+        }
+        if request.options.local_replacement
+            && current_runtime == GuestRuntimeKind::WebAssembly
+            && resolved.runtime == GuestRuntimeKind::WebAssembly
+        {
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            // The runner has already compiled the replacement before it asks
+            // the sidecar to commit. Recursively validate the original image
+            // and every `#!` interpreter in the kernel so scripts retain
+            // Linux pathname, mode, format, and recursion errors without
+            // requiring the script itself to contain raw WASM bytes.
+            vm.kernel
+                .validate_wasm_exec_image(&request.command, &guest_cwd)
+                .map_err(kernel_error)?;
+        } else {
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            validate_exact_exec_image_format(vm, &request.command, &resolved.runtime)?;
+        }
+        {
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            stage_agentos_package_command(vm, &mut resolved)?;
+        }
+        // Keep guest-visible envp separate from executor bootstrap variables
+        // added during resolution. Both local and separate-runtime exec paths
+        // must publish and inherit exactly the supplied environment.
+        let replacement_guest_env = request.options.env.clone();
+
+        if request.options.local_replacement {
+            if current_runtime != GuestRuntimeKind::WebAssembly
+                || resolved.runtime != GuestRuntimeKind::WebAssembly
+            {
+                return Err(SidecarError::InvalidState(format!(
+                    "ENOEXEC: in-place exec only supports WebAssembly images: {}",
+                    literal_exec_path
+                )));
+            }
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            // execve's envp is a complete replacement. `resolved.env` also
+            // contains host/runtime control variables injected while locating
+            // the module; those must never leak into the process's Linux-visible
+            // environment or become inherited by its future children.
+            let retained_internal_fds = Self::active_process_by_path(
+                vm.active_processes
+                    .get(root_process_id)
+                    .ok_or_else(|| missing_process_error(vm_id, root_process_id))?,
+                process_path,
+            )
+            .and_then(|process| process.kernel_stdin_writer_fd)
+            .into_iter()
+            .collect::<Vec<_>>();
+            vm.kernel
+                .exec_process_retaining_internal_fds(
+                    EXECUTION_DRIVER_NAME,
+                    kernel_pid,
+                    WASM_COMMAND,
+                    resolved.process_args.clone(),
+                    replacement_guest_env.clone(),
+                    resolved.guest_cwd.clone(),
+                    &retained_internal_fds,
+                    &request.options.cloexec_fds,
+                    Some(&literal_exec_path),
+                )
+                .map_err(kernel_error)?;
+
+            let root = vm
+                .active_processes
+                .get_mut(root_process_id)
+                .ok_or_else(|| missing_process_error(vm_id, root_process_id))?;
+            let process =
+                Self::active_process_by_path_mut(root, process_path).ok_or_else(|| {
+                    SidecarError::InvalidState(format!(
+                        "process disappeared during execve: {}",
+                        Self::child_process_path_label(root_process_id, process_path)
+                    ))
+                })?;
+            process.guest_cwd = resolved.guest_cwd;
+            process.host_cwd = resolved.host_cwd;
+            process.env = replacement_guest_env;
+            process.exit_signal = None;
+            process.exit_core_dumped = false;
+            process.deferred_kernel_wait_rpc = None;
+            process.module_resolution_cache = Default::default();
+            discard_replaced_image_pending_events(process);
+
+            // POSIX exec resets caught dispositions to default, preserves
+            // ignored dispositions, and preserves the signal mask/pending set.
+            reset_caught_signal_dispositions_after_exec(
+                &mut vm.signal_states,
+                root_process_id,
+                process_path,
+            );
+            return Ok(());
+        }
+
+        let vm = self
+            .vms
+            .get_mut(vm_id)
+            .ok_or_else(|| missing_vm_error(vm_id))?;
+        let mut execution_env = resolved.env.clone();
+        execution_env.insert(
+            String::from(EXECUTION_SANDBOX_ROOT_ENV),
+            normalize_host_path(&vm.cwd).to_string_lossy().into_owned(),
+        );
+        let replacement = match resolved.runtime {
+            GuestRuntimeKind::JavaScript => {
+                execution_env.extend(sanitize_javascript_child_process_internal_bootstrap_env(
+                    &request.options.internal_bootstrap_env,
+                ));
+                execution_env.insert(String::from("AGENTOS_KEEP_STDIN_OPEN"), String::from("1"));
+                let launch_entrypoint =
+                    resolve_agentos_package_javascript_launch_entrypoint(vm, &mut execution_env)
+                        .unwrap_or_else(|| resolved.entrypoint.clone());
+                let inline_code = load_javascript_entrypoint_source(
+                    vm,
+                    &resolved.host_cwd,
+                    &launch_entrypoint,
+                    &execution_env,
+                );
+                prepare_javascript_shadow(vm, &resolved, &execution_env)?;
+                let built_reader = build_module_reader(vm, &resolved);
+                let guest_reader = built_reader.clone().map(|reader| {
+                    Box::new(crate::plugins::host_dir::SessionModuleReader::new(reader))
+                        as Box<dyn GuestModuleReader>
+                });
+                let module_reader =
+                    built_reader.map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
+                let context =
+                    self.javascript_engine
+                        .create_context(CreateJavascriptContextRequest {
+                            vm_id: vm_id.to_owned(),
+                            bootstrap_module: None,
+                            compile_cache_root: Some(self.cache_root.join("node-compile-cache")),
+                        });
+                let context_id = context.context_id;
+                let replacement_result =
+                    self.javascript_engine.prepare_execution_with_module_reader(
+                        StartJavascriptExecutionRequest {
+                            guest_runtime: guest_runtime_identity(
+                                vm,
+                                Some(u64::from(kernel_pid)),
+                                Some(u64::from(parent_kernel_pid)),
+                            ),
+                            vm_id: vm_id.to_owned(),
+                            context_id: context_id.clone(),
+                            argv: std::iter::once(launch_entrypoint)
+                                .chain(resolved.execution_args.clone())
+                                .collect(),
+                            argv0: request.options.argv0.clone(),
+                            env: execution_env,
+                            cwd: resolved.host_cwd.clone(),
+                            limits: javascript_execution_limits(vm),
+                            inline_code,
+                            wasm_module_bytes: None,
+                        },
+                        module_reader,
+                        guest_reader,
+                    );
+                self.javascript_engine.dispose_context(&context_id);
+                ActiveExecution::Javascript(replacement_result.map_err(javascript_error)?)
+            }
+            GuestRuntimeKind::WebAssembly => {
+                execution_env.extend(sanitize_javascript_child_process_internal_bootstrap_env(
+                    &request.options.internal_bootstrap_env,
+                ));
+                execution_env.insert(String::from(WASM_STDIO_SYNC_RPC_ENV), String::from("1"));
+                execution_env.insert(String::from(WASM_EXEC_COMMIT_RPC_ENV), String::from("1"));
+                let context = self.wasm_engine.create_context(CreateWasmContextRequest {
+                    vm_id: vm_id.to_owned(),
+                    module_path: Some(resolved.entrypoint.clone()),
+                });
+                let context_id = context.context_id;
+                let replacement_result =
+                    self.wasm_engine
+                        .prepare_execution(StartWasmExecutionRequest {
+                            vm_id: vm_id.to_owned(),
+                            context_id: context_id.clone(),
+                            argv: resolved.process_args.clone(),
+                            env: execution_env,
+                            cwd: resolved.host_cwd.clone(),
+                            permission_tier: execution_wasm_permission_tier(
+                                resolved
+                                    .wasm_permission_tier
+                                    .unwrap_or(WasmPermissionTier::Full),
+                            ),
+                            limits: wasm_execution_limits(vm),
+                            guest_runtime: guest_runtime_identity(
+                                vm,
+                                Some(u64::from(kernel_pid)),
+                                Some(u64::from(parent_kernel_pid)),
+                            ),
+                        });
+                self.wasm_engine.dispose_context(&context_id);
+                ActiveExecution::Wasm(Box::new(replacement_result.map_err(wasm_error)?))
+            }
+            GuestRuntimeKind::Python => {
+                let python_file_path = if execution_env.contains_key("AGENTOS_PYTHON_ARGV") {
+                    execution_env.get("AGENTOS_PYTHON_FILE").map(PathBuf::from)
+                } else {
+                    python_file_entrypoint(&resolved.entrypoint)
+                };
+                let pyodide_dist_path = self
+                    .python_engine
+                    .bundled_pyodide_dist_path_for_vm(vm_id)
+                    .map_err(python_error)?;
+                let pyodide_cache_path = pyodide_dist_path
+                    .parent()
+                    .and_then(Path::parent)
+                    .unwrap_or(pyodide_dist_path.as_path())
+                    .join("pyodide-package-cache");
+                add_runtime_guest_path_mapping(
+                    &mut execution_env,
+                    PYTHON_PYODIDE_GUEST_ROOT,
+                    &pyodide_dist_path,
+                );
+                add_runtime_guest_path_mapping(
+                    &mut execution_env,
+                    PYTHON_PYODIDE_CACHE_GUEST_ROOT,
+                    &pyodide_cache_path,
+                );
+                add_runtime_host_access_path(
+                    &mut execution_env,
+                    "AGENTOS_EXTRA_FS_READ_PATHS",
+                    &pyodide_dist_path,
+                    true,
+                );
+                add_runtime_host_access_path(
+                    &mut execution_env,
+                    "AGENTOS_EXTRA_FS_READ_PATHS",
+                    &pyodide_cache_path,
+                    true,
+                );
+                add_runtime_host_access_path(
+                    &mut execution_env,
+                    "AGENTOS_EXTRA_FS_WRITE_PATHS",
+                    &pyodide_cache_path,
+                    false,
+                );
+                let context = self
+                    .python_engine
+                    .create_context(CreatePythonContextRequest {
+                        vm_id: vm_id.to_owned(),
+                        pyodide_dist_path,
+                    });
+                let context_id = context.context_id;
+                let replacement_result =
+                    self.python_engine
+                        .prepare_execution(StartPythonExecutionRequest {
+                            vm_id: vm_id.to_owned(),
+                            context_id: context_id.clone(),
+                            code: resolved.entrypoint.clone(),
+                            file_path: python_file_path,
+                            env: execution_env,
+                            cwd: resolved.host_cwd.clone(),
+                            limits: python_execution_limits(vm),
+                            guest_runtime: guest_runtime_identity(
+                                vm,
+                                Some(u64::from(kernel_pid)),
+                                Some(u64::from(parent_kernel_pid)),
+                            ),
+                        });
+                self.python_engine.dispose_context(&context_id);
+                ActiveExecution::Python(replacement_result.map_err(python_error)?)
+            }
+        };
+
+        // Hard production invariant: a cross-runtime exec image must still
+        // own its deferred execute payload here. This check makes it
+        // impossible to accidentally regress to the old start-before-commit
+        // path without failing execve before kernel state is mutated.
+        if !replacement.is_prepared_for_start() {
+            return Err(SidecarError::InvalidState(String::from(
+                "EIO: cross-runtime execve replacement started before kernel commit",
+            )));
+        }
+
+        let kernel_command = match resolved.runtime {
+            GuestRuntimeKind::JavaScript => JAVASCRIPT_COMMAND,
+            GuestRuntimeKind::WebAssembly => WASM_COMMAND,
+            GuestRuntimeKind::Python => PYTHON_COMMAND,
+        };
+        let retained_internal_fds = Self::active_process_by_path(
+            vm.active_processes
+                .get(root_process_id)
+                .ok_or_else(|| missing_process_error(vm_id, root_process_id))?,
+            process_path,
+        )
+        .and_then(|process| process.kernel_stdin_writer_fd)
+        .into_iter()
+        .collect::<Vec<_>>();
+        if let Err(error) = vm.kernel.exec_process_retaining_internal_fds(
+            EXECUTION_DRIVER_NAME,
+            kernel_pid,
+            kernel_command,
+            resolved.process_args.clone(),
+            replacement_guest_env.clone(),
+            resolved.guest_cwd.clone(),
+            &retained_internal_fds,
+            &request.options.cloexec_fds,
+            Some(&literal_exec_path),
+        ) {
+            let mut replacement = replacement;
+            if let Err(terminate_error) = replacement.terminate() {
+                tracing::warn!(
+                    vm_id,
+                    kernel_pid,
+                    error = %terminate_error,
+                    "failed to terminate prepared replacement after execve kernel commit was rejected"
+                );
+            }
+            return Err(kernel_error(error));
+        }
+
+        let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
+        let root = vm
+            .active_processes
+            .get_mut(root_process_id)
+            .ok_or_else(|| missing_process_error(vm_id, root_process_id))?;
+        let process = Self::active_process_by_path_mut(root, process_path).ok_or_else(|| {
+            SidecarError::InvalidState(format!(
+                "process disappeared during execve: {}",
+                Self::child_process_path_label(root_process_id, process_path)
+            ))
+        })?;
+        let mut old_execution = std::mem::replace(&mut process.execution, replacement);
+        process.runtime = resolved.runtime;
+        process.guest_cwd = resolved.guest_cwd;
+        process.host_cwd = resolved.host_cwd;
+        process.env = replacement_guest_env;
+        process.exit_signal = None;
+        process.exit_core_dumped = false;
+        process.deferred_kernel_wait_rpc = None;
+        process.module_resolution_cache = Default::default();
+        discard_replaced_image_pending_events(process);
+        rebind_process_runtime_event_targets(process, &kernel_readiness);
+
+        // POSIX exec resets caught dispositions to default but preserves
+        // dispositions explicitly set to ignore.
+        let signal_key = reset_caught_signal_dispositions_after_exec(
+            &mut vm.signal_states,
+            root_process_id,
+            process_path,
+        );
+        // The replacement isolate was registered and fully loaded before the
+        // kernel commit, but no guest code was enqueued. Only start it now,
+        // after both kernel-visible process state and sidecar-owned descriptors
+        // and event targets point at the replacement image.
+        #[cfg(test)]
+        let replacement_start_error = if std::mem::take(&mut self.fail_next_exec_start_after_commit)
+        {
+            Some(SidecarError::Execution(String::from(
+                "injected post-commit execve start failure",
+            )))
+        } else {
+            process.execution.start_prepared().err()
+        };
+        #[cfg(not(test))]
+        let replacement_start_error = process.execution.start_prepared().err();
+        if let Some(error) = replacement_start_error.as_ref() {
+            let message = format!("execve replacement runtime failed to start: {error}\n");
+            if let Err(queue_error) = process
+                .queue_pending_execution_event(ActiveExecutionEvent::Stderr(message.into_bytes()))
+                .and_then(|_| {
+                    process.queue_pending_execution_event(ActiveExecutionEvent::Exited(127))
+                })
+            {
+                tracing::error!(
+                    vm_id,
+                    process_id = %signal_key,
+                    error = %queue_error,
+                    "failed to queue fatal post-commit execve start failure"
+                );
+            }
+            process.kernel_handle.finish(127);
+            if let Err(terminate_error) = process.execution.terminate() {
+                tracing::error!(
+                    vm_id,
+                    process_id = %signal_key,
+                    error = %terminate_error,
+                    "failed to terminate replacement runtime after post-commit execve start failure"
+                );
+            }
+        }
+        // The old image is blocked in the exec RPC. Terminating it after the
+        // atomic state swap ensures no success response can resume old code.
+        if let Err(error) = old_execution.terminate() {
+            tracing::warn!(
+                vm_id,
+                process_id = %signal_key,
+                error = %error,
+                "execve committed but the replaced runtime image reported a termination error"
+            );
+        }
+        if let Some(error) = replacement_start_error {
+            // The kernel execve commit is irrevocable. Linux does not return an
+            // errno into the old image when a post-commit loader/start failure
+            // occurs; the new process image dies. Log the typed host failure,
+            // leave the queued exit for normal cleanup, and report committed
+            // success to the service loop so it never replies to old code.
+            tracing::error!(
+                vm_id,
+                process_id = %signal_key,
+                error = %error,
+                "execve replacement failed after commit; terminating the replacement process"
+            );
+        }
+        Ok(())
+    }
+
+    /// Commit metadata for an fexecve image that the trusted WASM runner has
+    /// already read and compiled from its live private descriptor. This route
+    /// deliberately performs no pathname resolution or reopen: the descriptor
+    /// may name an unlinked file, and the runner owns that open-file identity.
+    pub(crate) fn commit_wasm_fd_process_image(
+        &mut self,
+        vm_id: &str,
+        root_process_id: &str,
+        process_path: &[&str],
+        request: JavascriptChildProcessSpawnRequest,
+    ) -> Result<(), SidecarError> {
+        if !request.options.local_replacement || request.options.executable_fd.is_none() {
+            return Err(SidecarError::InvalidState(String::from(
+                "EINVAL: fd-image exec commit requires localReplacement and executableFd",
+            )));
+        }
+        if request.options.shell || request.options.detached || request.options.cwd.is_some() {
+            return Err(SidecarError::InvalidState(String::from(
+                "EINVAL: fexecve does not accept shell, detached, or cwd options",
+            )));
+        }
+
+        let (kernel_pid, retained_internal_fds) = {
+            let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
+            let root = vm
+                .active_processes
+                .get(root_process_id)
+                .ok_or_else(|| missing_process_error(vm_id, root_process_id))?;
+            let process = Self::active_process_by_path(root, process_path).ok_or_else(|| {
+                SidecarError::InvalidState(format!(
+                    "unknown process path {} during fexecve commit",
+                    Self::child_process_path_label(root_process_id, process_path)
+                ))
+            })?;
+            if process.runtime != GuestRuntimeKind::WebAssembly {
+                return Err(SidecarError::InvalidState(String::from(
+                    "ENOEXEC: fd-image exec commit requires a WebAssembly process",
+                )));
+            }
+            (
+                process.kernel_pid,
+                process
+                    .kernel_stdin_writer_fd
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let mut argv = Vec::with_capacity(request.args.len().saturating_add(1));
+        argv.push(
+            request
+                .options
+                .argv0
+                .clone()
+                .unwrap_or_else(|| request.command.clone()),
+        );
+        argv.extend(request.args);
+        let replacement_guest_env = request.options.env;
+
+        let vm = self
+            .vms
+            .get_mut(vm_id)
+            .ok_or_else(|| missing_vm_error(vm_id))?;
+        vm.kernel
+            .exec_process_retaining_internal_fds(
+                EXECUTION_DRIVER_NAME,
+                kernel_pid,
+                WASM_COMMAND,
+                argv,
+                replacement_guest_env.clone(),
+                String::new(),
+                &retained_internal_fds,
+                &request.options.cloexec_fds,
+                None,
+            )
+            .map_err(kernel_error)?;
+
+        let root = vm
+            .active_processes
+            .get_mut(root_process_id)
+            .ok_or_else(|| missing_process_error(vm_id, root_process_id))?;
+        let process = Self::active_process_by_path_mut(root, process_path).ok_or_else(|| {
+            SidecarError::InvalidState(format!(
+                "process disappeared during fexecve commit: {}",
+                Self::child_process_path_label(root_process_id, process_path)
+            ))
+        })?;
+        process.env = replacement_guest_env;
+        process.exit_signal = None;
+        process.exit_core_dumped = false;
+        process.deferred_kernel_wait_rpc = None;
+        process.module_resolution_cache = Default::default();
+        discard_replaced_image_pending_events(process);
+        reset_caught_signal_dispositions_after_exec(
+            &mut vm.signal_states,
+            root_process_id,
+            process_path,
+        );
+        Ok(())
     }
 
     pub(crate) fn spawn_javascript_child_process_sync(
@@ -7285,48 +11556,12 @@ where
         vm_id: &str,
         process_id: &str,
         current_process_path: &[&str],
-        request: JavascriptChildProcessSpawnRequest,
+        mut request: JavascriptChildProcessSpawnRequest,
     ) -> Result<Value, SidecarError> {
-        let mut request = request;
-        let total_start = Instant::now();
+        let spawn_attributes = javascript_spawn_attributes(&request.options)?;
+        let requested_pgid = spawn_attributes.process_group;
         let current_process_label =
             Self::child_process_path_label(process_id, current_process_path);
-        let phase_start = Instant::now();
-        let (parent_env, parent_guest_cwd, parent_host_cwd, parent_kernel_pid) = {
-            let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
-            let root = vm
-                .active_processes
-                .get(process_id)
-                .ok_or_else(|| missing_process_error(vm_id, process_id))?;
-            let parent =
-                Self::active_process_by_path(root, current_process_path).ok_or_else(|| {
-                    SidecarError::InvalidState(format!(
-                        "unknown child process path {current_process_label} during nested spawn"
-                    ))
-                })?;
-            (
-                parent.env.clone(),
-                parent.guest_cwd.clone(),
-                parent.host_cwd.clone(),
-                parent.kernel_pid,
-            )
-        };
-        let mut resolved = self.resolve_javascript_child_process_with_shebang(
-            vm_id,
-            &parent_env,
-            &parent_guest_cwd,
-            &parent_host_cwd,
-            &mut request,
-        )?;
-        {
-            let vm = self
-                .vms
-                .get_mut(vm_id)
-                .ok_or_else(|| missing_vm_error(vm_id))?;
-            stage_agentos_package_command(vm, &mut resolved)?;
-        }
-        let resolved = resolved;
-        record_execute_phase("child_process_resolve_execution", phase_start.elapsed());
         let parent_sync_roots = {
             let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
             let root = vm
@@ -7350,12 +11585,167 @@ where
                 .ok_or_else(|| missing_vm_error(vm_id))?;
             sync_process_host_roots_to_kernel(vm, &host_cwd, &guest_cwd)?;
         }
-
+        let prepared_host_net_fds = {
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            let current_network_counts = vm_spawn_host_net_resource_counts(vm);
+            let (kernel, active_processes) = (&mut vm.kernel, &mut vm.active_processes);
+            let root = active_processes
+                .get_mut(process_id)
+                .ok_or_else(|| missing_process_error(vm_id, process_id))?;
+            let parent =
+                Self::active_process_by_path_mut(root, current_process_path).ok_or_else(|| {
+                    SidecarError::InvalidState(format!(
+                        "unknown child process path {} during host-network fd inheritance",
+                        Self::child_process_path_label(process_id, current_process_path)
+                    ))
+                })?;
+            prepare_spawn_host_net_fds(
+                kernel,
+                parent,
+                current_network_counts,
+                &request.options.spawn_host_net_fds,
+                &request.options.spawn_fd_mappings,
+                &request.options.spawn_file_actions,
+            )?
+        };
+        let prepared_spawn_actions = if !prepared_host_net_fds.kernel_actions.is_empty() {
+            let (parent_pid, parent_cwd) = {
+                let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
+                let root = vm
+                    .active_processes
+                    .get(process_id)
+                    .ok_or_else(|| missing_process_error(vm_id, process_id))?;
+                let parent =
+                    Self::active_process_by_path(root, current_process_path).ok_or_else(|| {
+                        SidecarError::InvalidState(format!(
+                            "unknown child process path {} during spawn file actions",
+                            Self::child_process_path_label(process_id, current_process_path)
+                        ))
+                    })?;
+                let initial_cwd = request
+                    .options
+                    .cwd
+                    .as_deref()
+                    .map(|cwd| {
+                        if cwd.starts_with('/') {
+                            normalize_path(cwd)
+                        } else {
+                            normalize_path(&format!("{}/{cwd}", parent.guest_cwd))
+                        }
+                    })
+                    .unwrap_or_else(|| parent.guest_cwd.clone());
+                (parent.kernel_pid, initial_cwd)
+            };
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            Some(preapply_posix_spawn_file_actions(
+                &mut vm.kernel,
+                parent_pid,
+                &parent_cwd,
+                requested_pgid,
+                &request.options.spawn_fd_mappings,
+                &prepared_host_net_fds.kernel_actions,
+            )?)
+        } else {
+            None
+        };
+        if let Some(prepared) = prepared_spawn_actions.as_ref() {
+            request.options.cwd = Some(prepared.cwd.clone());
+        }
+        {
+            let parent_guest_cwd = {
+                let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
+                let root = vm
+                    .active_processes
+                    .get(process_id)
+                    .ok_or_else(|| missing_process_error(vm_id, process_id))?;
+                Self::active_process_by_path(root, current_process_path)
+                    .ok_or_else(|| {
+                        SidecarError::InvalidState(format!(
+                            "unknown child process path {} during program resolution",
+                            Self::child_process_path_label(process_id, current_process_path)
+                        ))
+                    })?
+                    .guest_cwd
+                    .clone()
+            };
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            resolve_posix_spawn_program(vm, &parent_guest_cwd, &mut request)?;
+        }
+        let total_start = Instant::now();
+        let phase_start = Instant::now();
+        let (parent_env, parent_guest_cwd, parent_host_cwd, parent_kernel_pid) = {
+            let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
+            let root = vm
+                .active_processes
+                .get(process_id)
+                .ok_or_else(|| missing_process_error(vm_id, process_id))?;
+            let parent =
+                Self::active_process_by_path(root, current_process_path).ok_or_else(|| {
+                    SidecarError::InvalidState(format!(
+                        "unknown child process path {current_process_label} during nested spawn"
+                    ))
+                })?;
+            (
+                parent.env.clone(),
+                parent.guest_cwd.clone(),
+                parent.host_cwd.clone(),
+                parent.kernel_pid,
+            )
+        };
+        let mut resolved =
+            if !request.options.spawn_exact_path && request.options.spawn_search_path.is_none() {
+                self.resolve_javascript_child_process_with_shebang(
+                    vm_id,
+                    &parent_env,
+                    &parent_guest_cwd,
+                    &parent_host_cwd,
+                    &mut request,
+                )?
+            } else {
+                let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
+                self.resolve_javascript_child_process_execution_with_mode(
+                    vm,
+                    &parent_env,
+                    &parent_guest_cwd,
+                    &parent_host_cwd,
+                    &request,
+                    request.options.spawn_exact_path,
+                    request.options.spawn_search_path.as_deref(),
+                )?
+            };
+        apply_child_process_argv0(&mut resolved, request.options.argv0.as_deref());
+        {
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            stage_agentos_package_command(vm, &mut resolved)?;
+        }
+        let resolved = resolved;
+        if prepared_host_net_fds.inherited_fd_count() != 0
+            && (resolved.runtime != GuestRuntimeKind::WebAssembly || resolved.tool_command)
+        {
+            return Err(SidecarError::InvalidState(String::from(
+                "ENOTSUP: inherited host-network fds require a WebAssembly child runtime",
+            )));
+        }
+        record_execute_phase("child_process_resolve_execution", phase_start.elapsed());
         let sidecar_requests = self.sidecar_requests.clone();
         let vm = self
             .vms
             .get_mut(vm_id)
             .ok_or_else(|| missing_vm_error(vm_id))?;
+        let vm_pending_stdin_bytes_budget = Arc::clone(&vm.pending_stdin_bytes_budget);
+        let vm_pending_event_bytes_budget = Arc::clone(&vm.pending_event_bytes_budget);
         let phase_start = Instant::now();
         let child_process_id = {
             let root = vm
@@ -7372,264 +11762,398 @@ where
         };
         let mut child_path = current_process_path.to_vec();
         child_path.push(child_process_id.as_str());
-        let (kernel_pid, kernel_handle, execution, kernel_stdin_writer_fd) = if resolved
-            .tool_command
-        {
-            let tool_resolution = resolve_tool_command(
-                vm,
-                &resolved.command,
-                &resolved.execution_args,
-                Some(&resolved.guest_cwd),
-            )?
-            .ok_or_else(|| {
-                SidecarError::InvalidState(format!(
-                    "tool command no longer resolves: {}",
-                    resolved.command
-                ))
-            })?;
-            let kernel_handle = vm
-                .kernel
-                .create_virtual_process(
-                    EXECUTION_DRIVER_NAME,
-                    TOOL_DRIVER_NAME,
+        let mut pending_kernel_handle = None;
+        let spawn_result = (|| {
+            let spawned = if resolved.tool_command {
+                let tool_resolution = resolve_tool_command(
+                    vm,
                     &resolved.command,
-                    resolved.process_args.clone(),
-                    VirtualProcessOptions {
-                        parent_pid: Some(parent_kernel_pid),
-                        env: resolved.env.clone(),
-                        cwd: Some(resolved.guest_cwd.clone()),
-                    },
-                )
-                .map_err(kernel_error)?;
-            let kernel_pid = kernel_handle.pid();
-            let tool_execution = ToolExecution::default();
-            let cancelled = tool_execution.cancelled.clone();
-            let pending_events = tool_execution.pending_events.clone();
-            let events_overflowed = tool_execution.events_overflowed.clone();
-            spawn_tool_process_events(ToolProcessEventRequest {
-                sidecar_requests: sidecar_requests.clone(),
-                connection_id: vm.connection_id.clone(),
-                session_id: vm.session_id.clone(),
-                vm_id: vm_id.to_owned(),
-                tool_resolution,
-                cancelled,
-                pending_events,
-                events_overflowed,
-            });
-            (
-                kernel_pid,
-                kernel_handle,
-                ActiveExecution::Tool(tool_execution),
-                None,
-            )
-        } else {
-            let kernel_command = match resolved.runtime {
-                GuestRuntimeKind::JavaScript => JAVASCRIPT_COMMAND,
-                GuestRuntimeKind::WebAssembly => WASM_COMMAND,
-                GuestRuntimeKind::Python => PYTHON_COMMAND,
-            };
-            let kernel_handle = vm
-                .kernel
-                .spawn_process(
-                    kernel_command,
-                    resolved.process_args.clone(),
-                    SpawnOptions {
-                        requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
-                        parent_pid: Some(parent_kernel_pid),
-                        env: resolved.env.clone(),
-                        cwd: Some(resolved.guest_cwd.clone()),
-                    },
-                )
-                .map_err(kernel_error)?;
-            let kernel_pid = kernel_handle.pid();
-            if request.options.detached {
-                vm.kernel
-                    .setsid(EXECUTION_DRIVER_NAME, kernel_pid)
-                    .map_err(kernel_error)?;
-            }
-            let mut execution_env = resolved.env.clone();
-            execution_env.insert(
-                String::from(EXECUTION_SANDBOX_ROOT_ENV),
-                normalize_host_path(&vm.cwd).to_string_lossy().into_owned(),
-            );
-            let execution = match resolved.runtime {
-                GuestRuntimeKind::JavaScript => {
-                    execution_env.extend(sanitize_javascript_child_process_internal_bootstrap_env(
-                        &request.options.internal_bootstrap_env,
-                    ));
-                    execution_env
-                        .insert(String::from("AGENTOS_KEEP_STDIN_OPEN"), String::from("1"));
-                    let launch_entrypoint = resolve_agentos_package_javascript_launch_entrypoint(
-                        vm,
-                        &mut execution_env,
+                    &resolved.execution_args,
+                    Some(&resolved.guest_cwd),
+                )?
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(format!(
+                        "tool command no longer resolves: {}",
+                        resolved.command
+                    ))
+                })?;
+                let kernel_handle = vm
+                    .kernel
+                    .create_virtual_process_with_process_group(
+                        EXECUTION_DRIVER_NAME,
+                        TOOL_DRIVER_NAME,
+                        &resolved.command,
+                        resolved.process_args.clone(),
+                        VirtualProcessOptions {
+                            parent_pid: Some(parent_kernel_pid),
+                            env: resolved.env.clone(),
+                            cwd: Some(resolved.guest_cwd.clone()),
+                        },
+                        requested_pgid,
                     )
-                    .unwrap_or_else(|| resolved.entrypoint.clone());
-                    let context =
-                        self.javascript_engine
-                            .create_context(CreateJavascriptContextRequest {
-                                vm_id: vm_id.to_owned(),
-                                bootstrap_module: None,
-                                compile_cache_root: Some(
-                                    self.cache_root.join("node-compile-cache"),
-                                ),
-                            });
-                    let inline_code = load_javascript_entrypoint_source(
-                        vm,
-                        &resolved.host_cwd,
-                        &launch_entrypoint,
-                        &execution_env,
+                    .map_err(kernel_error)?;
+                let kernel_pid = kernel_handle.pid();
+                if let Some(prepared) = prepared_spawn_actions {
+                    install_preapplied_posix_spawn_file_actions(
+                        &mut vm.kernel,
+                        &kernel_handle,
+                        prepared,
+                    )?;
+                } else {
+                    apply_posix_spawn_file_actions_or_rollback(
+                        &mut vm.kernel,
+                        &kernel_handle,
+                        &resolved.guest_cwd,
+                        &request.options.spawn_fd_mappings,
+                        &prepared_host_net_fds.kernel_actions,
+                    )?;
+                }
+                apply_spawn_session_or_rollback(
+                    &mut vm.kernel,
+                    &kernel_handle,
+                    spawn_attributes.new_session || request.options.detached,
+                )?;
+                pending_kernel_handle = Some(kernel_handle.clone());
+                let tool_execution = ToolExecution::default()
+                    .with_vm_pending_event_bytes_budget(Arc::clone(&vm_pending_event_bytes_budget));
+                let cancelled = tool_execution.cancelled.clone();
+                let pending_events = tool_execution.pending_events.clone();
+                let event_overflow_reason = tool_execution.event_overflow_reason.clone();
+                let pending_event_bytes = tool_execution.pending_event_bytes.clone();
+                let pending_event_count_limit = tool_execution.pending_event_count_limit.clone();
+                let pending_event_bytes_limit = tool_execution.pending_event_bytes_limit.clone();
+                spawn_tool_process_events(ToolProcessEventRequest {
+                    sidecar_requests: sidecar_requests.clone(),
+                    connection_id: vm.connection_id.clone(),
+                    session_id: vm.session_id.clone(),
+                    vm_id: vm_id.to_owned(),
+                    tool_resolution,
+                    cancelled,
+                    pending_events,
+                    event_overflow_reason,
+                    pending_event_bytes,
+                    pending_event_count_limit,
+                    pending_event_bytes_limit,
+                    vm_pending_event_bytes_budget: Arc::clone(&vm_pending_event_bytes_budget),
+                });
+                (
+                    kernel_pid,
+                    kernel_handle,
+                    ActiveExecution::Tool(tool_execution),
+                    None,
+                    false,
+                )
+            } else {
+                let kernel_command = match resolved.runtime {
+                    GuestRuntimeKind::JavaScript => JAVASCRIPT_COMMAND,
+                    GuestRuntimeKind::WebAssembly => WASM_COMMAND,
+                    GuestRuntimeKind::Python => PYTHON_COMMAND,
+                };
+                let kernel_handle = vm
+                    .kernel
+                    .spawn_process_with_process_group(
+                        kernel_command,
+                        resolved.process_args.clone(),
+                        SpawnOptions {
+                            requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                            parent_pid: Some(parent_kernel_pid),
+                            env: resolved.env.clone(),
+                            cwd: Some(resolved.guest_cwd.clone()),
+                        },
+                        requested_pgid,
+                    )
+                    .map_err(kernel_error)?;
+                let kernel_pid = kernel_handle.pid();
+                let applied_spawn_actions = if let Some(prepared) = prepared_spawn_actions {
+                    install_preapplied_posix_spawn_file_actions(
+                        &mut vm.kernel,
+                        &kernel_handle,
+                        prepared,
+                    )?
+                } else {
+                    apply_posix_spawn_file_actions_or_rollback(
+                        &mut vm.kernel,
+                        &kernel_handle,
+                        &resolved.guest_cwd,
+                        &request.options.spawn_fd_mappings,
+                        &prepared_host_net_fds.kernel_actions,
+                    )?
+                };
+                let posix_spawn_controls_stdin = !request.options.spawn_file_actions.is_empty()
+                    && (applied_spawn_actions
+                        .fd_mappings
+                        .iter()
+                        .any(|mapping| mapping[0] == 0)
+                        || applied_spawn_actions.closed_guest_fds.contains(&0)
+                        || prepared_host_net_fds
+                            .descriptions
+                            .iter()
+                            .any(|description| description.guest_fds.contains(&0)));
+                apply_spawn_session_or_rollback(
+                    &mut vm.kernel,
+                    &kernel_handle,
+                    spawn_attributes.new_session || request.options.detached,
+                )?;
+                pending_kernel_handle = Some(kernel_handle.clone());
+                let mut execution_env = resolved.env.clone();
+                if resolved.runtime == GuestRuntimeKind::WebAssembly {
+                    execution_env.insert(
+                        String::from("AGENTOS_WASM_INHERITED_FD_MAPPINGS"),
+                        serde_json::to_string(&applied_spawn_actions.fd_mappings).map_err(
+                            |error| {
+                                SidecarError::InvalidState(format!(
+                                    "failed to serialize inherited WASM fd mappings: {error}"
+                                ))
+                            },
+                        )?,
                     );
-                    prepare_javascript_shadow(vm, &resolved, &execution_env)?;
+                    execution_env.insert(
+                        String::from("AGENTOS_WASM_CLOSED_INHERITED_FDS"),
+                        serde_json::to_string(&applied_spawn_actions.closed_guest_fds).map_err(
+                            |error| {
+                                SidecarError::InvalidState(format!(
+                                    "failed to serialize closed inherited WASM fds: {error}"
+                                ))
+                            },
+                        )?,
+                    );
+                    execution_env.insert(
+                        String::from("AGENTOS_WASM_INHERITED_HOSTNET_FDS"),
+                        serde_json::to_string(&prepared_host_net_fds.bootstrap_json()).map_err(
+                            |error| {
+                                SidecarError::InvalidState(format!(
+                                    "failed to serialize inherited WASM host-network fds: {error}"
+                                ))
+                            },
+                        )?,
+                    );
+                }
+                execution_env.insert(
+                    String::from(EXECUTION_SANDBOX_ROOT_ENV),
+                    normalize_host_path(&vm.cwd).to_string_lossy().into_owned(),
+                );
+                let execution = match resolved.runtime {
+                    GuestRuntimeKind::JavaScript => {
+                        execution_env.extend(
+                            sanitize_javascript_child_process_internal_bootstrap_env(
+                                &request.options.internal_bootstrap_env,
+                            ),
+                        );
+                        execution_env
+                            .insert(String::from("AGENTOS_KEEP_STDIN_OPEN"), String::from("1"));
+                        let launch_entrypoint =
+                            resolve_agentos_package_javascript_launch_entrypoint(
+                                vm,
+                                &mut execution_env,
+                            )
+                            .unwrap_or_else(|| resolved.entrypoint.clone());
+                        let inline_code = load_javascript_entrypoint_source(
+                            vm,
+                            &resolved.host_cwd,
+                            &launch_entrypoint,
+                            &execution_env,
+                        );
+                        prepare_javascript_shadow(vm, &resolved, &execution_env)?;
 
-                    let built_reader = build_module_reader(vm, &resolved);
-                    let guest_reader = built_reader.clone().map(|reader| {
-                        Box::new(crate::plugins::host_dir::SessionModuleReader::new(reader))
-                            as Box<dyn GuestModuleReader>
-                    });
-                    let module_reader = built_reader
-                        .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
-                    let execution = self
-                        .javascript_engine
-                        .start_execution_with_module_reader(
-                            StartJavascriptExecutionRequest {
-                                guest_runtime: guest_runtime_identity(
-                                    vm,
-                                    Some(u64::from(kernel_pid)),
-                                    Some(u64::from(parent_kernel_pid)),
-                                ),
+                        let built_reader = build_module_reader(vm, &resolved);
+                        let guest_reader = built_reader.clone().map(|reader| {
+                            Box::new(crate::plugins::host_dir::SessionModuleReader::new(reader))
+                                as Box<dyn GuestModuleReader>
+                        });
+                        let module_reader = built_reader
+                            .map(|reader| Box::new(reader) as Box<dyn ModuleFsReader + Send>);
+                        let context =
+                            self.javascript_engine
+                                .create_context(CreateJavascriptContextRequest {
+                                    vm_id: vm_id.to_owned(),
+                                    bootstrap_module: None,
+                                    compile_cache_root: Some(
+                                        self.cache_root.join("node-compile-cache"),
+                                    ),
+                                });
+                        let context_id = context.context_id;
+                        let execution_result =
+                            self.javascript_engine.start_execution_with_module_reader(
+                                StartJavascriptExecutionRequest {
+                                    guest_runtime: guest_runtime_identity(
+                                        vm,
+                                        Some(u64::from(kernel_pid)),
+                                        Some(u64::from(parent_kernel_pid)),
+                                    ),
+                                    vm_id: vm_id.to_owned(),
+                                    context_id: context_id.clone(),
+                                    argv: std::iter::once(launch_entrypoint)
+                                        .chain(resolved.execution_args.clone())
+                                        .collect(),
+                                    argv0: request.options.argv0.clone(),
+                                    env: execution_env,
+                                    cwd: resolved.host_cwd.clone(),
+                                    limits: javascript_execution_limits(vm),
+                                    inline_code,
+                                    wasm_module_bytes: None,
+                                },
+                                module_reader,
+                                guest_reader,
+                            );
+                        self.javascript_engine.dispose_context(&context_id);
+                        let execution = execution_result.map_err(javascript_error)?;
+                        ActiveExecution::Javascript(execution)
+                    }
+                    GuestRuntimeKind::WebAssembly => {
+                        execution_env.extend(
+                            sanitize_javascript_child_process_internal_bootstrap_env(
+                                &request.options.internal_bootstrap_env,
+                            ),
+                        );
+                        execution_env
+                            .insert(String::from(WASM_STDIO_SYNC_RPC_ENV), String::from("1"));
+                        execution_env
+                            .insert(String::from(WASM_EXEC_COMMIT_RPC_ENV), String::from("1"));
+                        let wasm_limits = wasm_execution_limits(vm);
+                        let wasm_guest_runtime = guest_runtime_identity(
+                            vm,
+                            Some(u64::from(kernel_pid)),
+                            Some(u64::from(parent_kernel_pid)),
+                        );
+                        let context = self.wasm_engine.create_context(CreateWasmContextRequest {
+                            vm_id: vm_id.to_owned(),
+                            module_path: Some(resolved.entrypoint.clone()),
+                        });
+                        let context_id = context.context_id;
+                        let execution_result =
+                            self.wasm_engine.start_execution(StartWasmExecutionRequest {
                                 vm_id: vm_id.to_owned(),
-                                context_id: context.context_id,
-                                argv: std::iter::once(launch_entrypoint)
-                                    .chain(resolved.execution_args.clone())
-                                    .collect(),
+                                context_id: context_id.clone(),
+                                argv: resolved.process_args.clone(),
                                 env: execution_env,
                                 cwd: resolved.host_cwd.clone(),
-                                limits: javascript_execution_limits(vm),
-                                inline_code,
-                                wasm_module_bytes: None,
-                            },
-                            module_reader,
-                            guest_reader,
-                        )
-                        .map_err(javascript_error)?;
-                    ActiveExecution::Javascript(execution)
-                }
-                GuestRuntimeKind::WebAssembly => {
-                    execution_env.insert(String::from(WASM_STDIO_SYNC_RPC_ENV), String::from("1"));
-                    let wasm_limits = wasm_execution_limits(vm);
-                    let wasm_guest_runtime = guest_runtime_identity(
-                        vm,
-                        Some(u64::from(kernel_pid)),
-                        Some(u64::from(parent_kernel_pid)),
-                    );
-                    let context = self.wasm_engine.create_context(CreateWasmContextRequest {
-                        vm_id: vm_id.to_owned(),
-                        module_path: Some(resolved.entrypoint.clone()),
-                    });
-                    let execution = self
-                        .wasm_engine
-                        .start_execution(StartWasmExecutionRequest {
-                            vm_id: vm_id.to_owned(),
-                            context_id: context.context_id,
-                            argv: resolved.process_args.clone(),
-                            env: execution_env,
-                            cwd: resolved.host_cwd.clone(),
-                            permission_tier: execution_wasm_permission_tier(
-                                resolved
-                                    .wasm_permission_tier
-                                    .unwrap_or(WasmPermissionTier::Full),
-                            ),
-                            limits: wasm_limits,
-                            guest_runtime: wasm_guest_runtime,
-                        })
-                        .map_err(wasm_error)?;
-                    ActiveExecution::Wasm(Box::new(execution))
-                }
-                GuestRuntimeKind::Python => {
-                    // Nested `python` child_process: set up the Pyodide context the
-                    // same way the top-level execute path does, so a guest shell or
-                    // node parent can spawn `python` exactly like `node`.
-                    let python_file_path = if execution_env.contains_key("AGENTOS_PYTHON_ARGV") {
-                        execution_env.get("AGENTOS_PYTHON_FILE").map(PathBuf::from)
-                    } else {
-                        python_file_entrypoint(&resolved.entrypoint)
-                    };
-                    let pyodide_dist_path = self
-                        .python_engine
-                        .bundled_pyodide_dist_path_for_vm(vm_id)
-                        .map_err(python_error)?;
-                    let pyodide_cache_path = pyodide_dist_path
-                        .parent()
-                        .and_then(Path::parent)
-                        .unwrap_or(pyodide_dist_path.as_path())
-                        .join("pyodide-package-cache");
-                    add_runtime_guest_path_mapping(
-                        &mut execution_env,
-                        PYTHON_PYODIDE_GUEST_ROOT,
-                        &pyodide_dist_path,
-                    );
-                    add_runtime_guest_path_mapping(
-                        &mut execution_env,
-                        PYTHON_PYODIDE_CACHE_GUEST_ROOT,
-                        &pyodide_cache_path,
-                    );
-                    add_runtime_host_access_path(
-                        &mut execution_env,
-                        "AGENTOS_EXTRA_FS_READ_PATHS",
-                        &pyodide_dist_path,
-                        true,
-                    );
-                    add_runtime_host_access_path(
-                        &mut execution_env,
-                        "AGENTOS_EXTRA_FS_READ_PATHS",
-                        &pyodide_cache_path,
-                        true,
-                    );
-                    add_runtime_host_access_path(
-                        &mut execution_env,
-                        "AGENTOS_EXTRA_FS_WRITE_PATHS",
-                        &pyodide_cache_path,
-                        false,
-                    );
-                    let context = self
-                        .python_engine
-                        .create_context(CreatePythonContextRequest {
-                            vm_id: vm_id.to_owned(),
-                            pyodide_dist_path,
-                        });
-                    let execution = self
-                        .python_engine
-                        .start_execution(StartPythonExecutionRequest {
-                            vm_id: vm_id.to_owned(),
-                            context_id: context.context_id,
-                            code: resolved.entrypoint.clone(),
-                            file_path: python_file_path,
-                            env: execution_env,
-                            cwd: resolved.host_cwd.clone(),
-                            limits: python_execution_limits(vm),
-                            guest_runtime: guest_runtime_identity(
-                                vm,
-                                Some(u64::from(kernel_pid)),
-                                Some(u64::from(parent_kernel_pid)),
-                            ),
-                        })
-                        .map_err(python_error)?;
-                    ActiveExecution::Python(execution)
-                }
-            };
-            let kernel_stdin_writer_fd = match javascript_child_process_stdin_mode(&request) {
-                "pipe" => Some(install_kernel_stdin_pipe(&mut vm.kernel, kernel_pid)?),
-                "ignore" => {
-                    vm.kernel
-                        .fd_close(EXECUTION_DRIVER_NAME, kernel_pid, 0)
-                        .map_err(kernel_error)?;
+                                permission_tier: execution_wasm_permission_tier(
+                                    resolved
+                                        .wasm_permission_tier
+                                        .unwrap_or(WasmPermissionTier::Full),
+                                ),
+                                limits: wasm_limits,
+                                guest_runtime: wasm_guest_runtime,
+                            });
+                        self.wasm_engine.dispose_context(&context_id);
+                        let execution = execution_result.map_err(wasm_error)?;
+                        ActiveExecution::Wasm(Box::new(execution))
+                    }
+                    GuestRuntimeKind::Python => {
+                        // Nested `python` child_process: set up the Pyodide context the
+                        // same way the top-level execute path does, so a guest shell or
+                        // node parent can spawn `python` exactly like `node`.
+                        let python_file_path = if execution_env.contains_key("AGENTOS_PYTHON_ARGV")
+                        {
+                            execution_env.get("AGENTOS_PYTHON_FILE").map(PathBuf::from)
+                        } else {
+                            python_file_entrypoint(&resolved.entrypoint)
+                        };
+                        let pyodide_dist_path = self
+                            .python_engine
+                            .bundled_pyodide_dist_path_for_vm(vm_id)
+                            .map_err(python_error)?;
+                        let pyodide_cache_path = pyodide_dist_path
+                            .parent()
+                            .and_then(Path::parent)
+                            .unwrap_or(pyodide_dist_path.as_path())
+                            .join("pyodide-package-cache");
+                        add_runtime_guest_path_mapping(
+                            &mut execution_env,
+                            PYTHON_PYODIDE_GUEST_ROOT,
+                            &pyodide_dist_path,
+                        );
+                        add_runtime_guest_path_mapping(
+                            &mut execution_env,
+                            PYTHON_PYODIDE_CACHE_GUEST_ROOT,
+                            &pyodide_cache_path,
+                        );
+                        add_runtime_host_access_path(
+                            &mut execution_env,
+                            "AGENTOS_EXTRA_FS_READ_PATHS",
+                            &pyodide_dist_path,
+                            true,
+                        );
+                        add_runtime_host_access_path(
+                            &mut execution_env,
+                            "AGENTOS_EXTRA_FS_READ_PATHS",
+                            &pyodide_cache_path,
+                            true,
+                        );
+                        add_runtime_host_access_path(
+                            &mut execution_env,
+                            "AGENTOS_EXTRA_FS_WRITE_PATHS",
+                            &pyodide_cache_path,
+                            false,
+                        );
+                        let context =
+                            self.python_engine
+                                .create_context(CreatePythonContextRequest {
+                                    vm_id: vm_id.to_owned(),
+                                    pyodide_dist_path,
+                                });
+                        let context_id = context.context_id;
+                        let execution_result =
+                            self.python_engine
+                                .start_execution(StartPythonExecutionRequest {
+                                    vm_id: vm_id.to_owned(),
+                                    context_id: context_id.clone(),
+                                    code: resolved.entrypoint.clone(),
+                                    file_path: python_file_path,
+                                    env: execution_env,
+                                    cwd: resolved.host_cwd.clone(),
+                                    limits: python_execution_limits(vm),
+                                    guest_runtime: guest_runtime_identity(
+                                        vm,
+                                        Some(u64::from(kernel_pid)),
+                                        Some(u64::from(parent_kernel_pid)),
+                                    ),
+                                });
+                        self.python_engine.dispose_context(&context_id);
+                        let execution = execution_result.map_err(python_error)?;
+                        ActiveExecution::Python(execution)
+                    }
+                };
+                let kernel_stdin_writer_fd = if posix_spawn_controls_stdin {
                     None
-                }
-                "inherit" => None,
-                _ => Some(install_kernel_stdin_pipe(&mut vm.kernel, kernel_pid)?),
+                } else {
+                    match javascript_child_process_stdin_mode(&request) {
+                        "pipe" => Some(install_kernel_stdin_pipe(&mut vm.kernel, kernel_pid)?),
+                        "ignore" => {
+                            vm.kernel
+                                .fd_close(EXECUTION_DRIVER_NAME, kernel_pid, 0)
+                                .map_err(kernel_error)?;
+                            None
+                        }
+                        "inherit" => None,
+                        _ => Some(install_kernel_stdin_pipe(&mut vm.kernel, kernel_pid)?),
+                    }
+                };
+                (
+                    kernel_pid,
+                    kernel_handle,
+                    execution,
+                    kernel_stdin_writer_fd,
+                    posix_spawn_controls_stdin,
+                )
             };
-            (kernel_pid, kernel_handle, execution, kernel_stdin_writer_fd)
-        };
+            Ok::<_, SidecarError>(spawned)
+        })();
+        let (kernel_pid, kernel_handle, mut execution, kernel_stdin_writer_fd, direct_posix_stdin) =
+            match spawn_result {
+                Ok(spawned) => spawned,
+                Err(error) => {
+                    if let Some(process) = pending_kernel_handle.take() {
+                        rollback_unregistered_spawn_child(
+                            &mut vm.kernel,
+                            &process,
+                            None,
+                            "nested child_process.spawn",
+                        );
+                    }
+                    return Err(error);
+                }
+            };
         record_execute_phase(
             "child_process_spawn_and_start_execution",
             phase_start.elapsed(),
@@ -7640,15 +12164,53 @@ where
             .kernel
             .isatty(EXECUTION_DRIVER_NAME, kernel_pid, 1)
             .unwrap_or(false);
-        let root = vm
-            .active_processes
-            .get(process_id)
-            .ok_or_else(|| missing_process_error(vm_id, process_id))?;
-        let parent = Self::active_process_by_path(root, current_process_path).ok_or_else(|| {
-            SidecarError::InvalidState(format!(
-                "unknown child process path {current_process_label} during nested spawn"
-            ))
-        })?;
+        let child_process_group = match vm.kernel.getpgid(EXECUTION_DRIVER_NAME, kernel_pid) {
+            Ok(process_group) => process_group,
+            Err(error) => {
+                if let Some(process) = pending_kernel_handle.take() {
+                    rollback_unregistered_spawn_child(
+                        &mut vm.kernel,
+                        &process,
+                        Some(&mut execution),
+                        "nested child_process.spawn",
+                    );
+                }
+                return Err(kernel_error(error));
+            }
+        };
+        let process_event_limits = vm.limits.process.clone();
+        let root = match vm.active_processes.get_mut(process_id) {
+            Some(root) => root,
+            None => {
+                let error = missing_process_error(vm_id, process_id);
+                if let Some(child) = pending_kernel_handle.take() {
+                    rollback_unregistered_spawn_child(
+                        &mut vm.kernel,
+                        &child,
+                        Some(&mut execution),
+                        "nested child_process.spawn",
+                    );
+                }
+                return Err(error);
+            }
+        };
+        let parent = match Self::active_process_by_path_mut(root, current_process_path) {
+            Some(parent) => parent,
+            None => {
+                let error = SidecarError::InvalidState(format!(
+                    "unknown child process path {current_process_label} during nested spawn"
+                ));
+                if let Some(child) = pending_kernel_handle.take() {
+                    rollback_unregistered_spawn_child(
+                        &mut vm.kernel,
+                        &child,
+                        Some(&mut execution),
+                        "nested child_process.spawn",
+                    );
+                }
+                return Err(error);
+            }
+        };
         let inherited_tty_master_owner = if child_fd1_is_tty {
             parent
                 .tty_master_fd
@@ -7657,19 +12219,15 @@ where
         } else {
             None
         };
-        let root = vm
-            .active_processes
-            .get_mut(process_id)
-            .ok_or_else(|| missing_process_error(vm_id, process_id))?;
-        let parent =
-            Self::active_process_by_path_mut(root, current_process_path).ok_or_else(|| {
-                SidecarError::InvalidState(format!(
-                    "unknown child process path {current_process_label} during nested spawn"
-                ))
-            })?;
+        pending_kernel_handle.take();
         parent.child_processes.insert(
             child_process_id.clone(),
             ActiveProcess::new(kernel_pid, kernel_handle, resolved.runtime, execution)
+                .with_process_event_limits(&process_event_limits)
+                .with_vm_pending_byte_budgets(
+                    Arc::clone(&vm_pending_stdin_bytes_budget),
+                    Arc::clone(&vm_pending_event_bytes_budget),
+                )
                 .with_detached(request.options.detached)
                 .with_guest_cwd(resolved.guest_cwd.clone())
                 .with_env(resolved.env.clone())
@@ -7679,24 +12237,40 @@ where
             let child = parent
                 .child_processes
                 .get_mut(&child_process_id)
-                .ok_or_else(|| {
-                    SidecarError::InvalidState(format!(
-                        "child process {child_process_id} disappeared during nested spawn"
-                    ))
-                })?;
+                .expect("inserted nested child exists during spawn registration");
             child.tty_master_owner = inherited_tty_master_owner;
             if let Some(kernel_stdin_writer_fd) = kernel_stdin_writer_fd {
                 child.kernel_stdin_writer_fd = Some(kernel_stdin_writer_fd);
             }
+            prepared_host_net_fds.install(child);
         }
         record_execute_phase("child_process_register", phase_start.elapsed());
         record_execute_phase("child_process_spawn_total", total_start.elapsed());
         Ok(json!({
             "childId": child_process_id,
             "pid": kernel_pid,
+            "pgid": child_process_group,
+            "directPosixStdin": direct_posix_stdin,
             "command": resolved.command,
             "args": resolved.process_args,
         }))
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn spawn_descendant_javascript_child_process_for_test(
+        &mut self,
+        vm_id: &str,
+        process_id: &str,
+        current_process_path: &[&str],
+        request: JavascriptChildProcessSpawnRequest,
+    ) -> Result<Value, SidecarError> {
+        self.spawn_descendant_javascript_child_process(
+            vm_id,
+            process_id,
+            current_process_path,
+            request,
+        )
     }
 
     fn spawn_descendant_javascript_child_process_sync(
@@ -7956,7 +12530,7 @@ where
         }
     }
 
-    /// Deferred servicing for a CHILD's `__kernel_stdin_read` / `__kernel_poll`
+    /// Deferred servicing for a CHILD's kernel read / poll sync RPCs
     /// inside the child-event pump: probe readiness with a zero timeout, reply
     /// when ready / expired / non-blocking, otherwise park the RPC on the child
     /// (reply-by-token). The pump loop re-checks the parked RPC every
@@ -7998,25 +12572,52 @@ where
         let now = Instant::now();
         let requested_timeout_ms = match request.method.as_str() {
             "__kernel_stdin_read" => parse_kernel_stdin_read_args(request)?.1,
-            _ => u64::try_from(parse_kernel_poll_args(request)?.1).unwrap_or(0),
+            "__kernel_poll" => u64::try_from(parse_kernel_poll_args(request)?.1).unwrap_or(0),
+            "process.fd_read" => {
+                javascript_sync_rpc_arg_u64_optional(&request.args, 2, "fd_read timeout ms")?
+                    .unwrap_or(DEFAULT_KERNEL_STDIN_READ_TIMEOUT_MS)
+            }
+            _ => return Ok(false),
         };
         let deadline = match &child.deferred_kernel_wait_rpc {
             Some((parked, parked_deadline)) if parked.id == request.id => *parked_deadline,
             _ => now + Duration::from_millis(requested_timeout_ms),
         };
         let kernel_pid = child.kernel_pid;
+        let mut fd_read = None;
         let probe = match request.method.as_str() {
             "__kernel_stdin_read" => {
                 let (max_bytes, _) = parse_kernel_stdin_read_args(request)?;
                 kernel_stdin_read_response(kernel, kernel_pid, max_bytes, Duration::ZERO)
+                    .map(|value| (value, true))
             }
-            _ => {
+            "__kernel_poll" => {
                 let (fd_requests, _) = parse_kernel_poll_args(request)?;
-                kernel_poll_response(kernel, kernel_pid, &fd_requests, 0)
+                kernel_poll_response(kernel, kernel_pid, &fd_requests, 0).map(|value| (value, true))
             }
+            "process.fd_read" => {
+                let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_read fd")?;
+                let length = usize::try_from(javascript_sync_rpc_arg_u64(
+                    &request.args,
+                    1,
+                    "fd_read length",
+                )?)
+                .map_err(|_| SidecarError::InvalidState("fd_read length is too large".into()))?;
+                fd_read = Some((fd, length));
+                kernel
+                    .poll_fds(
+                        EXECUTION_DRIVER_NAME,
+                        kernel_pid,
+                        vec![PollFd::new(fd, POLLIN)],
+                        0,
+                    )
+                    .map(|result| (Value::Null, result.ready_count > 0))
+                    .map_err(kernel_error)
+            }
+            _ => unreachable!("unsupported deferred kernel wait method"),
         };
-        let probe = match probe {
-            Ok(value) => value,
+        let (probe, fd_read_ready) = match probe {
+            Ok(probe) => probe,
             Err(error) => {
                 child.deferred_kernel_wait_rpc = None;
                 child
@@ -8032,10 +12633,54 @@ where
         };
         let ready = match request.method.as_str() {
             "__kernel_stdin_read" => !probe.is_null(),
-            _ => probe.get("readyCount").and_then(Value::as_u64).unwrap_or(0) > 0,
+            "__kernel_poll" => probe.get("readyCount").and_then(Value::as_u64).unwrap_or(0) > 0,
+            "process.fd_read" => fd_read_ready,
+            _ => unreachable!("unsupported deferred kernel wait method"),
         };
         if ready || requested_timeout_ms == 0 || now >= deadline {
             child.deferred_kernel_wait_rpc = None;
+            if let Some((fd, length)) = fd_read {
+                // A deferred read's V8 reply token can time out independently
+                // of this sidecar poll. Claim it before the destructive read so
+                // a stale request can never consume bytes intended for a later
+                // read on the same descriptor.
+                let claimed = child
+                    .execution
+                    .claim_javascript_sync_rpc_response(request.id)?;
+                if !claimed {
+                    return Ok(true);
+                }
+                let read_result = kernel.fd_read_with_timeout_result(
+                    EXECUTION_DRIVER_NAME,
+                    kernel_pid,
+                    fd,
+                    length,
+                    Some(Duration::ZERO),
+                );
+                match read_result {
+                    Ok(Some(bytes)) => child
+                        .execution
+                        .respond_claimed_javascript_sync_rpc_success(
+                            request.id,
+                            javascript_sync_rpc_bytes_value(&bytes),
+                        )?,
+                    Ok(None) => child
+                        .execution
+                        .respond_claimed_javascript_sync_rpc_success(
+                            request.id,
+                            javascript_sync_rpc_bytes_value(&[]),
+                        )?,
+                    Err(error) => {
+                        let error = kernel_error(error);
+                        child.execution.respond_claimed_javascript_sync_rpc_error(
+                            request.id,
+                            javascript_sync_rpc_error_code(&error),
+                            error.to_string(),
+                        )?;
+                    }
+                }
+                return Ok(true);
+            }
             child
                 .execution
                 .respond_javascript_sync_rpc_response(request.id, probe.into())
@@ -8044,6 +12689,22 @@ where
         }
         child.deferred_kernel_wait_rpc = Some((request.clone(), deadline));
         Ok(true)
+    }
+
+    /// Re-probe every parked descriptor read in the VM after a successful
+    /// operation that can make a descriptor readable. Linux wakes blocked
+    /// readers as part of the write/close transition; relying only on a later
+    /// child-process pump can otherwise strand a reader until its deadline.
+    ///
+    /// The walk is bounded by the VM's enforced process limit: every visited
+    /// `ActiveProcess` has a corresponding kernel process accounted against
+    /// `ResourceLimits::max_processes`.
+    pub(crate) fn wake_ready_deferred_fd_reads(vm: &mut VmState) -> Result<(), SidecarError> {
+        let kernel = &mut vm.kernel;
+        for process in vm.active_processes.values_mut() {
+            recheck_ready_deferred_fd_reads(kernel, process)?;
+        }
+        Ok(())
     }
 
     /// Service `__kernel_stdio_write` for a process writing to the shared PTY.
@@ -8158,8 +12819,29 @@ where
         let mut child_path = current_process_path.to_vec();
         child_path.push(child_process_id);
         let child_gone_error = || javascript_child_process_gone_error(process_id, &child_path);
+        let has_live_sibling = self
+            .vms
+            .get(vm_id)
+            .and_then(|vm| Self::descendant_parent_process(vm, process_id, current_process_path))
+            .is_some_and(|parent| {
+                parent
+                    .child_processes
+                    .keys()
+                    .any(|sibling_id| sibling_id != child_process_id)
+            });
         let deadline = Instant::now() + Duration::from_millis(wait_ms);
-        let mut polled_once = false;
+        let mut internal_rpc_deadline = None;
+        let mut internal_rpcs_serviced = 0usize;
+        let mut internal_rpc_quantum_exhausted = || {
+            if wait_ms == 0 {
+                return true;
+            }
+            internal_rpcs_serviced += 1;
+            let rpc_deadline = internal_rpc_deadline
+                .get_or_insert_with(|| Instant::now() + DESCENDANT_INTERNAL_RPC_QUANTUM);
+            (has_live_sibling && internal_rpcs_serviced >= MAX_DESCENDANT_INTERNAL_RPCS_PER_POLL)
+                || Instant::now() >= *rpc_deadline
+        };
 
         loop {
             self.drain_queued_descendant_javascript_child_process_events(
@@ -8174,9 +12856,8 @@ where
                 child_process_id,
             )?;
             enum ChildPollResult {
-                Event(Box<Option<ActiveExecutionEvent>>),
+                Event(Box<Option<PolledExecutionEvent>>),
                 RecoverRuntimeExit,
-                Timeout,
             }
             let wait = if wait_ms == 0 {
                 Duration::ZERO
@@ -8195,13 +12876,10 @@ where
                 let Some(child) = parent.child_processes.get_mut(child_process_id) else {
                     return Err(child_gone_error());
                 };
-                if let Some(event) = child.pending_execution_events.pop_front() {
+                if let Some(event) = child.lease_pending_execution_event() {
                     ChildPollResult::Event(Box::new(Some(event)))
-                } else if polled_once && wait.is_zero() {
-                    ChildPollResult::Timeout
                 } else {
-                    polled_once = true;
-                    match child.execution.poll_event_blocking(wait) {
+                    match child.poll_execution_event_blocking(wait) {
                         Ok(Some(event)) => ChildPollResult::Event(Box::new(Some(event))),
                         Ok(None) => ChildPollResult::RecoverRuntimeExit,
                         Err(SidecarError::Execution(message))
@@ -8220,7 +12898,6 @@ where
             };
             let event = match poll_result {
                 ChildPollResult::Event(event) => *event,
-                ChildPollResult::Timeout => return Ok(Value::Null),
                 ChildPollResult::RecoverRuntimeExit => self
                     .recover_descendant_runtime_child_process_event(
                         vm_id,
@@ -8228,14 +12905,15 @@ where
                         current_process_path,
                         child_process_id,
                         wait.as_millis().try_into().unwrap_or(u64::MAX),
-                    )?,
+                    )?
+                    .map(PolledExecutionEvent::unreserved),
             };
 
             let Some(event) = event else {
                 return Ok(Value::Null);
             };
 
-            match event {
+            match event.into_event() {
                 ActiveExecutionEvent::Stdout(chunk) => {
                     return Ok(json!({
                         "type": "stdout",
@@ -8248,9 +12926,12 @@ where
                         "data": javascript_sync_rpc_bytes_value(&chunk),
                     }));
                 }
-                ActiveExecutionEvent::Exited(exit_code) => {
+                ActiveExecutionEvent::Exited(mut exit_code) => {
                     let cleanup_start = Instant::now();
-                    let had_trailing_events = {
+                    // Native runner exits carry the authoritative terminating
+                    // signal/core bit. Do not infer a signal solely from
+                    // 128+N: a program may legitimately exit with that value.
+                    {
                         let Some(vm) = self.vms.get_mut(vm_id) else {
                             return Ok(Value::Null);
                         };
@@ -8264,38 +12945,23 @@ where
                         let Some(child) = parent.child_processes.get_mut(child_process_id) else {
                             return Ok(Value::Null);
                         };
-                        let mut quiet_deadline = Instant::now() + PROCESS_EXIT_DRAIN_INITIAL_QUIET;
-                        loop {
-                            let wait = quiet_deadline.saturating_duration_since(Instant::now());
-                            let next = poll_child_execution_after_exit(child, wait)?;
-                            let Some(next) = next else {
-                                break;
-                            };
-                            if matches!(next, ActiveExecutionEvent::Exited(_)) {
-                                continue;
+                        let runtime_pid = child.execution.child_pid();
+                        if runtime_pid != 0 && !child.execution.uses_shared_v8_runtime() {
+                            if let RuntimeChildStatusObservation::Exited(status) =
+                                runtime_child_exit_status(runtime_pid)?
+                            {
+                                exit_code = status.status;
+                                child.exit_signal = status.signal;
+                                child.exit_core_dumped = status.core_dumped;
                             }
-                            child.queue_pending_execution_event(next)?;
-                            quiet_deadline = Instant::now() + PROCESS_EXIT_DRAIN_TRAILING_QUIET;
                         }
-                        if !child.pending_execution_events.is_empty() {
-                            child.queue_pending_execution_event(ActiveExecutionEvent::Exited(
-                                exit_code,
-                            ))?;
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if had_trailing_events {
-                        continue;
                     }
-
                     let parent_signal_key =
                         Self::child_process_signal_key(process_id, current_process_path);
                     let Some(vm) = self.vms.get_mut(vm_id) else {
                         return Ok(Value::Null);
                     };
-                    let signal_name = {
+                    let (signal_name, core_dumped) = {
                         let Some(parent) = Self::descendant_parent_process_mut(
                             vm,
                             process_id,
@@ -8306,15 +12972,21 @@ where
                         let Some(child) = parent.child_processes.get_mut(child_process_id) else {
                             return Ok(Value::Null);
                         };
-                        child.pending_self_signal_exit.take().and_then(|signal| {
-                            if exit_code == 128 + signal {
-                                canonical_signal_name(signal).map(str::to_owned)
-                            } else {
-                                None
-                            }
-                        })
+                        let actual_signal = child.exit_signal.take();
+                        child.pending_self_signal_exit = None;
+                        (
+                            actual_signal
+                                .and_then(canonical_signal_name)
+                                .map(str::to_owned),
+                            child.exit_core_dumped,
+                        )
                     };
-                    let (parent_runtime_pid, parent_v8_signal_session, should_signal_parent) = {
+                    let (
+                        parent_runtime_pid,
+                        parent_v8_signal_session,
+                        parent_is_wasm,
+                        should_signal_parent,
+                    ) = {
                         let Some(parent) =
                             Self::descendant_parent_process(vm, process_id, current_process_path)
                         else {
@@ -8329,6 +13001,7 @@ where
                                         if execution.uses_shared_v8_runtime()
                                 )
                             }),
+                            matches!(&parent.execution, ActiveExecution::Wasm(_)),
                             vm.signal_states
                                 .get(parent_signal_key)
                                 .and_then(|handlers| handlers.get(&(libc::SIGCHLD as u32)))
@@ -8337,22 +13010,33 @@ where
                                 }),
                         )
                     };
-                    let Some(parent) =
-                        Self::descendant_parent_process_mut(vm, process_id, current_process_path)
-                    else {
-                        return Ok(Value::Null);
+                    let (mut child, detached_children) = {
+                        let Some(parent) = Self::descendant_parent_process_mut(
+                            vm,
+                            process_id,
+                            current_process_path,
+                        ) else {
+                            return Ok(Value::Null);
+                        };
+                        let Some(mut child) = parent.child_processes.remove(child_process_id)
+                        else {
+                            return Ok(Value::Null);
+                        };
+                        let child_process_label =
+                            Self::child_process_path_label(process_id, &child_path);
+                        let detached_children =
+                            Self::adopt_detached_child_processes(&child_process_label, &mut child);
+                        (child, detached_children)
                     };
-                    let Some(mut child) = parent.child_processes.remove(child_process_id) else {
-                        return Ok(Value::Null);
-                    };
-                    let child_process_label =
-                        Self::child_process_path_label(process_id, &child_path);
-                    let detached_children =
-                        Self::adopt_detached_child_processes(&child_process_label, &mut child);
                     sync_process_host_writes_to_kernel(vm, &child)?;
                     release_inherited_child_raw_mode(&mut vm.kernel, &child)?;
                     let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
-                    terminate_child_process_tree(&mut vm.kernel, &mut child, &kernel_readiness);
+                    terminate_child_process_tree(
+                        &mut vm.kernel,
+                        &mut child,
+                        &kernel_readiness,
+                        &vm.unix_address_registry,
+                    );
                     child.kernel_handle.finish(exit_code);
                     let _ = vm.kernel.wait_and_reap(child.kernel_pid);
                     vm.signal_states.remove(child_process_id);
@@ -8363,7 +13047,20 @@ where
                             .insert(detached_process_id, detached_child);
                     }
                     if should_signal_parent {
-                        if let Some(session) = parent_v8_signal_session {
+                        if parent_is_wasm {
+                            // WASM guests do not install a host-OS signal handler.
+                            // Their runner drains this process-owned queue at syscall
+                            // boundaries, including ppoll(2) and waitpid(2). Sending
+                            // SIGCHLD to the runner PID bypasses that cooperative path.
+                            let Some(parent) = Self::descendant_parent_process_mut(
+                                vm,
+                                process_id,
+                                current_process_path,
+                            ) else {
+                                return Ok(Value::Null);
+                            };
+                            parent.queue_pending_wasm_signal(libc::SIGCHLD)?;
+                        } else if let Some(session) = parent_v8_signal_session {
                             dispatch_v8_session_signal_async(session, libc::SIGCHLD);
                         } else {
                             signal_runtime_process(parent_runtime_pid, libc::SIGCHLD)?;
@@ -8372,6 +13069,7 @@ where
                     let mut payload = Map::new();
                     payload.insert(String::from("type"), Value::String(String::from("exit")));
                     payload.insert(String::from("exitCode"), Value::from(exit_code));
+                    payload.insert(String::from("coreDumped"), Value::from(core_dumped));
                     if let Some(signal_name) = signal_name {
                         payload.insert(String::from("signal"), Value::String(signal_name));
                     }
@@ -8381,19 +13079,18 @@ where
                 ActiveExecutionEvent::JavascriptSyncRpcRequest(request) => {
                     let mut current_child_path = current_process_path.to_vec();
                     current_child_path.push(child_process_id);
-                    if matches!(
-                        request.method.as_str(),
-                        "__kernel_stdin_read" | "__kernel_poll"
-                    ) && self.service_child_kernel_wait_rpc(
-                        vm_id,
-                        process_id,
-                        current_process_path,
-                        child_process_id,
-                        &request,
-                    )? {
-                        // Replied immediately or parked on the child; the pump
-                        // loop re-checks parked RPCs every iteration.
-                        continue;
+                    if let Some(wait_request) = deferred_child_kernel_wait_request(&request)? {
+                        if self.service_child_kernel_wait_rpc(
+                            vm_id,
+                            process_id,
+                            current_process_path,
+                            child_process_id,
+                            &wait_request,
+                        )? {
+                            // Replied immediately or parked on the child; the
+                            // pump loop re-checks parked RPCs every iteration.
+                            return Ok(Value::Null);
+                        }
                     }
                     if request.method == "__kernel_stdio_write" {
                         let shared_tty = {
@@ -8453,10 +13150,44 @@ where
                                     )
                                     .or_else(ignore_stale_javascript_sync_rpc_response)?,
                             }
-                            continue;
+                            return Ok(Value::Null);
                         }
                     }
-                    let response = if request.method == "process.signal_state" {
+                    let response = if request.method == "process.exec_fd_image_commit" {
+                        let payload = {
+                            let Some(vm) = self.vms.get(vm_id) else {
+                                return Ok(Value::Null);
+                            };
+                            parse_javascript_child_process_spawn_request(vm, &request.args)?.0
+                        };
+                        self.commit_wasm_fd_process_image(
+                            vm_id,
+                            process_id,
+                            &current_child_path,
+                            payload,
+                        )?;
+                        Ok(json!({ "committed": true }).into())
+                    } else if request.method == "process.exec" {
+                        let payload = {
+                            let Some(vm) = self.vms.get(vm_id) else {
+                                return Ok(Value::Null);
+                            };
+                            parse_javascript_child_process_spawn_request(vm, &request.args)?.0
+                        };
+                        let local_replacement = payload.options.local_replacement;
+                        match self.exec_javascript_process_image(
+                            vm_id,
+                            process_id,
+                            &current_child_path,
+                            payload,
+                        ) {
+                            Ok(()) if local_replacement => Ok(json!({ "committed": true }).into()),
+                            // Separate-runtime replacement destroys the old
+                            // image and therefore receives no response.
+                            Ok(()) => return Ok(Value::Null),
+                            Err(error) => Err(error),
+                        }
+                    } else if request.method == "process.signal_state" {
                         let (signal, registration) =
                             parse_process_signal_state_request(&request.args)
                                 .map_err(|error| SidecarError::InvalidState(error.to_string()))?;
@@ -8523,6 +13254,13 @@ where
                         })
                     };
 
+                    if response.is_ok() && javascript_sync_rpc_may_make_fd_readable(&request) {
+                        let Some(vm) = self.vms.get_mut(vm_id) else {
+                            return Ok(Value::Null);
+                        };
+                        Self::wake_ready_deferred_fd_reads(vm)?;
+                    }
+
                     let Some(vm) = self.vms.get_mut(vm_id) else {
                         return Ok(Value::Null);
                     };
@@ -8571,6 +13309,16 @@ where
                     if let Some(event) = parent_signal_event {
                         return Ok(event);
                     }
+                    // A guest can issue another synchronous RPC immediately
+                    // after each reply (network poll loops do exactly that).
+                    // Service a short bounded batch before yielding: Linux
+                    // schedules a process for a time quantum, not one syscall,
+                    // while still preventing a busy child from starving a
+                    // sibling that must make it runnable.
+                    if internal_rpc_quantum_exhausted() {
+                        return Ok(Value::Null);
+                    }
+                    continue;
                 }
                 ActiveExecutionEvent::PythonVfsRpcRequest(request) => {
                     // The kernel-VFS bridge is wired for top-level Python
@@ -8601,6 +13349,7 @@ where
                         "ERR_AGENTOS_PYTHON_VFS_UNAVAILABLE",
                         "python VFS is not available for nested child processes",
                     );
+                    return Ok(Value::Null);
                 }
                 ActiveExecutionEvent::SignalState {
                     signal,
@@ -8695,11 +13444,29 @@ where
             }
 
             if !child_shared_runtime && child_runtime_pid != 0 {
-                if let Some(status) = runtime_child_exit_status(child_runtime_pid)? {
-                    return Ok(Some(ActiveExecutionEvent::Exited(status)));
-                }
-                if !runtime_child_is_alive(child_runtime_pid)? {
-                    return Ok(Some(ActiveExecutionEvent::Exited(0)));
+                match runtime_child_exit_status(child_runtime_pid)? {
+                    RuntimeChildStatusObservation::Exited(status) => {
+                        let Some(root) = vm.active_processes.get_mut(process_id) else {
+                            return Ok(None);
+                        };
+                        let Some(parent) =
+                            Self::active_process_by_path_mut(root, current_process_path)
+                        else {
+                            return Ok(None);
+                        };
+                        let Some(child) = parent.child_processes.get_mut(child_process_id) else {
+                            return Ok(None);
+                        };
+                        child.exit_signal = status.signal;
+                        child.exit_core_dumped = status.core_dumped;
+                        return Ok(Some(ActiveExecutionEvent::Exited(status.status)));
+                    }
+                    RuntimeChildStatusObservation::Running => {}
+                    RuntimeChildStatusObservation::NotWaitable => {
+                        return Err(SidecarError::Execution(format!(
+                            "ECHILD: guest runtime process {child_runtime_pid} exited without an observable wait status"
+                        )));
+                    }
                 }
             }
             if Instant::now() >= wait_deadline {
@@ -8722,6 +13489,7 @@ where
         let Some(vm) = self.vms.get_mut(vm_id) else {
             return Err(javascript_child_process_gone_error(process_id, &child_path));
         };
+        let pending_stdin_limit = vm.limits.process.pending_stdin_bytes;
         let Some(root) = vm.active_processes.get_mut(process_id) else {
             return Err(javascript_child_process_gone_error(process_id, &child_path));
         };
@@ -8731,13 +13499,8 @@ where
         let Some(child) = parent.child_processes.get_mut(child_process_id) else {
             return Err(javascript_child_process_gone_error(process_id, &child_path));
         };
-        if let Err(error) = child.execution.write_stdin(chunk) {
-            if is_broken_pipe_error(&error) {
-                return Ok(());
-            }
-            return Err(error);
-        }
-        write_kernel_process_stdin(&mut vm.kernel, child, chunk)
+        child.execution.write_stdin(chunk)?;
+        write_kernel_process_stdin(&mut vm.kernel, child, chunk, pending_stdin_limit)
     }
 
     fn close_descendant_javascript_child_process_stdin(
@@ -8778,6 +13541,11 @@ where
         let Some(vm) = self.vms.get_mut(vm_id) else {
             return Ok(());
         };
+        let registration = vm
+            .signal_states
+            .get(child_process_id)
+            .and_then(|handlers| handlers.get(&(signal as u32)))
+            .cloned();
         let Some(root) = vm.active_processes.get_mut(process_id) else {
             return Ok(());
         };
@@ -8788,7 +13556,12 @@ where
         let Some(child) = parent.child_processes.get_mut(child_process_id) else {
             return Ok(());
         };
-        terminate_tracked_child_process_for_signal(&mut vm.kernel, child, signal)?;
+        terminate_tracked_child_process_for_signal(
+            &mut vm.kernel,
+            child,
+            signal,
+            registration.as_ref(),
+        )?;
         let child_process_label = if current_process_path.is_empty() {
             child_process_id.to_owned()
         } else {
@@ -8859,12 +13632,11 @@ where
             let Some(source) = Self::active_process_by_path_mut(root, &source_path) else {
                 return Ok(Value::Null);
             };
-            source.pending_self_signal_exit = None;
             if !matches!(
                 canonical_signal_name(signal),
                 Some("SIGWINCH" | "SIGCHLD" | "SIGCONT" | "SIGURG")
             ) {
-                source.pending_self_signal_exit = Some(signal);
+                apply_active_process_default_signal(&mut vm.kernel, source, signal)?;
             }
             return Ok(json!({
                 "self": true,
@@ -8927,12 +13699,11 @@ where
             let Some(source) = Self::active_process_by_path_mut(root, &source_path) else {
                 return Ok(Value::Null);
             };
-            source.pending_self_signal_exit = None;
             if !matches!(
                 canonical_signal_name(signal),
                 Some("SIGWINCH" | "SIGCHLD" | "SIGCONT" | "SIGURG")
             ) {
-                source.pending_self_signal_exit = Some(signal);
+                apply_active_process_default_signal(&mut vm.kernel, source, signal)?;
             }
             return Ok(json!({
                 "self": true,
@@ -9057,6 +13828,7 @@ where
                 &[child_process_id],
             ));
         };
+        let pending_stdin_limit = vm.limits.process.pending_stdin_bytes;
         let Some(child) = vm
             .active_processes
             .get_mut(process_id)
@@ -9069,13 +13841,8 @@ where
                 &[child_process_id],
             ));
         };
-        if let Err(error) = child.execution.write_stdin(chunk) {
-            if is_broken_pipe_error(&error) {
-                return Ok(());
-            }
-            return Err(error);
-        }
-        write_kernel_process_stdin(&mut vm.kernel, child, chunk)
+        child.execution.write_stdin(chunk)?;
+        write_kernel_process_stdin(&mut vm.kernel, child, chunk, pending_stdin_limit)
     }
 
     pub(crate) fn close_javascript_child_process_stdin(
@@ -9118,20 +13885,33 @@ where
         let Some(vm) = self.vms.get_mut(vm_id) else {
             return Ok(());
         };
+        let registration = vm
+            .signal_states
+            .get(child_process_id)
+            .and_then(|handlers| handlers.get(&(signal as u32)))
+            .cloned();
         let process = vm
             .active_processes
             .get_mut(process_id)
             .ok_or_else(|| missing_process_error(vm_id, process_id))?;
         let source_pid = process.kernel_pid;
-        let child = process
-            .child_processes
-            .get_mut(child_process_id)
-            .ok_or_else(|| {
-                SidecarError::InvalidState(format!(
-                    "unknown child process {child_process_id} during kill"
-                ))
-            })?;
-        terminate_tracked_child_process_for_signal(&mut vm.kernel, child, signal)?;
+        let Some(child) = process.child_processes.get_mut(child_process_id) else {
+            // Child IDs are monotonically allocated per parent. If this ID was
+            // allocated but is no longer in the tree, its exit event already
+            // reaped it (or its spawn rolled back). Treat cleanup kills like
+            // Linux's already-completed child cleanup: idempotent and local.
+            // Never-allocated IDs remain errors so caller bugs are not hidden.
+            return missing_javascript_child_kill_result(
+                process.next_child_process_id,
+                child_process_id,
+            );
+        };
+        terminate_tracked_child_process_for_signal(
+            &mut vm.kernel,
+            child,
+            signal,
+            registration.as_ref(),
+        )?;
         emit_security_audit_event(
             &self.bridge,
             vm_id,
@@ -9193,6 +13973,12 @@ where
                 let Some(vm) = self.vms.get_mut(vm_id) else {
                     return Ok(());
                 };
+                let signal_key = path.last().map(String::as_str).unwrap_or(&process_id);
+                let registration = vm
+                    .signal_states
+                    .get(signal_key)
+                    .and_then(|handlers| handlers.get(&(signal as u32)))
+                    .cloned();
                 let Some(root) = vm.active_processes.get_mut(&process_id) else {
                     return Ok(());
                 };
@@ -9201,7 +13987,12 @@ where
                         "ESRCH: no such process {target_kernel_pid}"
                     )));
                 };
-                terminate_tracked_child_process_for_signal(&mut vm.kernel, target, signal)?;
+                terminate_tracked_child_process_for_signal(
+                    &mut vm.kernel,
+                    target,
+                    signal,
+                    registration.as_ref(),
+                )?;
                 emit_security_audit_event(
                     &self.bridge,
                     vm_id,
@@ -9299,41 +14090,103 @@ fn terminate_tracked_child_process_for_signal(
     kernel: &mut SidecarKernel,
     child: &mut ActiveProcess,
     signal: i32,
+    registration: Option<&SignalHandlerRegistration>,
 ) -> Result<(), SidecarError> {
-    let should_terminate_shared_runtime = child.execution.uses_shared_v8_runtime()
-        && signal != 0
-        && !matches!(
-            signal,
-            libc::SIGHUP
-                | libc::SIGINT
-                | libc::SIGTERM
-                | libc::SIGCHLD
-                | libc::SIGWINCH
-                | libc::SIGSTOP
-                | libc::SIGCONT
-        );
-    if should_terminate_shared_runtime {
-        child.execution.terminate()?;
-        child.pending_self_signal_exit = Some(signal);
-        child.queue_pending_execution_event(ActiveExecutionEvent::Exited(128 + signal))?;
-    } else {
-        kernel
+    if signal == 0 {
+        return kernel
             .kill_process(EXECUTION_DRIVER_NAME, child.kernel_pid, signal)
-            .map_err(kernel_error)?;
+            .map_err(kernel_error);
     }
-    Ok(())
+
+    if signal == libc::SIGCONT {
+        apply_active_process_default_signal(kernel, child, signal)?;
+        match registration.map(|registration| &registration.action) {
+            Some(SignalDispositionAction::User) => {
+                if matches!(&child.execution, ActiveExecution::Wasm(execution) if execution.uses_shared_v8_runtime())
+                {
+                    child.queue_pending_wasm_signal(signal)?;
+                } else if let Some(session) = child.execution.javascript_v8_session_handle() {
+                    dispatch_v8_session_signal_async(session, signal);
+                } else if !dispatch_v8_process_signal(child, signal)? {
+                    return Err(SidecarError::InvalidState(format!(
+                        "unsupported guest SIGCONT handler delivery for pid {}",
+                        child.kernel_pid
+                    )));
+                }
+            }
+            Some(SignalDispositionAction::Default | SignalDispositionAction::Ignore) | None => {}
+        }
+        return Ok(());
+    }
+
+    // SIGKILL and SIGSTOP are uncatchable. For every other signal, honor the
+    // guest-installed disposition before applying the default action.
+    if !matches!(signal, libc::SIGKILL | libc::SIGSTOP) {
+        match registration.map(|registration| &registration.action) {
+            Some(SignalDispositionAction::Ignore) => return Ok(()),
+            Some(SignalDispositionAction::User) => {
+                if matches!(&child.execution, ActiveExecution::Wasm(execution) if execution.uses_shared_v8_runtime())
+                {
+                    return child.queue_pending_wasm_signal(signal);
+                }
+                if let Some(session) = child.execution.javascript_v8_session_handle().filter(|_| {
+                    matches!(&child.execution, ActiveExecution::Javascript(execution) if execution.uses_shared_v8_runtime())
+                }) {
+                    dispatch_v8_session_signal_async(session, signal);
+                    return Ok(());
+                }
+                if dispatch_v8_process_signal(child, signal)? {
+                    return Ok(());
+                }
+                return Err(SidecarError::InvalidState(format!(
+                    "unsupported guest signal handler delivery for pid {}",
+                    child.kernel_pid
+                )));
+            }
+            Some(SignalDispositionAction::Default) | None => {}
+        }
+    }
+
+    if matches!(
+        canonical_signal_name(signal),
+        Some("SIGWINCH" | "SIGCHLD" | "SIGURG")
+    ) {
+        return Ok(());
+    }
+    apply_active_process_default_signal(kernel, child, signal)
 }
 
 fn sidecar_error_is_esrch(error: &SidecarError) -> bool {
     error.to_string().contains("ESRCH")
 }
 
-fn apply_active_process_default_signal(
+pub(crate) fn apply_active_process_default_signal(
     kernel: &mut SidecarKernel,
     process: &mut ActiveProcess,
     signal: i32,
 ) -> Result<(), SidecarError> {
-    if matches!(signal, libc::SIGSTOP | libc::SIGCONT) {
+    if matches!(
+        signal,
+        libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU
+    ) {
+        if process.execution.uses_shared_v8_runtime() {
+            process.execution.pause()?;
+        } else {
+            signal_runtime_process(process.execution.child_pid(), signal)?;
+        }
+        return kernel
+            .kill_process(EXECUTION_DRIVER_NAME, process.kernel_pid, signal)
+            .map_err(kernel_error);
+    }
+    if signal == libc::SIGCONT {
+        // Linux resumes a stopped process on SIGCONT even when the signal is
+        // blocked, ignored, or has a user handler. Handler delivery, if any,
+        // is layered on top by the caller after the process is runnable.
+        if process.execution.uses_shared_v8_runtime() {
+            process.execution.resume()?;
+        } else {
+            signal_runtime_process(process.execution.child_pid(), signal)?;
+        }
         return kernel
             .kill_process(EXECUTION_DRIVER_NAME, process.kernel_pid, signal)
             .map_err(kernel_error);
@@ -9344,6 +14197,8 @@ fn apply_active_process_default_signal(
     }
 
     if process.execution.uses_shared_v8_runtime() {
+        process.exit_signal = (signal != 0).then_some(signal);
+        process.exit_core_dumped = false;
         process.execution.terminate()?;
         if signal != 0 && matches!(process.execution, ActiveExecution::Wasm(_)) {
             process.queue_pending_execution_event(ActiveExecutionEvent::Exited(128 + signal))?;
@@ -9351,9 +14206,7 @@ fn apply_active_process_default_signal(
         return Ok(());
     }
 
-    kernel
-        .kill_process(EXECUTION_DRIVER_NAME, process.kernel_pid, signal)
-        .map_err(kernel_error)
+    signal_runtime_process(process.execution.child_pid(), signal)
 }
 
 fn map_wasm_signal_registration(
@@ -9390,6 +14243,52 @@ fn map_node_signal_registration(
     }
 }
 
+fn process_signal_state_key<'a>(process_id: &'a str, child_path: &[&'a str]) -> &'a str {
+    child_path.last().copied().unwrap_or(process_id)
+}
+
+fn reset_caught_signal_dispositions_after_exec(
+    signal_states: &mut BTreeMap<String, BTreeMap<u32, SignalHandlerRegistration>>,
+    process_id: &str,
+    child_path: &[&str],
+) -> String {
+    let signal_key = process_signal_state_key(process_id, child_path).to_owned();
+    if let Some(registrations) = signal_states.get_mut(&signal_key) {
+        registrations
+            .retain(|_, registration| registration.action == SignalDispositionAction::Ignore);
+    }
+    signal_key
+}
+
+fn discard_replaced_image_pending_events(process: &mut ActiveProcess) {
+    // Bytes written before exec remain observable through the same pipe on
+    // Linux. Retain those output events, but discard old-image RPCs, signal
+    // registrations, and exit notifications that cannot apply to the new
+    // image. Pending signals live in `pending_wasm_signals` and deliberately
+    // remain untouched.
+    let previous_pending_bytes = process.pending_execution_event_bytes;
+    process.pending_execution_events.retain(|event| {
+        matches!(
+            event,
+            ActiveExecutionEvent::Stdout(_) | ActiveExecutionEvent::Stderr(_)
+        )
+    });
+    process.pending_execution_event_bytes = process
+        .pending_execution_events
+        .iter()
+        .map(ActiveExecutionEvent::retained_bytes)
+        .fold(0usize, usize::saturating_add);
+    process
+        .vm_pending_event_bytes_budget
+        .release(previous_pending_bytes.saturating_sub(process.pending_execution_event_bytes));
+    process
+        .pending_execution_event_count_gauge
+        .observe_depth(process.pending_execution_events.len());
+    process
+        .pending_execution_event_bytes_gauge
+        .observe_depth(process.pending_execution_event_bytes);
+}
+
 fn javascript_child_process_sync_input_bytes(
     value: Option<&Value>,
 ) -> Result<Option<Vec<u8>>, SidecarError> {
@@ -9406,6 +14305,936 @@ fn javascript_child_process_sync_input_bytes(
             "child_process.spawn_sync input",
         )
         .map(Some),
+    }
+}
+
+const POSIX_SPAWN_SETPGROUP: u32 = 1 << 1;
+const POSIX_SPAWN_SETSCHEDPARAM: u32 = 1 << 4;
+const POSIX_SPAWN_SETSCHEDULER: u32 = 1 << 5;
+const POSIX_SPAWN_SETSID: u32 = 1 << 7;
+const SUPPORTED_POSIX_SPAWN_FLAGS: u32 = (1 << 0)
+    | POSIX_SPAWN_SETPGROUP
+    | (1 << 2)
+    | (1 << 3)
+    | POSIX_SPAWN_SETSCHEDPARAM
+    | POSIX_SPAWN_SETSCHEDULER
+    | (1 << 6)
+    | POSIX_SPAWN_SETSID;
+
+fn kernel_open_flags_from_wasi(oflag: i32) -> u32 {
+    let oflag = oflag as u32;
+    let mut flags = if oflag & 0x1000_0000 != 0 {
+        if oflag & 0x0400_0000 != 0 {
+            agentos_kernel::fd_table::O_RDWR
+        } else {
+            agentos_kernel::fd_table::O_WRONLY
+        }
+    } else {
+        agentos_kernel::fd_table::O_RDONLY
+    };
+    if oflag & 0x0000_0001 != 0 {
+        flags |= agentos_kernel::fd_table::O_APPEND;
+    }
+    if oflag & 0x0000_0004 != 0 {
+        flags |= agentos_kernel::fd_table::O_NONBLOCK;
+    }
+    if oflag & (1 << 12) != 0 {
+        flags |= agentos_kernel::fd_table::O_CREAT;
+    }
+    if oflag & (2 << 12) != 0 {
+        flags |= agentos_kernel::fd_table::O_DIRECTORY;
+    }
+    if oflag & (4 << 12) != 0 {
+        flags |= agentos_kernel::fd_table::O_EXCL;
+    }
+    if oflag & (8 << 12) != 0 {
+        flags |= agentos_kernel::fd_table::O_TRUNC;
+    }
+    if oflag & 0x0100_0000 != 0 {
+        flags |= agentos_kernel::fd_table::O_NOFOLLOW;
+    }
+    flags
+}
+
+#[cfg(test)]
+mod posix_spawn_open_flag_tests {
+    use super::kernel_open_flags_from_wasi;
+    use agentos_kernel::fd_table::{O_DIRECTORY, O_NOFOLLOW, O_TRUNC};
+
+    #[test]
+    fn guest_directory_and_nofollow_flags_reach_kernel_open() {
+        let flags = kernel_open_flags_from_wasi(((2 | 8) << 12) | 0x0100_0000);
+        assert_eq!(
+            flags & (O_DIRECTORY | O_NOFOLLOW | O_TRUNC),
+            O_DIRECTORY | O_NOFOLLOW | O_TRUNC
+        );
+    }
+}
+
+#[derive(Default)]
+struct AppliedPosixSpawnFileActions {
+    fd_mappings: Vec<[u32; 2]>,
+    closed_guest_fds: Vec<u32>,
+}
+
+struct PreparedPosixSpawnFd {
+    fd: u32,
+    fd_flags: u32,
+    transfer: TransferredFd,
+}
+
+struct PreparedPosixSpawnFileActions {
+    applied: AppliedPosixSpawnFileActions,
+    fds: Vec<PreparedPosixSpawnFd>,
+    cwd: String,
+}
+
+fn prepare_spawn_host_net_fds(
+    kernel: &mut SidecarKernel,
+    parent: &mut ActiveProcess,
+    current_network_counts: NetworkResourceCounts,
+    inherited_fds: &[JavascriptSpawnHostNetFd],
+    inherited_kernel_mappings: &[[u32; 2]],
+    actions: &[JavascriptPosixSpawnFileAction],
+) -> Result<PreparedSpawnHostNetFds, SidecarError> {
+    const LINUX_GUEST_FD_LIMIT: u32 = 1 << 20;
+    if let Some(limit) = kernel.resource_limits().max_open_fds {
+        if inherited_fds.len() > limit {
+            return Err(SidecarError::InvalidState(format!(
+                "EMFILE: inherited host-network fd list has {} entries, exceeding limits.resources.maxOpenFds ({limit}); raise limits.resources.maxOpenFds",
+                inherited_fds.len()
+            )));
+        }
+    }
+
+    let inherited_kernel_guest_fds = inherited_kernel_mappings
+        .iter()
+        .map(|mapping| mapping[0])
+        .collect::<BTreeSet<_>>();
+    let mut fd_states = BTreeMap::<u32, SpawnHostNetFdState>::new();
+    let mut source_descriptions = BTreeMap::<SpawnHostNetSource, usize>::new();
+    let mut description_metadata = Vec::<Value>::new();
+    let mut description_resources = Vec::<Option<TransferredHostNetSocket>>::new();
+
+    for inherited in inherited_fds {
+        if inherited.guest_fd >= LINUX_GUEST_FD_LIMIT {
+            return Err(SidecarError::InvalidState(format!(
+                "EBADF: inherited host-network guest fd {} exceeds the Linux descriptor limit",
+                inherited.guest_fd
+            )));
+        }
+        if inherited_kernel_guest_fds.contains(&inherited.guest_fd)
+            || fd_states.contains_key(&inherited.guest_fd)
+        {
+            return Err(SidecarError::InvalidState(format!(
+                "EINVAL: duplicate inherited guest fd {}",
+                inherited.guest_fd
+            )));
+        }
+
+        let source = spawn_host_net_source(inherited)?;
+        let description = if let Some(index) = source_descriptions.get(&source).copied() {
+            let existing = description_resources[index]
+                .as_ref()
+                .expect("spawn host-network description resource exists");
+            if validate_host_net_metadata(
+                &inherited.metadata,
+                existing.metadata(),
+                existing.class(),
+                "spawn host-network",
+            )
+            .is_err()
+            {
+                return Err(SidecarError::InvalidState(String::from(
+                    "EINVAL: aliases of one inherited host-network description disagree on metadata",
+                )));
+            }
+            index
+        } else {
+            let resource = prepare_transferred_host_net_resource(
+                kernel,
+                parent,
+                &source,
+                &inherited.metadata,
+                "spawn host-network",
+            )?;
+            let index = description_resources.len();
+            source_descriptions.insert(source, index);
+            description_metadata.push(resource.metadata().as_value());
+            description_resources.push(Some(resource));
+            index
+        };
+        fd_states.insert(
+            inherited.guest_fd,
+            SpawnHostNetFdState {
+                description,
+                close_on_exec: inherited.close_on_exec,
+            },
+        );
+    }
+
+    let kernel_actions = apply_spawn_host_net_file_actions(&mut fd_states, actions)?;
+    fd_states.retain(|_, state| !state.close_on_exec);
+
+    // fork/exec inheritance installs new descriptor references to the same
+    // Linux open-file descriptions. maxOpenFds bounds those references; the
+    // socket/connection limits continue to count each description once.
+    check_spawn_host_net_resource_limit(
+        kernel.resource_limits().max_sockets,
+        current_network_counts.sockets,
+        0,
+        "EMFILE",
+        "socket descriptions",
+        "maxSockets",
+    )?;
+    check_spawn_host_net_resource_limit(
+        kernel.resource_limits().max_connections,
+        current_network_counts.connections,
+        0,
+        "EAGAIN",
+        "connected socket descriptions",
+        "maxConnections",
+    )?;
+
+    let mut final_guest_fds = vec![Vec::new(); description_resources.len()];
+    for (guest_fd, state) in fd_states {
+        final_guest_fds[state.description].push(guest_fd);
+    }
+    let mut descriptions = Vec::new();
+    for (index, guest_fds) in final_guest_fds.into_iter().enumerate() {
+        if guest_fds.is_empty() {
+            continue;
+        }
+        descriptions.push(PreparedSpawnHostNetDescription {
+            guest_fds,
+            resource: description_resources[index]
+                .take()
+                .expect("spawn host-network description resource exists"),
+            metadata: description_metadata[index].clone(),
+        });
+    }
+    Ok(PreparedSpawnHostNetFds {
+        descriptions,
+        kernel_actions,
+    })
+}
+
+fn check_spawn_host_net_resource_limit(
+    limit: Option<usize>,
+    current: usize,
+    additional: usize,
+    errno: &str,
+    label: &str,
+    config_name: &str,
+) -> Result<(), SidecarError> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let requested = current.saturating_add(additional);
+    if additional > 0 && requested > limit {
+        return Err(SidecarError::InvalidState(format!(
+            "{errno}: inheriting {additional} host-network {label} would raise recursive VM usage from {current} to {requested}, exceeding limits.resources.{config_name} ({limit}); raise limits.resources.{config_name}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn spawn_host_net_network_counts(
+    fd_states: &BTreeMap<u32, SpawnHostNetFdState>,
+    description_connections: &[bool],
+) -> NetworkResourceCounts {
+    let surviving_descriptions = fd_states
+        .values()
+        .map(|state| state.description)
+        .collect::<BTreeSet<_>>();
+    NetworkResourceCounts {
+        sockets: surviving_descriptions.len(),
+        connections: surviving_descriptions
+            .iter()
+            .filter(|description| description_connections[**description])
+            .count(),
+    }
+}
+
+fn apply_spawn_host_net_file_actions(
+    fd_states: &mut BTreeMap<u32, SpawnHostNetFdState>,
+    actions: &[JavascriptPosixSpawnFileAction],
+) -> Result<Vec<JavascriptPosixSpawnFileAction>, SidecarError> {
+    let mut kernel_actions = Vec::with_capacity(actions.len());
+    for action in actions {
+        match action.command {
+            1 => {
+                let guest_fd = posix_spawn_action_guest_fd(action, "close")?;
+                let removed_host_net = fd_states.remove(&guest_fd).is_some();
+                if !removed_host_net || guest_fd <= 2 {
+                    kernel_actions.push(action.clone());
+                }
+            }
+            2 => {
+                let guest_fd = posix_spawn_action_guest_fd(action, "dup2 target")?;
+                let source_fd = posix_spawn_action_guest_source_fd(action)?;
+                if let Some(mut state) = fd_states.get(&source_fd).copied() {
+                    // POSIX spawn dup2 actions clear FD_CLOEXEC even for a
+                    // same-fd action; direct dup2(2) remains a no-op.
+                    state.close_on_exec = false;
+                    if guest_fd == source_fd {
+                        fd_states.insert(guest_fd, state);
+                        continue;
+                    }
+                    fd_states.insert(guest_fd, state);
+                    let mut close_target = action.clone();
+                    close_target.command = 1;
+                    close_target.guest_fd = Some(i32::try_from(guest_fd).map_err(|_| {
+                        SidecarError::InvalidState(format!(
+                            "EBADF: posix_spawn dup2 target {guest_fd} exceeds i32"
+                        ))
+                    })?);
+                    close_target.source_fd = 0;
+                    close_target.guest_source_fd = None;
+                    close_target.path.clear();
+                    close_target.close_from_guest_fds.clear();
+                    kernel_actions.push(close_target);
+                } else {
+                    fd_states.remove(&guest_fd);
+                    kernel_actions.push(action.clone());
+                }
+            }
+            3 => {
+                let guest_fd = posix_spawn_action_guest_fd(action, "open")?;
+                fd_states.remove(&guest_fd);
+                kernel_actions.push(action.clone());
+            }
+            4 => kernel_actions.push(action.clone()),
+            5 => {
+                let guest_fd = posix_spawn_action_guest_fd(action, "fchdir")?;
+                if fd_states.contains_key(&guest_fd) {
+                    return Err(SidecarError::InvalidState(format!(
+                        "ENOTDIR: posix_spawn fchdir fd {guest_fd} is a socket"
+                    )));
+                }
+                kernel_actions.push(action.clone());
+            }
+            6 => {
+                let low_fd = posix_spawn_action_guest_fd(action, "closefrom")?;
+                fd_states.retain(|guest_fd, _| *guest_fd < low_fd);
+                kernel_actions.push(action.clone());
+            }
+            command => {
+                return Err(SidecarError::InvalidState(format!(
+                    "EINVAL: unknown posix_spawn file action {command}"
+                )));
+            }
+        }
+    }
+    Ok(kernel_actions)
+}
+
+fn apply_posix_spawn_file_actions(
+    kernel: &mut SidecarKernel,
+    pid: u32,
+    initial_cwd: &str,
+    inherited_mappings: &[[u32; 2]],
+    actions: &[JavascriptPosixSpawnFileAction],
+) -> Result<(AppliedPosixSpawnFileActions, String), SidecarError> {
+    let inherited_kernel_fds = kernel
+        .fd_snapshot(EXECUTION_DRIVER_NAME, pid)
+        .map_err(kernel_error)?
+        .into_iter()
+        .map(|entry| entry.fd)
+        .collect::<BTreeSet<_>>();
+    let mut mappings = BTreeMap::new();
+    let mut mapped_kernel_fds = BTreeSet::new();
+    let mut closed_guest_fds = BTreeSet::new();
+    let mut cwd = kernel
+        .realpath_for_process(EXECUTION_DRIVER_NAME, pid, initial_cwd)
+        .map(|path| normalize_path(&path))
+        .map_err(kernel_error)?;
+    for [guest_fd, kernel_fd] in inherited_mappings {
+        // Runner-local descriptors can appear in the guest mapping without a
+        // kernel entry. Kernel-backed FD_CLOEXEC descriptors remain present
+        // until file actions finish, matching fork + exec ordering on Linux.
+        if !inherited_kernel_fds.contains(kernel_fd) {
+            continue;
+        }
+        if mappings.insert(*guest_fd, *kernel_fd).is_some() || !mapped_kernel_fds.insert(*kernel_fd)
+        {
+            return Err(SidecarError::InvalidState(String::from(
+                "EINVAL: duplicate posix_spawn guest/kernel fd mapping",
+            )));
+        }
+    }
+
+    let action_guest_fd = |action: &JavascriptPosixSpawnFileAction| {
+        u32::try_from(action.guest_fd.unwrap_or(action.fd)).map_err(|_| {
+            SidecarError::InvalidState(format!(
+                "EBADF: invalid posix_spawn guest fd {}",
+                action.guest_fd.unwrap_or(action.fd)
+            ))
+        })
+    };
+    for action in actions {
+        match action.command {
+            1 => {
+                let guest_fd = action_guest_fd(action)?;
+                closed_guest_fds.insert(guest_fd);
+                let fd = if let Some(fd) = mappings.remove(&guest_fd) {
+                    Some(fd)
+                } else if action.guest_fd.is_some() && guest_fd > 2 {
+                    // WASI preopens and other runner-local descriptors do not
+                    // exist in the kernel namespace. Closing them must never
+                    // fall through to an unrelated canonical fd with the same
+                    // number; the child runner suppresses them from its local
+                    // descriptor table instead.
+                    None
+                } else {
+                    let raw_fd = u32::try_from(action.fd).map_err(|_| {
+                        SidecarError::InvalidState(format!(
+                            "EBADF: invalid posix_spawn close fd {}",
+                            action.fd
+                        ))
+                    })?;
+                    if mapped_kernel_fds.contains(&raw_fd) {
+                        return Err(SidecarError::InvalidState(format!(
+                            "EBADF: posix_spawn guest fd {guest_fd} collides with another mapped descriptor"
+                        )));
+                    }
+                    Some(raw_fd)
+                };
+                if let Some(fd) = fd {
+                    mapped_kernel_fds.remove(&fd);
+                    kernel
+                        .fd_close(EXECUTION_DRIVER_NAME, pid, fd)
+                        .map_err(kernel_error)?;
+                }
+            }
+            2 => {
+                let guest_fd = action_guest_fd(action)?;
+                let guest_source_fd = u32::try_from(
+                    action.guest_source_fd.unwrap_or(action.source_fd),
+                )
+                .map_err(|_| {
+                    SidecarError::InvalidState(format!(
+                        "EBADF: invalid posix_spawn dup2 source {}",
+                        action.guest_source_fd.unwrap_or(action.source_fd)
+                    ))
+                })?;
+                if guest_source_fd == guest_fd {
+                    let fd = if let Some(fd) = mappings.get(&guest_source_fd).copied() {
+                        fd
+                    } else if action.guest_source_fd.is_some() && guest_source_fd > 2 {
+                        return Err(SidecarError::InvalidState(format!(
+                            "EBADF: posix_spawn dup2 source guest fd {guest_source_fd} is not kernel-backed"
+                        )));
+                    } else {
+                        u32::try_from(action.source_fd).map_err(|_| {
+                            SidecarError::InvalidState(format!(
+                                "EBADF: invalid posix_spawn dup2 source {}",
+                                action.source_fd
+                            ))
+                        })?
+                    };
+                    // POSIX requires dup2(fd, fd) to clear FD_CLOEXEC when it
+                    // is executed as a spawn file action. It is not the same
+                    // operation as a direct dup2(2) no-op: the file action is
+                    // specified to behave as though the descriptor had first
+                    // been duplicated onto itself without O_CLOEXEC.
+                    kernel
+                        .fd_fcntl(
+                            EXECUTION_DRIVER_NAME,
+                            pid,
+                            fd,
+                            agentos_kernel::fd_table::F_SETFD,
+                            0,
+                        )
+                        .map_err(kernel_error)?;
+                    closed_guest_fds.remove(&guest_fd);
+                    continue;
+                }
+                let source_fd = if let Some(fd) = mappings.get(&guest_source_fd).copied() {
+                    fd
+                } else if action.guest_source_fd.is_some() && guest_source_fd > 2 {
+                    return Err(SidecarError::InvalidState(format!(
+                        "EBADF: posix_spawn dup2 source guest fd {guest_source_fd} is not kernel-backed"
+                    )));
+                } else {
+                    let raw_fd = u32::try_from(action.source_fd).map_err(|_| {
+                        SidecarError::InvalidState(format!(
+                            "EBADF: invalid posix_spawn dup2 source {}",
+                            action.source_fd
+                        ))
+                    })?;
+                    if mapped_kernel_fds.contains(&raw_fd) {
+                        return Err(SidecarError::InvalidState(format!(
+                            "EBADF: posix_spawn dup2 source guest fd {guest_source_fd} collides with another mapped descriptor"
+                        )));
+                    }
+                    raw_fd
+                };
+                let fd = if let Some(fd) = mappings.get(&guest_fd).copied() {
+                    kernel
+                        .fd_dup2(EXECUTION_DRIVER_NAME, pid, source_fd, fd)
+                        .map_err(kernel_error)?;
+                    fd
+                } else {
+                    kernel
+                        .fd_dup(EXECUTION_DRIVER_NAME, pid, source_fd)
+                        .map_err(kernel_error)?
+                };
+                mappings.insert(guest_fd, fd);
+                mapped_kernel_fds.insert(fd);
+                closed_guest_fds.remove(&guest_fd);
+            }
+            3 => {
+                let guest_fd = action_guest_fd(action)?;
+                if let Some(fd) = mappings.remove(&guest_fd) {
+                    mapped_kernel_fds.remove(&fd);
+                    kernel
+                        .fd_close(EXECUTION_DRIVER_NAME, pid, fd)
+                        .map_err(kernel_error)?;
+                }
+                let action_path = resolve_posix_spawn_action_path(&cwd, &action.path);
+                let opened_fd = kernel
+                    .fd_open(
+                        EXECUTION_DRIVER_NAME,
+                        pid,
+                        &action_path,
+                        kernel_open_flags_from_wasi(action.oflag),
+                        Some(action.mode),
+                    )
+                    .map_err(kernel_error)?;
+                if action.oflag as u32 & (2 << 12) != 0 {
+                    let stat = kernel
+                        .fd_stat(EXECUTION_DRIVER_NAME, pid, opened_fd)
+                        .map_err(kernel_error)?;
+                    if stat.filetype != agentos_kernel::fd_table::FILETYPE_DIRECTORY {
+                        kernel
+                            .fd_close(EXECUTION_DRIVER_NAME, pid, opened_fd)
+                            .map_err(kernel_error)?;
+                        return Err(SidecarError::InvalidState(format!(
+                            "ENOTDIR: posix_spawn open path is not a directory: {}",
+                            action.path
+                        )));
+                    }
+                }
+                mappings.insert(guest_fd, opened_fd);
+                mapped_kernel_fds.insert(opened_fd);
+                closed_guest_fds.remove(&guest_fd);
+            }
+            4 => {
+                let action_path = resolve_posix_spawn_action_path(&cwd, &action.path);
+                let stat = kernel
+                    .stat_for_process(EXECUTION_DRIVER_NAME, pid, &action_path)
+                    .map_err(kernel_error)?;
+                if !stat.is_directory {
+                    return Err(SidecarError::InvalidState(format!(
+                        "ENOTDIR: posix_spawn chdir path is not a directory: {}",
+                        action.path
+                    )));
+                }
+                cwd = kernel
+                    .realpath_for_process(EXECUTION_DRIVER_NAME, pid, &action_path)
+                    .map(|path| normalize_path(&path))
+                    .map_err(kernel_error)?;
+            }
+            5 => {
+                let guest_fd = action_guest_fd(action)?;
+                let fd = if let Some(fd) = mappings.get(&guest_fd).copied() {
+                    fd
+                } else if action.guest_fd.is_some() && guest_fd > 2 {
+                    return Err(SidecarError::InvalidState(format!(
+                        "EBADF: posix_spawn fchdir guest fd {guest_fd} is not kernel-backed"
+                    )));
+                } else {
+                    u32::try_from(action.fd).map_err(|_| {
+                        SidecarError::InvalidState(format!(
+                            "EBADF: invalid posix_spawn fchdir fd {}",
+                            action.fd
+                        ))
+                    })?
+                };
+                let stat = kernel
+                    .fd_stat(EXECUTION_DRIVER_NAME, pid, fd)
+                    .map_err(kernel_error)?;
+                if stat.filetype != agentos_kernel::fd_table::FILETYPE_DIRECTORY {
+                    return Err(SidecarError::InvalidState(format!(
+                        "ENOTDIR: posix_spawn fchdir fd {guest_fd} is not a directory"
+                    )));
+                }
+                cwd = normalize_path(
+                    &kernel
+                        .fd_path(EXECUTION_DRIVER_NAME, pid, fd)
+                        .map_err(kernel_error)?,
+                );
+            }
+            6 => {
+                let low_fd = action_guest_fd(action)?;
+                if let Some(limit) = kernel.resource_limits().max_open_fds {
+                    if action.close_from_guest_fds.len() > limit {
+                        return Err(SidecarError::InvalidState(format!(
+                            "EMFILE: posix_spawn closefrom guest fd list has {} entries, exceeding limits.resources.maxOpenFds ({limit}); raise limits.resources.maxOpenFds",
+                            action.close_from_guest_fds.len()
+                        )));
+                    }
+                }
+                for guest_fd in &action.close_from_guest_fds {
+                    if *guest_fd < low_fd {
+                        return Err(SidecarError::InvalidState(format!(
+                            "EINVAL: posix_spawn closefrom guest fd {guest_fd} is below cutoff {low_fd}"
+                        )));
+                    }
+                    closed_guest_fds.insert(*guest_fd);
+                }
+                let open_kernel_fds = kernel
+                    .fd_snapshot(EXECUTION_DRIVER_NAME, pid)
+                    .map_err(kernel_error)?
+                    .into_iter()
+                    .map(|entry| entry.fd)
+                    .collect::<BTreeSet<_>>();
+
+                // File actions operate in the guest descriptor namespace.
+                // A guest fd may map to a different kernel fd, so applying a
+                // raw kernel `fd >= low_fd` cutoff would close the wrong end
+                // whenever (for example) guest stdout maps to kernel fd 8.
+                let mapped_fds = mappings
+                    .iter()
+                    .map(|(guest_fd, kernel_fd)| (*guest_fd, *kernel_fd))
+                    .collect::<Vec<_>>();
+                let mut to_close = BTreeMap::new();
+                for (guest_fd, kernel_fd) in mapped_fds {
+                    if guest_fd >= low_fd && open_kernel_fds.contains(&kernel_fd) {
+                        to_close.insert(guest_fd, kernel_fd);
+                    }
+                }
+                for kernel_fd in open_kernel_fds {
+                    if !mapped_kernel_fds.contains(&kernel_fd) && kernel_fd >= low_fd {
+                        to_close.insert(kernel_fd, kernel_fd);
+                    }
+                }
+
+                for (guest_fd, kernel_fd) in to_close {
+                    closed_guest_fds.insert(guest_fd);
+                    if mappings.remove(&guest_fd).is_some() {
+                        mapped_kernel_fds.remove(&kernel_fd);
+                    }
+                    kernel
+                        .fd_close(EXECUTION_DRIVER_NAME, pid, kernel_fd)
+                        .map_err(kernel_error)?;
+                }
+            }
+            command => {
+                return Err(SidecarError::InvalidState(format!(
+                    "EINVAL: unknown posix_spawn file action {command}"
+                )));
+            }
+        }
+    }
+    let child_kernel_fds = kernel
+        .fd_snapshot(EXECUTION_DRIVER_NAME, pid)
+        .map_err(kernel_error)?
+        .into_iter()
+        .map(|entry| entry.fd)
+        .collect::<BTreeSet<_>>();
+    Ok((
+        AppliedPosixSpawnFileActions {
+            fd_mappings: mappings
+                .into_iter()
+                .filter(|(_, kernel_fd)| child_kernel_fds.contains(kernel_fd))
+                .map(|(guest_fd, kernel_fd)| [guest_fd, kernel_fd])
+                .collect(),
+            closed_guest_fds: closed_guest_fds.into_iter().collect(),
+        },
+        cwd,
+    ))
+}
+
+fn resolve_posix_spawn_action_path(cwd: &str, action_path: &str) -> String {
+    // File actions are ordered. Resolve each relative pathname against the
+    // canonical cwd produced by all preceding chdir/fchdir actions.
+    if action_path.starts_with('/') {
+        normalize_path(action_path)
+    } else {
+        normalize_path(&format!("{cwd}/{action_path}"))
+    }
+}
+
+fn apply_posix_spawn_file_actions_or_rollback(
+    kernel: &mut SidecarKernel,
+    process: &KernelProcessHandle,
+    cwd: &str,
+    inherited_mappings: &[[u32; 2]],
+    actions: &[JavascriptPosixSpawnFileAction],
+) -> Result<AppliedPosixSpawnFileActions, SidecarError> {
+    match apply_posix_spawn_file_actions(kernel, process.pid(), cwd, inherited_mappings, actions) {
+        Ok((mappings, _)) => Ok(mappings),
+        Err(error) => {
+            process.finish(127);
+            if let Err(cleanup_error) = kernel.waitpid(process.pid()) {
+                eprintln!(
+                    "[agentos] failed to reap rejected posix_spawn child {}: {}",
+                    process.pid(),
+                    cleanup_error
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn rollback_unregistered_spawn_child(
+    kernel: &mut SidecarKernel,
+    process: &KernelProcessHandle,
+    execution: Option<&mut ActiveExecution>,
+    context: &str,
+) {
+    if let Some(execution) = execution {
+        if let ActiveExecution::Tool(tool) = execution {
+            tool.cancelled.store(true, Ordering::Relaxed);
+        } else if let Err(error) = execution.terminate() {
+            eprintln!(
+                "[agentos] failed to terminate rejected {context} runtime for PID {}: {error}",
+                process.pid()
+            );
+        }
+    }
+    process.finish(127);
+    if let Err(error) = kernel.waitpid(process.pid()) {
+        eprintln!(
+            "[agentos] failed to reap rejected {context} child {}: {error}",
+            process.pid()
+        );
+    }
+}
+
+fn apply_spawn_session_or_rollback(
+    kernel: &mut SidecarKernel,
+    process: &KernelProcessHandle,
+    create_session: bool,
+) -> Result<(), SidecarError> {
+    if !create_session {
+        return Ok(());
+    }
+    if let Err(error) = kernel.setsid(EXECUTION_DRIVER_NAME, process.pid()) {
+        process.finish(127);
+        if let Err(cleanup_error) = kernel.waitpid(process.pid()) {
+            eprintln!(
+                "[agentos] failed to reap rejected setsid child {}: {}",
+                process.pid(),
+                cleanup_error
+            );
+        }
+        return Err(kernel_error(error));
+    }
+    Ok(())
+}
+
+fn preapply_posix_spawn_file_actions(
+    kernel: &mut SidecarKernel,
+    parent_pid: u32,
+    cwd: &str,
+    requested_pgid: Option<u32>,
+    inherited_mappings: &[[u32; 2]],
+    actions: &[JavascriptPosixSpawnFileAction],
+) -> Result<PreparedPosixSpawnFileActions, SidecarError> {
+    // Linux runs file actions once before attempting the exec/PATH search.
+    // Stage them in a short-lived child FD table, then retain transfers of the
+    // resulting open descriptions. The eventual runtime child installs those
+    // exact descriptions; it never reopens a path or repeats O_EXCL/O_TRUNC.
+    let process = kernel
+        .spawn_process_with_process_group_preserving_cloexec(
+            WASM_COMMAND,
+            vec![String::from("posix-spawn-file-actions")],
+            SpawnOptions {
+                requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                parent_pid: Some(parent_pid),
+                env: BTreeMap::new(),
+                cwd: Some(cwd.to_owned()),
+            },
+            requested_pgid,
+        )
+        .map_err(kernel_error)?;
+    let prepared = (|| {
+        let (mut applied, cwd) = apply_posix_spawn_file_actions(
+            kernel,
+            process.pid(),
+            cwd,
+            inherited_mappings,
+            actions,
+        )?;
+        kernel
+            .close_process_cloexec_fds(EXECUTION_DRIVER_NAME, process.pid())
+            .map_err(kernel_error)?;
+        let snapshot = kernel
+            .fd_snapshot(EXECUTION_DRIVER_NAME, process.pid())
+            .map_err(kernel_error)?;
+        let surviving_fds = snapshot
+            .iter()
+            .map(|entry| entry.fd)
+            .collect::<BTreeSet<_>>();
+        applied
+            .fd_mappings
+            .retain(|mapping| surviving_fds.contains(&mapping[1]));
+        let mut fds = Vec::with_capacity(snapshot.len());
+        for entry in snapshot {
+            fds.push(PreparedPosixSpawnFd {
+                fd: entry.fd,
+                fd_flags: entry.fd_flags,
+                transfer: kernel
+                    .fd_transfer(EXECUTION_DRIVER_NAME, process.pid(), entry.fd)
+                    .map_err(kernel_error)?,
+            });
+        }
+        Ok(PreparedPosixSpawnFileActions { applied, fds, cwd })
+    })();
+    process.finish(if prepared.is_ok() { 0 } else { 127 });
+    let reap_result = kernel.waitpid(process.pid()).map_err(kernel_error);
+    match prepared {
+        Ok(prepared) => {
+            reap_result?;
+            Ok(prepared)
+        }
+        Err(error) => {
+            if let Err(reap_error) = reap_result {
+                eprintln!(
+                    "[agentos] failed to reap rejected preapplied posix_spawn child {}: {}",
+                    process.pid(),
+                    reap_error
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn install_preapplied_posix_spawn_file_actions(
+    kernel: &mut SidecarKernel,
+    process: &KernelProcessHandle,
+    prepared: PreparedPosixSpawnFileActions,
+) -> Result<AppliedPosixSpawnFileActions, SidecarError> {
+    let result = (|| {
+        let inherited_fds = kernel
+            .fd_snapshot(EXECUTION_DRIVER_NAME, process.pid())
+            .map_err(kernel_error)?;
+        for entry in inherited_fds {
+            kernel
+                .fd_close(EXECUTION_DRIVER_NAME, process.pid(), entry.fd)
+                .map_err(kernel_error)?;
+        }
+        for entry in &prepared.fds {
+            kernel
+                .fd_install_transfer_at(
+                    EXECUTION_DRIVER_NAME,
+                    process.pid(),
+                    entry.fd,
+                    entry.fd_flags,
+                    &entry.transfer,
+                )
+                .map_err(kernel_error)?;
+        }
+        Ok(prepared.applied)
+    })();
+    if result.is_err() {
+        process.finish(127);
+        if let Err(cleanup_error) = kernel.waitpid(process.pid()) {
+            eprintln!(
+                "[agentos] failed to reap rejected preapplied posix_spawn target {}: {}",
+                process.pid(),
+                cleanup_error
+            );
+        }
+    }
+    result
+}
+
+#[derive(Debug)]
+struct JavascriptSpawnAttributes {
+    process_group: Option<u32>,
+    new_session: bool,
+}
+
+fn javascript_spawn_attributes(
+    options: &JavascriptChildProcessSpawnOptions,
+) -> Result<JavascriptSpawnAttributes, SidecarError> {
+    if options.spawn_attr_flags & !SUPPORTED_POSIX_SPAWN_FLAGS != 0 {
+        return Err(SidecarError::InvalidState(format!(
+            "unsupported POSIX spawn attribute flags: {:#x}",
+            options.spawn_attr_flags & !SUPPORTED_POSIX_SPAWN_FLAGS
+        )));
+    }
+    for signal in options
+        .spawn_signal_defaults
+        .iter()
+        .chain(options.spawn_signal_mask.iter())
+    {
+        if !(1..=64).contains(signal) {
+            return Err(SidecarError::InvalidState(format!(
+                "invalid POSIX spawn signal number {signal}"
+            )));
+        }
+    }
+
+    let new_session = options.spawn_attr_flags & POSIX_SPAWN_SETSID != 0;
+    if new_session && options.spawn_attr_flags & POSIX_SPAWN_SETPGROUP != 0 {
+        return Err(SidecarError::InvalidState(String::from(
+            "EPERM: POSIX_SPAWN_SETSID cannot be combined with POSIX_SPAWN_SETPGROUP",
+        )));
+    }
+    if new_session && options.detached {
+        return Err(SidecarError::InvalidState(String::from(
+            "EINVAL: POSIX_SPAWN_SETSID cannot be combined with detached child-process mode",
+        )));
+    }
+    if options.spawn_attr_flags & (POSIX_SPAWN_SETSCHEDPARAM | POSIX_SPAWN_SETSCHEDULER) != 0
+        && options.spawn_sched_priority.unwrap_or_default() != 0
+    {
+        return Err(SidecarError::InvalidState(String::from(
+            "EINVAL: SCHED_OTHER requires scheduling priority zero",
+        )));
+    }
+    if options.spawn_attr_flags & POSIX_SPAWN_SETSCHEDULER != 0
+        && options.spawn_sched_policy.unwrap_or_default() != 0
+    {
+        return Err(SidecarError::InvalidState(String::from(
+            "EPERM: requested POSIX spawn scheduler policy requires host privilege",
+        )));
+    }
+
+    if options.spawn_attr_flags & POSIX_SPAWN_SETPGROUP == 0 {
+        if options.spawn_pgroup.unwrap_or(0) != 0 {
+            return Err(SidecarError::InvalidState(String::from(
+                "spawnPgroup requires POSIX_SPAWN_SETPGROUP",
+            )));
+        }
+        return Ok(JavascriptSpawnAttributes {
+            process_group: None,
+            new_session,
+        });
+    }
+    if options.detached {
+        return Err(SidecarError::InvalidState(String::from(
+            "POSIX_SPAWN_SETPGROUP cannot be combined with detached child-process mode",
+        )));
+    }
+    let pgid = options.spawn_pgroup.unwrap_or(0);
+    let process_group = u32::try_from(pgid).map_err(|_| {
+        SidecarError::InvalidState(format!("invalid POSIX spawn process group {pgid}"))
+    })?;
+    Ok(JavascriptSpawnAttributes {
+        process_group: Some(process_group),
+        new_session,
+    })
+}
+
+fn apply_child_process_argv0(resolved: &mut ResolvedChildProcessExecution, argv0: Option<&str>) {
+    let Some(argv0) = argv0 else {
+        return;
+    };
+    if resolved.process_args.is_empty() {
+        resolved.process_args.push(argv0.to_owned());
+    } else {
+        // Empty argv0 is valid on Linux and observable through procfs/runtime
+        // argv APIs. Do not coerce it back to the executable name.
+        resolved.process_args[0] = argv0.to_owned();
     }
 }
 
@@ -10077,18 +15906,141 @@ fn sync_vm_shadow_root_to_kernel(vm: &mut VmState) -> Result<(), SidecarError> {
         tracing::warn!("skipping host shadow sync rooted at the host filesystem root");
         return Ok(());
     }
+    let mut snapshot = collect_shadow_sync_snapshot(&shadow_root)?;
+    snapshot
+        .entries
+        .retain(|path, _| !should_skip_shadow_sync_path(vm, path));
+
+    // An unreadable subtree is not an empty subtree. Preserve the previous
+    // inventory below it so a transient EACCES cannot be misinterpreted as a
+    // request to delete all of its kernel children.
+    for (path, entry) in &vm.shadow_sync_inventory {
+        if snapshot
+            .incomplete_subtrees
+            .iter()
+            .any(|prefix| guest_path_is_at_or_below(path, prefix))
+        {
+            snapshot.entries.entry(path.clone()).or_insert(*entry);
+        }
+    }
+
+    let failed_replacements = propagate_shadow_deletions_to_kernel(vm, &mut snapshot.entries);
     let mut synced_file_times = BTreeMap::new();
-    let mut inventory = BTreeSet::new();
     sync_host_directory_tree_to_kernel_inner(
         vm,
         &shadow_root,
         &shadow_root,
         "/",
         &mut synced_file_times,
-        Some(&mut inventory),
+        Some(&snapshot.entries),
+        Some(&failed_replacements),
     )?;
-    propagate_shadow_deletions_to_kernel(vm, &inventory);
-    vm.shadow_sync_inventory = inventory;
+    vm.shadow_sync_inventory = snapshot.entries;
+    Ok(())
+}
+
+#[derive(Default)]
+struct ShadowSyncSnapshot {
+    entries: BTreeMap<String, ShadowSyncInventoryEntry>,
+    incomplete_subtrees: BTreeSet<String>,
+}
+
+/// Capture the shadow root before any additive kernel writes. The separate
+/// inventory pass lets deletion and type-replacement reconciliation happen
+/// first, which is essential when a stale symlink or directory occupies the
+/// pathname that is about to become a regular file.
+pub(crate) fn initial_shadow_sync_inventory(
+    shadow_root: &Path,
+) -> Result<BTreeMap<String, ShadowSyncInventoryEntry>, SidecarError> {
+    Ok(collect_shadow_sync_snapshot(shadow_root)?.entries)
+}
+
+fn collect_shadow_sync_snapshot(shadow_root: &Path) -> Result<ShadowSyncSnapshot, SidecarError> {
+    let mut snapshot = ShadowSyncSnapshot::default();
+    collect_shadow_sync_snapshot_inner(shadow_root, shadow_root, "/", &mut snapshot)?;
+    Ok(snapshot)
+}
+
+fn collect_shadow_sync_snapshot_inner(
+    shadow_root: &Path,
+    current_host_dir: &Path,
+    current_guest_dir: &str,
+    snapshot: &mut ShadowSyncSnapshot,
+) -> Result<(), SidecarError> {
+    let entries = match fs::read_dir(current_host_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(libc::EPERM) =>
+        {
+            let guest_path = normalize_path(current_guest_dir);
+            snapshot.incomplete_subtrees.insert(guest_path.clone());
+            tracing::warn!(
+                path = %current_host_dir.display(),
+                guest_path = %guest_path,
+                "shadow inventory is incomplete because a host directory is unreadable"
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(SidecarError::Io(format!(
+                "failed to inventory host shadow directory {}: {error}",
+                current_host_dir.display()
+            )));
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(SidecarError::Io(format!(
+                    "failed to inventory host shadow entry in {}: {error}",
+                    current_host_dir.display()
+                )));
+            }
+        };
+        let host_path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(SidecarError::Io(format!(
+                    "failed to inventory host shadow entry {}: {error}",
+                    host_path.display()
+                )));
+            }
+        };
+        let relative_path = host_path.strip_prefix(shadow_root).map_err(|error| {
+            SidecarError::InvalidState(format!(
+                "failed to relativize host shadow path {} against {}: {error}",
+                host_path.display(),
+                shadow_root.display()
+            ))
+        })?;
+        let guest_path = normalize_path(&format!(
+            "/{}",
+            relative_path.to_string_lossy().replace('\\', "/")
+        ));
+        let node_type = if file_type.is_dir() {
+            ShadowNodeType::Directory
+        } else if file_type.is_file() {
+            ShadowNodeType::File
+        } else if file_type.is_symlink() {
+            ShadowNodeType::Symlink
+        } else {
+            continue;
+        };
+        snapshot.entries.insert(
+            guest_path.clone(),
+            ShadowSyncInventoryEntry::present(node_type),
+        );
+        if node_type == ShadowNodeType::Directory {
+            collect_shadow_sync_snapshot_inner(shadow_root, &host_path, &guest_path, snapshot)?;
+        }
+    }
     Ok(())
 }
 
@@ -10099,27 +16051,41 @@ fn sync_vm_shadow_root_to_kernel(vm: &mut VmState) -> Result<(), SidecarError> {
 /// are surfaced as host-visible warnings instead of errors. Children sort
 /// after their parents in the `BTreeSet`, so the reverse iteration removes
 /// leaves before the directories that contain them.
-fn propagate_shadow_deletions_to_kernel(vm: &mut VmState, current: &BTreeSet<String>) {
-    if vm.shadow_sync_inventory.is_empty() {
-        return;
-    }
-    let stale: Vec<String> = vm
+fn propagate_shadow_deletions_to_kernel(
+    vm: &mut VmState,
+    current: &mut BTreeMap<String, ShadowSyncInventoryEntry>,
+) -> BTreeSet<String> {
+    let stale = vm
         .shadow_sync_inventory
         .iter()
         .rev()
-        .filter(|path| !current.contains(*path))
-        .cloned()
-        .collect();
-    for path in stale {
+        .filter_map(|(path, previous)| {
+            let replacement = current.get(path);
+            (previous.deletion_pending
+                || replacement.is_none()
+                || replacement.is_some_and(|entry| entry.node_type != previous.node_type))
+            .then(|| (path.clone(), *previous))
+        })
+        .collect::<Vec<_>>();
+    let mut failed = BTreeSet::new();
+    for (path, previous) in stale {
         if path == "/" || should_skip_shadow_sync_path(vm, &path) || is_shadow_bootstrap_dir(&path)
         {
             continue;
         }
         let stat = match vm.kernel.lstat(&path) {
             Ok(stat) => stat,
-            // Already gone (for example removed through the kernel-direct
-            // guest fs path, which mirrors deletions into the shadow itself).
-            Err(_) => continue,
+            Err(error) if error.code() == "ENOENT" => continue,
+            Err(error) => {
+                tracing::warn!(
+                    path = %path,
+                    error = %error,
+                    "failed to inspect a stale shadow path; deletion will be retried"
+                );
+                retain_shadow_deletion_tombstone(current, &path, previous);
+                failed.insert(path);
+                continue;
+            }
         };
         let result = if stat.is_directory && !stat.is_symbolic_link {
             vm.kernel.remove_dir(&path)
@@ -10131,11 +16097,28 @@ fn propagate_shadow_deletions_to_kernel(vm: &mut VmState, current: &BTreeSet<Str
                 tracing::warn!(
                     path = %path,
                     error = %error,
-                    "failed to propagate guest shadow deletion into the kernel VFS"
+                    "failed to propagate guest shadow deletion into the kernel VFS; deletion will be retried"
                 );
+                retain_shadow_deletion_tombstone(current, &path, previous);
+                failed.insert(path);
             }
         }
     }
+    failed
+}
+
+fn retain_shadow_deletion_tombstone(
+    current: &mut BTreeMap<String, ShadowSyncInventoryEntry>,
+    path: &str,
+    previous: ShadowSyncInventoryEntry,
+) {
+    current
+        .entry(path.to_owned())
+        .and_modify(|entry| entry.deletion_pending = true)
+        .or_insert(ShadowSyncInventoryEntry {
+            node_type: previous.node_type,
+            deletion_pending: true,
+        });
 }
 
 fn collect_active_process_host_sync_roots(
@@ -10224,6 +16207,7 @@ fn sync_host_directory_tree_to_kernel(
         &normalized_guest_root,
         &mut synced_file_times,
         None,
+        None,
     )
 }
 
@@ -10233,7 +16217,8 @@ fn sync_host_directory_tree_to_kernel_inner(
     current_host_dir: &Path,
     guest_root: &str,
     synced_file_times: &mut BTreeMap<(u64, u64), (u64, u64)>,
-    mut inventory: Option<&mut BTreeSet<String>>,
+    expected_inventory: Option<&BTreeMap<String, ShadowSyncInventoryEntry>>,
+    failed_replacements: Option<&BTreeSet<String>>,
 ) -> Result<(), SidecarError> {
     let entries = match fs::read_dir(current_host_dir) {
         Ok(entries) => entries,
@@ -10294,34 +16279,36 @@ fn sync_host_directory_tree_to_kernel_inner(
         if should_skip_shadow_sync_path(vm, &guest_path) {
             continue;
         }
-
-        // Record every shadow entry we can represent in the kernel (dirs,
-        // files, symlinks) so the deletion reconcile can tell "was in the
-        // shadow, now gone" apart from "never came from the shadow".
-        if let Some(inventory) = inventory.as_deref_mut() {
-            if file_type.is_dir() || file_type.is_file() || file_type.is_symlink() {
-                inventory.insert(guest_path.clone());
-            }
+        if expected_inventory.is_some_and(|inventory| !inventory.contains_key(&guest_path)) {
+            // The entry appeared after the inventory pass. Pick it up on the
+            // next sync rather than mixing two different shadow snapshots.
+            continue;
+        }
+        if failed_replacements.is_some_and(|failed| failed.contains(&guest_path)) {
+            // Never write through a stale object whose removal failed. The
+            // retained tombstone will retry before a future additive write.
+            continue;
         }
 
         if file_type.is_dir() {
+            ensure_kernel_shadow_node_type(vm, &guest_path, ShadowNodeType::Directory)?;
             let metadata = entry.metadata().map_err(|error| {
                 SidecarError::Io(format!(
                     "failed to read host shadow metadata {}: {error}",
                     host_path.display()
                 ))
             })?;
-            if !is_shadow_bootstrap_dir(&guest_path)
-                && !vm.kernel.exists(&guest_path).unwrap_or(false)
-            {
-                vm.kernel.mkdir(&guest_path, true).map_err(|error| {
-                    SidecarError::InvalidState(format!(
-                        "failed to sync host shadow directory {} to guest {}: {}",
-                        host_path.display(),
-                        guest_path,
-                        kernel_error(error)
-                    ))
-                })?;
+            if !is_shadow_bootstrap_dir(&guest_path) {
+                if !vm.kernel.exists(&guest_path).unwrap_or(false) {
+                    vm.kernel.mkdir(&guest_path, true).map_err(|error| {
+                        SidecarError::InvalidState(format!(
+                            "failed to sync host shadow directory {} to guest {}: {}",
+                            host_path.display(),
+                            guest_path,
+                            kernel_error(error)
+                        ))
+                    })?;
+                }
                 vm.kernel
                     .chmod(&guest_path, host_shadow_mode(&metadata))
                     .map_err(|error| {
@@ -10339,12 +16326,14 @@ fn sync_host_directory_tree_to_kernel_inner(
                 &host_path,
                 guest_root,
                 synced_file_times,
-                inventory.as_deref_mut(),
+                expected_inventory,
+                failed_replacements,
             )?;
             continue;
         }
 
         if file_type.is_file() {
+            ensure_kernel_shadow_node_type(vm, &guest_path, ShadowNodeType::File)?;
             let metadata = entry.metadata().map_err(|error| {
                 SidecarError::Io(format!(
                     "failed to read host shadow metadata {}: {error}",
@@ -10457,6 +16446,7 @@ fn sync_host_directory_tree_to_kernel_inner(
         }
 
         if file_type.is_symlink() {
+            ensure_kernel_shadow_node_type(vm, &guest_path, ShadowNodeType::Symlink)?;
             let target = match fs::read_link(&host_path) {
                 Ok(target) => target,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -10472,6 +16462,42 @@ fn sync_host_directory_tree_to_kernel_inner(
     }
 
     Ok(())
+}
+
+fn ensure_kernel_shadow_node_type(
+    vm: &mut VmState,
+    guest_path: &str,
+    desired: ShadowNodeType,
+) -> Result<(), SidecarError> {
+    let existing = match vm.kernel.lstat(guest_path) {
+        Ok(existing) => existing,
+        Err(error) if error.code() == "ENOENT" => return Ok(()),
+        Err(error) => return Err(kernel_error(error)),
+    };
+    let existing_type = if existing.is_symbolic_link {
+        ShadowNodeType::Symlink
+    } else if existing.is_directory {
+        ShadowNodeType::Directory
+    } else {
+        ShadowNodeType::File
+    };
+    if existing_type == desired {
+        return Ok(());
+    }
+
+    let result = if existing_type == ShadowNodeType::Directory {
+        vm.kernel.remove_dir(guest_path)
+    } else {
+        // `remove_file` unlinks the directory entry itself. It must run before
+        // `write_file`, otherwise that write would follow a stale symlink.
+        vm.kernel.remove_file(guest_path)
+    };
+    result.map_err(|error| {
+        SidecarError::InvalidState(format!(
+            "failed to replace shadow path {guest_path} from {existing_type:?} to {desired:?}: {}",
+            kernel_error(error)
+        ))
+    })
 }
 
 fn replace_kernel_symlink(
@@ -10608,12 +16634,26 @@ pub(crate) fn is_protected_agentos_shadow_sync_path(path: &str) -> bool {
 fn should_skip_shadow_sync_path(vm: &VmState, guest_path: &str) -> bool {
     is_kernel_owned_shadow_sync_path(guest_path)
         || is_protected_agentos_shadow_sync_path(guest_path)
+        // Never reconcile the covered parent filesystem through a live mount.
+        // This applies to every plugin (host_dir, js_bridge, package tar,
+        // synthetic leaves, and future plugins), not just mounts with a host
+        // backing path.
+        || vm.kernel.mounted_filesystems().iter().any(|mount| {
+            let mount_path = normalize_path(&mount.path);
+            mount_path != "/" && guest_path_is_at_or_below(guest_path, &mount_path)
+        })
         // agentOS package content is served guest-native from read-only tar
         // mounts; it is already present in the guest and cannot be written, so a
         // host->guest shadow sync would fail with EROFS. Skip it.
         || guest_path_is_within_agentos_package_mount(vm, guest_path)
         || host_mount_path_for_guest_path_from_mounts(&vm.configuration.mounts, guest_path)
             .is_some()
+}
+
+fn guest_path_is_at_or_below(path: &str, prefix: &str) -> bool {
+    let path = normalize_path(path);
+    let prefix = normalize_path(prefix);
+    prefix == "/" || path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
 fn resolve_path_like_guest_specifier(cwd: &str, specifier: &str) -> String {
@@ -11157,6 +17197,328 @@ fn resolve_guest_command_entrypoint(
     })
 }
 
+/// Resolve the literal pathname supplied to execve(2). Unlike the spawnp
+/// resolver above, this never searches PATH and never substitutes a registered
+/// command merely because a missing pathname has the same basename.
+fn resolve_exact_guest_command_entrypoint(
+    vm: &VmState,
+    guest_cwd: &str,
+    command: &str,
+) -> Option<String> {
+    if !is_path_like_specifier(command) {
+        return None;
+    }
+
+    let normalized = resolve_path_like_guest_specifier(guest_cwd, command);
+    if let Some(name) = registered_command_name_for_path(vm, &normalized) {
+        return vm.command_guest_paths.get(&name).cloned();
+    }
+    if vm
+        .kernel
+        .exists(&normalized)
+        .ok()
+        .is_some_and(|exists| exists)
+    {
+        // execve follows the final symlink. Returning the real path also lets
+        // projected package commands select their actual JS/WASM entrypoint.
+        return vm
+            .kernel
+            .realpath(&normalized)
+            .ok()
+            .map(|path| normalize_path(&path))
+            .or(Some(normalized));
+    }
+
+    resolve_vm_guest_path_to_host(vm, &normalized)
+        .is_file()
+        .then_some(normalized)
+}
+
+fn registered_command_name_for_path(vm: &VmState, path: &str) -> Option<String> {
+    let normalized = normalize_path(path);
+    let name = ["/bin/", "/usr/bin/", "/usr/local/bin/", "/opt/agentos/bin/"]
+        .into_iter()
+        .find_map(|prefix| normalized.strip_prefix(prefix))
+        .or_else(|| {
+            normalized
+                .strip_prefix("/__secure_exec/commands/")
+                .and_then(|suffix| suffix.rsplit('/').next())
+        })?;
+    (!name.is_empty() && !name.contains('/') && vm.kernel.commands().contains_key(name))
+        .then(|| name.to_owned())
+}
+
+const LINUX_BINPRM_BUF_SIZE: usize = 256;
+const LINUX_MAX_INTERPRETER_DEPTH: usize = 4;
+
+struct LinuxShebang {
+    interpreter: String,
+    optional_argument: Option<String>,
+}
+
+fn parse_linux_shebang(header: &[u8], path: &str) -> Result<Option<LinuxShebang>, SidecarError> {
+    if !header.starts_with(b"#!") {
+        return Ok(None);
+    }
+
+    let payload = &header[2..];
+    let newline = payload.iter().position(|byte| *byte == b'\n');
+    let line = newline.map_or(payload, |index| &payload[..index]);
+    let line_end = line
+        .iter()
+        .rposition(|byte| !matches!(*byte, b' ' | b'\t'))
+        .map(|index| index + 1)
+        .ok_or_else(|| SidecarError::Kernel(format!("ENOEXEC: invalid shebang line: {path}")))?;
+    let line = &line[..line_end];
+    let interpreter_start = line
+        .iter()
+        .position(|byte| !matches!(*byte, b' ' | b'\t'))
+        .ok_or_else(|| SidecarError::Kernel(format!("ENOEXEC: invalid shebang line: {path}")))?;
+    let interpreter_tail = &line[interpreter_start..];
+    let separator = interpreter_tail
+        .iter()
+        .position(|byte| matches!(*byte, b' ' | b'\t'));
+    if newline.is_none() && header.len() >= LINUX_BINPRM_BUF_SIZE && separator.is_none() {
+        return Err(SidecarError::Kernel(format!(
+            "ENOEXEC: shebang interpreter path exceeds the Linux header limit: {path}"
+        )));
+    }
+
+    let interpreter_end = separator.unwrap_or(interpreter_tail.len());
+    let interpreter = std::str::from_utf8(&interpreter_tail[..interpreter_end])
+        .map_err(|_| SidecarError::Kernel(format!("ENOEXEC: invalid shebang line: {path}")))?;
+    if interpreter.is_empty() {
+        return Err(SidecarError::Kernel(format!(
+            "ENOEXEC: invalid shebang line: {path}"
+        )));
+    }
+    let optional_argument = separator
+        .map(|index| &interpreter_tail[index..])
+        .map(|value| {
+            let start = value
+                .iter()
+                .position(|byte| !matches!(*byte, b' ' | b'\t'))
+                .unwrap_or(value.len());
+            let end = value
+                .iter()
+                .rposition(|byte| !matches!(*byte, b' ' | b'\t'))
+                .map(|index| index + 1)
+                .unwrap_or(start);
+            &value[start..end]
+        })
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            std::str::from_utf8(value)
+                .map(str::to_owned)
+                .map_err(|_| SidecarError::Kernel(format!("ENOEXEC: invalid shebang line: {path}")))
+        })
+        .transpose()?;
+
+    Ok(Some(LinuxShebang {
+        interpreter: interpreter.to_owned(),
+        optional_argument,
+    }))
+}
+
+struct SpawnPathCandidate {
+    lookup_path: String,
+    script_argument: String,
+}
+
+fn spawn_request_guest_cwd(
+    parent_guest_cwd: &str,
+    request: &JavascriptChildProcessSpawnRequest,
+) -> String {
+    request
+        .options
+        .cwd
+        .as_deref()
+        .map(|cwd| {
+            if cwd.starts_with('/') {
+                normalize_path(cwd)
+            } else {
+                normalize_path(&format!("{parent_guest_cwd}/{cwd}"))
+            }
+        })
+        .unwrap_or_else(|| parent_guest_cwd.to_owned())
+}
+
+/// Resolve a bare `posix_spawnp` name with the same candidate selection rules
+/// as Linux `execvpe`: the caller's PATH is authoritative, empty entries name
+/// the current working directory, permission-denied candidates are skipped in
+/// case a later entry succeeds, and EACCES wins if every usable candidate was
+/// denied. `script_argument` preserves the candidate spelling Linux places in
+/// argv when the selected image is a shebang script (notably `name`, rather
+/// than `./name`, for an empty PATH entry).
+fn resolve_posix_spawn_path_candidate(
+    vm: &mut VmState,
+    guest_cwd: &str,
+    command: &str,
+    search_path: &str,
+) -> Result<SpawnPathCandidate, SidecarError> {
+    if command.is_empty() {
+        return Err(SidecarError::Kernel(String::from(
+            "ENOENT: posix_spawnp command is empty",
+        )));
+    }
+
+    let mut permission_error = None;
+    for segment in search_path.split(':') {
+        // PATH entries are literal. Do not trim whitespace: a directory whose
+        // name starts or ends with a space is valid on Linux.
+        let script_argument = if segment.is_empty() {
+            command.to_owned()
+        } else {
+            format!("{segment}/{command}")
+        };
+        let lookup_path = if segment.is_empty() {
+            format!("./{command}")
+        } else {
+            script_argument.clone()
+        };
+        match vm.kernel.validate_executable_path(&lookup_path, guest_cwd) {
+            Ok(_) => {
+                return Ok(SpawnPathCandidate {
+                    lookup_path,
+                    script_argument,
+                });
+            }
+            Err(error) if error.code() == "EACCES" => permission_error = Some(error),
+            Err(error) if matches!(error.code(), "ENOENT" | "ENOTDIR") => {}
+            Err(error) => return Err(kernel_error(error)),
+        }
+    }
+
+    if let Some(error) = permission_error {
+        Err(kernel_error(error))
+    } else {
+        Err(SidecarError::Kernel(format!(
+            "ENOENT: posix_spawnp command not found in PATH: {command}"
+        )))
+    }
+}
+
+/// Finish pathname and shebang resolution after POSIX file actions have run.
+/// `posix_spawnp` searches PATH exactly once in this staged child state, then
+/// follows the same recursive shebang rules as literal `posix_spawn`.
+fn resolve_posix_spawn_program(
+    vm: &mut VmState,
+    parent_guest_cwd: &str,
+    request: &mut JavascriptChildProcessSpawnRequest,
+) -> Result<(), SidecarError> {
+    if request.options.spawn_exact_path {
+        return resolve_spawn_shebang(vm, parent_guest_cwd, request, None);
+    }
+
+    let Some(search_path) = request.options.spawn_search_path.clone() else {
+        // Ordinary Node child_process resolution retains its existing package
+        // and runtime-command behavior. Only proc_spawn_v4/posix_spawnp sends
+        // spawnSearchPath and requests Linux execvpe semantics here.
+        return Ok(());
+    };
+
+    if is_path_like_specifier(&request.command) {
+        // POSIX specifies that a name containing '/' bypasses PATH search.
+        request.options.spawn_exact_path = true;
+        request.options.spawn_search_path = None;
+        return resolve_spawn_shebang(vm, parent_guest_cwd, request, None);
+    }
+
+    let guest_cwd = spawn_request_guest_cwd(parent_guest_cwd, request);
+    let candidate =
+        resolve_posix_spawn_path_candidate(vm, &guest_cwd, &request.command, &search_path)?;
+    request.command = candidate.lookup_path;
+    request.options.spawn_exact_path = true;
+    request.options.spawn_search_path = None;
+    resolve_spawn_shebang(
+        vm,
+        parent_guest_cwd,
+        request,
+        Some(candidate.script_argument),
+    )
+}
+
+fn resolve_spawn_shebang(
+    vm: &mut VmState,
+    parent_guest_cwd: &str,
+    request: &mut JavascriptChildProcessSpawnRequest,
+    mut initial_script_argument: Option<String>,
+) -> Result<(), SidecarError> {
+    let guest_cwd = spawn_request_guest_cwd(parent_guest_cwd, request);
+    let mut interpreter_depth = 0;
+
+    loop {
+        let script_argument = initial_script_argument
+            .take()
+            .unwrap_or_else(|| request.command.clone());
+        let resolved_path = vm
+            .kernel
+            .validate_executable_path(&request.command, &guest_cwd)
+            .map_err(kernel_error)?;
+        if registered_command_name_for_path(vm, &resolved_path).is_some() {
+            return Ok(());
+        }
+
+        let header = vm
+            .kernel
+            .pread_file(&resolved_path, 0, LINUX_BINPRM_BUF_SIZE)
+            .map_err(kernel_error)?;
+        if header.starts_with(b"\0asm") {
+            return Ok(());
+        }
+        let Some(shebang) = parse_linux_shebang(&header, &resolved_path)? else {
+            return Err(SidecarError::Kernel(format!(
+                "ENOEXEC: exec format error: {resolved_path}"
+            )));
+        };
+        if interpreter_depth >= LINUX_MAX_INTERPRETER_DEPTH {
+            return Err(SidecarError::Kernel(format!(
+                "ELOOP: interpreter recursion for {resolved_path} exceeds the Linux limit"
+            )));
+        }
+        interpreter_depth += 1;
+
+        let mut interpreter_args = Vec::with_capacity(request.args.len() + 2);
+        if let Some(argument) = shebang.optional_argument {
+            interpreter_args.push(argument);
+        }
+        interpreter_args.push(script_argument);
+        interpreter_args.append(&mut request.args);
+        request.command = shebang.interpreter;
+        request.args = interpreter_args;
+        // Linux discards the caller-supplied script argv[0]. The final
+        // interpreter pathname becomes argv[0], including across a nested
+        // shebang chain.
+        request.options.argv0 = Some(request.command.clone());
+    }
+}
+
+fn validate_exact_exec_image_format(
+    vm: &mut VmState,
+    path: &str,
+    runtime: &GuestRuntimeKind,
+) -> Result<(), SidecarError> {
+    let header = vm.kernel.pread_file(path, 0, 4).map_err(kernel_error)?;
+    let valid = exact_exec_image_header_is_valid(runtime, &header);
+    if valid {
+        Ok(())
+    } else {
+        Err(SidecarError::InvalidState(format!(
+            "ENOEXEC: exec format error: {path}"
+        )))
+    }
+}
+
+fn exact_exec_image_header_is_valid(runtime: &GuestRuntimeKind, header: &[u8]) -> bool {
+    match runtime {
+        GuestRuntimeKind::WebAssembly => header == b"\0asm",
+        // Linux recognizes scripts through their shebang, not their filename
+        // extension. Runtime resolution has already checked that the shebang
+        // selects the corresponding supported interpreter.
+        GuestRuntimeKind::JavaScript | GuestRuntimeKind::Python => header.starts_with(b"#!"),
+    }
+}
+
 fn guest_command_search_dirs(vm: &VmState, guest_cwd: &str, path_env: Option<&str>) -> Vec<String> {
     let mut search_dirs = Vec::new();
     let mut seen = BTreeSet::new();
@@ -11480,6 +17842,12 @@ fn wasm_execution_limits(vm: &VmState) -> WasmExecutionLimits {
         max_stack_bytes: resource_limits
             .max_wasm_stack_bytes
             .map(|value| value as u64),
+        max_module_file_bytes: Some(vm.limits.wasm.max_module_file_bytes),
+        max_spawn_file_actions: Some(vm.limits.process.max_spawn_file_actions as u64),
+        max_spawn_file_action_bytes: Some(vm.limits.process.max_spawn_file_action_bytes as u64),
+        max_open_fds: resource_limits.max_open_fds.map(|value| value as u64),
+        max_sockets: resource_limits.max_sockets.map(|value| value as u64),
+        max_blocking_read_ms: resource_limits.max_blocking_read_ms,
         prewarm_timeout_ms: Some(vm.limits.wasm.prewarm_timeout_ms),
         runner_heap_limit_mb: Some(vm.limits.wasm.runner_heap_limit_mb),
     }
@@ -11902,20 +18270,1528 @@ mod runtime_guest_path_mapping_tests {
 }
 
 #[cfg(test)]
-mod kernel_poll_sync_rpc_tests {
+mod spawn_host_net_resource_limit_tests {
     use super::{
-        service_javascript_kernel_poll_sync_rpc, ActiveExecution, ActiveProcess,
-        JavascriptSyncRpcRequest, KernelPollFdResponse, SidecarKernel, ToolExecution,
-        EXECUTION_DRIVER_NAME, JAVASCRIPT_COMMAND,
+        add_live_host_net_transfer_descriptions, apply_spawn_host_net_file_actions,
+        check_spawn_host_net_resource_limit, host_net_open_description_options,
+        prepare_transferred_host_net_resource, register_host_net_transfer_description,
+        scm_rights_host_net_source, spawn_host_net_network_counts, spawn_host_net_source,
+        validate_host_net_metadata, ActiveExecution, ActiveProcess, HostNetOpenDescriptionOptions,
+        JavascriptPosixSpawnFileAction, JavascriptSpawnHostNetFd, SidecarKernel,
+        SpawnHostNetFdState, SpawnHostNetSource, ToolExecution, TransferredHostNetMetadata,
+        TransferredHostNetSocket, HOST_NET_AF_INET, HOST_NET_AF_INET6, HOST_NET_AF_UNIX,
+        HOST_NET_IPPROTO_TCP, HOST_NET_IPPROTO_UDP, HOST_NET_METADATA_MAX_STRING_BYTES,
+        HOST_NET_RECV_TIMEOUT_MAX_MS, HOST_NET_SOCK_CLOEXEC, HOST_NET_SOCK_DGRAM,
+        HOST_NET_SOCK_NONBLOCK, HOST_NET_SOCK_STREAM,
     };
     use agentos_kernel::command_registry::CommandDriver;
     use agentos_kernel::kernel::{KernelVmConfig, SpawnOptions};
     use agentos_kernel::mount_table::MountTable;
     use agentos_kernel::permissions::Permissions;
-    use agentos_kernel::poll::{POLLHUP, POLLIN};
     use agentos_kernel::vfs::MemoryFileSystem;
     use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    fn fd_state(description: usize, close_on_exec: bool) -> SpawnHostNetFdState {
+        SpawnHostNetFdState {
+            description,
+            close_on_exec,
+        }
+    }
+
+    fn close_action(guest_fd: i32) -> JavascriptPosixSpawnFileAction {
+        JavascriptPosixSpawnFileAction {
+            command: 1,
+            guest_fd: Some(guest_fd),
+            fd: guest_fd,
+            source_fd: 0,
+            guest_source_fd: None,
+            oflag: 0,
+            mode: 0,
+            path: String::new(),
+            close_from_guest_fds: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn inherited_aliases_count_one_open_description() {
+        let fd_states = BTreeMap::from([
+            (3, fd_state(0, false)),
+            (4, fd_state(0, false)),
+            (5, fd_state(1, false)),
+        ]);
+
+        let counts = spawn_host_net_network_counts(&fd_states, &[true, false]);
+
+        assert_eq!(counts.sockets, 2);
+        assert_eq!(counts.connections, 1);
+    }
+
+    #[test]
+    fn close_actions_and_cloexec_elide_inherited_descriptions() {
+        let mut fd_states = BTreeMap::from([
+            (3, fd_state(0, true)),
+            (4, fd_state(1, false)),
+            (5, fd_state(1, false)),
+        ]);
+
+        apply_spawn_host_net_file_actions(&mut fd_states, &[close_action(4), close_action(5)])
+            .expect("close actions should apply");
+        fd_states.retain(|_, state| !state.close_on_exec);
+        let counts = spawn_host_net_network_counts(&fd_states, &[true, true]);
+
+        assert_eq!(counts.sockets, 0);
+        assert_eq!(counts.connections, 0);
+    }
+
+    #[test]
+    fn recursive_vm_usage_rejects_nested_inheritance_over_either_limit() {
+        let socket_error = check_spawn_host_net_resource_limit(
+            Some(2),
+            2,
+            1,
+            "EMFILE",
+            "socket descriptions",
+            "maxSockets",
+        )
+        .expect_err("nested inheritance must not exceed maxSockets")
+        .to_string();
+        assert!(socket_error.contains("recursive VM usage from 2 to 3"));
+        assert!(socket_error.contains("limits.resources.maxSockets (2)"));
+
+        let connection_error = check_spawn_host_net_resource_limit(
+            Some(4),
+            4,
+            1,
+            "EAGAIN",
+            "connected socket descriptions",
+            "maxConnections",
+        )
+        .expect_err("nested inheritance must not exceed maxConnections")
+        .to_string();
+        assert!(connection_error.contains("recursive VM usage from 4 to 5"));
+        assert!(connection_error.contains("limits.resources.maxConnections (4)"));
+    }
+
+    fn canonical_tcp_metadata(nonblocking: bool) -> TransferredHostNetMetadata {
+        TransferredHostNetMetadata {
+            domain: HOST_NET_AF_INET,
+            socket_type: HOST_NET_SOCK_STREAM,
+            protocol: HOST_NET_IPPROTO_TCP,
+            nonblocking,
+            recv_timeout_ms: Some(250),
+            bind_options: None,
+            local_info: Some(json!({ "address": "127.0.0.1", "port": 41000 })),
+            local_unix_address: None,
+            local_reservation: None,
+            remote_info: Some(json!({ "address": "127.0.0.1", "port": 8080 })),
+            remote_unix_address: None,
+            listening: false,
+        }
+    }
+
+    fn assert_metadata_mismatch(mut value: Value, field: &str, replacement: Value) {
+        value
+            .as_object_mut()
+            .expect("metadata object")
+            .insert(field.to_owned(), replacement);
+        let error = validate_host_net_metadata(
+            &value,
+            &canonical_tcp_metadata(false),
+            "tcp",
+            "spawn host-network",
+        )
+        .expect_err("tampered metadata must be rejected")
+        .to_string();
+        assert!(error.contains(field), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn spawn_rejects_forged_socket_identity_lifecycle_and_addresses() {
+        let canonical = canonical_tcp_metadata(false).as_value();
+        for (field, replacement) in [
+            ("domain", json!(HOST_NET_AF_INET6)),
+            ("socketType", json!(HOST_NET_SOCK_DGRAM)),
+            ("protocol", json!(HOST_NET_IPPROTO_UDP)),
+            ("listening", json!(true)),
+            ("localInfo", json!({ "address": "10.0.0.1", "port": 41000 })),
+            (
+                "remoteInfo",
+                json!({ "address": "169.254.169.254", "port": 80 }),
+            ),
+            ("localUnixAddress", json!("unix:/forged")),
+            ("remoteUnixAddress", json!("unix:/forged-peer")),
+        ] {
+            assert_metadata_mismatch(canonical.clone(), field, replacement);
+        }
+
+        let mut wrong_class = canonical.clone();
+        wrong_class["class"] = json!("udp");
+        let error = validate_host_net_metadata(
+            &wrong_class,
+            &canonical_tcp_metadata(false),
+            "tcp",
+            "spawn host-network",
+        )
+        .expect_err("guest class must not override the resolved resource")
+        .to_string();
+        assert!(error.contains("class"));
+    }
+
+    #[test]
+    fn spawn_rejects_ambiguous_or_unbounded_resource_ids_and_resolves_before_metadata() {
+        let fd = JavascriptSpawnHostNetFd {
+            guest_fd: 3,
+            close_on_exec: false,
+            socket_id: Some(String::from("socket-1")),
+            server_id: Some(String::from("listener-1")),
+            udp_socket_id: None,
+            metadata: canonical_tcp_metadata(false).as_value(),
+        };
+        assert!(spawn_host_net_source(&fd)
+            .expect_err("multiple ids must be rejected")
+            .to_string()
+            .contains("exactly one resource id"));
+
+        let fd = JavascriptSpawnHostNetFd {
+            socket_id: Some("x".repeat(257)),
+            server_id: None,
+            ..fd
+        };
+        assert!(spawn_host_net_source(&fd)
+            .expect_err("oversized id must be rejected")
+            .to_string()
+            .contains("ENAMETOOLONG"));
+
+        let mut config = KernelVmConfig::new("vm-host-net-metadata-resolution-order");
+        config.permissions = Permissions::allow_all();
+        let mut kernel = SidecarKernel::new(MountTable::new(MemoryFileSystem::new()), config);
+        kernel
+            .register_driver(CommandDriver::new(
+                super::EXECUTION_DRIVER_NAME,
+                [super::WASM_COMMAND],
+            ))
+            .expect("register execution driver");
+        let kernel_handle = kernel
+            .spawn_process(
+                super::WASM_COMMAND,
+                Vec::new(),
+                SpawnOptions {
+                    requester_driver: Some(String::from(super::EXECUTION_DRIVER_NAME)),
+                    ..SpawnOptions::default()
+                },
+            )
+            .expect("spawn process");
+        let mut process = ActiveProcess::new(
+            kernel_handle.pid(),
+            kernel_handle,
+            super::GuestRuntimeKind::WebAssembly,
+            ActiveExecution::Tool(ToolExecution::default()),
+        );
+        let error = prepare_transferred_host_net_resource(
+            &mut kernel,
+            &mut process,
+            &SpawnHostNetSource::Tcp(String::from("forged-resource")),
+            &json!("also-malformed-metadata"),
+            "spawn host-network",
+        )
+        .expect_err("unknown sidecar resource must be rejected first")
+        .to_string();
+        assert!(error.contains("EBADF: unknown transferable socket forged-resource"));
+    }
+
+    #[test]
+    fn valid_alias_metadata_is_canonicalized_and_creation_flags_do_not_override_ofd_state() {
+        let expected = canonical_tcp_metadata(false);
+        let canonical = expected.as_value();
+        validate_host_net_metadata(&canonical, &expected, "tcp", "spawn host-network")
+            .expect("canonical alias metadata");
+
+        let mut alias = canonical.clone();
+        alias["protocol"] = json!(0);
+        alias["socketType"] =
+            json!(HOST_NET_SOCK_STREAM | HOST_NET_SOCK_NONBLOCK | HOST_NET_SOCK_CLOEXEC);
+        validate_host_net_metadata(&alias, &expected, "tcp", "spawn host-network")
+            .expect("Linux socket creation flags may differ from current OFD/fd state");
+
+        let emitted = expected.as_value();
+        assert_eq!(emitted["socketType"], json!(HOST_NET_SOCK_STREAM));
+        assert_eq!(emitted["nonblocking"], json!(false));
+        assert!(emitted.get("closeOnExec").is_none());
+    }
+
+    #[test]
+    fn scm_rights_rejects_forged_ids_metadata_and_unbounded_open_state() {
+        let canonical = canonical_tcp_metadata(false).as_value();
+        let mut ambiguous = canonical.clone();
+        ambiguous["socketId"] = json!("socket-1");
+        ambiguous["serverId"] = json!("listener-1");
+        assert!(scm_rights_host_net_source(&ambiguous)
+            .expect_err("SCM_RIGHTS class ids must be unambiguous")
+            .to_string()
+            .contains("at most one resource id"));
+
+        let mut wrong_class = canonical.clone();
+        wrong_class["class"] = json!("listener");
+        assert!(validate_host_net_metadata(
+            &wrong_class,
+            &canonical_tcp_metadata(false),
+            "tcp",
+            "SCM_RIGHTS host-network",
+        )
+        .expect_err("SCM class forgery")
+        .to_string()
+        .contains("class"));
+
+        let mut wrong_address = canonical.clone();
+        wrong_address["remoteInfo"] = json!({ "address": "203.0.113.8", "port": 22 });
+        assert!(validate_host_net_metadata(
+            &wrong_address,
+            &canonical_tcp_metadata(false),
+            "tcp",
+            "SCM_RIGHTS host-network",
+        )
+        .expect_err("SCM address forgery")
+        .to_string()
+        .contains("remoteInfo"));
+
+        let mut bad_nonblocking = canonical.clone();
+        bad_nonblocking["nonblocking"] = json!("yes");
+        assert!(
+            host_net_open_description_options(&bad_nonblocking, "SCM_RIGHTS host-network")
+                .expect_err("nonblocking must be strict boolean")
+                .to_string()
+                .contains("must be boolean")
+        );
+
+        let mut bad_timeout = canonical.clone();
+        bad_timeout["recvTimeoutMs"] = json!(HOST_NET_RECV_TIMEOUT_MAX_MS + 1);
+        assert!(
+            host_net_open_description_options(&bad_timeout, "SCM_RIGHTS host-network")
+                .expect_err("timeout must be range bounded")
+                .to_string()
+                .contains("exceeds")
+        );
+
+        let mut oversized = canonical;
+        oversized["extra"] = json!("x".repeat(HOST_NET_METADATA_MAX_STRING_BYTES + 1));
+        assert!(
+            host_net_open_description_options(&oversized, "SCM_RIGHTS host-network")
+                .expect_err("metadata strings must be bounded")
+                .to_string()
+                .contains("ENAMETOOLONG")
+        );
+    }
+
+    #[test]
+    fn scm_pending_accepts_only_canonical_unconnected_socket_tuples() {
+        let pending = json!({
+            "kind": "hostNet",
+            "domain": HOST_NET_AF_UNIX,
+            "socketType": HOST_NET_SOCK_STREAM,
+            "protocol": 0,
+            "nonblocking": true,
+            "recvTimeoutMs": null,
+            "bindOptions": null,
+            "localInfo": null,
+            "localUnixAddress": "unix-unnamed",
+            "localReservation": null,
+            "remoteInfo": null,
+            "remoteUnixAddress": null,
+            "listening": false,
+        });
+        let options = host_net_open_description_options(&pending, "SCM_RIGHTS pending socket")
+            .expect("pending options");
+        let canonical =
+            TransferredHostNetMetadata::pending(&pending, options, "SCM_RIGHTS pending socket")
+                .expect("valid unconnected Unix stream");
+        assert_eq!(
+            canonical.as_value()["localUnixAddress"],
+            json!("unix-unnamed")
+        );
+
+        for (field, replacement) in [
+            ("listening", json!(true)),
+            ("bindOptions", json!({ "path": "/forged" })),
+            ("remoteUnixAddress", json!("unix:/forged-peer")),
+        ] {
+            let mut forged = pending.clone();
+            forged[field] = replacement;
+            let options = host_net_open_description_options(&forged, "SCM_RIGHTS pending socket")
+                .expect("open state remains syntactically valid");
+            assert!(TransferredHostNetMetadata::pending(
+                &forged,
+                options,
+                "SCM_RIGHTS pending socket",
+            )
+            .is_err());
+        }
+
+        let unsupported = json!({
+            "domain": HOST_NET_AF_UNIX,
+            "socketType": HOST_NET_SOCK_DGRAM,
+            "protocol": 0,
+            "listening": false,
+        });
+        let options = HostNetOpenDescriptionOptions {
+            nonblocking: false,
+            recv_timeout_ms: None,
+        };
+        assert!(TransferredHostNetMetadata::pending(
+            &unsupported,
+            options,
+            "SCM_RIGHTS pending socket",
+        )
+        .expect_err("unsupported tuple")
+        .to_string()
+        .contains("EPROTONOSUPPORT"));
+    }
+
+    #[test]
+    fn duplicate_rights_share_one_description_and_queue_lifecycle_is_counted() {
+        let registry = Arc::new(Mutex::new(BTreeMap::new()));
+        let resource = TransferredHostNetSocket::Pending {
+            metadata: canonical_tcp_metadata(false),
+            description_handles: Arc::new(()),
+        };
+        let duplicate = resource
+            .clone_for_fd_transfer()
+            .expect("duplicate one open-file description");
+        register_host_net_transfer_description(&registry, &resource);
+        register_host_net_transfer_description(&registry, &duplicate);
+
+        let mut queued = BTreeMap::new();
+        add_live_host_net_transfer_descriptions(&registry, &mut queued);
+        assert_eq!(queued.len(), 1, "duplicate rights are one open description");
+        check_spawn_host_net_resource_limit(
+            Some(1),
+            1,
+            0,
+            "EMFILE",
+            "SCM_RIGHTS socket descriptions",
+            "maxSockets",
+        )
+        .expect("transferring an existing description at the maximum is allowed");
+
+        drop(resource);
+        queued.clear();
+        add_live_host_net_transfer_descriptions(&registry, &mut queued);
+        assert_eq!(
+            queued.len(),
+            1,
+            "queued/received alias keeps the description live"
+        );
+
+        drop(duplicate);
+        queued.clear();
+        add_live_host_net_transfer_descriptions(&registry, &mut queued);
+        assert!(
+            queued.is_empty(),
+            "dropping the final right releases the queue lease"
+        );
+
+        assert!(check_spawn_host_net_resource_limit(
+            Some(1),
+            1,
+            1,
+            "EMFILE",
+            "SCM_RIGHTS pending socket descriptions",
+            "maxSockets",
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod kernel_poll_sync_rpc_tests {
+    use super::{
+        apply_spawn_session_or_rollback, install_preapplied_posix_spawn_file_actions,
+        javascript_spawn_attributes, missing_javascript_child_kill_result,
+        preapply_posix_spawn_file_actions, rollback_unregistered_spawn_child,
+        service_javascript_kernel_poll_sync_rpc, ActiveExecution, ActiveProcess,
+        JavascriptChildProcessSpawnOptions, JavascriptPosixSpawnFileAction,
+        JavascriptSyncRpcRequest, KernelPollFdResponse, SidecarKernel, ToolExecution,
+        EXECUTION_DRIVER_NAME, JAVASCRIPT_COMMAND, WASM_COMMAND,
+    };
+    use agentos_kernel::command_registry::CommandDriver;
+    use agentos_kernel::fd_table::{FD_CLOEXEC, F_GETFD, F_SETFD};
+    use agentos_kernel::kernel::{KernelVmConfig, SpawnOptions};
+    use agentos_kernel::mount_table::{MountOptions, MountTable};
+    use agentos_kernel::permissions::Permissions;
+    use agentos_kernel::poll::{POLLHUP, POLLIN};
+    use agentos_kernel::vfs::{
+        MemoryFileSystem, VfsResult, VirtualDirEntry, VirtualFileSystem, VirtualStat,
+    };
+    use serde_json::{json, Value};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct SpawnOpenCounters {
+        exclusive_creates: AtomicUsize,
+        truncates: AtomicUsize,
+    }
+
+    struct CountingSpawnMount {
+        inner: MemoryFileSystem,
+        counters: Arc<SpawnOpenCounters>,
+    }
+
+    impl CountingSpawnMount {
+        fn new(counters: Arc<SpawnOpenCounters>) -> Self {
+            Self {
+                inner: MemoryFileSystem::new(),
+                counters,
+            }
+        }
+    }
+
+    impl VirtualFileSystem for CountingSpawnMount {
+        fn read_file(&mut self, path: &str) -> VfsResult<Vec<u8>> {
+            self.inner.read_file(path)
+        }
+
+        fn read_dir(&mut self, path: &str) -> VfsResult<Vec<String>> {
+            self.inner.read_dir(path)
+        }
+
+        fn read_dir_limited(&mut self, path: &str, max_entries: usize) -> VfsResult<Vec<String>> {
+            self.inner.read_dir_limited(path, max_entries)
+        }
+
+        fn read_dir_with_types(&mut self, path: &str) -> VfsResult<Vec<VirtualDirEntry>> {
+            self.inner.read_dir_with_types(path)
+        }
+
+        fn write_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<()> {
+            // Some mounted VFS wrappers implement exclusive creation in terms
+            // of the plugin's primitive write operation. Count the mutation
+            // that reaches this externally mutable mount, regardless of which
+            // wrapper supplied the exclusivity check.
+            if matches!(path, "/exclusive" | "/failed-exec-side-effect") {
+                self.counters
+                    .exclusive_creates
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.write_file(path, content)
+        }
+
+        fn write_file_with_mode(
+            &mut self,
+            path: &str,
+            content: impl Into<Vec<u8>>,
+            mode: Option<u32>,
+        ) -> VfsResult<()> {
+            self.inner.write_file_with_mode(path, content, mode)
+        }
+
+        fn create_file_exclusive(
+            &mut self,
+            path: &str,
+            content: impl Into<Vec<u8>>,
+        ) -> VfsResult<()> {
+            self.counters
+                .exclusive_creates
+                .fetch_add(1, Ordering::SeqCst);
+            self.inner.create_file_exclusive(path, content)
+        }
+
+        fn create_file_exclusive_with_mode(
+            &mut self,
+            path: &str,
+            content: impl Into<Vec<u8>>,
+            mode: Option<u32>,
+        ) -> VfsResult<()> {
+            self.counters
+                .exclusive_creates
+                .fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .create_file_exclusive_with_mode(path, content, mode)
+        }
+
+        fn append_file(&mut self, path: &str, content: impl Into<Vec<u8>>) -> VfsResult<u64> {
+            self.inner.append_file(path, content)
+        }
+
+        fn create_dir(&mut self, path: &str) -> VfsResult<()> {
+            self.inner.create_dir(path)
+        }
+
+        fn mkdir(&mut self, path: &str, recursive: bool) -> VfsResult<()> {
+            self.inner.mkdir(path, recursive)
+        }
+
+        fn exists(&self, path: &str) -> bool {
+            self.inner.exists(path)
+        }
+
+        fn stat(&mut self, path: &str) -> VfsResult<VirtualStat> {
+            self.inner.stat(path)
+        }
+
+        fn remove_file(&mut self, path: &str) -> VfsResult<()> {
+            self.inner.remove_file(path)
+        }
+
+        fn remove_dir(&mut self, path: &str) -> VfsResult<()> {
+            self.inner.remove_dir(path)
+        }
+
+        fn rename(&mut self, old_path: &str, new_path: &str) -> VfsResult<()> {
+            self.inner.rename(old_path, new_path)
+        }
+
+        fn realpath(&self, path: &str) -> VfsResult<String> {
+            self.inner.realpath(path)
+        }
+
+        fn symlink(&mut self, target: &str, link_path: &str) -> VfsResult<()> {
+            self.inner.symlink(target, link_path)
+        }
+
+        fn read_link(&self, path: &str) -> VfsResult<String> {
+            self.inner.read_link(path)
+        }
+
+        fn lstat(&self, path: &str) -> VfsResult<VirtualStat> {
+            self.inner.lstat(path)
+        }
+
+        fn link(&mut self, old_path: &str, new_path: &str) -> VfsResult<()> {
+            self.inner.link(old_path, new_path)
+        }
+
+        fn chmod(&mut self, path: &str, mode: u32) -> VfsResult<()> {
+            self.inner.chmod(path, mode)
+        }
+
+        fn chown(&mut self, path: &str, uid: u32, gid: u32) -> VfsResult<()> {
+            self.inner.chown(path, uid, gid)
+        }
+
+        fn utimes(&mut self, path: &str, atime_ms: u64, mtime_ms: u64) -> VfsResult<()> {
+            self.inner.utimes(path, atime_ms, mtime_ms)
+        }
+
+        fn truncate(&mut self, path: &str, length: u64) -> VfsResult<()> {
+            self.counters.truncates.fetch_add(1, Ordering::SeqCst);
+            self.inner.truncate(path, length)
+        }
+
+        fn pread(&mut self, path: &str, offset: u64, length: usize) -> VfsResult<Vec<u8>> {
+            self.inner.pread(path, offset, length)
+        }
+    }
+
+    #[test]
+    fn cleanup_kill_ignores_reaped_child_but_rejects_unknown_id() {
+        missing_javascript_child_kill_result(1, "child-1")
+            .expect("a previously allocated child is confirmed gone");
+
+        let unknown = missing_javascript_child_kill_result(1, "child-2")
+            .expect_err("a never-allocated child must remain an error");
+        assert!(unknown
+            .to_string()
+            .contains("unknown child process child-2"));
+
+        let malformed = missing_javascript_child_kill_result(1, "child-01")
+            .expect_err("a non-canonical child id must remain an error");
+        assert!(malformed
+            .to_string()
+            .contains("unknown child process child-01"));
+    }
+
+    #[test]
+    fn posix_spawn_dup2_actions_use_cloexec_sources_before_exec() {
+        let mut config = KernelVmConfig::new("vm-posix-spawn-cloexec-actions");
+        config.permissions = Permissions::allow_all();
+        let mut kernel = SidecarKernel::new(MountTable::new(MemoryFileSystem::new()), config);
+        kernel
+            .register_driver(CommandDriver::new(EXECUTION_DRIVER_NAME, [WASM_COMMAND]))
+            .unwrap();
+        let parent = kernel
+            .spawn_process(
+                WASM_COMMAND,
+                Vec::new(),
+                SpawnOptions {
+                    requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                    ..SpawnOptions::default()
+                },
+            )
+            .unwrap();
+        let (source_a, ordinary_cloexec) = kernel
+            .open_pipe(EXECUTION_DRIVER_NAME, parent.pid())
+            .unwrap();
+        let (source_b, inherited_non_cloexec) = kernel
+            .open_pipe(EXECUTION_DRIVER_NAME, parent.pid())
+            .unwrap();
+        let (same_fd_source, _same_fd_peer) = kernel
+            .open_pipe(EXECUTION_DRIVER_NAME, parent.pid())
+            .unwrap();
+        for fd in [source_a, source_b, ordinary_cloexec, same_fd_source] {
+            kernel
+                .fd_fcntl(EXECUTION_DRIVER_NAME, parent.pid(), fd, F_SETFD, FD_CLOEXEC)
+                .unwrap();
+        }
+        let source_description = kernel
+            .fd_transfer(EXECUTION_DRIVER_NAME, parent.pid(), source_a)
+            .unwrap()
+            .description_id();
+        let same_fd_description = kernel
+            .fd_transfer(EXECUTION_DRIVER_NAME, parent.pid(), same_fd_source)
+            .unwrap()
+            .description_id();
+        let dup2_action = |guest_source_fd: i32, source_fd: u32, guest_fd: i32, fd: i32| {
+            JavascriptPosixSpawnFileAction {
+                command: 2,
+                guest_fd: Some(guest_fd),
+                fd,
+                source_fd: source_fd as i32,
+                guest_source_fd: Some(guest_source_fd),
+                oflag: 0,
+                mode: 0,
+                path: String::new(),
+                close_from_guest_fds: Vec::new(),
+            }
+        };
+
+        // The first dup2 overwrites guest fd 8, so the following 8 -> 9 must
+        // observe source A. Both targets clear FD_CLOEXEC like Linux dup2.
+        let prepared = preapply_posix_spawn_file_actions(
+            &mut kernel,
+            parent.pid(),
+            "/",
+            None,
+            &[[7, source_a], [8, source_b], [10, same_fd_source]],
+            &[
+                dup2_action(10, same_fd_source, 10, same_fd_source as i32),
+                dup2_action(7, source_a, 8, source_b as i32),
+                dup2_action(8, source_b, 9, 9),
+            ],
+        )
+        .unwrap();
+
+        let prepared_fd = |guest_fd: u32| {
+            prepared
+                .applied
+                .fd_mappings
+                .iter()
+                .find_map(|mapping| (mapping[0] == guest_fd).then_some(mapping[1]))
+                .expect("guest mapping must survive exec")
+        };
+        let guest_8_fd = prepared_fd(8);
+        let guest_9_fd = prepared_fd(9);
+        let guest_10_fd = prepared_fd(10);
+        assert_eq!(guest_8_fd, source_b);
+        for target_fd in [guest_8_fd, guest_9_fd] {
+            let target = prepared
+                .fds
+                .iter()
+                .find(|entry| entry.fd == target_fd)
+                .expect("dup2 target must be prepared for the runtime child");
+            assert_eq!(target.transfer.description_id(), source_description);
+            assert_eq!(target.fd_flags & FD_CLOEXEC, 0);
+        }
+        let guest_10 = prepared
+            .fds
+            .iter()
+            .find(|entry| entry.fd == guest_10_fd)
+            .expect("same-fd dup2 target must be prepared for the runtime child");
+        assert_eq!(guest_10.transfer.description_id(), same_fd_description);
+        assert_eq!(guest_10.fd_flags & FD_CLOEXEC, 0);
+        assert_eq!(
+            guest_10_fd, same_fd_source,
+            "same-fd dup2 must retain the original open description"
+        );
+        assert!(
+            !prepared
+                .applied
+                .fd_mappings
+                .iter()
+                .any(|mapping| mapping[0] == 7),
+            "the original CLOEXEC source must close at exec"
+        );
+        assert!(
+            !prepared
+                .fds
+                .iter()
+                .any(|entry| entry.fd == ordinary_cloexec),
+            "an unmapped CLOEXEC descriptor must close at exec"
+        );
+        assert!(
+            prepared
+                .fds
+                .iter()
+                .any(|entry| entry.fd == inherited_non_cloexec),
+            "an ordinary non-CLOEXEC descriptor must survive"
+        );
+        assert_eq!(
+            kernel
+                .fd_fcntl(EXECUTION_DRIVER_NAME, parent.pid(), source_a, F_GETFD, 0,)
+                .unwrap(),
+            FD_CLOEXEC,
+            "staging must not mutate the parent descriptor table"
+        );
+
+        // Installing the staged descriptions into the actual runtime child
+        // must keep the parent writer alive across multiple request/response
+        // turns. EOF begins only after the parent's last writer is closed.
+        let child = kernel
+            .spawn_process(
+                WASM_COMMAND,
+                Vec::new(),
+                SpawnOptions {
+                    requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                    parent_pid: Some(parent.pid()),
+                    ..SpawnOptions::default()
+                },
+            )
+            .unwrap();
+        let applied =
+            install_preapplied_posix_spawn_file_actions(&mut kernel, &child, prepared).unwrap();
+        let child_read_fd = applied
+            .fd_mappings
+            .iter()
+            .find_map(|mapping| (mapping[0] == 8).then_some(mapping[1]))
+            .expect("installed child read mapping");
+        kernel
+            .fd_write(
+                EXECUTION_DRIVER_NAME,
+                parent.pid(),
+                ordinary_cloexec,
+                b"first",
+            )
+            .unwrap();
+        assert_eq!(
+            kernel
+                .fd_read(EXECUTION_DRIVER_NAME, child.pid(), child_read_fd, 16)
+                .unwrap(),
+            b"first"
+        );
+        kernel
+            .fd_write(
+                EXECUTION_DRIVER_NAME,
+                parent.pid(),
+                ordinary_cloexec,
+                b"second",
+            )
+            .unwrap();
+        assert_eq!(
+            kernel
+                .fd_read(EXECUTION_DRIVER_NAME, child.pid(), child_read_fd, 16)
+                .unwrap(),
+            b"second"
+        );
+        kernel
+            .fd_close(EXECUTION_DRIVER_NAME, parent.pid(), ordinary_cloexec)
+            .unwrap();
+        assert!(
+            kernel
+                .fd_read(EXECUTION_DRIVER_NAME, child.pid(), child_read_fd, 1)
+                .unwrap()
+                .is_empty(),
+            "the child must observe EOF after the last writer closes"
+        );
+
+        child.finish(0);
+        kernel.waitpid(child.pid()).unwrap();
+        parent.finish(0);
+        kernel.waitpid(parent.pid()).unwrap();
+    }
+
+    #[test]
+    fn posix_spawn_closefrom_actions_follow_guest_fd_ordering() {
+        let mut config = KernelVmConfig::new("vm-posix-spawn-closefrom-actions");
+        config.permissions = Permissions::allow_all();
+        let mut kernel = SidecarKernel::new(MountTable::new(MemoryFileSystem::new()), config);
+        kernel
+            .register_driver(CommandDriver::new(EXECUTION_DRIVER_NAME, [WASM_COMMAND]))
+            .unwrap();
+        kernel.write_file("/before-closefrom", b"before").unwrap();
+        kernel.write_file("/after-closefrom", b"after").unwrap();
+        let parent = kernel
+            .spawn_process(
+                WASM_COMMAND,
+                Vec::new(),
+                SpawnOptions {
+                    requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                    ..SpawnOptions::default()
+                },
+            )
+            .unwrap();
+
+        // Push the preserved source above the guest cutoff in the kernel
+        // namespace. closefrom(5) must still retain it because it is guest fd
+        // 4; the cutoff is never a raw kernel-fd comparison.
+        let mut dummy_fds = Vec::new();
+        while dummy_fds.last().copied().unwrap_or(0) < 8 {
+            let (read_fd, write_fd) = kernel
+                .open_pipe(EXECUTION_DRIVER_NAME, parent.pid())
+                .unwrap();
+            dummy_fds.extend([read_fd, write_fd]);
+        }
+        let keep_kernel_fd = *dummy_fds.last().unwrap();
+        let close_kernel_fd = dummy_fds[dummy_fds.len() - 2];
+
+        let action =
+            |command, guest_fd, source_guest_fd, path: &str| JavascriptPosixSpawnFileAction {
+                command,
+                guest_fd: Some(guest_fd),
+                fd: guest_fd,
+                source_fd: source_guest_fd,
+                guest_source_fd: Some(source_guest_fd),
+                oflag: 0,
+                mode: 0o600,
+                path: path.to_owned(),
+                close_from_guest_fds: Vec::new(),
+            };
+        let actions = [
+            action(3, 9, -1, "/before-closefrom"),
+            action(2, 10, 4, ""),
+            action(6, 5, 0, ""),
+            action(2, 11, 4, ""),
+            action(3, 12, -1, "/after-closefrom"),
+        ];
+        let prepared = preapply_posix_spawn_file_actions(
+            &mut kernel,
+            parent.pid(),
+            "/",
+            None,
+            &[[4, keep_kernel_fd], [8, close_kernel_fd]],
+            &actions,
+        )
+        .unwrap();
+
+        let surviving_guest_fds = prepared
+            .applied
+            .fd_mappings
+            .iter()
+            .map(|mapping| mapping[0])
+            .collect::<std::collections::BTreeSet<_>>();
+        for fd in [4, 11, 12] {
+            assert!(
+                surviving_guest_fds.contains(&fd),
+                "action after closefrom must leave guest fd {fd} open"
+            );
+        }
+        for fd in [8, 9, 10] {
+            assert!(
+                !surviving_guest_fds.contains(&fd),
+                "action before closefrom must close guest fd {fd}"
+            );
+            assert!(prepared.applied.closed_guest_fds.contains(&fd));
+        }
+        assert!(
+            prepared.fds.iter().any(|entry| entry.fd == keep_kernel_fd),
+            "guest fd below the cutoff must preserve a higher kernel fd"
+        );
+
+        parent.finish(0);
+        kernel.waitpid(parent.pid()).unwrap();
+    }
+
+    #[test]
+    fn preapplied_spawn_pipe_writer_lifetime_stress() {
+        let mut config = KernelVmConfig::new("vm-posix-spawn-pipe-lifetime-stress");
+        config.permissions = Permissions::allow_all();
+        let mut kernel = SidecarKernel::new(MountTable::new(MemoryFileSystem::new()), config);
+        kernel
+            .register_driver(CommandDriver::new(EXECUTION_DRIVER_NAME, [WASM_COMMAND]))
+            .unwrap();
+        let parent = kernel
+            .spawn_process(
+                WASM_COMMAND,
+                Vec::new(),
+                SpawnOptions {
+                    requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                    ..SpawnOptions::default()
+                },
+            )
+            .unwrap();
+
+        for iteration in 0..128u32 {
+            let (read_fd, write_fd) = kernel
+                .open_pipe(EXECUTION_DRIVER_NAME, parent.pid())
+                .unwrap();
+            let actions = [
+                JavascriptPosixSpawnFileAction {
+                    command: 2,
+                    guest_fd: Some(0),
+                    fd: 0,
+                    source_fd: read_fd as i32,
+                    guest_source_fd: Some(7),
+                    oflag: 0,
+                    mode: 0,
+                    path: String::new(),
+                    close_from_guest_fds: Vec::new(),
+                },
+                JavascriptPosixSpawnFileAction {
+                    command: 1,
+                    guest_fd: Some(7),
+                    fd: read_fd as i32,
+                    source_fd: 0,
+                    guest_source_fd: None,
+                    oflag: 0,
+                    mode: 0,
+                    path: String::new(),
+                    close_from_guest_fds: Vec::new(),
+                },
+                JavascriptPosixSpawnFileAction {
+                    command: 1,
+                    guest_fd: Some(8),
+                    fd: write_fd as i32,
+                    source_fd: 0,
+                    guest_source_fd: None,
+                    oflag: 0,
+                    mode: 0,
+                    path: String::new(),
+                    close_from_guest_fds: Vec::new(),
+                },
+            ];
+            let prepared = preapply_posix_spawn_file_actions(
+                &mut kernel,
+                parent.pid(),
+                "/",
+                None,
+                &[[7, read_fd], [8, write_fd]],
+                &actions,
+            )
+            .unwrap();
+            let child = kernel
+                .spawn_process(
+                    WASM_COMMAND,
+                    Vec::new(),
+                    SpawnOptions {
+                        requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                        parent_pid: Some(parent.pid()),
+                        ..SpawnOptions::default()
+                    },
+                )
+                .unwrap();
+            let applied =
+                install_preapplied_posix_spawn_file_actions(&mut kernel, &child, prepared).unwrap();
+            let child_read_fd = applied
+                .fd_mappings
+                .iter()
+                .find_map(|mapping| (mapping[0] == 0).then_some(mapping[1]))
+                .unwrap();
+
+            for payload in [b"first".as_slice(), b"second".as_slice()] {
+                kernel
+                    .fd_write(EXECUTION_DRIVER_NAME, parent.pid(), write_fd, payload)
+                    .unwrap_or_else(|error| panic!("iteration {iteration} write failed: {error}"));
+                assert_eq!(
+                    kernel
+                        .fd_read(
+                            EXECUTION_DRIVER_NAME,
+                            child.pid(),
+                            child_read_fd,
+                            payload.len(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("iteration {iteration} read failed: {error}")
+                        }),
+                    payload,
+                    "iteration {iteration} must preserve the parent writer"
+                );
+            }
+            kernel
+                .fd_close(EXECUTION_DRIVER_NAME, parent.pid(), write_fd)
+                .unwrap();
+            assert!(
+                kernel
+                    .fd_read(EXECUTION_DRIVER_NAME, child.pid(), child_read_fd, 1)
+                    .unwrap()
+                    .is_empty(),
+                "iteration {iteration} must expose EOF after the last writer closes"
+            );
+            kernel
+                .fd_close(EXECUTION_DRIVER_NAME, parent.pid(), read_fd)
+                .unwrap();
+            child.finish(0);
+            kernel.waitpid(child.pid()).unwrap();
+        }
+
+        parent.finish(0);
+        kernel.waitpid(parent.pid()).unwrap();
+    }
+
+    #[test]
+    fn spawn_open_actions_transfer_exact_descriptions_and_mutate_plugin_once() {
+        let counters = Arc::new(SpawnOpenCounters::default());
+        let mut mounts = MountTable::new(MemoryFileSystem::new());
+        mounts
+            .mount(
+                "/plugin",
+                CountingSpawnMount::new(Arc::clone(&counters)),
+                MountOptions::new("counting-spawn-open"),
+            )
+            .unwrap();
+        let mut config = KernelVmConfig::new("vm-posix-spawn-open-transfer");
+        config.permissions = Permissions::allow_all();
+        let mut kernel = SidecarKernel::new(mounts, config);
+        kernel
+            .register_driver(CommandDriver::new(EXECUTION_DRIVER_NAME, [WASM_COMMAND]))
+            .unwrap();
+        let parent = kernel
+            .spawn_process(
+                WASM_COMMAND,
+                Vec::new(),
+                SpawnOptions {
+                    requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                    ..SpawnOptions::default()
+                },
+            )
+            .unwrap();
+        let open_action = |guest_fd, path: &str, oflag| JavascriptPosixSpawnFileAction {
+            command: 3,
+            guest_fd: Some(guest_fd),
+            fd: guest_fd,
+            source_fd: -1,
+            guest_source_fd: None,
+            oflag,
+            mode: 0o600,
+            path: path.to_owned(),
+            close_from_guest_fds: Vec::new(),
+        };
+        let spawn_target = |kernel: &mut SidecarKernel| {
+            kernel
+                .spawn_process(
+                    WASM_COMMAND,
+                    Vec::new(),
+                    SpawnOptions {
+                        requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                        parent_pid: Some(parent.pid()),
+                        ..SpawnOptions::default()
+                    },
+                )
+                .unwrap()
+        };
+        let prepared_description = |prepared: &super::PreparedPosixSpawnFileActions,
+                                    guest_fd: u32| {
+            let kernel_fd = prepared
+                .applied
+                .fd_mappings
+                .iter()
+                .find_map(|mapping| (mapping[0] == guest_fd).then_some(mapping[1]))
+                .expect("prepared guest fd mapping");
+            let description_id = prepared
+                .fds
+                .iter()
+                .find_map(|entry| {
+                    (entry.fd == kernel_fd).then_some(entry.transfer.description_id())
+                })
+                .expect("prepared transferred description");
+            (kernel_fd, description_id)
+        };
+
+        let exclusive = preapply_posix_spawn_file_actions(
+            &mut kernel,
+            parent.pid(),
+            "/",
+            None,
+            &[],
+            &[open_action(
+                40,
+                "/plugin/exclusive",
+                0x1000_0000 | (1 << 12) | (4 << 12),
+            )],
+        )
+        .unwrap();
+        let (exclusive_fd, exclusive_description) = prepared_description(&exclusive, 40);
+        assert_eq!(counters.exclusive_creates.load(Ordering::SeqCst), 1);
+        let exclusive_child = spawn_target(&mut kernel);
+        install_preapplied_posix_spawn_file_actions(&mut kernel, &exclusive_child, exclusive)
+            .unwrap();
+        assert_eq!(counters.exclusive_creates.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            kernel
+                .fd_transfer(EXECUTION_DRIVER_NAME, exclusive_child.pid(), exclusive_fd)
+                .unwrap()
+                .description_id(),
+            exclusive_description
+        );
+
+        kernel
+            .write_file("/plugin/truncated", b"must disappear")
+            .unwrap();
+        let truncated = preapply_posix_spawn_file_actions(
+            &mut kernel,
+            parent.pid(),
+            "/",
+            None,
+            &[],
+            &[open_action(
+                41,
+                "/plugin/truncated",
+                0x1000_0000 | (8 << 12),
+            )],
+        )
+        .unwrap();
+        let (truncated_fd, truncated_description) = prepared_description(&truncated, 41);
+        assert_eq!(counters.truncates.load(Ordering::SeqCst), 1);
+        let truncated_child = spawn_target(&mut kernel);
+        install_preapplied_posix_spawn_file_actions(&mut kernel, &truncated_child, truncated)
+            .unwrap();
+        assert_eq!(counters.truncates.load(Ordering::SeqCst), 1);
+        assert_eq!(kernel.read_file("/plugin/truncated").unwrap(), b"");
+        assert_eq!(
+            kernel
+                .fd_transfer(EXECUTION_DRIVER_NAME, truncated_child.pid(), truncated_fd)
+                .unwrap()
+                .description_id(),
+            truncated_description
+        );
+
+        // Command resolution happens after file actions. If exec returns
+        // ENOENT, the O_EXCL creation must remain, but no second open may occur.
+        let failed_exec = preapply_posix_spawn_file_actions(
+            &mut kernel,
+            parent.pid(),
+            "/",
+            None,
+            &[],
+            &[open_action(
+                42,
+                "/plugin/failed-exec-side-effect",
+                0x1000_0000 | (1 << 12) | (4 << 12),
+            )],
+        )
+        .unwrap();
+        let exec_error = kernel
+            .validate_executable_path("/plugin/missing-executable", "/")
+            .expect_err("the staged child image must fail exec resolution");
+        assert_eq!(exec_error.code(), "ENOENT");
+        drop(failed_exec);
+        assert_eq!(counters.exclusive_creates.load(Ordering::SeqCst), 2);
+        assert!(kernel.read_file("/plugin/failed-exec-side-effect").is_ok());
+
+        exclusive_child.finish(0);
+        truncated_child.finish(0);
+        parent.finish(0);
+        kernel.waitpid(exclusive_child.pid()).unwrap();
+        kernel.waitpid(truncated_child.pid()).unwrap();
+        kernel.waitpid(parent.pid()).unwrap();
+    }
+
+    #[test]
+    fn posix_spawn_actions_preserve_ordered_side_effects_and_validate_cwd_like_linux() {
+        let mut config = KernelVmConfig::new("vm-posix-spawn-action-order");
+        config.permissions = Permissions::allow_all();
+        let mut kernel = SidecarKernel::new(MountTable::new(MemoryFileSystem::new()), config);
+        kernel
+            .register_driver(CommandDriver::new(EXECUTION_DRIVER_NAME, [WASM_COMMAND]))
+            .expect("register execution driver");
+        let parent = kernel
+            .spawn_process(
+                WASM_COMMAND,
+                Vec::new(),
+                SpawnOptions {
+                    requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                    ..SpawnOptions::default()
+                },
+            )
+            .expect("spawn parent");
+        let open_action = |guest_fd, path: &str, oflag| JavascriptPosixSpawnFileAction {
+            command: 3,
+            guest_fd: Some(guest_fd),
+            fd: guest_fd,
+            source_fd: -1,
+            guest_source_fd: None,
+            oflag,
+            mode: 0o600,
+            path: path.to_owned(),
+            close_from_guest_fds: Vec::new(),
+        };
+        let chdir_action = |path: &str| JavascriptPosixSpawnFileAction {
+            command: 4,
+            guest_fd: None,
+            fd: -1,
+            source_fd: -1,
+            guest_source_fd: None,
+            oflag: 0,
+            mode: 0,
+            path: path.to_owned(),
+            close_from_guest_fds: Vec::new(),
+        };
+        let fchdir_action = |guest_fd| JavascriptPosixSpawnFileAction {
+            command: 5,
+            guest_fd: Some(guest_fd),
+            fd: guest_fd,
+            source_fd: -1,
+            guest_source_fd: None,
+            oflag: 0,
+            mode: 0,
+            path: String::new(),
+            close_from_guest_fds: Vec::new(),
+        };
+
+        let error = match preapply_posix_spawn_file_actions(
+            &mut kernel,
+            parent.pid(),
+            "/",
+            None,
+            &[],
+            &[
+                open_action(
+                    40,
+                    "/created-before-failed-chdir",
+                    0x1000_0000 | (1 << 12) | (4 << 12),
+                ),
+                chdir_action("/missing-directory"),
+            ],
+        ) {
+            Ok(_) => panic!("a missing chdir target must fail the spawn"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("ENOENT"), "{error}");
+        assert!(
+            kernel
+                .exists("/created-before-failed-chdir")
+                .expect("query earlier O_CREAT side effect"),
+            "Linux preserves successful earlier file-action side effects"
+        );
+
+        kernel
+            .write_file("/regular-file", b"not a directory")
+            .expect("write regular file");
+        let error = match preapply_posix_spawn_file_actions(
+            &mut kernel,
+            parent.pid(),
+            "/",
+            None,
+            &[],
+            &[
+                open_action(41, "/regular-file", 0),
+                JavascriptPosixSpawnFileAction {
+                    command: 5,
+                    guest_fd: Some(41),
+                    fd: 41,
+                    source_fd: -1,
+                    guest_source_fd: None,
+                    oflag: 0,
+                    mode: 0,
+                    path: String::new(),
+                    close_from_guest_fds: Vec::new(),
+                },
+            ],
+        ) {
+            Ok(_) => panic!("fchdir on a regular file must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("ENOTDIR"), "{error}");
+
+        kernel.mkdir("/work", true).expect("create work directory");
+        let prepared = preapply_posix_spawn_file_actions(
+            &mut kernel,
+            parent.pid(),
+            "/",
+            None,
+            &[],
+            &[chdir_action("/work")],
+        )
+        .expect("chdir action succeeds");
+        assert_eq!(prepared.cwd, "/work");
+
+        kernel
+            .mkdir("/real/chdir/subdirectory", true)
+            .expect("create canonical chdir target");
+        kernel
+            .write_file("/real/chdir/target", b"canonical-chdir-target")
+            .expect("write canonical chdir-relative target");
+        kernel
+            .write_file("/target", b"must-survive")
+            .expect("write non-target at the textual symlink parent");
+        kernel
+            .symlink("/real/chdir/subdirectory", "/chdir-alias")
+            .expect("create chdir symlink");
+        let chdir_relative = preapply_posix_spawn_file_actions(
+            &mut kernel,
+            parent.pid(),
+            "/",
+            None,
+            &[],
+            &[
+                chdir_action("chdir-alias"),
+                open_action(42, "../target", 0x1000_0000 | (8 << 12)),
+            ],
+        )
+        .expect("resolve open relative to canonical chdir target");
+        assert_eq!(chdir_relative.cwd, "/real/chdir/subdirectory");
+        assert_eq!(
+            kernel
+                .read_file("/real/chdir/target")
+                .expect("read canonical chdir-relative target"),
+            b""
+        );
+        assert_eq!(
+            kernel
+                .read_file("/target")
+                .expect("read textual-symlink-parent non-target"),
+            b"must-survive"
+        );
+
+        kernel
+            .mkdir("/real/fchdir/subdirectory", true)
+            .expect("create canonical fchdir target");
+        kernel
+            .write_file("/real/fchdir/target", b"canonical-fchdir-target")
+            .expect("write canonical fchdir-relative target");
+        kernel
+            .symlink("/real/fchdir/subdirectory", "/fchdir-alias")
+            .expect("create fchdir symlink");
+        let fchdir_relative = preapply_posix_spawn_file_actions(
+            &mut kernel,
+            parent.pid(),
+            "/",
+            None,
+            &[],
+            &[
+                open_action(43, "/fchdir-alias", 2 << 12),
+                fchdir_action(43),
+                open_action(44, "../target", 0x1000_0000 | (8 << 12)),
+            ],
+        )
+        .expect("resolve open relative to canonical fchdir target");
+        assert_eq!(fchdir_relative.cwd, "/real/fchdir/subdirectory");
+        assert_eq!(
+            kernel
+                .read_file("/real/fchdir/target")
+                .expect("read canonical fchdir-relative target"),
+            b""
+        );
+        assert_eq!(
+            kernel
+                .read_file("/target")
+                .expect("read non-target after fchdir-relative open"),
+            b"must-survive"
+        );
+
+        parent.finish(0);
+        kernel.waitpid(parent.pid()).expect("reap parent");
+    }
+
+    #[test]
+    fn rejected_unregistered_spawn_children_restore_process_and_fd_baselines() {
+        let mut config = KernelVmConfig::new("vm-rejected-spawn-rollback");
+        config.permissions = Permissions::allow_all();
+        let mut kernel = SidecarKernel::new(MountTable::new(MemoryFileSystem::new()), config);
+        kernel
+            .register_driver(CommandDriver::new(EXECUTION_DRIVER_NAME, [WASM_COMMAND]))
+            .expect("register execution driver");
+        let parent = kernel
+            .spawn_process(
+                WASM_COMMAND,
+                Vec::new(),
+                SpawnOptions {
+                    requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                    ..SpawnOptions::default()
+                },
+            )
+            .expect("spawn parent");
+        let baseline = kernel.resource_snapshot();
+
+        for iteration in 0..32 {
+            let child = kernel
+                .spawn_process(
+                    WASM_COMMAND,
+                    vec![String::from("malformed-runtime-image")],
+                    SpawnOptions {
+                        requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                        parent_pid: Some(parent.pid()),
+                        ..SpawnOptions::default()
+                    },
+                )
+                .unwrap_or_else(|error| panic!("iteration {iteration} spawn failed: {error}"));
+            kernel
+                .open_pipe(EXECUTION_DRIVER_NAME, child.pid())
+                .unwrap_or_else(|error| panic!("iteration {iteration} pipe failed: {error}"));
+            let tool = ToolExecution::default();
+            let cancelled = Arc::clone(&tool.cancelled);
+            let mut execution = ActiveExecution::Tool(tool);
+            rollback_unregistered_spawn_child(
+                &mut kernel,
+                &child,
+                Some(&mut execution),
+                "malformed WASM regression test",
+            );
+            assert!(cancelled.load(Ordering::Relaxed));
+            assert_eq!(
+                kernel.resource_snapshot(),
+                baseline,
+                "iteration {iteration} must release the child process, fd table, and pipe"
+            );
+        }
+
+        parent.finish(0);
+        kernel.waitpid(parent.pid()).expect("reap parent");
+    }
+
+    #[test]
+    fn posix_spawn_setsid_creates_a_session_and_rejects_setpgroup_conflict() {
+        let mut config = KernelVmConfig::new("vm-posix-spawn-setsid");
+        config.permissions = Permissions::allow_all();
+        let mut kernel = SidecarKernel::new(MountTable::new(MemoryFileSystem::new()), config);
+        kernel
+            .register_driver(CommandDriver::new(EXECUTION_DRIVER_NAME, [WASM_COMMAND]))
+            .expect("register execution driver");
+        let parent = kernel
+            .spawn_process(
+                WASM_COMMAND,
+                Vec::new(),
+                SpawnOptions {
+                    requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                    ..SpawnOptions::default()
+                },
+            )
+            .expect("spawn parent");
+        let child = kernel
+            .spawn_process(
+                WASM_COMMAND,
+                Vec::new(),
+                SpawnOptions {
+                    requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                    parent_pid: Some(parent.pid()),
+                    ..SpawnOptions::default()
+                },
+            )
+            .expect("spawn child");
+        let attributes = javascript_spawn_attributes(&JavascriptChildProcessSpawnOptions {
+            spawn_attr_flags: super::POSIX_SPAWN_SETSID,
+            ..Default::default()
+        })
+        .expect("validate SETSID attributes");
+        assert!(attributes.new_session);
+        apply_spawn_session_or_rollback(&mut kernel, &child, attributes.new_session)
+            .expect("apply SETSID");
+        assert_eq!(
+            kernel
+                .getsid(EXECUTION_DRIVER_NAME, child.pid())
+                .expect("child session id"),
+            child.pid()
+        );
+        assert_eq!(
+            kernel
+                .getpgid(EXECUTION_DRIVER_NAME, child.pid())
+                .expect("child process group"),
+            child.pid()
+        );
+
+        let conflict = javascript_spawn_attributes(&JavascriptChildProcessSpawnOptions {
+            spawn_attr_flags: super::POSIX_SPAWN_SETSID | super::POSIX_SPAWN_SETPGROUP,
+            ..Default::default()
+        })
+        .expect_err("SETSID|SETPGROUP must fail");
+        assert!(conflict.to_string().contains("EPERM"));
+
+        child.finish(0);
+        parent.finish(0);
+        kernel.waitpid(child.pid()).expect("reap child");
+        kernel.waitpid(parent.pid()).expect("reap parent");
+    }
+
     #[test]
     fn javascript_kernel_poll_sync_rpc_reports_multiple_kernel_fds() {
         let mut config = KernelVmConfig::new("vm-js-kernel-poll");
@@ -12605,6 +20481,7 @@ fn parse_dns_record_type(rrtype: &str) -> Result<RecordType, SidecarError> {
         "SRV" => Ok(RecordType::SRV),
         "CNAME" => Ok(RecordType::CNAME),
         "PTR" => Ok(RecordType::PTR),
+        "SSHFP" => Ok(RecordType::SSHFP),
         "NS" => Ok(RecordType::NS),
         "SOA" => Ok(RecordType::SOA),
         "NAPTR" => Ok(RecordType::NAPTR),
@@ -13335,11 +21212,6 @@ fn parse_socket_inode(target: &Path) -> Option<u64> {
     trimmed.parse().ok()
 }
 
-fn unix_socket_path(addr: &UnixSocketAddr) -> Option<String> {
-    addr.as_pathname()
-        .map(|path| path.to_string_lossy().into_owned())
-}
-
 fn find_unix_socket_for_pid(
     pid: u32,
     inodes: &BTreeSet<u64>,
@@ -13427,12 +21299,17 @@ pub(crate) fn vm_network_resource_counts(vm: &VmState) -> NetworkResourceCounts 
         sockets: snapshot.sockets,
         connections: snapshot.socket_connections,
     };
+    let mut descriptions = BTreeMap::new();
     for process in vm.active_processes.values() {
-        let process_counts = process.sidecar_only_network_resource_counts();
-        counts.sockets += process_counts.sockets;
-        counts.connections += process_counts.connections;
+        process.collect_network_resource_counts(true, &mut descriptions, &mut counts);
     }
+    add_live_host_net_transfer_descriptions(&vm.host_net_transfer_descriptions, &mut descriptions);
+    add_host_net_description_counts(&descriptions, &mut counts);
     counts
+}
+
+fn vm_spawn_host_net_resource_counts(vm: &VmState) -> NetworkResourceCounts {
+    vm_network_resource_counts(vm)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13562,6 +21439,12 @@ fn collect_javascript_socket_port_state(
 pub(crate) fn build_javascript_socket_path_context(
     vm: &VmState,
 ) -> Result<JavascriptSocketPathContext, SidecarError> {
+    let mut abstract_namespace_digest = Sha256::new();
+    abstract_namespace_digest.update(b"agentos-vm-unix-abstract-v1\0");
+    abstract_namespace_digest.update(vm.connection_id.as_bytes());
+    abstract_namespace_digest.update(b"\0");
+    abstract_namespace_digest.update(vm.session_id.as_bytes());
+    let unix_abstract_namespace = abstract_namespace_digest.finalize().into();
     let mut loopback_exempt_ports = vm.create_loopback_exempt_ports.clone();
     loopback_exempt_ports.extend(vm.configuration.loopback_exempt_ports.iter().copied());
     let mut tcp_loopback_guest_to_host_ports = BTreeMap::new();
@@ -13584,7 +21467,10 @@ pub(crate) fn build_javascript_socket_path_context(
         );
     }
     Ok(JavascriptSocketPathContext {
-        sandbox_root: vm.cwd.clone(),
+        unix_abstract_namespace,
+        unix_socket_host_dir: vm.unix_socket_host_dir.clone(),
+        unix_bound_addresses: Arc::clone(&vm.unix_address_registry),
+        host_net_transfer_descriptions: Arc::clone(&vm.host_net_transfer_descriptions),
         mounts: vm.configuration.mounts.clone(),
         listen_policy: vm.listen_policy,
         loopback_exempt_ports,
@@ -13971,7 +21857,7 @@ fn host_mount_path_for_guest_path(vm: &VmState, guest_path: &str) -> Option<Path
             ((mount.plugin.id == "host_dir") || (mount.plugin.id == "module_access"))
                 .then(|| {
                     mount_config_host_backing_path(&mount.plugin.config)
-                        .map(|host_path| (mount.guest_path.as_str(), host_path))
+                        .map(|host_path| (normalize_path(&mount.guest_path), host_path))
                 })
                 .flatten()
         })
@@ -13984,7 +21870,7 @@ fn host_mount_path_for_guest_path(vm: &VmState, guest_path: &str) -> Option<Path
         }
 
         let suffix = normalized
-            .strip_prefix(guest_root)
+            .strip_prefix(&guest_root)
             .unwrap_or_default()
             .trim_start_matches('/');
         let mut path = PathBuf::from(host_root);
@@ -14210,7 +22096,7 @@ fn host_mount_path_for_guest_path_from_mounts(
         }
 
         let suffix = normalized
-            .strip_prefix(guest_root)
+            .strip_prefix(&guest_root)
             .unwrap_or_default()
             .trim_start_matches('/');
         let mut path = PathBuf::from(host_root);
@@ -14221,6 +22107,37 @@ fn host_mount_path_for_guest_path_from_mounts(
     }
 
     None
+}
+
+fn host_mount_read_only_for_guest_path(
+    mounts: &[crate::protocol::MountDescriptor],
+    guest_path: &str,
+) -> Option<bool> {
+    let normalized = normalize_path(guest_path);
+    mounts
+        .iter()
+        .filter(|mount| mount.plugin.id == "host_dir" || mount.plugin.id == "module_access")
+        .filter(|mount| {
+            normalized == mount.guest_path
+                || normalized.starts_with(&format!("{}/", mount.guest_path.trim_end_matches('/')))
+        })
+        .max_by_key(|mount| mount.guest_path.len())
+        .map(|mount| mount.read_only)
+}
+
+fn reject_host_mounted_unix_socket_path(
+    context: &JavascriptSocketPathContext,
+    guest_path: &str,
+) -> Result<(), SidecarError> {
+    if let Some(read_only) = host_mount_read_only_for_guest_path(&context.mounts, guest_path) {
+        let errno = if read_only {
+            libc::EROFS
+        } else {
+            libc::ENOTSUP
+        };
+        return Err(sidecar_net_error(std::io::Error::from_raw_os_error(errno)));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -14275,32 +22192,20 @@ mod host_mount_path_for_guest_path_from_mounts_tests {
     }
 }
 
-fn resolve_guest_socket_host_path(
+fn allocate_guest_socket_host_path(
     context: &JavascriptSocketPathContext,
+    kernel_pid: u32,
+    listener_id: &str,
     guest_path: &str,
 ) -> PathBuf {
-    if let Some(path) = host_mount_path_for_guest_path_from_mounts(&context.mounts, guest_path) {
-        return path;
-    }
-
-    let normalized = normalize_path(guest_path);
-    let mut host_path = context.sandbox_root.clone();
-    let suffix = normalized.trim_start_matches('/');
-    if !suffix.is_empty() {
-        host_path.push(suffix);
-    }
-    host_path
-}
-
-fn ensure_kernel_parent_directories(
-    kernel: &mut SidecarKernel,
-    path: &str,
-) -> Result<(), SidecarError> {
-    let parent = dirname(path);
-    if parent != "/" && !kernel.exists(&parent).map_err(kernel_error)? {
-        kernel.mkdir(&parent, true).map_err(kernel_error)?;
-    }
-    Ok(())
+    let mut digest = Sha256::new();
+    digest.update(b"agentos-unix-path-v1\0");
+    digest.update(kernel_pid.to_le_bytes());
+    digest.update(listener_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(guest_path.as_bytes());
+    let leaf = abstract_unix_name_hex(&digest.finalize()[..16]);
+    context.unix_socket_host_dir.join(leaf)
 }
 
 // JavascriptChildProcessSpawnOptions, JavascriptChildProcessSpawnRequest moved to crate::protocol
@@ -14317,6 +22222,9 @@ pub(crate) fn sanitize_javascript_child_process_internal_bootstrap_env(
         "AGENTOS_VIRTUAL_PROCESS_UID",
         "AGENTOS_VIRTUAL_PROCESS_GID",
         "AGENTOS_VIRTUAL_PROCESS_VERSION",
+        "AGENTOS_WASM_INITIAL_SIGNAL_MASK",
+        "AGENTOS_WASM_INITIAL_SIGNAL_IGNORES",
+        "AGENTOS_WASM_INITIAL_PENDING_SIGNALS",
     ];
 
     env.iter()
@@ -14343,6 +22251,22 @@ fn resolve_tcp_bind_addr(host: &str, port: u16) -> Result<SocketAddr, SidecarErr
 
 pub(crate) fn format_dns_resource(hostname: &str) -> String {
     format!("dns://{hostname}")
+}
+
+fn format_unix_socket_resource(
+    path: Option<&str>,
+    abstract_path_hex: Option<&str>,
+    autobind: bool,
+) -> String {
+    if let Some(path) = path {
+        format!("unix:{path}")
+    } else if let Some(hex) = abstract_path_hex {
+        format!("unix:abstract:{hex}")
+    } else if autobind {
+        String::from("unix:autobind")
+    } else {
+        String::from("unix:unnamed")
+    }
 }
 
 // --- Guest Python socket bridge helpers ------------------------------------
@@ -14734,12 +22658,21 @@ fn javascript_net_read_value(
 
 fn io_error_code(error: &std::io::Error) -> Option<String> {
     match error.raw_os_error() {
+        Some(libc::EACCES) => Some(String::from("EACCES")),
+        Some(libc::EAGAIN) => Some(String::from("EAGAIN")),
         Some(libc::EADDRINUSE) => Some(String::from("EADDRINUSE")),
         Some(libc::EADDRNOTAVAIL) => Some(String::from("EADDRNOTAVAIL")),
         Some(libc::ECONNREFUSED) => Some(String::from("ECONNREFUSED")),
         Some(libc::ECONNRESET) => Some(String::from("ECONNRESET")),
         Some(libc::EINVAL) => Some(String::from("EINVAL")),
+        Some(libc::EISCONN) => Some(String::from("EISCONN")),
+        Some(libc::ENAMETOOLONG) => Some(String::from("ENAMETOOLONG")),
+        Some(libc::ENOENT) => Some(String::from("ENOENT")),
+        Some(libc::ENOTDIR) => Some(String::from("ENOTDIR")),
+        Some(libc::ENOTSUP) => Some(String::from("ENOTSUP")),
+        Some(libc::ENXIO) => Some(String::from("ENXIO")),
         Some(libc::EPIPE) => Some(String::from("EPIPE")),
+        Some(libc::EROFS) => Some(String::from("EROFS")),
         Some(libc::ETIMEDOUT) => Some(String::from("ETIMEDOUT")),
         Some(libc::EHOSTUNREACH) => Some(String::from("EHOSTUNREACH")),
         Some(libc::ENETUNREACH) => Some(String::from("ENETUNREACH")),
@@ -14753,6 +22686,17 @@ fn sidecar_net_error(error: std::io::Error) -> SidecarError {
         None => error.to_string(),
     };
     SidecarError::Execution(message)
+}
+
+fn nonblocking_unix_connect_error(error: std::io::Error) -> SidecarError {
+    let code = error.raw_os_error();
+    if code == Some(libc::EINPROGRESS)
+        || code == Some(libc::EALREADY)
+        || code == Some(libc::EWOULDBLOCK)
+    {
+        return sidecar_net_error(std::io::Error::from_raw_os_error(libc::EAGAIN));
+    }
+    sidecar_net_error(error)
 }
 
 fn tls_provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -14823,7 +22767,31 @@ fn tls_private_key_from_material(
     )))
 }
 
-fn tls_root_store(options: &JavascriptTlsBridgeOptions) -> Result<RootCertStore, SidecarError> {
+fn vm_default_ca_bundle_for_tls_options(
+    kernel: &mut SidecarKernel,
+    options: &JavascriptTlsBridgeOptions,
+) -> Result<Vec<u8>, SidecarError> {
+    if options.is_server || options.reject_unauthorized == Some(false) || options.ca.is_some() {
+        return Ok(Vec::new());
+    }
+
+    read_vm_default_ca_bundle(kernel)
+}
+
+fn read_vm_default_ca_bundle(kernel: &mut SidecarKernel) -> Result<Vec<u8>, SidecarError> {
+    kernel
+        .read_file(CA_CERTIFICATES_GUEST_PATH)
+        .map_err(|error| {
+            SidecarError::Execution(format!(
+                "failed to read VM TLS trust store {CA_CERTIFICATES_GUEST_PATH}: {error}"
+            ))
+        })
+}
+
+fn tls_root_store(
+    options: &JavascriptTlsBridgeOptions,
+    default_ca_bundle: &[u8],
+) -> Result<RootCertStore, SidecarError> {
     let mut roots = RootCertStore::empty();
     if let Some(ca) = options.ca.as_ref() {
         for certificate in tls_certificates_from_material(ca)? {
@@ -14834,10 +22802,19 @@ fn tls_root_store(options: &JavascriptTlsBridgeOptions) -> Result<RootCertStore,
         return Ok(roots);
     }
 
-    for certificate in rustls_native_certs::load_native_certs().certs {
+    let mut reader = std::io::BufReader::new(Cursor::new(default_ca_bundle));
+    let certificates = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sidecar_net_error)?;
+    if certificates.is_empty() {
+        return Err(SidecarError::InvalidState(format!(
+            "VM TLS trust store {CA_CERTIFICATES_GUEST_PATH} did not contain any certificates"
+        )));
+    }
+    for certificate in certificates {
         roots.add(certificate).map_err(|error| {
             SidecarError::InvalidState(format!(
-                "failed to add native TLS certificate to root store: {error}"
+                "failed to add VM TLS certificate from {CA_CERTIFICATES_GUEST_PATH} to root store: {error}"
             ))
         })?;
     }
@@ -14847,8 +22824,9 @@ fn tls_root_store(options: &JavascriptTlsBridgeOptions) -> Result<RootCertStore,
 fn build_client_tls_stream(
     stream: TcpStream,
     options: &JavascriptTlsBridgeOptions,
+    default_ca_bundle: &[u8],
 ) -> Result<rustls::StreamOwned<ClientConnection, TcpStream>, SidecarError> {
-    let config = build_client_tls_config(options)?;
+    let config = build_client_tls_config(options, default_ca_bundle)?;
     let server_name = options
         .servername
         .clone()
@@ -14887,9 +22865,10 @@ fn build_client_tls_stream(
 fn build_client_loopback_tls_stream(
     transport: crate::state::LoopbackTlsEndpoint,
     options: &JavascriptTlsBridgeOptions,
+    default_ca_bundle: &[u8],
 ) -> Result<rustls::StreamOwned<ClientConnection, crate::state::LoopbackTlsEndpoint>, SidecarError>
 {
-    let config = build_client_tls_config(options)?;
+    let config = build_client_tls_config(options, default_ca_bundle)?;
     let server_name = options
         .servername
         .clone()
@@ -14916,6 +22895,7 @@ fn build_client_loopback_tls_stream(
 
 fn build_client_tls_config(
     options: &JavascriptTlsBridgeOptions,
+    default_ca_bundle: &[u8],
 ) -> Result<ClientConfig, SidecarError> {
     let provider = tls_provider();
     let builder = ClientConfig::builder_with_provider(provider.clone())
@@ -14936,7 +22916,7 @@ fn build_client_tls_config(
             .with_no_client_auth()
     } else {
         builder
-            .with_root_certificates(tls_root_store(options)?)
+            .with_root_certificates(tls_root_store(options, default_ca_bundle)?)
             .with_no_client_auth()
     };
 
@@ -15524,7 +23504,7 @@ fn spawn_tls_socket_reader(
 
 fn spawn_unix_socket_reader(
     stream: UnixStream,
-    sender: Sender<JavascriptTcpSocketEvent>,
+    read_state: Arc<(Mutex<UnixSocketReadState>, Condvar)>,
     event_pusher: Arc<Mutex<Option<JavascriptSocketEventPusher>>>,
     saw_local_shutdown: Arc<AtomicBool>,
     saw_remote_end: Arc<AtomicBool>,
@@ -15532,48 +23512,272 @@ fn spawn_unix_socket_reader(
 ) {
     thread::spawn(move || {
         let mut stream = stream;
-        let mut buffer = vec![0_u8; 64 * 1024];
         loop {
+            let available = {
+                let (state_lock, ready) = &*read_state;
+                let mut state = match state_lock.lock() {
+                    Ok(state) => state,
+                    Err(_) => return,
+                };
+                while state.bytes.len() >= state.max_buffered_bytes && !state.closed {
+                    state = match ready.wait(state) {
+                        Ok(state) => state,
+                        Err(_) => return,
+                    };
+                }
+                if state.closed {
+                    return;
+                }
+                state.max_buffered_bytes - state.bytes.len()
+            };
+            let mut buffer = vec![0_u8; available.min(64 * 1024)];
             match stream.read(&mut buffer) {
                 Ok(0) => {
                     saw_remote_end.store(true, Ordering::SeqCst);
-                    let _ = sender.send(JavascriptTcpSocketEvent::End);
+                    let (state_lock, ready) = &*read_state;
+                    let mut state = match state_lock.lock() {
+                        Ok(state) => state,
+                        Err(_) => return,
+                    };
+                    state
+                        .terminal_events
+                        .push_back(JavascriptTcpSocketEvent::End);
                     push_socket_event(&event_pusher, "end");
                     if saw_local_shutdown.load(Ordering::SeqCst)
                         && !close_notified.swap(true, Ordering::SeqCst)
                     {
-                        let _ = sender.send(JavascriptTcpSocketEvent::Close { had_error: false });
+                        state
+                            .terminal_events
+                            .push_back(JavascriptTcpSocketEvent::Close { had_error: false });
                         push_socket_event(&event_pusher, "close");
                     }
+                    ready.notify_all();
                     break;
                 }
                 Ok(bytes_read) => {
-                    if sender
-                        .send(JavascriptTcpSocketEvent::Data(
-                            buffer[..bytes_read].to_vec(),
-                        ))
-                        .is_err()
-                    {
-                        break;
+                    let (state_lock, ready) = &*read_state;
+                    let mut state = match state_lock.lock() {
+                        Ok(state) => state,
+                        Err(_) => return,
+                    };
+                    state.bytes.extend(&buffer[..bytes_read]);
+                    let warning_bytes = state.max_buffered_bytes.saturating_mul(4) / 5;
+                    if !state.warned_near_limit && state.bytes.len() >= warning_bytes.max(1) {
+                        state.warned_near_limit = true;
+                        eprintln!(
+                            "[agentos] AF_UNIX receive buffer is nearing limits.resources.maxSocketBufferedBytes ({} of {} bytes)",
+                            state.bytes.len(),
+                            state.max_buffered_bytes
+                        );
                     }
+                    ready.notify_all();
+                    drop(state);
                     push_socket_event(&event_pusher, "data");
                 }
                 Err(error) => {
                     let code = io_error_code(&error);
-                    let _ = sender.send(JavascriptTcpSocketEvent::Error {
-                        code,
-                        message: error.to_string(),
-                    });
+                    let (state_lock, ready) = &*read_state;
+                    let mut state = match state_lock.lock() {
+                        Ok(state) => state,
+                        Err(_) => return,
+                    };
+                    state
+                        .terminal_events
+                        .push_back(JavascriptTcpSocketEvent::Error {
+                            code,
+                            message: error.to_string(),
+                        });
                     push_socket_event(&event_pusher, "error");
                     if !close_notified.swap(true, Ordering::SeqCst) {
-                        let _ = sender.send(JavascriptTcpSocketEvent::Close { had_error: true });
+                        state
+                            .terminal_events
+                            .push_back(JavascriptTcpSocketEvent::Close { had_error: true });
                         push_socket_event(&event_pusher, "close");
                     }
+                    ready.notify_all();
                     break;
                 }
             }
         }
     });
+}
+
+/// Whether a successful sync RPC can transition a pipe/socket descriptor from
+/// not-readable to readable (including EOF). WASM process RPCs carry the real
+/// method name as argument zero, so inspect that remapping too.
+pub(crate) fn javascript_sync_rpc_may_make_fd_readable(request: &JavascriptSyncRpcRequest) -> bool {
+    let method = if request.method == "process.wasm_sync_rpc" {
+        request
+            .args
+            .first()
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    } else {
+        request.method.as_str()
+    };
+    matches!(
+        method,
+        "process.fd_write"
+            | "process.fd_close"
+            | "process.fd_socket_shutdown"
+            | "__kernel_stdio_write"
+            | "child_process.write_stdin"
+            | "child_process.close_stdin"
+    )
+}
+
+/// Normalize child wait RPCs before the descendant event pump dispatches them.
+/// WASM host-process calls arrive through `process.wasm_sync_rpc` with the real
+/// method in argument zero; failing to unwrap `process.fd_read` here sends it
+/// through the generic blocking service path and deadlocks the parent that must
+/// write or close the pipe.
+fn deferred_child_kernel_wait_request(
+    request: &JavascriptSyncRpcRequest,
+) -> Result<Option<JavascriptSyncRpcRequest>, SidecarError> {
+    if matches!(
+        request.method.as_str(),
+        "__kernel_stdin_read" | "__kernel_poll" | "process.fd_read"
+    ) {
+        return Ok(Some(request.clone()));
+    }
+    if request.method != "process.wasm_sync_rpc" {
+        return Ok(None);
+    }
+    let Some(method) = request.args.first().and_then(Value::as_str) else {
+        return Err(SidecarError::InvalidState(String::from(
+            "WASM process sync RPC method must be a string",
+        )));
+    };
+    if method != "process.fd_read" {
+        return Ok(None);
+    }
+    Ok(Some(JavascriptSyncRpcRequest {
+        id: request.id,
+        method: method.to_owned(),
+        args: request.args[1..].to_vec(),
+        raw_bytes_args: request
+            .raw_bytes_args
+            .iter()
+            .filter_map(|(index, bytes)| {
+                (*index > 0 && *index != usize::MAX).then(|| (*index - 1, bytes.clone()))
+            })
+            .collect(),
+    }))
+}
+
+#[cfg(test)]
+mod deferred_child_kernel_wait_tests {
+    use super::{deferred_child_kernel_wait_request, JavascriptSyncRpcRequest};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn wrapped_wasm_fd_read_is_normalized_for_descendant_deferral() {
+        let request = JavascriptSyncRpcRequest {
+            id: 41,
+            method: String::from("process.wasm_sync_rpc"),
+            args: vec![json!("process.fd_read"), json!(7), json!(4096), json!(5000)],
+            raw_bytes_args: HashMap::new(),
+        };
+
+        let normalized = deferred_child_kernel_wait_request(&request)
+            .expect("normalize wrapped request")
+            .expect("wrapped fd_read must use descendant wait path");
+        assert_eq!(normalized.id, request.id);
+        assert_eq!(normalized.method, "process.fd_read");
+        assert_eq!(normalized.args, request.args[1..]);
+    }
+}
+
+fn recheck_ready_deferred_fd_reads(
+    kernel: &mut SidecarKernel,
+    process: &mut ActiveProcess,
+) -> Result<(), SidecarError> {
+    let parked_request = process
+        .deferred_kernel_wait_rpc
+        .as_ref()
+        .map(|(request, _)| request.clone())
+        .filter(|request| request.method == "process.fd_read");
+
+    if let Some(request) = parked_request {
+        let descriptor = (|| {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_read fd")?;
+            let length = usize::try_from(javascript_sync_rpc_arg_u64(
+                &request.args,
+                1,
+                "fd_read length",
+            )?)
+            .map_err(|_| SidecarError::InvalidState("fd_read length is too large".into()))?;
+            Ok::<_, SidecarError>((fd, length))
+        })();
+
+        match descriptor {
+            Ok((fd, length)) => {
+                // Claim before the authoritative read. Readiness is only a
+                // scheduling hint; after the token is claimed, the zero-time
+                // read can safely resolve the request with bytes, EOF, or a
+                // cooperative EAGAIN. The runner hides EAGAIN from a blocking
+                // guest unless its configured maxBlockingReadMs expires.
+                process.deferred_kernel_wait_rpc = None;
+                let claimed = process
+                    .execution
+                    .claim_javascript_sync_rpc_response(request.id)?;
+                if claimed {
+                    let read_result = kernel.fd_read_with_timeout_result(
+                        EXECUTION_DRIVER_NAME,
+                        process.kernel_pid,
+                        fd,
+                        length,
+                        Some(Duration::ZERO),
+                    );
+                    match read_result {
+                        Ok(Some(bytes)) => process
+                            .execution
+                            .respond_claimed_javascript_sync_rpc_success(
+                                request.id,
+                                javascript_sync_rpc_bytes_value(&bytes),
+                            )?,
+                        Ok(None) => process
+                            .execution
+                            .respond_claimed_javascript_sync_rpc_success(
+                                request.id,
+                                javascript_sync_rpc_bytes_value(&[]),
+                            )?,
+                        Err(error) => {
+                            let error = kernel_error(error);
+                            process
+                                .execution
+                                .respond_claimed_javascript_sync_rpc_error(
+                                    request.id,
+                                    javascript_sync_rpc_error_code(&error),
+                                    error.to_string(),
+                                )?;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                process.deferred_kernel_wait_rpc = None;
+                if process
+                    .execution
+                    .claim_javascript_sync_rpc_response(request.id)?
+                {
+                    process
+                        .execution
+                        .respond_claimed_javascript_sync_rpc_error(
+                            request.id,
+                            javascript_sync_rpc_error_code(&error),
+                            error.to_string(),
+                        )?;
+                }
+            }
+        }
+    }
+
+    for child in process.child_processes.values_mut() {
+        recheck_ready_deferred_fd_reads(kernel, child)?;
+    }
+    Ok(())
 }
 
 /// Unblock a guest thread parked in a deferred `__kernel_stdin_read` /
@@ -15593,6 +23797,7 @@ fn terminate_child_process_tree(
     kernel: &mut SidecarKernel,
     process: &mut ActiveProcess,
     kernel_readiness: &KernelSocketReadinessRegistry,
+    unix_address_registry: &GuestUnixAddressRegistry,
 ) {
     flush_parked_kernel_wait_rpc(process);
     let sqlite_database_ids = process.sqlite_databases.keys().copied().collect::<Vec<_>>();
@@ -15624,29 +23829,75 @@ fn terminate_child_process_tree(
     for listener_id in listener_ids {
         if let Some(listener) = process.tcp_listeners.remove(&listener_id) {
             unregister_kernel_readiness_target(kernel_readiness, listener.kernel_socket_id);
-            let _ = listener.close(kernel, process.kernel_pid);
+            if let Err(error) = listener.close(kernel, process.kernel_pid) {
+                eprintln!("failed to close TCP listener {listener_id}: {error}");
+            }
         }
     }
 
     let sockets = process.tcp_sockets.keys().cloned().collect::<Vec<_>>();
     for socket_id in sockets {
         if let Some(socket) = process.tcp_sockets.remove(&socket_id) {
+            if !socket.is_final_description_handle() {
+                continue;
+            }
             unregister_kernel_readiness_target(kernel_readiness, socket.kernel_socket_id);
-            let _ = socket.close(kernel, process.kernel_pid);
+            if let Err(error) = socket.close(kernel, process.kernel_pid) {
+                eprintln!("failed to close TCP socket {socket_id}: {error}");
+            }
         }
     }
 
     let unix_listener_ids = process.unix_listeners.keys().cloned().collect::<Vec<_>>();
     for listener_id in unix_listener_ids {
         if let Some(listener) = process.unix_listeners.remove(&listener_id) {
-            let _ = listener.close();
+            if !listener.is_final_description_handle() {
+                continue;
+            }
+            if let Err(error) = close_pending_guest_unix_connections(
+                unix_address_registry,
+                &listener.registry_binding_id,
+            ) {
+                eprintln!("failed to close pending Unix connections {listener_id}: {error}");
+            }
+            if let Err(error) =
+                release_guest_unix_binding(unix_address_registry, &listener.registry_binding_id)
+            {
+                eprintln!("failed to release Unix listener metadata {listener_id}: {error}");
+            }
+            if let Err(error) =
+                purge_guest_unix_target(unix_address_registry, &listener.registry_binding_id)
+            {
+                eprintln!("failed to purge Unix listener metadata {listener_id}: {error}");
+            }
+            if let Err(error) = listener.close() {
+                eprintln!("failed to close Unix listener {listener_id}: {error}");
+            }
         }
     }
 
     let unix_sockets = process.unix_sockets.keys().cloned().collect::<Vec<_>>();
     for socket_id in unix_sockets {
-        if let Some(socket) = process.unix_sockets.remove(&socket_id) {
-            let _ = socket.close();
+        if let Some(mut socket) = process.unix_sockets.remove(&socket_id) {
+            if !socket.is_final_description_handle() {
+                continue;
+            }
+            if socket.listener_id.is_some() {
+                if let Err(error) = socket.cache_remote_peer_metadata(unix_address_registry) {
+                    eprintln!("failed to cache Unix peer metadata for {socket_id}: {error}");
+                }
+                if let Some(state) = socket.connection_state.as_ref() {
+                    state.accepted_peer_open.store(false, Ordering::SeqCst);
+                }
+            }
+            if let Some(binding_id) = socket.local_registry_binding_id.as_deref() {
+                if let Err(error) = release_guest_unix_binding(unix_address_registry, binding_id) {
+                    eprintln!("failed to release Unix socket metadata {socket_id}: {error}");
+                }
+            }
+            if let Err(error) = socket.close() {
+                eprintln!("failed to close Unix socket {socket_id}: {error}");
+            }
         }
     }
 
@@ -15654,7 +23905,9 @@ fn terminate_child_process_tree(
     for socket_id in udp_socket_ids {
         if let Some(mut socket) = process.udp_sockets.remove(&socket_id) {
             unregister_kernel_readiness_target(kernel_readiness, socket.kernel_socket_id);
-            socket.close(kernel, process.kernel_pid);
+            if let Err(error) = socket.close(kernel, process.kernel_pid) {
+                eprintln!("failed to close UDP socket {socket_id}: {error}");
+            }
         }
     }
 
@@ -15663,7 +23916,7 @@ fn terminate_child_process_tree(
         let Some(mut child) = process.child_processes.remove(&child_id) else {
             continue;
         };
-        terminate_child_process_tree(kernel, &mut child, kernel_readiness);
+        terminate_child_process_tree(kernel, &mut child, kernel_readiness, unix_address_registry);
         let _ = kernel.kill_process(EXECUTION_DRIVER_NAME, child.kernel_pid, SIGTERM);
         let _ = signal_runtime_process(child.execution.child_pid(), SIGTERM);
         child.kernel_handle.finish(0);
@@ -16665,6 +24918,71 @@ pub(crate) fn javascript_sync_rpc_arg_u64_optional(
     javascript_sync_rpc_arg_u64(args, index, label).map(Some)
 }
 
+fn wasm_process_resolve_at_path(
+    kernel: &SidecarKernel,
+    pid: u32,
+    dir_fd: u32,
+    path: &str,
+) -> Result<String, SidecarError> {
+    if path.starts_with('/') {
+        return Ok(normalize_path(path));
+    }
+    let stat = kernel
+        .fd_stat(EXECUTION_DRIVER_NAME, pid, dir_fd)
+        .map_err(kernel_error)?;
+    if stat.filetype != agentos_kernel::fd_table::FILETYPE_DIRECTORY {
+        return Err(SidecarError::InvalidState(format!(
+            "ENOTDIR: file descriptor {dir_fd} is not a directory"
+        )));
+    }
+    let base = kernel
+        .fd_path(EXECUTION_DRIVER_NAME, pid, dir_fd)
+        .map_err(kernel_error)?;
+    Ok(normalize_path(&format!("{base}/{path}")))
+}
+
+fn wasm_process_path_stat_value(stat: agentos_kernel::vfs::VirtualStat) -> Value {
+    let filetype = if stat.is_directory {
+        agentos_kernel::fd_table::FILETYPE_DIRECTORY
+    } else if stat.is_symbolic_link {
+        agentos_kernel::fd_table::FILETYPE_SYMBOLIC_LINK
+    } else {
+        agentos_kernel::fd_table::FILETYPE_REGULAR_FILE
+    };
+    json!({
+        "dev": stat.dev,
+        "ino": stat.ino,
+        "filetype": filetype,
+        "nlink": stat.nlink,
+        "size": stat.size,
+        "atimeMs": stat.atime_ms,
+        "mtimeMs": stat.mtime_ms,
+        "ctimeMs": stat.ctime_ms,
+    })
+}
+
+fn wasm_process_utime_spec(
+    nanoseconds: &str,
+    explicit: bool,
+    now: bool,
+) -> Result<VirtualUtimeSpec, SidecarError> {
+    if now {
+        return Ok(VirtualUtimeSpec::Now);
+    }
+    if !explicit {
+        return Ok(VirtualUtimeSpec::Omit);
+    }
+    let nanoseconds = nanoseconds.parse::<u64>().map_err(|_| {
+        SidecarError::InvalidState("EINVAL: pathname timestamp must be u64 nanoseconds".into())
+    })?;
+    let seconds = i64::try_from(nanoseconds / 1_000_000_000).map_err(|_| {
+        SidecarError::InvalidState("EINVAL: pathname timestamp exceeds i64 seconds".into())
+    })?;
+    VirtualTimeSpec::new(seconds, (nanoseconds % 1_000_000_000) as u32)
+        .map(VirtualUtimeSpec::Set)
+        .map_err(|error| SidecarError::InvalidState(format!("EINVAL: {error}")))
+}
+
 pub(crate) fn javascript_sync_rpc_bytes_arg(
     args: &[Value],
     index: usize,
@@ -17024,8 +25342,92 @@ where
     B: NativeSidecarBridge + Send + 'static,
     BridgeError<B>: fmt::Debug + Send + Sync + 'static,
 {
+    const ALLOWED_WASM_PROCESS_SYNC_RPCS: &[&str] = &[
+        "process.umask",
+        "process.getpgid",
+        "process.setpgid",
+        "process.waitpid_transition",
+        "process.itimer_real",
+        "process.fd_pipe",
+        "process.fd_open",
+        "process.path_open_at",
+        "process.path_mkdir_at",
+        "process.path_stat_at",
+        "process.path_chown_at",
+        "process.path_utimes_at",
+        "process.path_link_at",
+        "process.path_readlink_at",
+        "process.path_remove_dir_at",
+        "process.path_rename_at",
+        "process.path_symlink_at",
+        "process.path_unlink_at",
+        "process.fd_snapshot",
+        "process.fd_read",
+        "process.fd_pread",
+        "process.fd_write",
+        "process.fd_pwrite",
+        "process.fd_sync",
+        "process.fd_datasync",
+        "process.fd_readdir",
+        "process.fd_close",
+        "process.fd_stat",
+        "process.fd_filestat",
+        "process.fd_chmod",
+        "process.fd_chown",
+        "process.fd_truncate",
+        "process.fd_set_flags",
+        "process.fd_getfd",
+        "process.fd_setfd",
+        "process.fd_record_lock",
+        "process.fd_record_lock_cancel",
+        "process.fd_dup",
+        "process.fd_dup2",
+        "process.fd_dup_min",
+        "process.fd_seek",
+        "process.fd_chdir_path",
+        "process.fd_socketpair",
+        "process.fd_sendmsg_rights",
+        "process.fd_recvmsg_rights",
+        "process.fd_socket_shutdown",
+        "dns.resolveRawRr",
+    ];
+    let remapped_request = if request.sync_request.method == "process.wasm_sync_rpc" {
+        let method = javascript_sync_rpc_arg_str(
+            &request.sync_request.args,
+            0,
+            "WASM process sync RPC method",
+        )?;
+        if !ALLOWED_WASM_PROCESS_SYNC_RPCS.contains(&method) {
+            return Err(SidecarError::InvalidState(format!(
+                "unsupported WASM process sync RPC method {method}"
+            )));
+        }
+        let raw_bytes_args = request
+            .sync_request
+            .raw_bytes_args
+            .iter()
+            .filter_map(|(index, bytes)| {
+                (*index > 0 && *index != usize::MAX).then(|| (*index - 1, bytes.clone()))
+            })
+            .collect();
+        Some(JavascriptSyncRpcRequest {
+            id: request.sync_request.id,
+            method: method.to_owned(),
+            args: request.sync_request.args[1..].to_vec(),
+            raw_bytes_args,
+        })
+    } else {
+        None
+    };
+    let original_request = request.sync_request;
     if sync_rpc_trace_enabled() {
-        record_sync_rpc(request.sync_request.method.as_str());
+        record_sync_rpc(
+            remapped_request
+                .as_ref()
+                .unwrap_or(original_request)
+                .method
+                .as_str(),
+        );
     }
     let JavascriptSyncRpcServiceRequest {
         bridge,
@@ -17035,10 +25437,11 @@ where
         kernel,
         kernel_readiness,
         process,
-        sync_request: request,
+        sync_request: _,
         resource_limits,
         network_counts,
     } = request;
+    let request = remapped_request.as_ref().unwrap_or(original_request);
     if request.raw_bytes_args.contains_key(&usize::MAX) && request.method == "fs.readSync" {
         let kernel_pid = process.kernel_pid;
         let bytes = service_javascript_fs_read_sync_rpc(kernel, process, kernel_pid, request)?;
@@ -17125,7 +25528,7 @@ where
         | "crypto.diffieHellmanSessionCall"
         | "crypto.diffieHellmanSessionDestroy"
         | "crypto.subtle" => service_javascript_crypto_sync_rpc(process, request),
-        "dns.lookup" | "dns.resolve" | "dns.resolve4" | "dns.resolve6" => {
+        "dns.lookup" | "dns.resolve" | "dns.resolve4" | "dns.resolve6" | "dns.resolveRawRr" => {
             service_javascript_dns_sync_rpc(bridge, kernel, vm_id, dns, request)
         }
         "net.http_listen" | "net.http_close" | "net.http_wait" | "net.http_respond" => {
@@ -17177,6 +25580,8 @@ where
             })
         }
         "net.connect"
+        | "net.bind_unix"
+        | "net.bind_connected_unix"
         | "net.reserve_tcp_port"
         | "net.release_tcp_port"
         | "net.listen"
@@ -17271,14 +25676,11 @@ where
                     "unknown process pid {target_pid}"
                 )));
             }
-            process.pending_self_signal_exit = None;
-            if parsed_signal != 0
-                && !matches!(
-                    canonical_signal_name(parsed_signal),
-                    Some("SIGWINCH" | "SIGCHLD" | "SIGCONT" | "SIGURG")
-                )
-            {
-                process.pending_self_signal_exit = Some(parsed_signal);
+            if !matches!(
+                canonical_signal_name(parsed_signal),
+                Some("SIGWINCH" | "SIGCHLD" | "SIGCONT" | "SIGURG")
+            ) {
+                apply_active_process_default_signal(kernel, process, parsed_signal)?;
             }
             Ok(json!({
                 "self": true,
@@ -17286,14 +25688,1012 @@ where
             }))
         }
         "process.take_signal" => {
-            let signal = process.pending_wasm_signals.pop_front();
+            let signal = if process.real_interval_timer.take_expiry() {
+                Some(libc::SIGALRM)
+            } else {
+                process.pending_wasm_signals.pop_first()
+            };
+            process
+                .pending_wasm_signals_gauge
+                .observe_depth(process.pending_wasm_signals.len());
             Ok(signal.map(Value::from).unwrap_or(Value::Null).into())
+        }
+        "process.itimer_real" => {
+            let operation = javascript_sync_rpc_arg_u32(&request.args, 0, "ITIMER_REAL operation")?;
+            let values = match operation {
+                0 => process.real_interval_timer.get(),
+                1 => {
+                    let value_us = javascript_sync_rpc_arg_u64(
+                        &request.args,
+                        1,
+                        "ITIMER_REAL value microseconds",
+                    )?;
+                    let interval_us = javascript_sync_rpc_arg_u64(
+                        &request.args,
+                        2,
+                        "ITIMER_REAL interval microseconds",
+                    )?;
+                    process.real_interval_timer.set(value_us, interval_us)
+                }
+                other => {
+                    return Err(SidecarError::InvalidState(format!(
+                        "EINVAL: invalid ITIMER_REAL operation {other}"
+                    )))
+                }
+            };
+            Ok(json!({
+                "remainingUs": values.0,
+                "intervalUs": values.1,
+            }))
+        }
+        "process.waitpid_transition" => {
+            let selector = javascript_sync_rpc_arg_i32(&request.args, 0, "waitpid selector")?;
+            let options = javascript_sync_rpc_arg_u32(&request.args, 1, "waitpid options")?;
+            if options & !(1 | 2 | 8) != 0 {
+                return Err(SidecarError::InvalidState(format!(
+                    "EINVAL: invalid waitpid option bits {:#x}",
+                    options & !(1 | 2 | 8)
+                )));
+            }
+            let mut flags = WaitPidFlags::WNOHANG;
+            if options & 2 != 0 {
+                flags |= WaitPidFlags::WUNTRACED;
+            }
+            if options & 8 != 0 {
+                flags |= WaitPidFlags::WCONTINUED;
+            }
+            let transition = kernel
+                .take_nonterminal_wait_event(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    selector,
+                    flags,
+                )
+                .map_err(kernel_error)?;
+            match transition {
+                Some(event) => {
+                    let status = match event.event {
+                        agentos_kernel::kernel::WaitPidEvent::Stopped => {
+                            ((event.status as u32 & 0xff) << 8) | 0x7f
+                        }
+                        agentos_kernel::kernel::WaitPidEvent::Continued => 0xffff,
+                        agentos_kernel::kernel::WaitPidEvent::Exited => {
+                            return Err(SidecarError::InvalidState(String::from(
+                                "terminal wait event escaped nonterminal query",
+                            )))
+                        }
+                    };
+                    Ok(json!({
+                        "pid": event.pid,
+                        "status": status,
+                    }))
+                }
+                None => Ok(Value::Null),
+            }
+        }
+        "process.fd_pipe" => kernel
+            .open_pipe(EXECUTION_DRIVER_NAME, process.kernel_pid)
+            .map(|(read_fd, write_fd)| json!({ "readFd": read_fd, "writeFd": write_fd }))
+            .map_err(kernel_error),
+        "process.fd_open" => {
+            let path = javascript_sync_rpc_arg_str(&request.args, 0, "fd_open path")?;
+            let flags = javascript_sync_rpc_arg_u32(&request.args, 1, "fd_open flags")?;
+            let mode = javascript_sync_rpc_arg_u32_optional(&request.args, 2, "fd_open mode")?;
+            kernel
+                .fd_open(EXECUTION_DRIVER_NAME, process.kernel_pid, path, flags, mode)
+                .map(Value::from)
+                .map_err(kernel_error)
+        }
+        "process.path_open_at" => {
+            let dir_fd = javascript_sync_rpc_arg_u32(&request.args, 0, "path_open_at dir fd")?;
+            let path = javascript_sync_rpc_arg_str(&request.args, 1, "path_open_at path")?;
+            let flags = javascript_sync_rpc_arg_u32(&request.args, 2, "path_open_at flags")?;
+            let mode = javascript_sync_rpc_arg_u32_optional(&request.args, 3, "path_open_at mode")?;
+            let path = wasm_process_resolve_at_path(kernel, process.kernel_pid, dir_fd, path)?;
+            kernel
+                .fd_open(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    &path,
+                    flags,
+                    mode,
+                )
+                .map(Value::from)
+                .map_err(kernel_error)
+        }
+        "process.path_mkdir_at" => {
+            let dir_fd = javascript_sync_rpc_arg_u32(&request.args, 0, "path_mkdir_at dir fd")?;
+            let path = javascript_sync_rpc_arg_str(&request.args, 1, "path_mkdir_at path")?;
+            let path = wasm_process_resolve_at_path(kernel, process.kernel_pid, dir_fd, path)?;
+            kernel
+                .mkdir_for_process(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    &path,
+                    false,
+                    None,
+                )
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
+        }
+        "process.path_stat_at" => {
+            let dir_fd = javascript_sync_rpc_arg_u32(&request.args, 0, "path_stat_at dir fd")?;
+            let path = javascript_sync_rpc_arg_str(&request.args, 1, "path_stat_at path")?;
+            let follow = javascript_sync_rpc_arg_bool(&request.args, 2, "path_stat_at follow")?;
+            let path = wasm_process_resolve_at_path(kernel, process.kernel_pid, dir_fd, path)?;
+            let stat = if follow {
+                kernel.stat_for_process(EXECUTION_DRIVER_NAME, process.kernel_pid, &path)
+            } else {
+                kernel.lstat_for_process(EXECUTION_DRIVER_NAME, process.kernel_pid, &path)
+            }
+            .map_err(kernel_error)?;
+            Ok(wasm_process_path_stat_value(stat))
+        }
+        "process.path_chown_at" => {
+            let dir_fd = javascript_sync_rpc_arg_u32(&request.args, 0, "path_chown_at dir fd")?;
+            let path = javascript_sync_rpc_arg_str(&request.args, 1, "path_chown_at path")?;
+            let uid = javascript_sync_rpc_arg_u32(&request.args, 2, "path_chown_at uid")?;
+            let gid = javascript_sync_rpc_arg_u32(&request.args, 3, "path_chown_at gid")?;
+            let follow = javascript_sync_rpc_arg_bool(&request.args, 4, "path_chown_at follow")?;
+            let path = wasm_process_resolve_at_path(kernel, process.kernel_pid, dir_fd, path)?;
+            kernel
+                .chown_for_process(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    &path,
+                    uid,
+                    gid,
+                    follow,
+                )
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
+        }
+        "process.path_utimes_at" => {
+            let dir_fd = javascript_sync_rpc_arg_u32(&request.args, 0, "path_utimes_at dir fd")?;
+            let path = javascript_sync_rpc_arg_str(&request.args, 1, "path_utimes_at path")?;
+            let follow = javascript_sync_rpc_arg_bool(&request.args, 2, "path_utimes_at follow")?;
+            let atime_ns = javascript_sync_rpc_arg_str(&request.args, 3, "path_utimes_at atime")?;
+            let mtime_ns = javascript_sync_rpc_arg_str(&request.args, 4, "path_utimes_at mtime")?;
+            let fst_flags = javascript_sync_rpc_arg_u32(&request.args, 5, "path_utimes_at flags")?;
+            let path = wasm_process_resolve_at_path(kernel, process.kernel_pid, dir_fd, path)?;
+            let atime = wasm_process_utime_spec(atime_ns, fst_flags & 1 != 0, fst_flags & 2 != 0)?;
+            let mtime = wasm_process_utime_spec(mtime_ns, fst_flags & 4 != 0, fst_flags & 8 != 0)?;
+            if follow {
+                kernel.utimes_spec(&path, atime, mtime)
+            } else {
+                kernel.lutimes(&path, atime, mtime)
+            }
+            .map(|()| Value::Null)
+            .map_err(kernel_error)
+        }
+        "process.path_link_at" => {
+            let old_fd = javascript_sync_rpc_arg_u32(&request.args, 0, "path_link_at old fd")?;
+            let old_path = javascript_sync_rpc_arg_str(&request.args, 1, "path_link_at old path")?;
+            let new_fd = javascript_sync_rpc_arg_u32(&request.args, 2, "path_link_at new fd")?;
+            let new_path = javascript_sync_rpc_arg_str(&request.args, 3, "path_link_at new path")?;
+            let follow = javascript_sync_rpc_arg_bool(&request.args, 4, "path_link_at follow")?;
+            let mut old_path =
+                wasm_process_resolve_at_path(kernel, process.kernel_pid, old_fd, old_path)?;
+            let new_path =
+                wasm_process_resolve_at_path(kernel, process.kernel_pid, new_fd, new_path)?;
+            if follow {
+                old_path = kernel
+                    .realpath_for_process(EXECUTION_DRIVER_NAME, process.kernel_pid, &old_path)
+                    .map_err(kernel_error)?;
+            }
+            kernel
+                .link(&old_path, &new_path)
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
+        }
+        "process.path_readlink_at" => {
+            let dir_fd = javascript_sync_rpc_arg_u32(&request.args, 0, "path_readlink_at dir fd")?;
+            let path = javascript_sync_rpc_arg_str(&request.args, 1, "path_readlink_at path")?;
+            let path = wasm_process_resolve_at_path(kernel, process.kernel_pid, dir_fd, path)?;
+            kernel
+                .read_link_for_process(EXECUTION_DRIVER_NAME, process.kernel_pid, &path)
+                .map(Value::String)
+                .map_err(kernel_error)
+        }
+        "process.path_remove_dir_at" => {
+            let dir_fd =
+                javascript_sync_rpc_arg_u32(&request.args, 0, "path_remove_dir_at dir fd")?;
+            let path = javascript_sync_rpc_arg_str(&request.args, 1, "path_remove_dir_at path")?;
+            let path = wasm_process_resolve_at_path(kernel, process.kernel_pid, dir_fd, path)?;
+            kernel
+                .remove_dir(&path)
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
+        }
+        "process.path_rename_at" => {
+            let old_fd = javascript_sync_rpc_arg_u32(&request.args, 0, "path_rename_at old fd")?;
+            let old_path =
+                javascript_sync_rpc_arg_str(&request.args, 1, "path_rename_at old path")?;
+            let new_fd = javascript_sync_rpc_arg_u32(&request.args, 2, "path_rename_at new fd")?;
+            let new_path =
+                javascript_sync_rpc_arg_str(&request.args, 3, "path_rename_at new path")?;
+            let old_path =
+                wasm_process_resolve_at_path(kernel, process.kernel_pid, old_fd, old_path)?;
+            let new_path =
+                wasm_process_resolve_at_path(kernel, process.kernel_pid, new_fd, new_path)?;
+            kernel
+                .rename(&old_path, &new_path)
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
+        }
+        "process.path_symlink_at" => {
+            let target = javascript_sync_rpc_arg_str(&request.args, 0, "path_symlink_at target")?;
+            let dir_fd = javascript_sync_rpc_arg_u32(&request.args, 1, "path_symlink_at dir fd")?;
+            let path = javascript_sync_rpc_arg_str(&request.args, 2, "path_symlink_at path")?;
+            let path = wasm_process_resolve_at_path(kernel, process.kernel_pid, dir_fd, path)?;
+            kernel
+                .symlink(target, &path)
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
+        }
+        "process.path_unlink_at" => {
+            let dir_fd = javascript_sync_rpc_arg_u32(&request.args, 0, "path_unlink_at dir fd")?;
+            let path = javascript_sync_rpc_arg_str(&request.args, 1, "path_unlink_at path")?;
+            let path = wasm_process_resolve_at_path(kernel, process.kernel_pid, dir_fd, path)?;
+            kernel
+                .remove_file(&path)
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
+        }
+        "process.fd_snapshot" => kernel
+            .fd_snapshot(EXECUTION_DRIVER_NAME, process.kernel_pid)
+            .map(|entries| {
+                Value::Array(
+                    entries
+                        .into_iter()
+                        .map(|entry| {
+                            json!({
+                                "fd": entry.fd,
+                                "fdFlags": entry.fd_flags,
+                                "statusFlags": entry.status_flags,
+                                "filetype": entry.filetype,
+                                "kind": if entry.is_socket {
+                                    "socket"
+                                } else if entry.is_pipe {
+                                    "pipe"
+                                } else if entry.is_pty {
+                                    "pty"
+                                } else {
+                                    "file"
+                                },
+                            })
+                        })
+                        .collect(),
+                )
+            })
+            .map_err(kernel_error),
+        "process.fd_read" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_read fd")?;
+            let length = usize::try_from(javascript_sync_rpc_arg_u64(
+                &request.args,
+                1,
+                "fd_read length",
+            )?)
+            .map_err(|_| SidecarError::InvalidState("fd_read length is too large".into()))?;
+            let timeout_ms =
+                javascript_sync_rpc_arg_u64_optional(&request.args, 2, "fd_read timeout ms")?;
+            match timeout_ms {
+                Some(timeout_ms) => kernel
+                    .fd_read_with_timeout_result(
+                        EXECUTION_DRIVER_NAME,
+                        process.kernel_pid,
+                        fd,
+                        length,
+                        Some(Duration::from_millis(timeout_ms)),
+                    )
+                    .map(Option::unwrap_or_default),
+                None => kernel.fd_read(EXECUTION_DRIVER_NAME, process.kernel_pid, fd, length),
+            }
+            .map(|bytes| javascript_sync_rpc_bytes_value(&bytes))
+            .map_err(kernel_error)
+        }
+        "process.fd_pread" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_pread fd")?;
+            let length = usize::try_from(javascript_sync_rpc_arg_u64(
+                &request.args,
+                1,
+                "fd_pread length",
+            )?)
+            .map_err(|_| SidecarError::InvalidState("fd_pread length is too large".into()))?;
+            let offset = javascript_sync_rpc_arg_str(&request.args, 2, "fd_pread offset")?
+                .parse::<u64>()
+                .map_err(|_| SidecarError::InvalidState("fd_pread offset must be u64".into()))?;
+            kernel
+                .fd_pread(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    fd,
+                    length,
+                    offset,
+                )
+                .map(|bytes| javascript_sync_rpc_bytes_value(&bytes))
+                .map_err(kernel_error)
+        }
+        "process.fd_write" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_write fd")?;
+            let data = javascript_sync_rpc_bytes_arg(&request.args, 1, "fd_write data")?;
+            kernel
+                .fd_write(EXECUTION_DRIVER_NAME, process.kernel_pid, fd, &data)
+                .map(Value::from)
+                .map_err(kernel_error)
+        }
+        "process.fd_pwrite" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_pwrite fd")?;
+            let data = javascript_sync_rpc_bytes_arg(&request.args, 1, "fd_pwrite data")?;
+            let offset = javascript_sync_rpc_arg_str(&request.args, 2, "fd_pwrite offset")?
+                .parse::<u64>()
+                .map_err(|_| SidecarError::InvalidState("fd_pwrite offset must be u64".into()))?;
+            kernel
+                .fd_pwrite(EXECUTION_DRIVER_NAME, process.kernel_pid, fd, &data, offset)
+                .map(Value::from)
+                .map_err(kernel_error)
+        }
+        "process.fd_sync" | "process.fd_datasync" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_sync fd")?;
+            kernel
+                .fd_sync(EXECUTION_DRIVER_NAME, process.kernel_pid, fd)
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
+        }
+        "process.fd_readdir" => {
+            const MAX_READDIR_ENTRIES_PER_CALL: usize = 4096;
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_readdir fd")?;
+            let cookie = javascript_sync_rpc_arg_str(&request.args, 1, "fd_readdir cookie")?
+                .parse::<usize>()
+                .map_err(|_| {
+                    SidecarError::InvalidState("fd_readdir cookie must be usize".into())
+                })?;
+            let max_entries = usize::try_from(javascript_sync_rpc_arg_u64(
+                &request.args,
+                2,
+                "fd_readdir max entries",
+            )?)
+            .unwrap_or(usize::MAX)
+            .min(MAX_READDIR_ENTRIES_PER_CALL);
+            kernel
+                .fd_read_dir_with_types(EXECUTION_DRIVER_NAME, process.kernel_pid, fd)
+                .map(|entries| {
+                    Value::Array(
+                        entries
+                            .into_iter()
+                            .enumerate()
+                            .skip(cookie)
+                            .take(max_entries)
+                            .map(|(index, entry)| {
+                                json!({
+                                    "name": entry.name,
+                                    "ino": entry.ino.to_string(),
+                                    "filetype": if entry.is_directory {
+                                        agentos_kernel::fd_table::FILETYPE_DIRECTORY
+                                    } else if entry.is_symbolic_link {
+                                        agentos_kernel::fd_table::FILETYPE_SYMBOLIC_LINK
+                                    } else {
+                                        agentos_kernel::fd_table::FILETYPE_REGULAR_FILE
+                                    },
+                                    "next": index.saturating_add(1).to_string(),
+                                })
+                            })
+                            .collect(),
+                    )
+                })
+                .map_err(kernel_error)
+        }
+        "process.fd_close" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_close fd")?;
+            kernel
+                .fd_close(EXECUTION_DRIVER_NAME, process.kernel_pid, fd)
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
+        }
+        "process.fd_stat" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_stat fd")?;
+            kernel
+                .fd_stat(EXECUTION_DRIVER_NAME, process.kernel_pid, fd)
+                .map(|stat| {
+                    json!({
+                        "filetype": stat.filetype,
+                        "flags": stat.flags,
+                        "rights": stat.rights,
+                    })
+                })
+                .map_err(kernel_error)
+        }
+        "process.fd_filestat" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_filestat fd")?;
+            let fd_stat = kernel
+                .fd_stat(EXECUTION_DRIVER_NAME, process.kernel_pid, fd)
+                .map_err(kernel_error)?;
+            kernel
+                .dev_fd_stat(EXECUTION_DRIVER_NAME, process.kernel_pid, fd)
+                .map(|stat| {
+                    json!({
+                        "dev": stat.dev,
+                        "ino": stat.ino,
+                        "filetype": fd_stat.filetype,
+                        "nlink": stat.nlink,
+                        "mode": stat.mode,
+                        "size": stat.size,
+                        "atimeMs": stat.atime_ms,
+                        "mtimeMs": stat.mtime_ms,
+                        "ctimeMs": stat.ctime_ms,
+                    })
+                })
+                .map_err(kernel_error)
+        }
+        "process.fd_chown" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_chown fd")?;
+            let uid = javascript_sync_rpc_arg_u32(&request.args, 1, "fd_chown uid")?;
+            let gid = javascript_sync_rpc_arg_u32(&request.args, 2, "fd_chown gid")?;
+            kernel
+                .fd_chown_for_process(EXECUTION_DRIVER_NAME, process.kernel_pid, fd, uid, gid)
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
+        }
+        "process.fd_chmod" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_chmod fd")?;
+            let mode = javascript_sync_rpc_arg_u32(&request.args, 1, "fd_chmod mode")?;
+            kernel
+                .fd_chmod_for_process(EXECUTION_DRIVER_NAME, process.kernel_pid, fd, mode)
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
+        }
+        "process.fd_truncate" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_truncate fd")?;
+            let length = javascript_sync_rpc_arg_str(&request.args, 1, "fd_truncate length")?
+                .parse::<u64>()
+                .map_err(|_| SidecarError::InvalidState("fd_truncate length must be u64".into()))?;
+            kernel
+                .fd_truncate(EXECUTION_DRIVER_NAME, process.kernel_pid, fd, length)
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
+        }
+        "process.fd_set_flags" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_set_flags fd")?;
+            let flags = javascript_sync_rpc_arg_u32(&request.args, 1, "fd_set_flags flags")?;
+            kernel
+                .fd_fcntl(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    fd,
+                    agentos_kernel::fd_table::F_SETFL,
+                    flags,
+                )
+                .map(Value::from)
+                .map_err(kernel_error)
+        }
+        "process.fd_getfd" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_getfd fd")?;
+            kernel
+                .fd_fcntl(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    fd,
+                    agentos_kernel::fd_table::F_GETFD,
+                    0,
+                )
+                .map(Value::from)
+                .map_err(kernel_error)
+        }
+        "process.fd_setfd" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_setfd fd")?;
+            let flags = javascript_sync_rpc_arg_u32(&request.args, 1, "fd_setfd flags")?;
+            kernel
+                .fd_fcntl(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    fd,
+                    agentos_kernel::fd_table::F_SETFD,
+                    flags,
+                )
+                .map(Value::from)
+                .map_err(kernel_error)
+        }
+        "process.fd_record_lock" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_record_lock fd")?;
+            let command = javascript_sync_rpc_arg_u32(&request.args, 1, "fd_record_lock command")?;
+            let raw_lock_type =
+                javascript_sync_rpc_arg_u32(&request.args, 2, "fd_record_lock type")?;
+            let start = javascript_sync_rpc_arg_str(&request.args, 3, "fd_record_lock start")?
+                .parse::<u64>()
+                .map_err(|_| {
+                    SidecarError::InvalidState("EINVAL: fd_record_lock start must be u64".into())
+                })?;
+            let length = javascript_sync_rpc_arg_str(&request.args, 4, "fd_record_lock length")?
+                .parse::<u64>()
+                .map_err(|_| {
+                    SidecarError::InvalidState("EINVAL: fd_record_lock length must be u64".into())
+                })?;
+            let lock_type = match raw_lock_type {
+                0 => agentos_kernel::fd_table::RecordLockType::Read,
+                1 => agentos_kernel::fd_table::RecordLockType::Write,
+                2 => agentos_kernel::fd_table::RecordLockType::Unlock,
+                _ => {
+                    return Err(SidecarError::InvalidState(
+                        "EINVAL: fd_record_lock type must be F_RDLCK, F_WRLCK, or F_UNLCK".into(),
+                    ))
+                }
+            };
+            let conflict = match command {
+                12 => kernel.fd_record_lock(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    fd,
+                    lock_type,
+                    start,
+                    length,
+                    true,
+                ),
+                13 => kernel.fd_record_lock(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    fd,
+                    lock_type,
+                    start,
+                    length,
+                    false,
+                ),
+                14 => kernel
+                    .fd_record_lock_wait(
+                        EXECUTION_DRIVER_NAME,
+                        process.kernel_pid,
+                        fd,
+                        lock_type,
+                        start,
+                        length,
+                    )
+                    .map(|()| None),
+                _ => {
+                    return Err(SidecarError::InvalidState(format!(
+                        "EINVAL: unsupported fd_record_lock command {command}"
+                    )))
+                }
+            }
+            .map_err(kernel_error)?;
+            let response = conflict.map_or_else(
+                || json!({ "type": 2, "pid": 0, "start": start.to_string(), "length": length.to_string() }),
+                |lock| {
+                    let lock_type = match lock.lock_type {
+                        agentos_kernel::fd_table::RecordLockType::Read => 0,
+                        agentos_kernel::fd_table::RecordLockType::Write => 1,
+                        agentos_kernel::fd_table::RecordLockType::Unlock => 2,
+                    };
+                    json!({
+                        "type": lock_type,
+                        "pid": lock.pid,
+                        "start": lock.start.to_string(),
+                        "length": lock.length().to_string(),
+                    })
+                },
+            );
+            Ok(response)
+        }
+        "process.fd_record_lock_cancel" => kernel
+            .fd_record_lock_cancel(EXECUTION_DRIVER_NAME, process.kernel_pid)
+            .map(|()| Value::Null)
+            .map_err(kernel_error),
+        "process.fd_dup" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_dup fd")?;
+            kernel
+                .fd_dup(EXECUTION_DRIVER_NAME, process.kernel_pid, fd)
+                .map(Value::from)
+                .map_err(kernel_error)
+        }
+        "process.fd_dup2" => {
+            let old_fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_dup2 old fd")?;
+            let new_fd = javascript_sync_rpc_arg_u32(&request.args, 1, "fd_dup2 new fd")?;
+            kernel
+                .fd_dup2(EXECUTION_DRIVER_NAME, process.kernel_pid, old_fd, new_fd)
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
+        }
+        "process.fd_dup_min" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_dup_min fd")?;
+            let min_fd = javascript_sync_rpc_arg_u32(&request.args, 1, "fd_dup_min minimum")?;
+            kernel
+                .fd_fcntl(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    fd,
+                    agentos_kernel::fd_table::F_DUPFD,
+                    min_fd,
+                )
+                .map(Value::from)
+                .map_err(kernel_error)
+        }
+        "process.fd_seek" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fd_seek fd")?;
+            let offset = javascript_sync_rpc_arg_str(&request.args, 1, "fd_seek offset")?
+                .parse::<i64>()
+                .map_err(|_| SidecarError::InvalidState("fd_seek offset must be i64".into()))?;
+            let whence = u8::try_from(javascript_sync_rpc_arg_u32(
+                &request.args,
+                2,
+                "fd_seek whence",
+            )?)
+            .map_err(|_| SidecarError::InvalidState("fd_seek whence is invalid".into()))?;
+            kernel
+                .fd_seek(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    fd,
+                    offset,
+                    whence,
+                )
+                .map(|next| Value::String(next.to_string()))
+                .map_err(kernel_error)
+        }
+        "process.fd_chdir_path" => {
+            let fd = javascript_sync_rpc_arg_u32(&request.args, 0, "fchdir fd")?;
+            let stat = kernel
+                .fd_stat(EXECUTION_DRIVER_NAME, process.kernel_pid, fd)
+                .map_err(kernel_error)?;
+            if stat.filetype != agentos_kernel::fd_table::FILETYPE_DIRECTORY {
+                return Err(SidecarError::InvalidState(format!(
+                    "ENOTDIR: file descriptor {fd} is not a directory"
+                )));
+            }
+            kernel
+                .fd_path(EXECUTION_DRIVER_NAME, process.kernel_pid, fd)
+                .map(Value::String)
+                .map_err(kernel_error)
+        }
+        "process.fd_socketpair" => {
+            let socket_kind = javascript_sync_rpc_arg_u32(&request.args, 0, "socketpair kind")?;
+            let nonblocking =
+                javascript_sync_rpc_arg_bool(&request.args, 1, "socketpair nonblocking")?;
+            let close_on_exec =
+                javascript_sync_rpc_arg_bool(&request.args, 2, "socketpair close-on-exec")?;
+            let socket_type = match socket_kind {
+                1 => SocketType::Stream,
+                2 => SocketType::Datagram,
+                3 => SocketType::SeqPacket,
+                _ => {
+                    return Err(SidecarError::InvalidState(format!(
+                        "unsupported socketpair kind {socket_kind}"
+                    )))
+                }
+            };
+            kernel
+                .fd_socketpair(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    socket_type,
+                    nonblocking,
+                    close_on_exec,
+                )
+                .map(|(first_fd, second_fd)| json!({ "firstFd": first_fd, "secondFd": second_fd }))
+                .map_err(kernel_error)
+        }
+        "process.fd_sendmsg_rights" => {
+            let socket_fd = javascript_sync_rpc_arg_u32(&request.args, 0, "sendmsg socket fd")?;
+            let data = javascript_sync_rpc_bytes_arg(&request.args, 1, "sendmsg data")?;
+            let raw_rights = request
+                .args
+                .get(2)
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(
+                        "sendmsg rights must be an array of file descriptors".into(),
+                    )
+                })?;
+            if raw_rights.len() > LINUX_SCM_MAX_FD {
+                return Err(SidecarError::InvalidState(format!(
+                    "EINVAL: SCM_RIGHTS accepts at most {LINUX_SCM_MAX_FD} descriptors"
+                )));
+            }
+            if let Some(limit) = resource_limits.max_open_fds {
+                if raw_rights.len() > limit {
+                    return Err(SidecarError::InvalidState(format!(
+                        "EMFILE: SCM_RIGHTS descriptor list has {} entries, exceeding limits.resources.maxOpenFds ({limit}); raise limits.resources.maxOpenFds",
+                        raw_rights.len()
+                    )));
+                }
+            }
+            let mut rights = Vec::with_capacity(raw_rights.len());
+            let mut pending_host_net_count = 0usize;
+            for value in raw_rights {
+                if let Some(fd) = value.as_u64().and_then(|fd| u32::try_from(fd).ok()) {
+                    rights.push(FdTransferRequest::Fd(fd));
+                    continue;
+                }
+                if value.get("kind").and_then(Value::as_str) != Some("hostNet") {
+                    return Err(SidecarError::InvalidState(
+                        "sendmsg rights entries must be kernel fds or hostNet descriptions".into(),
+                    ));
+                }
+                let source = scm_rights_host_net_source(value)?;
+                let transferred = if let Some(source) = source {
+                    let transferred = prepare_transferred_host_net_resource(
+                        kernel,
+                        process,
+                        &source,
+                        value,
+                        "SCM_RIGHTS host-network",
+                    )?;
+                    transferred
+                } else {
+                    let options =
+                        host_net_open_description_options(value, "SCM_RIGHTS pending socket")?;
+                    let metadata = TransferredHostNetMetadata::pending(
+                        value,
+                        options,
+                        "SCM_RIGHTS pending socket",
+                    )?;
+                    pending_host_net_count = pending_host_net_count.saturating_add(1);
+                    TransferredHostNetSocket::Pending {
+                        metadata,
+                        description_handles: Arc::new(()),
+                    }
+                };
+                register_host_net_transfer_description(
+                    &socket_paths.host_net_transfer_descriptions,
+                    &transferred,
+                );
+                rights.push(FdTransferRequest::Opaque(Arc::new(transferred)));
+            }
+            check_spawn_host_net_resource_limit(
+                resource_limits.max_sockets,
+                network_counts.sockets,
+                pending_host_net_count,
+                "EMFILE",
+                "SCM_RIGHTS socket descriptions",
+                "maxSockets",
+            )?;
+            check_spawn_host_net_resource_limit(
+                resource_limits.max_connections,
+                network_counts.connections,
+                0,
+                "EAGAIN",
+                "SCM_RIGHTS connected socket descriptions",
+                "maxConnections",
+            )?;
+            kernel
+                .fd_socket_sendmsg_transfers(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    socket_fd,
+                    &data,
+                    &rights,
+                )
+                .map(Value::from)
+                .map_err(kernel_error)
+        }
+        "process.fd_recvmsg_rights" => {
+            let socket_fd = javascript_sync_rpc_arg_u32(&request.args, 0, "recvmsg socket fd")?;
+            let max_bytes = usize::try_from(javascript_sync_rpc_arg_u64(
+                &request.args,
+                1,
+                "recvmsg maximum bytes",
+            )?)
+            .map_err(|_| SidecarError::InvalidState("recvmsg byte limit is too large".into()))?;
+            let max_rights = usize::try_from(javascript_sync_rpc_arg_u64(
+                &request.args,
+                2,
+                "recvmsg maximum rights",
+            )?)
+            .map_err(|_| SidecarError::InvalidState("recvmsg rights limit is too large".into()))?;
+            let close_on_exec =
+                javascript_sync_rpc_arg_bool(&request.args, 3, "recvmsg close-on-exec")?;
+            let peek = request
+                .args
+                .get(4)
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let dontwait = request
+                .args
+                .get(5)
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let waitall = request
+                .args
+                .get(6)
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let message = kernel
+                .fd_socket_recvmsg(
+                    EXECUTION_DRIVER_NAME,
+                    process.kernel_pid,
+                    socket_fd,
+                    max_bytes,
+                    max_rights,
+                    close_on_exec,
+                    peek,
+                    dontwait,
+                    waitall,
+                )
+                .map_err(kernel_error)?;
+            Ok(if let Some(message) = message {
+                let mut rights = Vec::with_capacity(message.rights.len());
+                for right in message.rights {
+                    match right {
+                        ReceivedFdRight::Fd(fd) => {
+                            rights.push(json!({ "kind": "kernel", "fd": fd }));
+                        }
+                        ReceivedFdRight::Opaque(resource) => {
+                            let transferred = Arc::downcast::<TransferredHostNetSocket>(resource)
+                                .map_err(|_| {
+                                SidecarError::InvalidState(
+                                    "received unknown SCM_RIGHTS resource type".into(),
+                                )
+                            })?;
+                            let transferred = match Arc::try_unwrap(transferred) {
+                                Ok(transferred) => transferred,
+                                Err(shared) => shared.clone_for_fd_transfer()?,
+                            };
+                            match transferred {
+                                TransferredHostNetSocket::Tcp {
+                                    mut socket,
+                                    metadata,
+                                } => {
+                                    let new_socket_id = process.allocate_tcp_socket_id();
+                                    socket.listener_id = None;
+                                    socket.set_event_pusher(
+                                        process.execution.javascript_v8_session_handle(),
+                                        new_socket_id.clone(),
+                                    );
+                                    register_kernel_readiness_target(
+                                        &kernel_readiness,
+                                        socket.kernel_socket_id,
+                                        process.execution.javascript_v8_session_handle(),
+                                        new_socket_id.clone(),
+                                        KernelSocketReadinessEvent::Data,
+                                    );
+                                    let local = socket.guest_local_addr;
+                                    let remote = socket.guest_remote_addr;
+                                    process.tcp_sockets.insert(new_socket_id.clone(), socket);
+                                    rights.push(transferred_hostnet_value(
+                                        "tcp",
+                                        metadata,
+                                        Some(("socketId", new_socket_id)),
+                                        Some(local),
+                                        Some(remote),
+                                    ));
+                                }
+                                TransferredHostNetSocket::TcpListener { listener, metadata } => {
+                                    let listener_id = process.allocate_tcp_listener_id();
+                                    let local = listener.guest_local_addr();
+                                    register_kernel_readiness_target(
+                                        &kernel_readiness,
+                                        listener.kernel_socket_id,
+                                        process.execution.javascript_v8_session_handle(),
+                                        listener_id.clone(),
+                                        KernelSocketReadinessEvent::Accept,
+                                    );
+                                    process.tcp_listeners.insert(listener_id.clone(), listener);
+                                    rights.push(transferred_hostnet_value(
+                                        "listener",
+                                        metadata,
+                                        Some(("serverId", listener_id)),
+                                        Some(local),
+                                        None,
+                                    ));
+                                }
+                                TransferredHostNetSocket::Udp { socket, metadata } => {
+                                    let socket_id = process.allocate_udp_socket_id();
+                                    let local = socket.guest_local_addr;
+                                    register_kernel_readiness_target(
+                                        &kernel_readiness,
+                                        socket.kernel_socket_id,
+                                        process.execution.javascript_v8_session_handle(),
+                                        socket_id.clone(),
+                                        KernelSocketReadinessEvent::Datagram,
+                                    );
+                                    process.udp_sockets.insert(socket_id.clone(), socket);
+                                    rights.push(transferred_hostnet_value(
+                                        "udp",
+                                        metadata,
+                                        Some(("udpSocketId", socket_id)),
+                                        local,
+                                        None,
+                                    ));
+                                }
+                                TransferredHostNetSocket::Unix {
+                                    mut socket,
+                                    metadata,
+                                } => {
+                                    let socket_id = process.allocate_unix_socket_id();
+                                    socket.listener_id = None;
+                                    process.unix_sockets.insert(socket_id.clone(), socket);
+                                    rights.push(transferred_hostnet_value(
+                                        "unix",
+                                        metadata,
+                                        Some(("socketId", socket_id)),
+                                        None,
+                                        None,
+                                    ));
+                                }
+                                TransferredHostNetSocket::UnixListener { listener, metadata } => {
+                                    let listener_id = process.allocate_unix_listener_id();
+                                    process.unix_listeners.insert(listener_id.clone(), listener);
+                                    rights.push(transferred_hostnet_value(
+                                        "unix-listener",
+                                        metadata,
+                                        Some(("serverId", listener_id)),
+                                        None,
+                                        None,
+                                    ));
+                                }
+                                TransferredHostNetSocket::Pending { metadata, .. } => {
+                                    rights.push(transferred_hostnet_value(
+                                        "pending", metadata, None, None, None,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                json!({
+                    "data": javascript_sync_rpc_bytes_value(&message.payload),
+                    "rights": rights,
+                    "payloadTruncated": message.payload_truncated,
+                    "controlTruncated": message.control_truncated,
+                    "fullLength": message.full_length,
+                })
+            } else {
+                json!({
+                    "data": javascript_sync_rpc_bytes_value(&[]),
+                    "rights": [],
+                    "payloadTruncated": false,
+                    "controlTruncated": false,
+                    "fullLength": 0,
+                })
+            })
+        }
+        "process.fd_socket_shutdown" => {
+            let socket_fd = javascript_sync_rpc_arg_u32(&request.args, 0, "shutdown socket fd")?;
+            let how = match javascript_sync_rpc_arg_u32(&request.args, 1, "shutdown mode")? {
+                0 => KernelSocketShutdown::Read,
+                1 => KernelSocketShutdown::Write,
+                2 => KernelSocketShutdown::Both,
+                other => {
+                    return Err(SidecarError::InvalidState(format!(
+                        "invalid shutdown mode {other}"
+                    )))
+                }
+            };
+            kernel
+                .fd_socket_shutdown(EXECUTION_DRIVER_NAME, process.kernel_pid, socket_fd, how)
+                .map(|()| Value::Null)
+                .map_err(kernel_error)
         }
         "process.umask" => {
             let new_mask = javascript_sync_rpc_arg_u32_optional(&request.args, 0, "process umask")?;
             kernel
                 .umask(EXECUTION_DRIVER_NAME, process.kernel_pid, new_mask)
                 .map(|mask| json!(mask))
+                .map_err(kernel_error)
+        }
+        "process.getpgid" => {
+            let requested_pid =
+                javascript_sync_rpc_arg_u32(&request.args, 0, "process getpgid pid")?;
+            let target_pid = if requested_pid == 0 {
+                process.kernel_pid
+            } else {
+                requested_pid
+            };
+            kernel
+                .getpgid(EXECUTION_DRIVER_NAME, target_pid)
+                .map(|pgid| json!(pgid))
+                .map_err(kernel_error)
+        }
+        "process.setpgid" => {
+            let requested_pid =
+                javascript_sync_rpc_arg_u32(&request.args, 0, "process setpgid pid")?;
+            let pgid =
+                javascript_sync_rpc_arg_u32(&request.args, 1, "process setpgid process group")?;
+            let target_pid = if requested_pid == 0 {
+                process.kernel_pid
+            } else {
+                requested_pid
+            };
+            kernel
+                .setpgid(EXECUTION_DRIVER_NAME, target_pid, pgid)
+                .map(|()| Value::Null)
                 .map_err(kernel_error)
         }
         "fs.chmodSync" | "fs.promises.chmod" => {
@@ -19604,6 +29004,7 @@ fn service_javascript_kernel_stdin_sync_rpc(
     process: &mut ActiveProcess,
     request: &JavascriptSyncRpcRequest,
 ) -> Result<Value, SidecarError> {
+    flush_pending_kernel_stdin(kernel, process)?;
     let (max_bytes, timeout_ms) = parse_kernel_stdin_read_args(request)?;
     kernel_stdin_read_response(
         kernel,
@@ -19915,7 +29316,10 @@ pub(crate) fn kernel_poll_response(
     }))
 }
 
-fn install_kernel_stdin_pipe(kernel: &mut SidecarKernel, pid: u32) -> Result<u32, SidecarError> {
+pub(crate) fn install_kernel_stdin_pipe(
+    kernel: &mut SidecarKernel,
+    pid: u32,
+) -> Result<u32, SidecarError> {
     let (read_fd, write_fd) = kernel
         .open_pipe(EXECUTION_DRIVER_NAME, pid)
         .map_err(kernel_error)?;
@@ -19979,17 +29383,11 @@ fn javascript_child_process_stdin_mode(request: &JavascriptChildProcessSpawnRequ
         .unwrap_or("pipe")
 }
 
-/// Host-side cap on stdin bytes queued for a child's kernel pipe. Matches the
-/// kernel's default per-write bound (`resource.max_fd_write_bytes`); a parent
-/// cannot park more than this behind a slow child before getting a typed
-/// error.
-const MAX_PENDING_KERNEL_STDIN_BYTES: usize =
-    agentos_kernel::resource_accounting::DEFAULT_MAX_FD_WRITE_BYTES;
-
 pub(crate) fn write_kernel_process_stdin(
     kernel: &mut SidecarKernel,
     process: &mut ActiveProcess,
     chunk: &[u8],
+    pending_stdin_limit: usize,
 ) -> Result<(), SidecarError> {
     // Non-TTY JavaScript uses the in-process local stdin bridge, not a kernel
     // fd; a TTY JavaScript process (tty_master_fd set) DOES route through the
@@ -20023,16 +29421,30 @@ pub(crate) fn write_kernel_process_stdin(
     // multi-buffer stdin payloads (e.g. git's spooled pack piped into
     // `index-pack --stdin`) used to truncate at 64 KiB.
     let pending_total = process.pending_kernel_stdin.total;
-    if pending_total.saturating_add(chunk.len()) > MAX_PENDING_KERNEL_STDIN_BYTES {
+    if pending_total.saturating_add(chunk.len()) > pending_stdin_limit {
         return Err(SidecarError::InvalidState(format!(
             "child process stdin backlog limit exceeded: {pending_total} pending + {} new bytes \
-             > {MAX_PENDING_KERNEL_STDIN_BYTES} (MAX_PENDING_KERNEL_STDIN_BYTES); the child is \
-             not draining stdin — write smaller chunks after the child consumes them, or raise \
-             this bound together with the kernel resource.max_fd_write_bytes limit",
+             > {pending_stdin_limit} (limits.process.pendingStdinBytes); the child is not \
+             draining stdin — write smaller chunks after the child consumes them or raise \
+             limits.process.pendingStdinBytes",
             chunk.len(),
         )));
     }
+    if !process
+        .vm_pending_stdin_bytes_budget
+        .try_reserve(chunk.len())
+    {
+        return Err(SidecarError::InvalidState(format!(
+            "VM child process stdin backlogs exceeded {} retained bytes \
+             (limits.process.pendingStdinBytes); wait for a child to drain stdin or raise \
+             limits.process.pendingStdinBytes",
+            process.vm_pending_stdin_bytes_budget.limit()
+        )));
+    }
     process.pending_kernel_stdin.push(chunk);
+    process
+        .pending_kernel_stdin_gauge
+        .observe_depth(process.pending_kernel_stdin.total);
     flush_pending_kernel_stdin(kernel, process)
 }
 
@@ -20049,7 +29461,8 @@ pub(crate) fn flush_pending_kernel_stdin(
         return Ok(());
     }
     let Some(writer_fd) = process.kernel_stdin_writer_fd else {
-        process.pending_kernel_stdin.clear();
+        clear_pending_kernel_stdin(process);
+        process.pending_kernel_stdin_gauge.observe_depth(0);
         process.pending_kernel_stdin.close_requested = false;
         return Ok(());
     };
@@ -20062,14 +29475,22 @@ pub(crate) fn flush_pending_kernel_stdin(
                     .pending_kernel_stdin
                     .total
                     .saturating_sub(slice.len());
+                process.vm_pending_stdin_bytes_budget.release(slice.len());
                 process.pending_kernel_stdin.front_offset = 0;
+                process
+                    .pending_kernel_stdin_gauge
+                    .observe_depth(process.pending_kernel_stdin.total);
             }
             Ok(written) => {
                 // Pipe is full mid-chunk; keep the remainder queued.
                 process.pending_kernel_stdin.total =
                     process.pending_kernel_stdin.total.saturating_sub(written);
+                process.vm_pending_stdin_bytes_budget.release(written);
                 process.pending_kernel_stdin.front_offset = offset + written;
                 process.pending_kernel_stdin.chunks.push_front(front);
+                process
+                    .pending_kernel_stdin_gauge
+                    .observe_depth(process.pending_kernel_stdin.total);
                 break;
             }
             Err(error) if error.code() == "EAGAIN" => {
@@ -20081,7 +29502,8 @@ pub(crate) fn flush_pending_kernel_stdin(
                 // the writer, but preserve Linux write(2) behavior by returning
                 // EPIPE to the caller instead of reporting that discarded
                 // backlog bytes were accepted.
-                process.pending_kernel_stdin.clear();
+                clear_pending_kernel_stdin(process);
+                process.pending_kernel_stdin_gauge.observe_depth(0);
                 process.pending_kernel_stdin.close_requested = false;
                 process.kernel_stdin_writer_fd = None;
                 if let Err(close_error) =
@@ -20110,7 +29532,16 @@ pub(crate) fn flush_pending_kernel_stdin(
                 .map_err(kernel_error)?;
         }
     }
+    process
+        .pending_kernel_stdin_gauge
+        .observe_depth(process.pending_kernel_stdin.total);
     Ok(())
+}
+
+fn clear_pending_kernel_stdin(process: &mut ActiveProcess) {
+    let pending_bytes = process.pending_kernel_stdin.total;
+    process.pending_kernel_stdin.clear();
+    process.vm_pending_stdin_bytes_budget.release(pending_bytes);
 }
 
 /// For a TTY JavaScript guest, cooked input becomes readable on the PTY slave
@@ -20382,7 +29813,11 @@ where
 
     match event {
         ActiveExecutionEvent::JavascriptSyncRpcRequest(request) => {
-            let network_counts = process.network_resource_counts();
+            let network_counts = process_network_resource_counts_with_transfers(
+                kernel,
+                process,
+                &socket_paths.host_net_transfer_descriptions,
+            );
             let response = service_javascript_sync_rpc(JavascriptSyncRpcServiceRequest {
                 bridge,
                 vm_id,
@@ -20739,6 +30174,7 @@ fn issue_outbound_http_request(
     options: &JavascriptHttpRequestOptions,
     headers: &HttpHeaderCollection,
     pinned_addresses: &[IpAddr],
+    default_ca_bundle: &[u8],
 ) -> Result<Value, SidecarError> {
     let method = options.method.as_deref().unwrap_or("GET");
     // Pin the underlying resolver to the egress-vetted addresses. ureq performs
@@ -20788,7 +30224,10 @@ fn issue_outbound_http_request(
             reject_unauthorized: options.reject_unauthorized,
             ..JavascriptTlsBridgeOptions::default()
         };
-        agent_builder = agent_builder.tls_config(Arc::new(build_client_tls_config(&tls_options)?));
+        agent_builder = agent_builder.tls_config(Arc::new(build_client_tls_config(
+            &tls_options,
+            default_ca_bundle,
+        )?));
     }
     let agent = agent_builder.build();
     let mut request = agent.request_url(method, url);
@@ -20859,7 +30298,11 @@ where
 
         match event {
             ActiveExecutionEvent::JavascriptSyncRpcRequest(request) => {
-                let network_counts = process.network_resource_counts();
+                let network_counts = process_network_resource_counts_with_transfers(
+                    kernel,
+                    process,
+                    &socket_paths.host_net_transfer_descriptions,
+                );
                 let response = service_javascript_sync_rpc(JavascriptSyncRpcServiceRequest {
                     bridge,
                     vm_id,
@@ -21026,7 +30469,7 @@ where
                     .collect(),
             ))
         }
-        "dns.resolve" | "dns.resolve4" | "dns.resolve6" => {
+        "dns.resolve" | "dns.resolve4" | "dns.resolve6" | "dns.resolveRawRr" => {
             let payload = request
                 .args
                 .first()
@@ -21051,16 +30494,91 @@ where
                     .to_ascii_uppercase(),
             };
             let record_type = parse_dns_record_type(&requested_type)?;
-            let resolution = resolve_dns_records(
-                bridge,
-                kernel,
-                vm_id,
-                dns,
-                &payload.hostname,
-                record_type,
-                DnsLookupPolicy::CheckPermissions,
-            )?;
-            dns_resolution_to_node_value(&resolution, &requested_type)
+            if request.method == "dns.resolveRawRr" {
+                if !matches!(requested_type.as_str(), "PTR" | "SSHFP") {
+                    return Err(SidecarError::InvalidState(format!(
+                        "EINVAL: raw DNS RR bridge does not support {requested_type}"
+                    )));
+                }
+                let resolution = match kernel.resolve_dns_records(
+                    &payload.hostname,
+                    record_type,
+                    DnsLookupPolicy::CheckPermissions,
+                ) {
+                    Ok(resolution) => {
+                        emit_dns_record_resolution_event(
+                            bridge,
+                            vm_id,
+                            &payload.hostname,
+                            &resolution,
+                            dns,
+                        );
+                        resolution
+                    }
+                    Err(error) if matches!(error.code(), "ENOENT" | "ENODATA") => {
+                        let status = if error.code() == "ENOENT" {
+                            "nxdomain"
+                        } else {
+                            "nodata"
+                        };
+                        return Ok(json!({
+                            "status": status,
+                            "records": [],
+                        }));
+                    }
+                    Err(error) => {
+                        let sidecar_error = kernel_error(error.clone());
+                        if error.code() != "EACCES" {
+                            emit_dns_resolution_failure_event(
+                                bridge,
+                                vm_id,
+                                &payload.hostname,
+                                dns,
+                                &sidecar_error,
+                            );
+                        }
+                        return Err(sidecar_error);
+                    }
+                };
+                let records: Vec<Value> = resolution
+                    .records()
+                    .iter()
+                    .filter_map(|record| {
+                        let data = match record.data() {
+                            RData::PTR(name) if requested_type == "PTR" => {
+                                normalize_dns_name_for_node(&name.0).into_bytes()
+                            }
+                            RData::SSHFP(sshfp) if requested_type == "SSHFP" => {
+                                let mut data = Vec::with_capacity(sshfp.fingerprint.len() + 2);
+                                data.push(sshfp.algorithm.into());
+                                data.push(sshfp.fingerprint_type.into());
+                                data.extend_from_slice(&sshfp.fingerprint);
+                                data
+                            }
+                            _ => return None,
+                        };
+                        Some(json!({
+                            "data": base64::engine::general_purpose::STANDARD.encode(data),
+                            "ttl": record.ttl(),
+                        }))
+                    })
+                    .collect();
+                Ok(json!({
+                    "status": "ok",
+                    "records": records,
+                }))
+            } else {
+                let resolution = resolve_dns_records(
+                    bridge,
+                    kernel,
+                    vm_id,
+                    dns,
+                    &payload.hostname,
+                    record_type,
+                    DnsLookupPolicy::CheckPermissions,
+                )?;
+                dns_resolution_to_node_value(&resolution, &requested_type)
+            }
         }
         other => Err(SidecarError::InvalidState(format!(
             "unsupported JavaScript dns sync RPC method {other}"
@@ -21238,7 +30756,7 @@ where
                 SidecarError::InvalidState(format!("unknown UDP socket {socket_id}"))
             })?;
             unregister_kernel_readiness_target(&kernel_readiness, socket.kernel_socket_id);
-            socket.close(kernel, process.kernel_pid);
+            socket.close(kernel, process.kernel_pid)?;
             Ok(Value::Null)
         }
         "dgram.address" => {
@@ -21753,6 +31271,7 @@ fn spawn_http2_client_session(
     session_id: u64,
     remote_addr: SocketAddr,
     tls: Option<JavascriptTlsBridgeOptions>,
+    default_ca_bundle: Vec<u8>,
     snapshot: Arc<Mutex<Http2SessionSnapshot>>,
     mut command_rx: UnboundedReceiver<Http2SessionCommand>,
 ) {
@@ -21865,7 +31384,7 @@ fn spawn_http2_client_session(
                         return;
                     }
                 };
-                let connector = match build_client_tls_config(options) {
+                let connector = match build_client_tls_config(options, &default_ca_bundle) {
                     Ok(config) => TlsConnector::from(Arc::new(config)),
                     Err(error) => {
                         push_http2_session_event(
@@ -22997,10 +32516,22 @@ fn spawn_http2_server_accept_loop(
                     );
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    wait_fd_readable_until(
+                    if let Err(wait_error) = wait_fd_readable_until(
                         listener.as_fd(),
                         Instant::now() + Duration::from_millis(100),
-                    );
+                    ) {
+                        push_http2_server_event(
+                            &shared,
+                            server_id,
+                            Http2BridgeEvent {
+                                kind: String::from("serverStreamError"),
+                                id: server_id,
+                                data: Some(http2_error_payload(wait_error.to_string())),
+                                ..Http2BridgeEvent::default()
+                            },
+                        );
+                        thread::sleep(HTTP2_POLL_DELAY);
+                    }
                 }
                 Err(error) => {
                     push_http2_server_event(
@@ -23361,20 +32892,26 @@ where
                 state.session_events.entry(session_id).or_default();
                 session_id
             };
+            let tls = if secure {
+                Some(payload.tls.unwrap_or(JavascriptTlsBridgeOptions {
+                    is_server: false,
+                    servername: Some(host.to_string()),
+                    alpn_protocols: Some(vec![String::from("h2")]),
+                    ..JavascriptTlsBridgeOptions::default()
+                }))
+            } else {
+                None
+            };
+            let default_ca_bundle = match tls.as_ref() {
+                Some(options) => vm_default_ca_bundle_for_tls_options(kernel, options)?,
+                None => Vec::new(),
+            };
             spawn_http2_client_session(
                 Arc::clone(&process.http2.shared),
                 session_id,
                 resolved.actual_addr,
-                if secure {
-                    Some(payload.tls.unwrap_or(JavascriptTlsBridgeOptions {
-                        is_server: false,
-                        servername: Some(host.to_string()),
-                        alpn_protocols: Some(vec![String::from("h2")]),
-                        ..JavascriptTlsBridgeOptions::default()
-                    }))
-                } else {
-                    None
-                },
+                tls,
+                default_ca_bundle,
                 Arc::clone(&snapshot),
                 command_rx,
             );
@@ -23673,6 +33210,23 @@ fn resolve_http2_file_response_guest_path(process: &ActiveProcess, path: &str) -
     }
 }
 
+fn resolve_guest_unix_path(
+    process: &ActiveProcess,
+    path: &str,
+) -> Result<(String, String), SidecarError> {
+    if path.as_bytes().len() > 108 {
+        return Err(sidecar_net_error(std::io::Error::from_raw_os_error(
+            libc::ENAMETOOLONG,
+        )));
+    }
+    let resolved = if Path::new(path).is_absolute() {
+        normalize_path(path)
+    } else {
+        normalize_path(&format!("{}/{}", process.guest_cwd, path))
+    };
+    Ok((resolved, path.to_owned()))
+}
+
 pub(crate) fn clamp_javascript_net_poll_wait(wait_ms: u64) -> Duration {
     // WASM net.poll runs on the sidecar's sync-RPC main thread. Guest-controlled waits
     // must stay bounded so one VM cannot stall dispose/shutdown or unrelated VM work.
@@ -23681,6 +33235,21 @@ pub(crate) fn clamp_javascript_net_poll_wait(wait_ms: u64) -> Duration {
     } else {
         Duration::from_millis(wait_ms).min(JAVASCRIPT_NET_POLL_MAX_WAIT)
     }
+}
+
+fn javascript_unix_socket_buffer_limit(resource_limits: &ResourceLimits) -> usize {
+    resource_limits
+        .max_socket_buffered_bytes
+        .unwrap_or(DEFAULT_MAX_SOCKET_BUFFERED_BYTES)
+        .max(1)
+}
+
+fn javascript_unix_socket_write_timeout(resource_limits: &ResourceLimits) -> Duration {
+    Duration::from_millis(
+        resource_limits
+            .max_blocking_read_ms
+            .unwrap_or(DEFAULT_BLOCKING_READ_TIMEOUT_MS),
+    )
 }
 
 fn service_javascript_net_sync_rpc_response<B>(
@@ -23702,6 +33271,23 @@ where
     } = request;
     let trace_enabled = net_tcp_trace_enabled(&process.env);
     let socket_id = javascript_sync_rpc_arg_str(&request.args, 0, "net.socket_read socket id")?;
+    let max_bytes = usize::try_from(
+        javascript_sync_rpc_arg_u64_optional(&request.args, 1, "net.socket_read maximum bytes")?
+            .unwrap_or(64 * 1024),
+    )
+    .map_err(|_| SidecarError::InvalidState("net.socket_read byte limit is too large".into()))?;
+    let peek = request
+        .args
+        .get(2)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let wait_ms = javascript_sync_rpc_arg_u64_optional(
+        &request.args,
+        3,
+        "net.socket_read wait milliseconds",
+    )?
+    .unwrap_or_default();
+    let wait = clamp_javascript_net_poll_wait(wait_ms);
     if trace_enabled {
         NET_TCP_TRACE_COUNTERS
             .socket_read_calls
@@ -23712,13 +33298,20 @@ where
     }
 
     let event = if let Some(socket) = process.tcp_sockets.get_mut(socket_id) {
-        socket.poll(kernel, process.kernel_pid, Duration::ZERO, trace_enabled)?
+        socket.poll_readable(
+            kernel,
+            process.kernel_pid,
+            wait,
+            max_bytes,
+            peek,
+            trace_enabled,
+        )?
     } else {
         let socket = process
             .unix_sockets
             .get_mut(socket_id)
             .ok_or_else(|| SidecarError::InvalidState(format!("unknown net socket {socket_id}")))?;
-        socket.poll(Duration::ZERO)?
+        socket.poll_readable(wait, max_bytes, peek)?
     };
 
     match event {
@@ -23850,6 +33443,425 @@ where
             *pending = Some(response_json.to_owned());
             Ok(Value::Null)
         }
+        "net.bind_unix" => {
+            check_network_resource_limit(
+                resource_limits.max_sockets,
+                network_counts.sockets,
+                1,
+                "socket",
+            )?;
+            let payload = request
+                .args
+                .first()
+                .cloned()
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(String::from(
+                        "net.bind_unix requires a request payload",
+                    ))
+                })
+                .and_then(|value| {
+                    serde_json::from_value::<JavascriptNetListenRequest>(value).map_err(|error| {
+                        SidecarError::InvalidState(format!(
+                            "invalid net.bind_unix payload: {error}"
+                        ))
+                    })
+                })?;
+            let address_kinds = usize::from(payload.path.is_some())
+                + usize::from(payload.abstract_path_hex.is_some())
+                + usize::from(payload.autobind);
+            if address_kinds != 1 || payload.bound_server_id.is_some() {
+                return Err(SidecarError::InvalidState(String::from(
+                    "net.bind_unix requires exactly one Unix address",
+                )));
+            }
+            bridge.require_network_access(
+                vm_id,
+                NetworkOperation::Listen,
+                format_unix_socket_resource(
+                    payload.path.as_deref(),
+                    payload.abstract_path_hex.as_deref(),
+                    payload.autobind,
+                ),
+            )?;
+
+            let listener_id = process.allocate_unix_listener_id();
+            let registry_binding_id = guest_unix_binding_id(process.kernel_pid, &listener_id);
+            let mut listener = if payload.autobind {
+                let mut bound = None;
+                for nonce in 0..4096 {
+                    let guest_name =
+                        guest_autobind_unix_name(process.kernel_pid, &listener_id, nonce);
+                    let host_name = host_abstract_unix_name(socket_paths, &guest_name);
+                    let host_address_key = abstract_unix_host_address_key(&host_name);
+                    let local_path = abstract_unix_node_path(&guest_name);
+                    let abstract_path_hex = abstract_unix_name_hex(&guest_name);
+                    register_guest_unix_binding(
+                        &socket_paths.unix_bound_addresses,
+                        &registry_binding_id,
+                        &host_address_key,
+                        GuestUnixAddress {
+                            path: local_path,
+                            abstract_path_hex: Some(abstract_path_hex),
+                        },
+                        None,
+                        None,
+                    )?;
+                    match ActiveUnixListener::bind_abstract_unlistened(&host_name, &guest_name) {
+                        Ok(listener) => {
+                            bound = Some(listener);
+                            break;
+                        }
+                        Err(error) => {
+                            rollback_guest_unix_binding(
+                                &socket_paths.unix_bound_addresses,
+                                &registry_binding_id,
+                            )?;
+                            if guest_errno_code(&error.to_string()) != Some("EADDRINUSE") {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                bound.ok_or_else(|| {
+                    SidecarError::Execution(String::from(
+                        "EADDRINUSE: Linux AF_UNIX autobind namespace exhausted after 4096 attempts",
+                    ))
+                })?
+            } else if let Some(hex) = payload.abstract_path_hex.as_deref() {
+                let guest_name = decode_abstract_unix_name(hex)?;
+                let host_name = host_abstract_unix_name(socket_paths, &guest_name);
+                let host_address_key = abstract_unix_host_address_key(&host_name);
+                register_guest_unix_binding(
+                    &socket_paths.unix_bound_addresses,
+                    &registry_binding_id,
+                    &host_address_key,
+                    GuestUnixAddress {
+                        path: abstract_unix_node_path(&guest_name),
+                        abstract_path_hex: Some(abstract_unix_name_hex(&guest_name)),
+                    },
+                    None,
+                    None,
+                )?;
+                match ActiveUnixListener::bind_abstract_unlistened(&host_name, &guest_name) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        rollback_guest_unix_binding(
+                            &socket_paths.unix_bound_addresses,
+                            &registry_binding_id,
+                        )?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                let (candidate_path, reported_path) = resolve_guest_unix_path(
+                    process,
+                    payload.path.as_deref().expect("validated path"),
+                )?;
+                reject_host_mounted_unix_socket_path(socket_paths, &candidate_path)?;
+                let canonical_candidate = kernel
+                    .resolve_unix_socket_bind_target_for_process(
+                        EXECUTION_DRIVER_NAME,
+                        process.kernel_pid,
+                        &process.guest_cwd,
+                        payload.path.as_deref().expect("validated path"),
+                    )
+                    .map_err(kernel_error)?;
+                reject_host_mounted_unix_socket_path(socket_paths, &canonical_candidate)?;
+                let node = kernel
+                    .bind_unix_socket_path_for_process(
+                        EXECUTION_DRIVER_NAME,
+                        process.kernel_pid,
+                        &process.guest_cwd,
+                        payload.path.as_deref().expect("validated path"),
+                    )
+                    .map_err(kernel_error)?;
+                let guest_path = node.canonical_path;
+                let host_path = allocate_guest_socket_host_path(
+                    socket_paths,
+                    process.kernel_pid,
+                    &listener_id,
+                    &guest_path,
+                );
+                let host_address_key = pathname_unix_host_address_key(&host_path);
+                if let Err(error) = register_guest_unix_binding(
+                    &socket_paths.unix_bound_addresses,
+                    &registry_binding_id,
+                    &host_address_key,
+                    GuestUnixAddress {
+                        path: reported_path.clone(),
+                        abstract_path_hex: None,
+                    },
+                    Some((node.stat.dev, node.stat.ino)),
+                    Some(host_path.clone()),
+                ) {
+                    if let Err(rollback_error) = kernel.remove_file(&guest_path) {
+                        return Err(SidecarError::Execution(format!(
+                            "{error}; failed to roll back Unix socket node {guest_path}: {}",
+                            kernel_error(rollback_error)
+                        )));
+                    }
+                    return Err(error);
+                }
+                let mut listener =
+                    match ActiveUnixListener::bind_unlistened(&host_path, &reported_path) {
+                        Ok(listener) => listener,
+                        Err(error) => {
+                            if let Err(rollback_error) = rollback_guest_unix_path_binding(
+                                &socket_paths.unix_bound_addresses,
+                                &registry_binding_id,
+                                kernel,
+                                &guest_path,
+                                &host_path,
+                            ) {
+                                return Err(SidecarError::Execution(format!(
+                                    "{error}; rollback failed: {rollback_error}"
+                                )));
+                            }
+                            return Err(error);
+                        }
+                    };
+                listener.private_host_path = Some(host_path.clone());
+                listener.guest_node_path = Some(guest_path);
+                listener
+            };
+            listener.registry_binding_id = registry_binding_id;
+            let local_path = listener.path.clone();
+            let abstract_path_hex = listener.abstract_path_hex.clone();
+            process.unix_listeners.insert(listener_id.clone(), listener);
+            Ok(json!({
+                "serverId": listener_id,
+                "localPath": local_path,
+                "localAbstractPathHex": abstract_path_hex,
+            }))
+        }
+        "net.bind_connected_unix" => {
+            let payload = request
+                .args
+                .first()
+                .cloned()
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(String::from(
+                        "net.bind_connected_unix requires a request payload",
+                    ))
+                })
+                .and_then(|value| {
+                    serde_json::from_value::<JavascriptNetBindConnectedUnixRequest>(value).map_err(
+                        |error| {
+                            SidecarError::InvalidState(format!(
+                                "invalid net.bind_connected_unix payload: {error}"
+                            ))
+                        },
+                    )
+                })?;
+            if usize::from(payload.path.is_some())
+                + usize::from(payload.abstract_path_hex.is_some())
+                + usize::from(payload.autobind)
+                != 1
+            {
+                return Err(SidecarError::InvalidState(String::from(
+                    "net.bind_connected_unix requires exactly one Unix address",
+                )));
+            }
+            bridge.require_network_access(
+                vm_id,
+                NetworkOperation::Listen,
+                format_unix_socket_resource(
+                    payload.path.as_deref(),
+                    payload.abstract_path_hex.as_deref(),
+                    payload.autobind,
+                ),
+            )?;
+            let binding_id = guest_unix_binding_id(
+                process.kernel_pid,
+                &format!("connected:{}", payload.socket_id),
+            );
+            let socket = process
+                .unix_sockets
+                .get(&payload.socket_id)
+                .ok_or_else(|| {
+                    SidecarError::InvalidState(format!("unknown Unix socket {}", payload.socket_id))
+                })?;
+            if socket.local_registry_binding_id.is_some() {
+                return Err(sidecar_net_error(std::io::Error::from_raw_os_error(
+                    libc::EINVAL,
+                )));
+            }
+            let remote_registry_binding_id = socket.remote_registry_binding_id.clone();
+            let peer_can_observe_late_bind =
+                guest_unix_connection_peer_open(socket.connection_state.as_ref());
+
+            if payload.autobind || payload.abstract_path_hex.is_some() {
+                let explicit_name = payload
+                    .abstract_path_hex
+                    .as_deref()
+                    .map(decode_abstract_unix_name)
+                    .transpose()?;
+                let mut bound_name = None;
+                let attempts = if explicit_name.is_some() { 1 } else { 4096 };
+                for nonce in 0..attempts {
+                    let guest_name = explicit_name.clone().unwrap_or_else(|| {
+                        guest_autobind_unix_name(process.kernel_pid, &binding_id, nonce).to_vec()
+                    });
+                    let host_name = host_abstract_unix_name(socket_paths, &guest_name);
+                    let host_address_key = abstract_unix_host_address_key(&host_name);
+                    let local_path = abstract_unix_node_path(&guest_name);
+                    let hex = abstract_unix_name_hex(&guest_name);
+                    register_guest_unix_binding(
+                        &socket_paths.unix_bound_addresses,
+                        &binding_id,
+                        &host_address_key,
+                        GuestUnixAddress {
+                            path: local_path,
+                            abstract_path_hex: Some(hex),
+                        },
+                        None,
+                        None,
+                    )?;
+                    if peer_can_observe_late_bind {
+                        let target_binding_id = remote_registry_binding_id
+                            .as_deref()
+                            .expect("tracked Unix connection has a target binding");
+                        if let Err(error) = queue_guest_unix_peer(
+                            &socket_paths.unix_bound_addresses,
+                            &binding_id,
+                            target_binding_id,
+                        ) {
+                            rollback_guest_unix_binding(
+                                &socket_paths.unix_bound_addresses,
+                                &binding_id,
+                            )?;
+                            return Err(error);
+                        }
+                    }
+                    let bind_result = process
+                        .unix_sockets
+                        .get_mut(&payload.socket_id)
+                        .expect("validated Unix socket remains registered")
+                        .bind_abstract(&host_name, &guest_name, &binding_id);
+                    match bind_result {
+                        Ok(()) => {
+                            bound_name = Some(guest_name);
+                            break;
+                        }
+                        Err(error) => {
+                            rollback_guest_unix_binding(
+                                &socket_paths.unix_bound_addresses,
+                                &binding_id,
+                            )?;
+                            if explicit_name.is_some()
+                                || guest_errno_code(&error.to_string()) != Some("EADDRINUSE")
+                            {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                let guest_name = bound_name.ok_or_else(|| {
+                    sidecar_net_error(std::io::Error::from_raw_os_error(libc::EADDRINUSE))
+                })?;
+                let local_path = abstract_unix_node_path(&guest_name);
+                let hex = abstract_unix_name_hex(&guest_name);
+                Ok(json!({
+                    "localPath": local_path,
+                    "localAbstractPathHex": hex,
+                }))
+            } else {
+                let (candidate_path, reported_path) = resolve_guest_unix_path(
+                    process,
+                    payload.path.as_deref().expect("validated path"),
+                )?;
+                reject_host_mounted_unix_socket_path(socket_paths, &candidate_path)?;
+                let canonical_candidate = kernel
+                    .resolve_unix_socket_bind_target_for_process(
+                        EXECUTION_DRIVER_NAME,
+                        process.kernel_pid,
+                        &process.guest_cwd,
+                        payload.path.as_deref().expect("validated path"),
+                    )
+                    .map_err(kernel_error)?;
+                reject_host_mounted_unix_socket_path(socket_paths, &canonical_candidate)?;
+                let node = kernel
+                    .bind_unix_socket_path_for_process(
+                        EXECUTION_DRIVER_NAME,
+                        process.kernel_pid,
+                        &process.guest_cwd,
+                        payload.path.as_deref().expect("validated path"),
+                    )
+                    .map_err(kernel_error)?;
+                let guest_path = node.canonical_path;
+                let host_path = allocate_guest_socket_host_path(
+                    socket_paths,
+                    process.kernel_pid,
+                    &binding_id,
+                    &guest_path,
+                );
+                let host_address_key = pathname_unix_host_address_key(&host_path);
+                if let Err(error) = register_guest_unix_binding(
+                    &socket_paths.unix_bound_addresses,
+                    &binding_id,
+                    &host_address_key,
+                    GuestUnixAddress {
+                        path: reported_path.clone(),
+                        abstract_path_hex: None,
+                    },
+                    Some((node.stat.dev, node.stat.ino)),
+                    Some(host_path.clone()),
+                ) {
+                    if let Err(rollback_error) = kernel.remove_file(&guest_path) {
+                        return Err(SidecarError::Execution(format!(
+                            "{error}; failed to roll back Unix socket node {guest_path}: {}",
+                            kernel_error(rollback_error)
+                        )));
+                    }
+                    return Err(error);
+                }
+                if peer_can_observe_late_bind {
+                    let target_binding_id = remote_registry_binding_id
+                        .as_deref()
+                        .expect("tracked Unix connection has a target binding");
+                    if let Err(error) = queue_guest_unix_peer(
+                        &socket_paths.unix_bound_addresses,
+                        &binding_id,
+                        target_binding_id,
+                    ) {
+                        if let Err(rollback_error) = rollback_guest_unix_path_binding(
+                            &socket_paths.unix_bound_addresses,
+                            &binding_id,
+                            kernel,
+                            &guest_path,
+                            &host_path,
+                        ) {
+                            return Err(SidecarError::Execution(format!(
+                                "{error}; rollback failed: {rollback_error}"
+                            )));
+                        }
+                        return Err(error);
+                    }
+                }
+                let bind_result = process
+                    .unix_sockets
+                    .get_mut(&payload.socket_id)
+                    .expect("validated Unix socket remains registered")
+                    .bind_path(&host_path, &reported_path, &binding_id);
+                if let Err(error) = bind_result {
+                    if let Err(rollback_error) = rollback_guest_unix_path_binding(
+                        &socket_paths.unix_bound_addresses,
+                        &binding_id,
+                        kernel,
+                        &guest_path,
+                        &host_path,
+                    ) {
+                        return Err(SidecarError::Execution(format!(
+                            "{error}; rollback failed: {rollback_error}"
+                        )));
+                    }
+                    return Err(error);
+                }
+                Ok(json!({
+                    "localPath": reported_path,
+                }))
+            }
+        }
         "net.reserve_tcp_port" => {
             let payload = request
                 .args
@@ -23900,12 +33912,6 @@ where
         }
         "net.connect" => {
             check_network_resource_limit(
-                resource_limits.max_sockets,
-                network_counts.sockets,
-                1,
-                "socket",
-            )?;
-            check_network_resource_limit(
                 resource_limits.max_connections,
                 network_counts.connections,
                 1,
@@ -23925,10 +33931,70 @@ where
                         SidecarError::InvalidState(format!("invalid net.connect payload: {error}"))
                     })
                 })?;
-            if let Some(path) = payload.path.as_deref() {
-                let guest_path = normalize_path(path);
-                let host_path = resolve_guest_socket_host_path(socket_paths, &guest_path);
-                let socket = ActiveUnixSocket::connect(&host_path, &guest_path)?;
+            check_network_resource_limit(
+                resource_limits.max_sockets,
+                network_counts.sockets,
+                usize::from(payload.bound_server_id.is_none()),
+                "socket",
+            )?;
+            if payload.path.is_some() && payload.abstract_path_hex.is_some() {
+                return Err(SidecarError::InvalidState(String::from(
+                    "net.connect accepts either path or abstractPathHex, not both",
+                )));
+            }
+            if payload.path.is_some() || payload.abstract_path_hex.is_some() {
+                bridge.require_network_access(
+                    vm_id,
+                    NetworkOperation::Http,
+                    format_unix_socket_resource(
+                        payload.path.as_deref(),
+                        payload.abstract_path_hex.as_deref(),
+                        false,
+                    ),
+                )?;
+            }
+            if let Some(hex) = payload.abstract_path_hex.as_deref() {
+                let guest_name = decode_abstract_unix_name(hex)?;
+                let host_name = host_abstract_unix_name(socket_paths, &guest_name);
+                let target_host_address_key = abstract_unix_host_address_key(&host_name);
+                let target_binding_id = guest_unix_binding_for_host_key(
+                    &socket_paths.unix_bound_addresses,
+                    &target_host_address_key,
+                )?
+                .map(|(binding_id, _)| binding_id)
+                .ok_or_else(|| {
+                    sidecar_net_error(std::io::Error::from_raw_os_error(libc::ECONNREFUSED))
+                })?;
+                let mut socket = if let Some(bound_id) = payload.bound_server_id.as_deref() {
+                    let bound = process.unix_listeners.get_mut(bound_id).ok_or_else(|| {
+                        SidecarError::InvalidState(format!("unknown bound Unix socket {bound_id}"))
+                    })?;
+                    let source_binding_id = bound.registry_binding_id.clone();
+                    let socket = bound.connect_bound_abstract(
+                        &host_name,
+                        &guest_name,
+                        &source_binding_id,
+                        javascript_unix_socket_buffer_limit(resource_limits),
+                    )?;
+                    queue_guest_unix_peer(
+                        &socket_paths.unix_bound_addresses,
+                        &source_binding_id,
+                        &target_binding_id,
+                    )?;
+                    process.unix_listeners.remove(bound_id);
+                    socket
+                } else {
+                    ActiveUnixSocket::connect_abstract(
+                        &host_name,
+                        &guest_name,
+                        javascript_unix_socket_buffer_limit(resource_limits),
+                    )?
+                };
+                socket.connection_state = Some(register_guest_unix_connection(
+                    &socket_paths.unix_bound_addresses,
+                    &target_binding_id,
+                )?);
+                socket.remote_registry_binding_id = Some(target_binding_id);
                 let socket_id = process.allocate_unix_socket_id();
                 socket.set_event_pusher(
                     process.execution.javascript_v8_session_handle(),
@@ -23937,9 +34003,72 @@ where
                 process.unix_sockets.insert(socket_id.clone(), socket);
                 Ok(json!({
                     "socketId": socket_id,
-                    "remotePath": guest_path,
+                    "remotePath": abstract_unix_node_path(&guest_name),
+                    "remoteAbstractPathHex": abstract_unix_name_hex(&guest_name),
+                }))
+            } else if let Some(path) = payload.path.as_deref() {
+                let (candidate_path, _requested_path) = resolve_guest_unix_path(process, path)?;
+                reject_host_mounted_unix_socket_path(socket_paths, &candidate_path)?;
+                let node = kernel
+                    .resolve_unix_socket_connect_target_for_process(
+                        EXECUTION_DRIVER_NAME,
+                        process.kernel_pid,
+                        &process.guest_cwd,
+                        path,
+                    )
+                    .map_err(kernel_error)?;
+                reject_host_mounted_unix_socket_path(socket_paths, &node.canonical_path)?;
+                let (host_path, target_binding_id, target_address) =
+                    guest_unix_path_target(socket_paths, (node.stat.dev, node.stat.ino))?
+                        .ok_or_else(|| {
+                            sidecar_net_error(std::io::Error::from_raw_os_error(libc::ECONNREFUSED))
+                        })?;
+                let mut socket = if let Some(bound_id) = payload.bound_server_id.as_deref() {
+                    let bound = process.unix_listeners.get_mut(bound_id).ok_or_else(|| {
+                        SidecarError::InvalidState(format!("unknown bound Unix socket {bound_id}"))
+                    })?;
+                    let source_binding_id = bound.registry_binding_id.clone();
+                    let socket = bound.connect_bound_path(
+                        &host_path,
+                        &target_address.path,
+                        &source_binding_id,
+                        javascript_unix_socket_buffer_limit(resource_limits),
+                    )?;
+                    queue_guest_unix_peer(
+                        &socket_paths.unix_bound_addresses,
+                        &source_binding_id,
+                        &target_binding_id,
+                    )?;
+                    process.unix_listeners.remove(bound_id);
+                    socket
+                } else {
+                    ActiveUnixSocket::connect(
+                        &host_path,
+                        &target_address.path,
+                        javascript_unix_socket_buffer_limit(resource_limits),
+                    )?
+                };
+                socket.connection_state = Some(register_guest_unix_connection(
+                    &socket_paths.unix_bound_addresses,
+                    &target_binding_id,
+                )?);
+                socket.remote_registry_binding_id = Some(target_binding_id);
+                let socket_id = process.allocate_unix_socket_id();
+                socket.set_event_pusher(
+                    process.execution.javascript_v8_session_handle(),
+                    socket_id.clone(),
+                );
+                process.unix_sockets.insert(socket_id.clone(), socket);
+                Ok(json!({
+                    "socketId": socket_id,
+                    "remotePath": target_address.path,
                 }))
             } else {
+                if payload.bound_server_id.is_some() {
+                    return Err(SidecarError::InvalidState(String::from(
+                        "net.connect boundServerId requires a Unix address",
+                    )));
+                }
                 let port = payload.port.ok_or_else(|| {
                     SidecarError::InvalidState(String::from(
                         "net.connect requires either a path or port",
@@ -24044,12 +34173,6 @@ where
             }
         }
         "net.listen" => {
-            check_network_resource_limit(
-                resource_limits.max_sockets,
-                network_counts.sockets,
-                1,
-                "socket",
-            )?;
             let payload = request
                 .args
                 .first()
@@ -24075,30 +34198,157 @@ where
                         },
                     ),
                 })?;
-            if let Some(path) = payload.path.as_deref() {
-                let guest_path = normalize_path(path);
-                if kernel.exists(&guest_path).map_err(kernel_error)? {
-                    return Err(sidecar_net_error(std::io::Error::from_raw_os_error(
-                        libc::EADDRINUSE,
+            check_network_resource_limit(
+                resource_limits.max_sockets,
+                network_counts.sockets,
+                usize::from(payload.bound_server_id.is_none()),
+                "socket",
+            )?;
+            if payload.path.is_some() && payload.abstract_path_hex.is_some() {
+                return Err(SidecarError::InvalidState(String::from(
+                    "net.listen accepts either path or abstractPathHex, not both",
+                )));
+            }
+            if let Some(listener_id) = payload.bound_server_id.as_deref() {
+                if payload.path.is_some() || payload.abstract_path_hex.is_some() || payload.autobind
+                {
+                    return Err(SidecarError::InvalidState(String::from(
+                        "net.listen boundServerId cannot be combined with an address",
                     )));
                 }
-
-                let host_path = resolve_guest_socket_host_path(socket_paths, &guest_path);
-                let on_host_mount =
-                    host_mount_path_for_guest_path_from_mounts(&socket_paths.mounts, &guest_path)
-                        .is_some();
-                let listener = ActiveUnixListener::bind(&host_path, &guest_path, payload.backlog)?;
-                if !on_host_mount {
-                    ensure_kernel_parent_directories(kernel, &guest_path)?;
-                    kernel
-                        .write_file(&guest_path, Vec::new())
-                        .map_err(kernel_error)?;
-                }
+                let listener = process.unix_listeners.get_mut(listener_id).ok_or_else(|| {
+                    SidecarError::InvalidState(format!("unknown bound Unix socket {listener_id}"))
+                })?;
+                listener.listen(payload.backlog)?;
+                Ok(json!({
+                    "serverId": listener_id,
+                    "localPath": listener.path,
+                    "localAbstractPathHex": listener.abstract_path_hex,
+                }))
+            } else if let Some(hex) = payload.abstract_path_hex.as_deref() {
+                bridge.require_network_access(
+                    vm_id,
+                    NetworkOperation::Listen,
+                    format_unix_socket_resource(None, Some(hex), false),
+                )?;
+                let guest_name = decode_abstract_unix_name(hex)?;
+                let host_name = host_abstract_unix_name(socket_paths, &guest_name);
                 let listener_id = process.allocate_unix_listener_id();
+                let registry_binding_id = guest_unix_binding_id(process.kernel_pid, &listener_id);
+                let host_address_key = abstract_unix_host_address_key(&host_name);
+                let local_path = abstract_unix_node_path(&guest_name);
+                let abstract_path_hex = abstract_unix_name_hex(&guest_name);
+                register_guest_unix_binding(
+                    &socket_paths.unix_bound_addresses,
+                    &registry_binding_id,
+                    &host_address_key,
+                    GuestUnixAddress {
+                        path: local_path.clone(),
+                        abstract_path_hex: Some(abstract_path_hex.clone()),
+                    },
+                    None,
+                    None,
+                )?;
+                let mut listener = match ActiveUnixListener::bind_abstract(
+                    &host_name,
+                    &guest_name,
+                    payload.backlog,
+                ) {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        rollback_guest_unix_binding(
+                            &socket_paths.unix_bound_addresses,
+                            &registry_binding_id,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                listener.registry_binding_id = registry_binding_id;
                 process.unix_listeners.insert(listener_id.clone(), listener);
                 Ok(json!({
                     "serverId": listener_id,
-                    "path": guest_path,
+                    "localPath": local_path,
+                    "localAbstractPathHex": Some(abstract_path_hex),
+                }))
+            } else if let Some(path) = payload.path.as_deref() {
+                bridge.require_network_access(
+                    vm_id,
+                    NetworkOperation::Listen,
+                    format_unix_socket_resource(Some(path), None, false),
+                )?;
+                let (candidate_path, reported_path) = resolve_guest_unix_path(process, path)?;
+                let listener_id = process.allocate_unix_listener_id();
+                let registry_binding_id = guest_unix_binding_id(process.kernel_pid, &listener_id);
+                reject_host_mounted_unix_socket_path(socket_paths, &candidate_path)?;
+                let canonical_candidate = kernel
+                    .resolve_unix_socket_bind_target_for_process(
+                        EXECUTION_DRIVER_NAME,
+                        process.kernel_pid,
+                        &process.guest_cwd,
+                        path,
+                    )
+                    .map_err(kernel_error)?;
+                reject_host_mounted_unix_socket_path(socket_paths, &canonical_candidate)?;
+                let node = kernel
+                    .bind_unix_socket_path_for_process(
+                        EXECUTION_DRIVER_NAME,
+                        process.kernel_pid,
+                        &process.guest_cwd,
+                        path,
+                    )
+                    .map_err(kernel_error)?;
+                let guest_path = node.canonical_path;
+                let host_path = allocate_guest_socket_host_path(
+                    socket_paths,
+                    process.kernel_pid,
+                    &listener_id,
+                    &guest_path,
+                );
+                let host_address_key = pathname_unix_host_address_key(&host_path);
+                if let Err(error) = register_guest_unix_binding(
+                    &socket_paths.unix_bound_addresses,
+                    &registry_binding_id,
+                    &host_address_key,
+                    GuestUnixAddress {
+                        path: reported_path.clone(),
+                        abstract_path_hex: None,
+                    },
+                    Some((node.stat.dev, node.stat.ino)),
+                    Some(host_path.clone()),
+                ) {
+                    if let Err(rollback_error) = kernel.remove_file(&guest_path) {
+                        return Err(SidecarError::Execution(format!(
+                            "{error}; failed to roll back Unix socket node {guest_path}: {}",
+                            kernel_error(rollback_error)
+                        )));
+                    }
+                    return Err(error);
+                }
+                let mut listener =
+                    match ActiveUnixListener::bind(&host_path, &reported_path, payload.backlog) {
+                        Ok(listener) => listener,
+                        Err(error) => {
+                            if let Err(rollback_error) = rollback_guest_unix_path_binding(
+                                &socket_paths.unix_bound_addresses,
+                                &registry_binding_id,
+                                kernel,
+                                &guest_path,
+                                &host_path,
+                            ) {
+                                return Err(SidecarError::Execution(format!(
+                                    "{error}; rollback failed: {rollback_error}"
+                                )));
+                            }
+                            return Err(error);
+                        }
+                    };
+                listener.registry_binding_id = registry_binding_id;
+                listener.private_host_path = Some(host_path);
+                listener.guest_node_path = Some(guest_path);
+                process.unix_listeners.insert(listener_id.clone(), listener);
+                Ok(json!({
+                    "serverId": listener_id,
+                    "localPath": reported_path,
                 }))
             } else {
                 let (family, bind_host, guest_host) =
@@ -24171,9 +34421,9 @@ where
                     .unwrap_or_default();
             let wait = clamp_javascript_net_poll_wait(wait_ms);
             let event = if let Some(socket) = process.tcp_sockets.get_mut(socket_id) {
-                socket.poll(kernel, process.kernel_pid, wait, trace_enabled)?
+                socket.poll_readiness(kernel, process.kernel_pid, wait, trace_enabled)?
             } else if let Some(socket) = process.unix_sockets.get_mut(socket_id) {
-                socket.poll(wait)?
+                socket.poll_readiness(wait)?
             } else {
                 return Err(SidecarError::InvalidState(format!(
                     "unknown net socket {socket_id}"
@@ -24203,7 +34453,7 @@ where
                             &kernel_readiness,
                         );
                     } else if let Some(socket) = process.unix_sockets.remove(socket_id) {
-                        release_unix_socket_handle(process, socket_id, socket);
+                        release_unix_socket_handle(process, socket_id, socket, socket_paths);
                     }
                     Ok(json!({
                         "type": "close",
@@ -24219,15 +34469,41 @@ where
             if let Some(socket) = process.tcp_sockets.get(socket_id) {
                 javascript_net_json_string(socket.socket_info(), "net.socket_wait_connect")
             } else {
-                let socket = process.unix_sockets.get(socket_id).ok_or_else(|| {
+                let socket = process.unix_sockets.get_mut(socket_id).ok_or_else(|| {
                     SidecarError::InvalidState(format!("unknown net socket {socket_id}"))
                 })?;
-                javascript_net_json_string(socket.socket_info(), "net.socket_wait_connect")
+                javascript_net_json_string(
+                    socket.socket_info(&socket_paths.unix_bound_addresses)?,
+                    "net.socket_wait_connect",
+                )
             }
         }
         "net.socket_read" => {
             let socket_id =
                 javascript_sync_rpc_arg_str(&request.args, 0, "net.socket_read socket id")?;
+            let max_bytes = usize::try_from(
+                javascript_sync_rpc_arg_u64_optional(
+                    &request.args,
+                    1,
+                    "net.socket_read maximum bytes",
+                )?
+                .unwrap_or(64 * 1024),
+            )
+            .map_err(|_| {
+                SidecarError::InvalidState("net.socket_read byte limit is too large".into())
+            })?;
+            let peek = request
+                .args
+                .get(2)
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let wait_ms = javascript_sync_rpc_arg_u64_optional(
+                &request.args,
+                3,
+                "net.socket_read wait milliseconds",
+            )?
+            .unwrap_or_default();
+            let wait = clamp_javascript_net_poll_wait(wait_ms);
             if trace_enabled {
                 NET_TCP_TRACE_COUNTERS
                     .socket_read_calls
@@ -24237,17 +34513,19 @@ where
                     .fetch_add(1, Ordering::Relaxed);
             }
             if let Some(socket) = process.tcp_sockets.get_mut(socket_id) {
-                javascript_net_read_value(socket.poll(
+                javascript_net_read_value(socket.poll_readable(
                     kernel,
                     process.kernel_pid,
-                    Duration::ZERO,
+                    wait,
+                    max_bytes,
+                    peek,
                     trace_enabled,
                 )?)
             } else {
                 let socket = process.unix_sockets.get_mut(socket_id).ok_or_else(|| {
                     SidecarError::InvalidState(format!("unknown net socket {socket_id}"))
                 })?;
-                javascript_net_read_value(socket.poll(Duration::ZERO)?)
+                javascript_net_read_value(socket.poll_readable(wait, max_bytes, peek)?)
             }
         }
         "net.socket_set_no_delay" => {
@@ -24379,7 +34657,11 @@ where
                                 )
                             }) {
                                 if let Some(stream) = stream {
-                                    let _ = stream.shutdown(Shutdown::Both);
+                                    if let Err(error) = stream.shutdown(Shutdown::Both) {
+                                        eprintln!(
+                                            "failed to reject excess TCP socket connection: {error}"
+                                        );
+                                    }
                                 }
                                 return Ok(json!({
                                     "type": "error",
@@ -24446,11 +34728,16 @@ where
                 let listener = process.unix_listeners.get_mut(listener_id).ok_or_else(|| {
                     SidecarError::InvalidState(format!("unknown net listener {listener_id}"))
                 })?;
-                listener.poll(Duration::from_millis(wait_ms))?
+                let target_binding_id = listener.registry_binding_id.clone();
+                listener.poll(
+                    Duration::from_millis(wait_ms),
+                    socket_paths,
+                    &target_binding_id,
+                )?
             };
 
             match event {
-                Some(JavascriptUnixListenerEvent::Connection(pending)) => {
+                Some(JavascriptUnixListenerEvent::Connection(mut pending)) => {
                     if let Err(error) = check_network_resource_limit(
                         resource_limits.max_sockets,
                         network_counts.sockets,
@@ -24465,19 +34752,35 @@ where
                             "connection",
                         )
                     }) {
-                        let _ = pending.stream.shutdown(Shutdown::Both);
+                        if let Err(error) = pending.stream.shutdown(Shutdown::Both) {
+                            eprintln!("failed to reject excess Unix socket connection: {error}");
+                        }
                         return Ok(json!({
                             "type": "error",
                             "code": "EAGAIN",
                             "message": error.to_string(),
                         }));
                     }
-                    let socket = ActiveUnixSocket::from_stream(
+                    let mut socket = ActiveUnixSocket::from_stream(
                         pending.stream,
                         Some(listener_id.to_string()),
                         pending.local_path.clone(),
                         pending.remote_path.clone(),
+                        pending.local_abstract_path_hex.clone(),
+                        pending.remote_abstract_path_hex.clone(),
+                        None,
+                        None,
+                        javascript_unix_socket_buffer_limit(resource_limits),
                     )?;
+                    socket.connection_state = pending.connection_guard.state.take();
+                    socket.remote_registry_binding_id = Some(
+                        process
+                            .unix_listeners
+                            .get(listener_id)
+                            .expect("Unix listener remains registered during accept")
+                            .registry_binding_id
+                            .clone(),
+                    );
                     let socket_id = process.allocate_unix_socket_id();
                     socket.set_event_pusher(
                         process.execution.javascript_v8_session_handle(),
@@ -24492,6 +34795,8 @@ where
                         "socketId": socket_id,
                         "localPath": pending.local_path,
                         "remotePath": pending.remote_path,
+                        "localAbstractPathHex": pending.local_abstract_path_hex,
+                        "remoteAbstractPathHex": pending.remote_abstract_path_hex,
                     }))
                 }
                 Some(JavascriptUnixListenerEvent::Error { code, message }) => Ok(json!({
@@ -24597,8 +34902,9 @@ where
             let listener = process.unix_listeners.get_mut(listener_id).ok_or_else(|| {
                 SidecarError::InvalidState(format!("unknown net listener {listener_id}"))
             })?;
-            match listener.poll(Duration::ZERO)? {
-                Some(JavascriptUnixListenerEvent::Connection(pending)) => {
+            let target_binding_id = listener.registry_binding_id.clone();
+            match listener.poll(Duration::ZERO, socket_paths, &target_binding_id)? {
+                Some(JavascriptUnixListenerEvent::Connection(mut pending)) => {
                     check_network_resource_limit(
                         resource_limits.max_sockets,
                         network_counts.sockets,
@@ -24614,13 +34920,22 @@ where
                     let info = json!({
                         "localPath": pending.local_path.clone(),
                         "remotePath": pending.remote_path.clone(),
+                        "localAbstractPathHex": pending.local_abstract_path_hex.clone(),
+                        "remoteAbstractPathHex": pending.remote_abstract_path_hex.clone(),
                     });
-                    let socket = ActiveUnixSocket::from_stream(
+                    let mut socket = ActiveUnixSocket::from_stream(
                         pending.stream,
                         Some(listener_id.to_string()),
                         pending.local_path,
                         pending.remote_path,
+                        pending.local_abstract_path_hex,
+                        pending.remote_abstract_path_hex,
+                        None,
+                        None,
+                        javascript_unix_socket_buffer_limit(resource_limits),
                     )?;
+                    socket.connection_state = pending.connection_guard.state.take();
+                    socket.remote_registry_binding_id = Some(target_binding_id);
                     let socket_id = process.allocate_unix_socket_id();
                     socket.set_event_pusher(
                         process.execution.javascript_v8_session_handle(),
@@ -24703,6 +35018,11 @@ where
             } else {
                 javascript_sync_rpc_bytes_arg(&request.args, 1, "net.write chunk")?
             };
+            let nonblocking = request
+                .args
+                .get(2)
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             if trace_enabled {
                 NET_TCP_TRACE_COUNTERS
                     .socket_write_calls
@@ -24736,7 +35056,13 @@ where
                 let socket = process.unix_sockets.get(socket_id).ok_or_else(|| {
                     SidecarError::InvalidState(format!("unknown net socket {socket_id}"))
                 })?;
-                socket.write_all(&chunk).map(|written| json!(written))
+                socket
+                    .write(
+                        &chunk,
+                        nonblocking,
+                        javascript_unix_socket_write_timeout(resource_limits),
+                    )
+                    .map(|written| json!(written))
             }
         }
         "net.shutdown" => {
@@ -24758,7 +35084,7 @@ where
                 release_tcp_socket_handle(process, socket_id, socket, kernel, &kernel_readiness);
                 Ok(Value::Null)
             } else if let Some(socket) = process.unix_sockets.remove(socket_id) {
-                release_unix_socket_handle(process, socket_id, socket);
+                release_unix_socket_handle(process, socket_id, socket, socket_paths);
                 Ok(Value::Null)
             } else {
                 Ok(Value::Null)
@@ -24767,6 +35093,11 @@ where
         "net.server_close" => {
             let listener_id =
                 javascript_sync_rpc_arg_str(&request.args, 0, "net.server_close listener id")?;
+            let unlink_node_path = request
+                .args
+                .get(1)
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             if let Some(listener) = process.tcp_listeners.remove(listener_id) {
                 unregister_kernel_readiness_target(&kernel_readiness, listener.kernel_socket_id);
                 listener.close(kernel, process.kernel_pid)?;
@@ -24775,8 +35106,58 @@ where
                 let listener = process.unix_listeners.remove(listener_id).ok_or_else(|| {
                     SidecarError::InvalidState(format!("unknown net listener {listener_id}"))
                 })?;
-                listener.close()?;
-                Ok(Value::Null)
+                if !listener.is_final_description_handle() {
+                    return Ok(Value::Null);
+                }
+                let mut cleanup_errors = Vec::new();
+                for socket in process
+                    .unix_sockets
+                    .values_mut()
+                    .filter(|socket| socket.listener_id.as_deref() == Some(listener_id))
+                {
+                    if let Err(error) =
+                        socket.cache_remote_peer_metadata(&socket_paths.unix_bound_addresses)
+                    {
+                        cleanup_errors.push(format!("cache accepted peer metadata: {error}"));
+                    }
+                }
+                if let Err(error) = close_pending_guest_unix_connections(
+                    &socket_paths.unix_bound_addresses,
+                    &listener.registry_binding_id,
+                ) {
+                    cleanup_errors.push(format!("close pending connections: {error}"));
+                }
+                if let Err(error) = release_guest_unix_binding(
+                    &socket_paths.unix_bound_addresses,
+                    &listener.registry_binding_id,
+                ) {
+                    cleanup_errors.push(format!("release listener metadata: {error}"));
+                }
+                if let Err(error) = purge_guest_unix_target(
+                    &socket_paths.unix_bound_addresses,
+                    &listener.registry_binding_id,
+                ) {
+                    cleanup_errors.push(format!("purge queued peer metadata: {error}"));
+                }
+                let guest_node_path = listener.guest_node_path.clone();
+                if let Err(error) = listener.close() {
+                    cleanup_errors.push(format!("close listener: {error}"));
+                }
+                if unlink_node_path {
+                    if let Some(path) = guest_node_path.as_deref() {
+                        match kernel.remove_file(path) {
+                            Ok(()) => {}
+                            Err(error) if error.code() == "ENOENT" => {}
+                            Err(error) => cleanup_errors
+                                .push(format!("remove Unix socket node: {}", kernel_error(error))),
+                        }
+                    }
+                }
+                if cleanup_errors.is_empty() {
+                    Ok(Value::Null)
+                } else {
+                    Err(SidecarError::Execution(cleanup_errors.join("; ")))
+                }
             }
         }
         "tls.get_ciphers" => javascript_net_json_string(
@@ -24819,6 +35200,27 @@ pub(crate) fn canonical_signal_name(signal: i32) -> Option<&'static str> {
     agentos_native_sidecar_core::canonical_signal_name(signal)
 }
 
+fn dispatch_v8_signal_to_tracked_processes(
+    process: &ActiveProcess,
+    target_pids: &BTreeSet<u32>,
+    signal: i32,
+) -> Result<usize, SidecarError> {
+    let mut delivered = 0;
+    if target_pids.contains(&process.kernel_pid)
+        && matches!(
+            &process.execution,
+            ActiveExecution::Javascript(_) | ActiveExecution::Wasm(_)
+        )
+        && dispatch_v8_process_signal(process, signal)?
+    {
+        delivered += 1;
+    }
+    for child in process.child_processes.values() {
+        delivered += dispatch_v8_signal_to_tracked_processes(child, target_pids, signal)?;
+    }
+    Ok(delivered)
+}
+
 fn dispatch_v8_process_signal(process: &ActiveProcess, signal: i32) -> Result<bool, SidecarError> {
     let Some(signal_name) = signal_name_for_stream_event(signal) else {
         return Ok(false);
@@ -24839,27 +35241,6 @@ fn dispatch_v8_process_signal(process: &ActiveProcess, signal: i32) -> Result<bo
         }),
     )?;
     Ok(true)
-}
-
-fn dispatch_v8_signal_to_tracked_processes(
-    process: &ActiveProcess,
-    target_pids: &BTreeSet<u32>,
-    signal: i32,
-) -> Result<usize, SidecarError> {
-    let mut delivered = 0;
-    if target_pids.contains(&process.kernel_pid)
-        && matches!(
-            &process.execution,
-            ActiveExecution::Javascript(_) | ActiveExecution::Wasm(_)
-        )
-        && dispatch_v8_process_signal(process, signal)?
-    {
-        delivered += 1;
-    }
-    for child in process.child_processes.values() {
-        delivered += dispatch_v8_signal_to_tracked_processes(child, target_pids, signal)?;
-    }
-    Ok(delivered)
 }
 
 fn dispatch_v8_session_signal_async(session: V8SessionHandle, signal: i32) {
@@ -24901,13 +35282,40 @@ pub(crate) fn parse_signal(signal: &str) -> Result<i32, SidecarError> {
 }
 
 pub(crate) fn runtime_child_is_alive(child_pid: u32) -> Result<bool, SidecarError> {
-    Ok(runtime_child_exit_status(child_pid)?.is_none())
+    Ok(matches!(
+        runtime_child_exit_status(child_pid)?,
+        RuntimeChildStatusObservation::Running
+    ))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RuntimeChildExitStatus {
+    status: i32,
+    signal: Option<i32>,
+    core_dumped: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeChildStatusObservation {
+    Running,
+    Exited(RuntimeChildExitStatus),
+    /// The pid is not a waitable child (or its status was already consumed).
+    /// This is not an exit status and must never be converted to exit(0).
+    NotWaitable,
 }
 
 #[cfg(not(target_os = "macos"))]
-fn runtime_child_exit_status(child_pid: u32) -> Result<Option<i32>, SidecarError> {
+fn runtime_child_exit_status(
+    child_pid: u32,
+) -> Result<RuntimeChildStatusObservation, SidecarError> {
     if child_pid == 0 {
-        return Ok(Some(0));
+        return Ok(RuntimeChildStatusObservation::Exited(
+            RuntimeChildExitStatus {
+                status: 0,
+                signal: None,
+                core_dumped: false,
+            },
+        ));
     }
 
     let wait_flags = WaitPidFlag::WNOHANG
@@ -24918,12 +35326,26 @@ fn runtime_child_exit_status(child_pid: u32) -> Result<Option<i32>, SidecarError
     match wait_on_child(WaitId::Pid(Pid::from_raw(child_pid as i32)), wait_flags) {
         Ok(WaitStatus::StillAlive)
         | Ok(WaitStatus::Stopped(_, _))
-        | Ok(WaitStatus::Continued(_)) => Ok(None),
-        Ok(WaitStatus::Exited(_, status)) => Ok(Some(status)),
-        Ok(WaitStatus::Signaled(_, signal, _)) => Ok(Some(128 + signal as i32)),
+        | Ok(WaitStatus::Continued(_)) => Ok(RuntimeChildStatusObservation::Running),
+        Ok(WaitStatus::Exited(_, status)) => Ok(RuntimeChildStatusObservation::Exited(
+            RuntimeChildExitStatus {
+                status,
+                signal: None,
+                core_dumped: false,
+            },
+        )),
+        Ok(WaitStatus::Signaled(_, signal, core_dumped)) => Ok(
+            RuntimeChildStatusObservation::Exited(RuntimeChildExitStatus {
+                status: 128 + signal as i32,
+                signal: Some(signal as i32),
+                core_dumped,
+            }),
+        ),
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        Ok(WaitStatus::PtraceEvent(_, _, _) | WaitStatus::PtraceSyscall(_)) => Ok(None),
-        Err(nix::errno::Errno::ECHILD) => Ok(Some(0)),
+        Ok(WaitStatus::PtraceEvent(_, _, _) | WaitStatus::PtraceSyscall(_)) => {
+            Ok(RuntimeChildStatusObservation::Running)
+        }
+        Err(nix::errno::Errno::ECHILD) => Ok(RuntimeChildStatusObservation::NotWaitable),
         Err(error) => Err(SidecarError::Execution(format!(
             "failed to inspect guest runtime process {child_pid}: {error}"
         ))),
@@ -24936,18 +35358,38 @@ fn runtime_child_exit_status(child_pid: u32) -> Result<Option<i32>, SidecarError
 // reaping parent), but a second status query after exit returns ECHILD → treated
 // as "exited(0)" below.
 #[cfg(target_os = "macos")]
-fn runtime_child_exit_status(child_pid: u32) -> Result<Option<i32>, SidecarError> {
+fn runtime_child_exit_status(
+    child_pid: u32,
+) -> Result<RuntimeChildStatusObservation, SidecarError> {
     if child_pid == 0 {
-        return Ok(Some(0));
+        return Ok(RuntimeChildStatusObservation::Exited(
+            RuntimeChildExitStatus {
+                status: 0,
+                signal: None,
+                core_dumped: false,
+            },
+        ));
     }
 
     match waitpid(Pid::from_raw(child_pid as i32), Some(WaitPidFlag::WNOHANG)) {
         Ok(WaitStatus::StillAlive)
         | Ok(WaitStatus::Stopped(_, _))
-        | Ok(WaitStatus::Continued(_)) => Ok(None),
-        Ok(WaitStatus::Exited(_, status)) => Ok(Some(status)),
-        Ok(WaitStatus::Signaled(_, signal, _)) => Ok(Some(128 + signal as i32)),
-        Err(nix::errno::Errno::ECHILD) => Ok(Some(0)),
+        | Ok(WaitStatus::Continued(_)) => Ok(RuntimeChildStatusObservation::Running),
+        Ok(WaitStatus::Exited(_, status)) => Ok(RuntimeChildStatusObservation::Exited(
+            RuntimeChildExitStatus {
+                status,
+                signal: None,
+                core_dumped: false,
+            },
+        )),
+        Ok(WaitStatus::Signaled(_, signal, core_dumped)) => Ok(
+            RuntimeChildStatusObservation::Exited(RuntimeChildExitStatus {
+                status: 128 + signal as i32,
+                signal: Some(signal as i32),
+                core_dumped,
+            }),
+        ),
+        Err(nix::errno::Errno::ECHILD) => Ok(RuntimeChildStatusObservation::NotWaitable),
         Err(error) => Err(SidecarError::Execution(format!(
             "failed to inspect guest runtime process {child_pid}: {error}"
         ))),
@@ -25149,6 +35591,188 @@ mod error_code_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod exec_signal_state_tests {
+    use super::{
+        exact_exec_image_header_is_valid, reset_caught_signal_dispositions_after_exec,
+        GuestRuntimeKind, SignalDispositionAction, SignalHandlerRegistration,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn nested_exec_resets_caught_dispositions_under_descendant_key() {
+        let mut states = BTreeMap::from([
+            (
+                String::from("child-1"),
+                BTreeMap::from([
+                    (
+                        10,
+                        SignalHandlerRegistration {
+                            action: SignalDispositionAction::User,
+                            mask: Vec::new(),
+                            flags: 0,
+                        },
+                    ),
+                    (
+                        12,
+                        SignalHandlerRegistration {
+                            action: SignalDispositionAction::Ignore,
+                            mask: Vec::new(),
+                            flags: 0,
+                        },
+                    ),
+                ]),
+            ),
+            (
+                String::from("root/child-1"),
+                BTreeMap::from([(
+                    15,
+                    SignalHandlerRegistration {
+                        action: SignalDispositionAction::User,
+                        mask: Vec::new(),
+                        flags: 0,
+                    },
+                )]),
+            ),
+        ]);
+
+        let key = reset_caught_signal_dispositions_after_exec(
+            &mut states,
+            "root",
+            &["parent", "child-1"],
+        );
+
+        assert_eq!(key, "child-1");
+        let child = states.get("child-1").expect("descendant signal state");
+        assert!(!child.contains_key(&10), "caught disposition must reset");
+        assert_eq!(
+            child.get(&12).map(|registration| &registration.action),
+            Some(&SignalDispositionAction::Ignore),
+            "ignored disposition must survive exec"
+        );
+        assert!(
+            states
+                .get("root/child-1")
+                .expect("unrelated legacy/full-path state")
+                .contains_key(&15),
+            "exec must use the same leaf key as descendant signal registration"
+        );
+    }
+
+    #[test]
+    fn exact_exec_rejects_existing_files_with_invalid_runtime_format() {
+        assert!(exact_exec_image_header_is_valid(
+            &GuestRuntimeKind::WebAssembly,
+            b"\0asm"
+        ));
+        assert!(!exact_exec_image_header_is_valid(
+            &GuestRuntimeKind::WebAssembly,
+            b"data"
+        ));
+        assert!(exact_exec_image_header_is_valid(
+            &GuestRuntimeKind::JavaScript,
+            b"#!/u"
+        ));
+        assert!(!exact_exec_image_header_is_valid(
+            &GuestRuntimeKind::JavaScript,
+            b"cons"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tls_trust_tests {
+    use super::{
+        tls_root_store, vm_default_ca_bundle_for_tls_options, JavascriptTlsBridgeOptions,
+        JavascriptTlsDataValue, JavascriptTlsMaterial, SidecarKernel,
+    };
+    use agentos_kernel::kernel::KernelVmConfig;
+    use agentos_kernel::mount_table::MountTable;
+    use agentos_kernel::permissions::Permissions;
+    use agentos_kernel::vfs::MemoryFileSystem;
+    use agentos_native_sidecar_core::ca::{CA_CERTIFICATES_BUNDLE, CA_CERTIFICATES_GUEST_PATH};
+    use base64::Engine;
+    use std::io::Cursor;
+
+    fn first_ca_pem() -> Vec<u8> {
+        const END_MARKER: &[u8] = b"-----END CERTIFICATE-----";
+        let end = CA_CERTIFICATES_BUNDLE
+            .windows(END_MARKER.len())
+            .position(|window| window == END_MARKER)
+            .expect("embedded CA bundle contains a certificate")
+            + END_MARKER.len();
+        let mut pem = CA_CERTIFICATES_BUNDLE[..end].to_vec();
+        pem.push(b'\n');
+        pem
+    }
+
+    fn test_kernel(bundle: &[u8]) -> SidecarKernel {
+        let mut config = KernelVmConfig::new("vm-live-tls-trust");
+        config.permissions = Permissions::allow_all();
+        let mut kernel = SidecarKernel::new(MountTable::new(MemoryFileSystem::new()), config);
+        kernel
+            .mkdir("/etc/ssl/certs", true)
+            .expect("create VM trust directory");
+        kernel
+            .write_file(CA_CERTIFICATES_GUEST_PATH, bundle)
+            .expect("install VM trust bundle");
+        kernel
+    }
+
+    #[test]
+    fn default_tls_trust_is_read_live_from_the_vm_without_host_fallback() {
+        let first_pem = first_ca_pem();
+        let options = JavascriptTlsBridgeOptions::default();
+        let mut kernel = test_kernel(&first_pem);
+
+        let first = vm_default_ca_bundle_for_tls_options(&mut kernel, &options)
+            .expect("read initial VM trust bundle");
+        assert_eq!(first, first_pem);
+        assert_eq!(
+            tls_root_store(&options, &first)
+                .expect("build roots from the VM bundle")
+                .len(),
+            1,
+            "the root store must contain only the one VM certificate, not host roots"
+        );
+
+        kernel
+            .write_file(CA_CERTIFICATES_GUEST_PATH, b"not a certificate")
+            .expect("replace the live VM trust bundle");
+        let replacement = vm_default_ca_bundle_for_tls_options(&mut kernel, &options)
+            .expect("reread replacement VM trust bundle");
+        assert_eq!(replacement, b"not a certificate");
+        assert!(
+            tls_root_store(&options, &replacement).is_err(),
+            "an invalid VM bundle must fail instead of falling back to host trust"
+        );
+    }
+
+    #[test]
+    fn node_custom_ca_replaces_the_default_vm_bundle() {
+        let certificate = rustls_pemfile::certs(&mut Cursor::new(first_ca_pem()))
+            .next()
+            .expect("one certificate")
+            .expect("parse certificate");
+        let options = JavascriptTlsBridgeOptions {
+            ca: Some(JavascriptTlsMaterial::Single(
+                JavascriptTlsDataValue::Buffer {
+                    data: base64::engine::general_purpose::STANDARD.encode(certificate.as_ref()),
+                },
+            )),
+            ..JavascriptTlsBridgeOptions::default()
+        };
+
+        assert_eq!(
+            tls_root_store(&options, b"invalid default bundle")
+                .expect("custom CA must replace, not append to, default roots")
+                .len(),
+            1
+        );
+    }
+}
+
 #[cfg(test)]
 mod ssrf_egress_classifier_tests {
     // F-005/006/007 (sec-sidecar T1/T7/T11): the egress classifier must treat the
@@ -25378,7 +36002,7 @@ mod dns_rebinding_pin_tests {
 
         let url = Url::parse(&format!("http://attacker.example:{port}/")).expect("url");
         let pinned = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
-        let result = issue_outbound_http_request(&url, &options(), &empty_headers(), &pinned)
+        let result = issue_outbound_http_request(&url, &options(), &empty_headers(), &pinned, &[])
             .expect("pinned request should reach the vetted loopback target");
         let payload = result.as_str().expect("string payload");
         assert!(
@@ -25394,7 +36018,7 @@ mod dns_rebinding_pin_tests {
     #[test]
     fn outbound_http_refuses_when_no_vetted_address() {
         let url = Url::parse("https://attacker.example/").expect("url");
-        let error = issue_outbound_http_request(&url, &options(), &empty_headers(), &[])
+        let error = issue_outbound_http_request(&url, &options(), &empty_headers(), &[], &[])
             .expect_err("empty pinned set must be refused");
         let message = error.to_string();
         assert!(

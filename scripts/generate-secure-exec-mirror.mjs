@@ -169,6 +169,22 @@ function writeRoot(root, npmShims, rustShims) {
 		"packages:\n  - packages/*\n\nonlyBuiltDependencies: []\n",
 	);
 	write(
+		join(root, "turbo.json"),
+		json({
+			$schema: "https://turbo.build/schema.json",
+			tasks: {
+				build: {
+					dependsOn: ["^build"],
+					outputs: ["dist/**"],
+				},
+				"check-types": {
+					dependsOn: ["^check-types"],
+					outputs: [],
+				},
+			},
+		}),
+	);
+	write(
 		join(root, "tsconfig.base.json"),
 		json({
 			compilerOptions: {

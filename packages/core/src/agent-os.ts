@@ -461,6 +461,14 @@ export interface AgentOsLimits {
 		prewarmTimeoutMs?: number;
 		runnerHeapLimitMb?: number;
 	};
+	/** Process spawn, I/O, and lifecycle-event backlog limits. */
+	process?: {
+		maxSpawnFileActions?: number;
+		maxSpawnFileActionBytes?: number;
+		pendingStdinBytes?: number;
+		pendingEventCount?: number;
+		pendingEventBytes?: number;
+	};
 }
 
 export interface AgentStderrEvent {
@@ -1277,9 +1285,23 @@ const SIDECAR_BUILD_INPUTS = [
 	join(REPO_ROOT, "Cargo.toml"),
 	join(REPO_ROOT, "Cargo.lock"),
 	join(REPO_ROOT, "crates/bridge"),
+	join(REPO_ROOT, "crates/build-support"),
 	join(REPO_ROOT, "crates/execution"),
 	join(REPO_ROOT, "crates/kernel"),
-	join(REPO_ROOT, "crates/sidecar"),
+	join(REPO_ROOT, "crates/agentos-protocol"),
+	join(REPO_ROOT, "crates/agentos-sidecar"),
+	join(REPO_ROOT, "crates/native-sidecar"),
+	join(REPO_ROOT, "crates/native-sidecar-core"),
+	join(REPO_ROOT, "crates/sidecar-protocol"),
+	join(REPO_ROOT, "crates/v8-runtime"),
+	join(REPO_ROOT, "crates/vfs"),
+	join(REPO_ROOT, "crates/vm-config"),
+	join(REPO_ROOT, "packages/build-tools/bridge-src"),
+	join(REPO_ROOT, "packages/build-tools/package.json"),
+	join(REPO_ROOT, "packages/build-tools/scripts/build-v8-bridge.mjs"),
+	join(REPO_ROOT, "packages/core/fixtures/base-filesystem.json"),
+	join(REPO_ROOT, "packages/runtime-core/fixtures/base-filesystem.json"),
+	join(REPO_ROOT, "pnpm-lock.yaml"),
 ] as const;
 let ensuredSidecarBinary: string | null = null;
 
@@ -2071,6 +2093,7 @@ async function handleJsBridgeCall(
 					path(),
 					requireBridgeNumber(args.uid, "uid"),
 					requireBridgeNumber(args.gid, "gid"),
+					{ followSymlinks: args.followSymlinks !== false },
 				);
 				break;
 			case "utimes":

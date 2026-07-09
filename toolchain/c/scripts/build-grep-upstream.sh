@@ -115,10 +115,12 @@ PCRE_LIBS="" \
 gl_cv_func_select_supports0=yes \
 gl_cv_func_select_detects_ebadf=yes \
 gl_cv_func_pselect_detects_ebadf=yes \
+ac_cv_func_sigaction=yes \
+ac_cv_func_sigprocmask=yes \
 ac_cv_func_clock_getres=no \
 ac_cv_func_clock_gettime=no \
-CFLAGS="-O2 -flto -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -DFD_SETSIZE=8192" \
-LIBS="-lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-process-clocks" \
+CFLAGS="-O2 -flto -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS" \
+LIBS="-lwasi-emulated-mman -lwasi-emulated-process-clocks" \
 ./configure \
   --host=wasm32-unknown-wasi \
   --disable-shared \

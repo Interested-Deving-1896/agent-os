@@ -61,9 +61,35 @@ describe("root public API exports", () => {
 		expect(validateToolkits).toBeTypeOf("function");
 		expect(MAX_TOOL_DESCRIPTION_LENGTH).toBeGreaterThan(0);
 		expect(agentOsLimitsSchema.safeParse({}).success).toBe(true);
-		expect(agentOsOptionsSchema.safeParse({ defaultSoftware: false }).success).toBe(
-			true,
-		);
+		expect(
+			agentOsLimitsSchema.safeParse({
+				process: {
+					maxSpawnFileActions: 4096,
+					maxSpawnFileActionBytes: 1024 * 1024,
+					pendingStdinBytes: 1024,
+					pendingEventCount: 16,
+					pendingEventBytes: 4096,
+				},
+			}).success,
+		).toBe(true);
+		expect(
+			agentOsLimitsSchema.safeParse({
+				process: { pendingEventCount: 0 },
+			}).success,
+		).toBe(false);
+		expect(
+			agentOsLimitsSchema.safeParse({
+				process: { maxSpawnFileActions: 0 },
+			}).success,
+		).toBe(false);
+		expect(
+			agentOsLimitsSchema.safeParse({
+				process: { maxSpawnFileActionBytes: 0 },
+			}).success,
+		).toBe(false);
+		expect(
+			agentOsOptionsSchema.safeParse({ defaultSoftware: false }).success,
+		).toBe(true);
 		expect(hostToolSchema).toBeTypeOf("object");
 		expect(toolKitSchema).toBeTypeOf("object");
 		expect(mountConfigSchema).toBeTypeOf("object");

@@ -21,8 +21,16 @@ software such as curl expects to find in <sys/socket.h> and <poll.h>.
  #define POLLOUT POLLWRNORM
 --- a/libc-bottom-half/headers/public/__header_sys_socket.h
 +++ b/libc-bottom-half/headers/public/__header_sys_socket.h
-@@ -49,6 +49,82 @@
- #define MSG_TRUNC __WASI_ROFLAGS_RECV_DATA_TRUNCATED
+@@ -46,9 +46,126 @@
+ #else // __wasilibc_use_wasip2
+-#define MSG_PEEK __WASI_RIFLAGS_RECV_PEEK
+-#define MSG_WAITALL __WASI_RIFLAGS_RECV_WAITALL
+-#define MSG_TRUNC __WASI_ROFLAGS_RECV_DATA_TRUNCATED
++/* AgentOS owns the WASI p1 socket ABI and accepts Linux message flags in
++ * host_net, so expose Linux values rather than raw WASI riflags/roflags. */
++#define MSG_PEEK 0x0002
++#define MSG_WAITALL 0x0100
++#define MSG_TRUNC 0x0020
  #endif // __wasilibc_use_wasip2
  
 +/*
@@ -37,6 +45,14 @@ software such as curl expects to find in <sys/socket.h> and <poll.h>.
 +
 +#ifndef MSG_NOSIGNAL
 +#define MSG_NOSIGNAL  0x4000
++#endif
++
++#ifndef MSG_CTRUNC
++#define MSG_CTRUNC 0x0008
++#endif
++
++#ifndef MSG_CMSG_CLOEXEC
++#define MSG_CMSG_CLOEXEC 0x40000000
 +#endif
 +
 +#ifndef SOL_IP
@@ -101,6 +117,90 @@ software such as curl expects to find in <sys/socket.h> and <poll.h>.
 +#endif
 +#endif
 +
++/* Linux/musl-compatible ancillary-data traversal and SCM_RIGHTS ABI. */
++#define __CMSG_LEN(cmsg) \
++    (((cmsg)->cmsg_len + sizeof(long) - 1) & ~(long)(sizeof(long) - 1))
++#define __CMSG_NEXT(cmsg) ((unsigned char *)(cmsg) + __CMSG_LEN(cmsg))
++#define __MHDR_END(mhdr) \
++    ((unsigned char *)(mhdr)->msg_control + (mhdr)->msg_controllen)
++
++#define CMSG_DATA(cmsg) \
++    ((unsigned char *)(((struct cmsghdr *)(cmsg)) + 1))
++#define CMSG_NXTHDR(mhdr, cmsg) \
++    ((cmsg)->cmsg_len < sizeof(struct cmsghdr) || \
++    __CMSG_LEN(cmsg) + sizeof(struct cmsghdr) >= \
++        __MHDR_END(mhdr) - (unsigned char *)(cmsg) ? \
++    (struct cmsghdr *)0 : (struct cmsghdr *)__CMSG_NEXT(cmsg))
++#define CMSG_FIRSTHDR(mhdr) \
++    ((size_t)(mhdr)->msg_controllen >= sizeof(struct cmsghdr) ? \
++    (struct cmsghdr *)(mhdr)->msg_control : (struct cmsghdr *)0)
++
++#define CMSG_ALIGN(len) \
++    (((len) + sizeof(size_t) - 1) & (size_t)~(sizeof(size_t) - 1))
++#define CMSG_SPACE(len) \
++    (CMSG_ALIGN(len) + CMSG_ALIGN(sizeof(struct cmsghdr)))
++#define CMSG_LEN(len) (CMSG_ALIGN(sizeof(struct cmsghdr)) + (len))
++
++#define SCM_RIGHTS 0x01
++
++/* WASI reserves 5/6 for DGRAM/STREAM; use a private non-conflicting value. */
++#ifndef SOCK_SEQPACKET
++#define SOCK_SEQPACKET 1
++#endif
++
  #define SOCK_DGRAM __WASI_FILETYPE_SOCKET_DGRAM
  #define SOCK_STREAM __WASI_FILETYPE_SOCKET_STREAM
  
+--- a/libc-bottom-half/headers/public/__errno_values.h
++++ b/libc-bottom-half/headers/public/__errno_values.h
+@@ -69,6 +69,11 @@
+ #define EPIPE __WASI_ERRNO_PIPE
+ #define EPROTO __WASI_ERRNO_PROTO
+ #define EPROTONOSUPPORT __WASI_ERRNO_PROTONOSUPPORT
++/*
++ * WASI p1 omitted this distinct POSIX error. Allocate the next free guest
++ * errno value so applications can distinguish an unsupported socket type.
++ */
++#define ESOCKTNOSUPPORT 77
+ #define EPROTOTYPE __WASI_ERRNO_PROTOTYPE
+ #define ERANGE __WASI_ERRNO_RANGE
+ #define EROFS __WASI_ERRNO_ROFS
+--- a/libc-top-half/musl/src/errno/__strerror.h
++++ b/libc-top-half/musl/src/errno/__strerror.h
+@@ -93,9 +93,7 @@
+ E(EPROTOTYPE,   "Protocol wrong type for socket")
+ E(ENOPROTOOPT,  "Protocol not available")
+ E(EPROTONOSUPPORT,"Protocol not supported")
+-#ifdef __wasilibc_unmodified_upstream // errno value not in WASI
+ E(ESOCKTNOSUPPORT,"Socket type not supported")
+-#endif
+ E(ENOTSUP,      "Not supported")
+ #ifdef __wasilibc_unmodified_upstream // errno value not in WASI
+ E(EPFNOSUPPORT, "Protocol family not supported")
+--- a/libc-bottom-half/cloudlibc/src/libc/sys/socket/recv.c
++++ b/libc-bottom-half/cloudlibc/src/libc/sys/socket/recv.c
+@@ -9,9 +9,6 @@
+ #include <errno.h>
+ #include <stdint.h>
+ 
+-static_assert(MSG_PEEK == __WASI_RIFLAGS_RECV_PEEK, "Value mismatch");
+-static_assert(MSG_WAITALL == __WASI_RIFLAGS_RECV_WAITALL, "Value mismatch");
+-
+ ssize_t recv(int socket, void *restrict buffer, size_t length, int flags) {
+   // Validate flags.
+   if ((flags & ~(MSG_PEEK | MSG_WAITALL)) != 0) {
+@@ -23,7 +20,13 @@
+   __wasi_iovec_t iov = {.buf = buffer, .buf_len = length};
+   __wasi_iovec_t *ri_data = &iov;
+   size_t ri_data_len = 1;
+-  __wasi_riflags_t ri_flags = flags;
++  __wasi_riflags_t ri_flags = 0;
++  if ((flags & MSG_PEEK) != 0) {
++    ri_flags |= __WASI_RIFLAGS_RECV_PEEK;
++  }
++  if ((flags & MSG_WAITALL) != 0) {
++    ri_flags |= __WASI_RIFLAGS_RECV_WAITALL;
++  }
+ 
+   // Perform system call.
+   size_t ro_datalen;

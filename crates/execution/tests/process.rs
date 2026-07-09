@@ -48,6 +48,7 @@ fn embedded_runtime_process_keeps_host_pid_internal_for_javascript() {
     let execution = engine
         .start_execution(StartJavascriptExecutionRequest {
             limits: Default::default(),
+            argv0: None,
             guest_runtime: Default::default(),
             vm_id: String::from("vm-js"),
             context_id: context.context_id,

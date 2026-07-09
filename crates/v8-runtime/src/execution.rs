@@ -5215,7 +5215,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                crate::session::run_event_loop(scope, &rx, &pending, None, None)
+                crate::session::run_event_loop(scope, &rx, &pending, None, None, None)
             };
 
             assert!(
@@ -5294,7 +5294,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                crate::session::run_event_loop(scope, &rx, &pending, None, None)
+                crate::session::run_event_loop(scope, &rx, &pending, None, None, None)
             };
 
             assert!(matches!(
@@ -5345,7 +5345,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                crate::session::run_event_loop(scope, &rx, &pending, None, None)
+                crate::session::run_event_loop(scope, &rx, &pending, None, None, None)
             };
 
             assert!(
@@ -5395,7 +5395,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                crate::session::run_event_loop(scope, &rx, &pending, None, None)
+                crate::session::run_event_loop(scope, &rx, &pending, None, None, None)
             };
 
             assert!(
@@ -5417,7 +5417,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                crate::session::run_event_loop(scope, &rx, &pending, None, None)
+                crate::session::run_event_loop(scope, &rx, &pending, None, None, None)
             };
 
             assert!(matches!(
@@ -5496,7 +5496,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                crate::session::run_event_loop(scope, &rx, &pending, None, None)
+                crate::session::run_event_loop(scope, &rx, &pending, None, None, None)
             };
 
             assert!(matches!(
@@ -5568,7 +5568,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                crate::session::run_event_loop(scope, &rx, &pending, None, None);
+                crate::session::run_event_loop(scope, &rx, &pending, None, None, None);
             }
 
             // .then handler should have run (microtasks flushed)
@@ -5655,7 +5655,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                crate::session::run_event_loop(scope, &rx, &pending, None, None)
+                crate::session::run_event_loop(scope, &rx, &pending, None, None, None)
             };
 
             assert!(matches!(
@@ -5738,7 +5738,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                crate::session::run_event_loop(scope, &rx, &pending, None, None)
+                crate::session::run_event_loop(scope, &rx, &pending, None, None, None)
             };
 
             assert!(matches!(
@@ -5817,7 +5817,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                crate::session::run_event_loop(scope, &rx, &pending, None, None)
+                crate::session::run_event_loop(scope, &rx, &pending, None, None, None)
             };
 
             assert!(matches!(
@@ -5889,7 +5889,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                crate::session::run_event_loop(scope, &rx, &pending, None, None)
+                crate::session::run_event_loop(scope, &rx, &pending, None, None, None)
             };
 
             assert!(matches!(
@@ -5965,7 +5965,7 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                crate::session::run_event_loop(scope, &rx, &pending, None, None);
+                crate::session::run_event_loop(scope, &rx, &pending, None, None, None);
             }
 
             // Microtask enqueued by the dispatch callback should have run
@@ -6095,7 +6095,14 @@ export const file = new File([], "empty.txt");
                 let scope = &mut v8::HandleScope::new(&mut iso);
                 let local = v8::Local::new(scope, &ctx);
                 let scope = &mut v8::ContextScope::new(scope, local);
-                crate::session::run_event_loop(scope, &cmd_rx, &pending, Some(&abort_rx), None)
+                crate::session::run_event_loop(
+                    scope,
+                    &cmd_rx,
+                    &pending,
+                    Some(&abort_rx),
+                    None,
+                    None,
+                )
             };
 
             assert!(

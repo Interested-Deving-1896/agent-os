@@ -1,0 +1,88 @@
+Use AgentOS's owned process syscall when building upstream kill for WASI.
+
+The upstream CLI parsing and diagnostics stay intact; only the final platform
+delivery call differs because nix does not expose signals on wasm32-wasip1.
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 6aa0d68..4b2ea70 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -64,6 +64,9 @@
+ features = ["signal"]
+ default-features = false
+ 
++[target."cfg(target_os = \"wasi\")".dependencies.wasi-ext]
++version = "0.1.0"
++
+ [lints.clippy]
+ cargo_common_metadata = "allow"
+ cast_lossless = "allow"
+diff --git a/src/kill.rs b/src/kill.rs
+index da6fb67..178a37f 100644
+--- a/src/kill.rs
++++ b/src/kill.rs
+@@ -6,7 +6,9 @@
+ // spell-checker:ignore (ToDO) signalname pids killpg
+ 
+ use clap::{Arg, ArgAction, Command};
++#[cfg(not(target_os = "wasi"))]
+ use nix::sys::signal::{self, Signal};
++#[cfg(not(target_os = "wasi"))]
+ use nix::unistd::Pid;
+ use std::io::Error;
+ use uucore::display::Quotable;
+@@ -68,18 +70,6 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
+                 15_usize //SIGTERM
+             };
+ 
+-            let sig_name = signal_name_by_value(sig);
+-            // Signal does not support converting from EXIT
+-            // Instead, nix::signal::kill expects Option::None to properly handle EXIT
+-            let sig: Option<Signal> = if sig_name.is_some_and(|name| name == "EXIT") {
+-                None
+-            } else {
+-                let sig = (sig as i32)
+-                    .try_into()
+-                    .map_err(|e| Error::from_raw_os_error(e as i32))?;
+-                Some(sig)
+-            };
+-
+             let pids = parse_pids(&pids_or_signals)?;
+             if pids.is_empty() {
+                 Err(USimpleError::new(1, translate!("kill-error-no-process-id")))
+@@ -250,7 +240,34 @@ fn parse_pids(pids: &[String]) -> UResult<Vec<i32>> {
+         .collect()
+ }
+ 
+-fn kill(sig: Option<Signal>, pids: &[i32]) {
++#[cfg(target_os = "wasi")]
++fn kill(sig: usize, pids: &[i32]) {
++    for &pid in pids {
++        if let Err(errno) = wasi_ext::kill(pid as u32, sig as u32) {
++            show!(
++                Error::from_raw_os_error(errno as i32)
++                    .map_err_context(|| { translate!("kill-error-sending-signal", "pid" => pid) })
++            );
++        }
++    }
++}
++
++#[cfg(not(target_os = "wasi"))]
++fn kill(sig: usize, pids: &[i32]) {
++    let sig_name = signal_name_by_value(sig);
++    // Signal does not support converting from EXIT. nix::signal::kill expects
++    // None to implement signal zero's existence/permission check.
++    let sig: Option<Signal> = if sig_name.is_some_and(|name| name == "EXIT") {
++        None
++    } else {
++        match (sig as i32).try_into() {
++            Ok(signal) => Some(signal),
++            Err(errno) => {
++                show!(Error::from_raw_os_error(errno as i32));
++                return;
++            }
++        }
++    };
+     for &pid in pids {
+         if let Err(e) = signal::kill(Pid::from_raw(pid), sig) {
+             show!(

@@ -14,7 +14,7 @@
 
 --- /dev/null
 +++ b/library/std/src/sys/process/wasi.rs
-@@ -0,0 +1,673 @@
+@@ -0,0 +1,808 @@
 +// WASI process implementation using wasmVM host_process syscalls.
 +//
 +// Replaces the unsupported() stubs with real process management
@@ -30,9 +30,9 @@
 +use crate::process::StdioPipes;
 +use crate::sys::fd::FileDesc;
 +use crate::sys::fs::File;
-+use crate::sys::FromInner;
++use crate::sys::{cvt_r, FromInner};
 +use crate::io::{BorrowedCursor, IoSlice, IoSliceMut};
-+use crate::{fmt, io};
++use crate::{fmt, io, mem};
 +
 +// ============================================================
 +// host_process FFI bindings
@@ -40,27 +40,62 @@
 +
 +#[link(wasm_import_module = "host_process")]
 +unsafe extern "C" {
-+    fn proc_spawn(
++    fn proc_spawn_v3(
 +        exec_path_ptr: *const u8,
 +        exec_path_len: u32,
 +        argv_ptr: *const u8,
 +        argv_len: u32,
 +        envp_ptr: *const u8,
 +        envp_len: u32,
-+        stdin_fd: u32,
-+        stdout_fd: u32,
-+        stderr_fd: u32,
++        actions_ptr: *const u8,
++        actions_len: u32,
 +        cwd_ptr: *const u8,
 +        cwd_len: u32,
++        attr_flags: u32,
++        sigdefault_lo: u32,
++        sigdefault_hi: u32,
++        sigmask_lo: u32,
++        sigmask_hi: u32,
++        pgroup: u32,
 +        ret_pid: *mut u32,
 +    ) -> u32;
 +
-+    fn proc_waitpid(
++    fn proc_signal_mask_v2(
++        how: u32,
++        set_lo: u32,
++        set_hi: u32,
++        ret_old_lo: *mut u32,
++        ret_old_hi: *mut u32,
++    ) -> u32;
++
++    fn proc_exec(
++        exec_path_ptr: *const u8,
++        exec_path_len: u32,
++        argv_ptr: *const u8,
++        argv_len: u32,
++        envp_ptr: *const u8,
++        envp_len: u32,
++        cloexec_fds_ptr: *const u32,
++        cloexec_fds_len: u32,
++    ) -> u32;
++
++    fn proc_fexec(
++        exec_fd: u32,
++        argv_ptr: *const u8,
++        argv_len: u32,
++        envp_ptr: *const u8,
++        envp_len: u32,
++        cloexec_fds_ptr: *const u32,
++        cloexec_fds_len: u32,
++    ) -> u32;
++
++    fn proc_waitpid_v2(
 +        pid: u32,
 +        options: u32,
 +        ret_exit_code: *mut u32,
 +        ret_signal: *mut u32,
 +        ret_pid: *mut u32,
++        ret_core_dumped: *mut u32,
 +    ) -> u32;
 +
 +    fn proc_kill(pid: u32, signal: u32) -> u32;
@@ -73,10 +108,38 @@
 +    io::Error::from_raw_os_error(errno as i32)
 +}
 +
++const FDOP_CLOSE: u32 = 1;
++const FDOP_DUP2: u32 = 2;
++const FDOP_OPEN: u32 = 3;
++const O_WRONLY: u32 = 1;
++
++fn append_spawn_action(
++    actions: &mut Vec<u8>,
++    command: u32,
++    fd: u32,
++    source_fd: u32,
++    open_flags: u32,
++    path: &[u8],
++) {
++    for value in [command, fd, source_fd, open_flags, 0, path.len() as u32] {
++        actions.extend_from_slice(&value.to_le_bytes());
++    }
++    actions.extend_from_slice(path);
++}
++
++fn append_stdio_action(actions: &mut Vec<u8>, source_fd: u32, target_fd: u32) {
++    if source_fd == u32::MAX {
++        let open_flags = if target_fd == 0 { 0 } else { O_WRONLY };
++        append_spawn_action(actions, FDOP_OPEN, target_fd, 0, open_flags, b"/dev/null");
++    } else {
++        append_spawn_action(actions, FDOP_DUP2, target_fd, source_fd, 0, &[]);
++    }
++}
++
 +/// Encode separate host termination fields into POSIX wait-status bits expected by ExitStatus.
-+fn encode_wait_status(exit_code: u32, signal: u32) -> i32 {
++fn encode_wait_status(exit_code: u32, signal: u32, core_dumped: u32) -> i32 {
 +    if signal != 0 {
-+        (signal & 0x7f) as i32
++        ((signal & 0x7f) | if core_dumped != 0 { 0x80 } else { 0 }) as i32
 +    } else {
 +        ((exit_code & 0xff) << 8) as i32
 +    }
@@ -141,6 +204,10 @@
 +
 +    pub fn diverge(&self) -> ! {
 +        panic!("ChildPipe::diverge called on a valid pipe")
++    }
++
++    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
++        self.0.set_nonblocking(nonblocking)
 +    }
 +}
 +
@@ -280,33 +347,14 @@
 +    /// Serialize environment as KEY=VALUE\0 byte buffer.
 +    fn serialize_envp(&self) -> Vec<u8> {
 +        let mut buf = Vec::new();
-+        if self.env.does_clear() {
-+            // Only include explicitly set vars
-+            for (key, value) in self.env.iter() {
-+                if let Some(val) = value {
-+                    buf.extend_from_slice(key.as_bytes());
-+                    buf.push(b'=');
-+                    buf.extend_from_slice(val.as_bytes());
-+                    buf.push(0);
-+                }
-+            }
-+        } else {
-+            // Inherit current environment
-+            for (key, value) in crate::env::vars_os() {
-+                buf.extend_from_slice(key.as_bytes());
-+                buf.push(b'=');
-+                buf.extend_from_slice(value.as_bytes());
-+                buf.push(0);
-+            }
-+            // Apply overrides (host uses last value for duplicate keys)
-+            for (key, value_opt) in self.env.iter() {
-+                if let Some(value) = value_opt {
-+                    buf.extend_from_slice(key.as_bytes());
-+                    buf.push(b'=');
-+                    buf.extend_from_slice(value.as_bytes());
-+                    buf.push(0);
-+                }
-+            }
++        // Capture applies clear, override, and removal semantics before
++        // serialization. In particular, env_remove must not leave the inherited
++        // value earlier in this NUL-separated buffer.
++        for (key, value) in self.env.capture() {
++            buf.extend_from_slice(key.as_bytes());
++            buf.push(b'=');
++            buf.extend_from_slice(value.as_bytes());
++            buf.push(0);
 +        }
 +        buf
 +    }
@@ -318,28 +366,29 @@
 +        default_fd: u32,
 +        is_input: bool,
 +        use_pipe_default: bool,
-+    ) -> io::Result<(u32, Option<ChildPipe>)> {
-+        let make_pipe = || -> io::Result<(u32, Option<ChildPipe>)> {
++    ) -> io::Result<(u32, Option<ChildPipe>, Option<OwnedFd>)> {
++        let make_pipe = || -> io::Result<(u32, Option<ChildPipe>, Option<OwnedFd>)> {
 +            let (read_fd, write_fd) = create_pipe()?;
 +            if is_input {
-+                Ok((read_fd, Some(child_pipe_from_raw(write_fd))))
++                Ok((read_fd, Some(child_pipe_from_raw(write_fd)),
++                    Some(unsafe { OwnedFd::from_raw_fd(read_fd as RawFd) })))
 +            } else {
-+                Ok((write_fd, Some(child_pipe_from_raw(read_fd))))
++                Ok((write_fd, Some(child_pipe_from_raw(read_fd)),
++                    Some(unsafe { OwnedFd::from_raw_fd(write_fd as RawFd) })))
 +            }
 +        };
 +
 +        match stdio {
 +            None if use_pipe_default => make_pipe(),
-+            None | Some(Stdio::Inherit) => Ok((default_fd, None)),
++            None | Some(Stdio::Inherit) => Ok((default_fd, None, None)),
 +            Some(Stdio::Null) => {
-+                // Sentinel fd that the host interprets as /dev/null
-+                Ok((u32::MAX, None))
++                Ok((u32::MAX, None, None))
 +            }
 +            Some(Stdio::MakePipe) => make_pipe(),
-+            Some(Stdio::ParentStdout) => Ok((1, None)),
-+            Some(Stdio::ParentStderr) => Ok((2, None)),
++            Some(Stdio::ParentStdout) => Ok((1, None, None)),
++            Some(Stdio::ParentStderr) => Ok((2, None, None)),
 +            Some(Stdio::InheritFile(file)) => {
-+                Ok((file.as_raw_fd() as u32, None))
++                Ok((file.as_raw_fd() as u32, None, None))
 +            }
 +        }
 +    }
@@ -363,28 +412,73 @@
 +
 +        let use_pipes = matches!(default, Stdio::MakePipe);
 +
-+        let (child_stdin_fd, parent_stdin) =
++        let (child_stdin_fd, parent_stdin, child_stdin_guard) =
 +            Self::setup_one_stdio(&self.stdin, 0, true, use_pipes)?;
-+        let (child_stdout_fd, parent_stdout) =
++        let (child_stdout_fd, parent_stdout, child_stdout_guard) =
 +            Self::setup_one_stdio(&self.stdout, 1, false, use_pipes)?;
-+        let (child_stderr_fd, parent_stderr) =
++        let (child_stderr_fd, parent_stderr, child_stderr_guard) =
 +            Self::setup_one_stdio(&self.stderr, 2, false, use_pipes)?;
 +
-+        // Spawn the child process
++        let mut actions = Vec::new();
++        for (source, target) in [
++            (child_stdin_fd, 0),
++            (child_stdout_fd, 1),
++            (child_stderr_fd, 2),
++        ] {
++            if source != target {
++                append_stdio_action(&mut actions, source, target);
++            }
++        }
++        // Close both unused halves only after every dup, so an fd needed by a
++        // later stdio action cannot be invalidated by an earlier pipe cleanup.
++        let mut closed = [u32::MAX; 6];
++        let mut closed_len = 0;
++        for raw_fd in [
++            child_stdin_guard.as_ref().map(|fd| fd.as_raw_fd()),
++            child_stdout_guard.as_ref().map(|fd| fd.as_raw_fd()),
++            child_stderr_guard.as_ref().map(|fd| fd.as_raw_fd()),
++            parent_stdin.as_ref().map(|pipe| pipe.0.as_raw_fd()),
++            parent_stdout.as_ref().map(|pipe| pipe.0.as_raw_fd()),
++            parent_stderr.as_ref().map(|pipe| pipe.0.as_raw_fd()),
++        ].into_iter().flatten().map(|fd| fd as u32) {
++            if raw_fd > 2 && !closed[..closed_len].contains(&raw_fd) {
++                append_spawn_action(&mut actions, FDOP_CLOSE, raw_fd, 0, 0, &[]);
++                closed[closed_len] = raw_fd;
++                closed_len += 1;
++            }
++        }
++
++        // Query the authoritative mask so ordinary Command spawning inherits it.
++        let mut sigmask_lo = 0;
++        let mut sigmask_hi = 0;
++        let mask_errno = unsafe {
++            proc_signal_mask_v2(3, 0, 0, &mut sigmask_lo, &mut sigmask_hi)
++        };
++        if mask_errno != 0 {
++            return Err(wasi_err(mask_errno));
++        }
++
++        // Spawn the child process. The pipe guards keep child ends alive through
++        // the call and close them in the parent before this function returns.
 +        let mut pid: u32 = 0;
 +        let errno = unsafe {
-+            proc_spawn(
++            proc_spawn_v3(
 +                self.program.as_bytes().as_ptr(),
 +                self.program.as_bytes().len() as u32,
 +                argv.as_ptr(),
 +                argv.len() as u32,
 +                envp.as_ptr(),
 +                envp.len() as u32,
-+                child_stdin_fd,
-+                child_stdout_fd,
-+                child_stderr_fd,
++                actions.as_ptr(),
++                actions.len() as u32,
 +                cwd_bytes.as_ptr(),
 +                cwd_bytes.len() as u32,
++                0,
++                0,
++                0,
++                sigmask_lo,
++                sigmask_hi,
++                0,
 +                &mut pid,
 +            )
 +        };
@@ -580,13 +674,21 @@
 +        let mut exit_code: u32 = 0;
 +        let mut signal: u32 = 0;
 +        let mut ret_pid: u32 = 0;
++        let mut core_dumped: u32 = 0;
 +        let errno = unsafe {
-+            proc_waitpid(self.pid, 0, &mut exit_code, &mut signal, &mut ret_pid)
++            proc_waitpid_v2(
++                self.pid,
++                0,
++                &mut exit_code,
++                &mut signal,
++                &mut ret_pid,
++                &mut core_dumped,
++            )
 +        };
 +        if errno != 0 {
 +            return Err(wasi_err(errno));
 +        }
-+        let status = ExitStatus(encode_wait_status(exit_code, signal));
++        let status = ExitStatus(encode_wait_status(exit_code, signal, core_dumped));
 +        self.status = Some(status);
 +        Ok(status)
 +    }
@@ -599,19 +701,24 @@
 +        let mut exit_code: u32 = 0;
 +        let mut signal: u32 = 0;
 +        let mut ret_pid: u32 = 0;
++        let mut core_dumped: u32 = 0;
 +        let errno = unsafe {
-+            proc_waitpid(self.pid, 1, &mut exit_code, &mut signal, &mut ret_pid)
++            proc_waitpid_v2(
++                self.pid,
++                1,
++                &mut exit_code,
++                &mut signal,
++                &mut ret_pid,
++                &mut core_dumped,
++            )
 +        };
 +        if errno == 0 {
 +            if ret_pid == 0 {
 +                return Ok(None);
 +            }
-+            let status = ExitStatus(encode_wait_status(exit_code, signal));
++            let status = ExitStatus(encode_wait_status(exit_code, signal, core_dumped));
 +            self.status = Some(status);
 +            Ok(Some(status))
-+        } else if errno == 10 {
-+            // ECHILD — child not yet exited
-+            Ok(None)
 +        } else {
 +            Err(wasi_err(errno))
 +        }
@@ -683,8 +790,36 @@
 +    err: ChildPipe,
 +    stderr: &mut Vec<u8>,
 +) -> io::Result<()> {
-+    // In WASI single-threaded context, read sequentially
-+    out.read_to_end(stdout)?;
-+    err.read_to_end(stderr)?;
-+    Ok(())
++    // Drain both pipes together. Sequential blocking reads deadlock when the
++    // child fills stderr while the parent is waiting for stdout EOF (or vice
++    // versa), which diverges from Command::output on native platforms.
++    out.set_nonblocking(true)?;
++    err.set_nonblocking(true)?;
++
++    let mut fds: [libc::pollfd; 2] = unsafe { mem::zeroed() };
++    fds[0].fd = out.0.as_raw_fd();
++    fds[0].events = libc::POLLIN;
++    fds[1].fd = err.0.as_raw_fd();
++    fds[1].events = libc::POLLIN;
++    loop {
++        cvt_r(|| unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) })?;
++
++        if fds[0].revents != 0 && read_nonblocking(&out.0, stdout)? {
++            err.set_nonblocking(false)?;
++            return err.read_to_end(stderr).map(drop);
++        }
++        if fds[1].revents != 0 && read_nonblocking(&err.0, stderr)? {
++            out.set_nonblocking(false)?;
++            return out.read_to_end(stdout).map(drop);
++        }
++    }
++}
++
++fn read_nonblocking(fd: &FileDesc, destination: &mut Vec<u8>) -> io::Result<bool> {
++    match fd.read_to_end(destination) {
++        Ok(_) => Ok(true),
++        Err(error) if error.raw_os_error() == Some(libc::EWOULDBLOCK)
++            || error.raw_os_error() == Some(libc::EAGAIN) => Ok(false),
++        Err(error) => Err(error),
++    }
 +}

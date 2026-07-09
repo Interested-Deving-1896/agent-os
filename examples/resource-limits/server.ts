@@ -13,6 +13,11 @@ const vm = agentOS({
 			maxWasmMemoryBytes: 128 * 1024 * 1024, // WASM linear memory
 			maxWasmStackBytes: 4 * 1024 * 1024, // WASM call-stack ceiling
 		},
+		process: {
+			pendingStdinBytes: 64 * 1024 * 1024, // stdin waiting on a kernel pipe
+			pendingEventCount: 10_000, // queued process/runtime events per stage
+			pendingEventBytes: 64 * 1024 * 1024, // queued event payload per stage
+		},
 		jsRuntime: {
 			v8HeapLimitMb: 128, // JS isolate heap
 			cpuTimeLimitMs: 30_000, // active JS CPU time

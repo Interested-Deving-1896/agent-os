@@ -16,6 +16,7 @@ export type { PatternPermissionScope } from "./generated/PatternPermissionScope.
 export type { PermissionMode } from "./generated/PermissionMode.js";
 export type { PermissionsPolicy } from "./generated/PermissionsPolicy.js";
 export type { PluginLimitsConfig } from "./generated/PluginLimitsConfig.js";
+export type { ProcessLimitsConfig } from "./generated/ProcessLimitsConfig.js";
 export type { PythonLimitsConfig } from "./generated/PythonLimitsConfig.js";
 export type { ResourceLimitsConfig } from "./generated/ResourceLimitsConfig.js";
 export type { RootFilesystemConfig } from "./generated/RootFilesystemConfig.js";

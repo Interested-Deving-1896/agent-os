@@ -1,5 +1,7 @@
+use crate::fd_table::TransferredFd;
 use crate::poll::{PollEvents, POLLERR, POLLHUP, POLLIN, POLLOUT};
 use crate::vfs::normalize_path;
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -134,6 +136,7 @@ pub enum SocketDomain {
 pub enum SocketType {
     Stream,
     Datagram,
+    SeqPacket,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -196,6 +199,10 @@ impl SocketSpec {
 
     pub const fn unix_datagram() -> Self {
         Self::new(SocketDomain::Unix, SocketType::Datagram)
+    }
+
+    pub const fn unix_seqpacket() -> Self {
+        Self::new(SocketDomain::Unix, SocketType::SeqPacket)
     }
 }
 
@@ -296,7 +303,13 @@ impl SocketRecord {
         self.datagram_state
             .as_ref()
             .map(|state| state.recv_queue.len())
-            .unwrap_or(0)
+            .unwrap_or_else(|| {
+                self.connection_state
+                    .as_ref()
+                    .filter(|_| self.spec.socket_type != SocketType::Stream)
+                    .map(|state| state.recv_buffer.len())
+                    .unwrap_or(0)
+            })
     }
 
     pub fn queued_datagram_bytes(&self) -> usize {
@@ -346,6 +359,46 @@ impl SocketRecord {
 pub struct ReceivedDatagram {
     source_address: Option<InetSocketAddress>,
     payload: Vec<u8>,
+}
+
+pub type OpaqueTransferredRight = Arc<dyn Any + Send + Sync + 'static>;
+
+#[derive(Clone)]
+pub enum TransferredSocketRight {
+    Fd(TransferredFd),
+    Opaque(OpaqueTransferredRight),
+}
+
+impl fmt::Debug for TransferredSocketRight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fd(fd) => f.debug_tuple("Fd").field(&fd.description_id()).finish(),
+            Self::Opaque(resource) => f
+                .debug_tuple("Opaque")
+                .field(&(Arc::as_ptr(resource) as *const ()))
+                .finish(),
+        }
+    }
+}
+
+impl PartialEq for TransferredSocketRight {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Fd(left), Self::Fd(right)) => left == right,
+            (Self::Opaque(left), Self::Opaque(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TransferredSocketRight {}
+
+#[derive(Debug)]
+pub struct ReceivedSocketMessage {
+    pub payload: Vec<u8>,
+    pub rights: Vec<TransferredSocketRight>,
+    pub truncated: bool,
+    pub full_length: usize,
 }
 
 impl ReceivedDatagram {
@@ -490,11 +543,17 @@ struct ListenerState {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct ConnectionState {
     peer_socket_id: Option<SocketId>,
-    recv_buffer: VecDeque<Vec<u8>>,
+    recv_buffer: VecDeque<RecvChunk>,
     recv_buffer_len: usize,
     read_shutdown: bool,
     write_shutdown: bool,
     peer_write_shutdown: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecvChunk {
+    data: Vec<u8>,
+    rights: Vec<TransferredSocketRight>,
 }
 
 impl ConnectionState {
@@ -503,23 +562,55 @@ impl ConnectionState {
     }
 
     fn has_buffered_data(&self) -> bool {
-        self.recv_buffer_len > 0
+        !self.recv_buffer.is_empty()
     }
 
-    fn push_recv(&mut self, data: &[u8]) {
-        if data.is_empty() {
+    fn push_recv(&mut self, data: &[u8], rights: Vec<TransferredSocketRight>) {
+        if data.is_empty() && rights.is_empty() {
             return;
         }
-        self.recv_buffer.push_back(data.to_vec());
+        self.recv_buffer.push_back(RecvChunk {
+            data: data.to_vec(),
+            rights,
+        });
         self.recv_buffer_len = self.recv_buffer_len.saturating_add(data.len());
     }
 
-    fn read_recv(&mut self, max_bytes: usize) -> Option<Vec<u8>> {
-        if max_bytes == 0 {
-            return Some(Vec::new());
-        }
-        if self.recv_buffer_len == 0 {
+    fn read_recv(&mut self, max_bytes: usize, message_oriented: bool) -> Option<Vec<u8>> {
+        self.read_recv_message(max_bytes, message_oriented)
+            .map(|message| message.payload)
+    }
+
+    fn read_recv_message(
+        &mut self,
+        max_bytes: usize,
+        message_oriented: bool,
+    ) -> Option<ReceivedSocketMessage> {
+        if self.recv_buffer.is_empty() {
             return None;
+        }
+
+        if message_oriented {
+            let chunk = self.recv_buffer.pop_front()?;
+            self.recv_buffer_len = self.recv_buffer_len.saturating_sub(chunk.data.len());
+            let truncated = chunk.data.len() > max_bytes;
+            let full_length = chunk.data.len();
+            return Some(ReceivedSocketMessage {
+                payload: chunk.data[..chunk.data.len().min(max_bytes)].to_vec(),
+                rights: chunk.rights,
+                truncated,
+                full_length,
+            });
+        }
+
+        if max_bytes == 0 {
+            let chunk = self.recv_buffer.front_mut()?;
+            return Some(ReceivedSocketMessage {
+                payload: Vec::new(),
+                rights: std::mem::take(&mut chunk.rights),
+                truncated: false,
+                full_length: 0,
+            });
         }
 
         let read_len = self.recv_buffer_len.min(max_bytes);
@@ -531,18 +622,23 @@ impl ConnectionState {
             .load(Ordering::Relaxed)
             .then(Instant::now);
         let mut out = Vec::with_capacity(read_len);
+        let mut rights = Vec::new();
         while remaining > 0 {
             let mut chunk = self.recv_buffer.pop_front()?;
             chunks += 1;
-            if chunk.len() <= remaining {
-                remaining -= chunk.len();
-                out.extend_from_slice(&chunk);
+            rights.append(&mut chunk.rights);
+            if chunk.data.len() <= remaining {
+                remaining -= chunk.data.len();
+                out.extend_from_slice(&chunk.data);
                 continue;
             }
 
-            let tail = chunk.split_off(remaining);
-            out.extend_from_slice(&chunk);
-            self.recv_buffer.push_front(tail);
+            let tail = chunk.data.split_off(remaining);
+            out.extend_from_slice(&chunk.data);
+            self.recv_buffer.push_front(RecvChunk {
+                data: tail,
+                rights: Vec::new(),
+            });
             remaining = 0;
         }
         if let Some(started) = trace_started {
@@ -561,7 +657,48 @@ impl ConnectionState {
                 Ordering::Relaxed,
             );
         }
-        Some(out)
+        Some(ReceivedSocketMessage {
+            payload: out,
+            rights,
+            truncated: false,
+            full_length: read_len,
+        })
+    }
+
+    fn peek_recv_message(
+        &self,
+        max_bytes: usize,
+        message_oriented: bool,
+    ) -> Option<ReceivedSocketMessage> {
+        let first = self.recv_buffer.front()?;
+        if message_oriented {
+            return Some(ReceivedSocketMessage {
+                payload: first.data[..first.data.len().min(max_bytes)].to_vec(),
+                rights: first.rights.clone(),
+                truncated: first.data.len() > max_bytes,
+                full_length: first.data.len(),
+            });
+        }
+
+        let read_len = self.recv_buffer_len.min(max_bytes);
+        let mut payload = Vec::with_capacity(read_len);
+        let mut rights = Vec::new();
+        let mut remaining = read_len;
+        for (index, chunk) in self.recv_buffer.iter().enumerate() {
+            if index > 0 && remaining == 0 {
+                break;
+            }
+            rights.extend(chunk.rights.iter().cloned());
+            let take = remaining.min(chunk.data.len());
+            payload.extend_from_slice(&chunk.data[..take]);
+            remaining -= take;
+        }
+        Some(ReceivedSocketMessage {
+            payload,
+            rights,
+            truncated: false,
+            full_length: read_len,
+        })
     }
 
     fn clear_recv(&mut self) {
@@ -681,6 +818,35 @@ impl SocketTable {
             .sockets
             .get(&socket_id)
             .cloned()
+    }
+
+    pub fn reassign_owner(&self, socket_id: SocketId, owner_pid: u32) -> SocketResult<()> {
+        let mut table = lock_or_recover(&self.inner.state);
+        let previous_owner = table
+            .sockets
+            .get(&socket_id)
+            .ok_or_else(|| SocketTableError::not_found(socket_id))?
+            .owner_pid;
+        if previous_owner == owner_pid {
+            return Ok(());
+        }
+        if let Some(ids) = table.by_owner.get_mut(&previous_owner) {
+            ids.remove(&socket_id);
+            if ids.is_empty() {
+                table.by_owner.remove(&previous_owner);
+            }
+        }
+        table
+            .by_owner
+            .entry(owner_pid)
+            .or_default()
+            .insert(socket_id);
+        table
+            .sockets
+            .get_mut(&socket_id)
+            .expect("socket checked before owner reassignment")
+            .owner_pid = owner_pid;
+        Ok(())
     }
 
     pub fn records_for_owner(&self, owner_pid: u32) -> Vec<SocketRecord> {
@@ -1629,8 +1795,63 @@ impl SocketTable {
             }
 
             let was_empty = !peer_connection.has_buffered_data();
-            peer_connection.push_recv(data);
+            peer_connection.push_recv(data, Vec::new());
             (was_empty && !data.is_empty()).then_some(SocketReadiness {
+                socket_id: peer_socket_id,
+                kind: SocketReadinessKind::Data,
+            })
+        };
+        self.emit_readiness(readiness);
+        Ok(data.len())
+    }
+
+    pub fn send_message(
+        &self,
+        socket_id: SocketId,
+        data: &[u8],
+        rights: Vec<TransferredSocketRight>,
+    ) -> SocketResult<usize> {
+        let readiness = {
+            let mut table = lock_or_recover(&self.inner.state);
+            let record = table
+                .sockets
+                .get(&socket_id)
+                .cloned()
+                .ok_or_else(|| SocketTableError::not_found(socket_id))?;
+            let connection = record.connection_state.as_ref().ok_or_else(|| {
+                SocketTableError::not_connected(format!("socket {socket_id} is not connected"))
+            })?;
+            if record.state != SocketState::Connected {
+                return Err(SocketTableError::not_connected(format!(
+                    "socket {socket_id} is not connected"
+                )));
+            }
+            if connection.write_shutdown {
+                return Err(SocketTableError::broken_pipe(format!(
+                    "socket {socket_id} write side is shut down"
+                )));
+            }
+            if data.is_empty() && record.spec.socket_type == SocketType::Stream {
+                return Ok(0);
+            }
+
+            let peer_socket_id = connection.peer_socket_id.ok_or_else(|| {
+                SocketTableError::broken_pipe(format!("socket {socket_id} peer is closed"))
+            })?;
+            let peer = table.sockets.get_mut(&peer_socket_id).ok_or_else(|| {
+                SocketTableError::broken_pipe(format!("socket {socket_id} peer is closed"))
+            })?;
+            let peer_connection = peer.connection_state.as_mut().ok_or_else(|| {
+                SocketTableError::broken_pipe(format!("socket {socket_id} peer is closed"))
+            })?;
+            if peer_connection.read_shutdown {
+                return Err(SocketTableError::broken_pipe(format!(
+                    "socket {peer_socket_id} read side is shut down"
+                )));
+            }
+            let was_empty = !peer_connection.has_buffered_data();
+            peer_connection.push_recv(data, rights);
+            was_empty.then_some(SocketReadiness {
                 socket_id: peer_socket_id,
                 kind: SocketReadinessKind::Data,
             })
@@ -1720,7 +1941,9 @@ impl SocketTable {
             let connection = record.connection_state.as_mut().ok_or_else(|| {
                 SocketTableError::not_connected(format!("socket {socket_id} is not connected"))
             })?;
-            return Ok(connection.read_recv(max_bytes));
+            return Ok(
+                connection.read_recv(max_bytes, record.spec.socket_type != SocketType::Stream)
+            );
         }
 
         let peer_open = connection
@@ -1734,6 +1957,61 @@ impl SocketTable {
         Err(SocketTableError::would_block(format!(
             "socket {socket_id} has no readable data"
         )))
+    }
+
+    pub fn recv_message(
+        &self,
+        socket_id: SocketId,
+        max_bytes: usize,
+        peek: bool,
+    ) -> SocketResult<Option<ReceivedSocketMessage>> {
+        let mut table = lock_or_recover(&self.inner.state);
+        let record = table
+            .sockets
+            .get_mut(&socket_id)
+            .ok_or_else(|| SocketTableError::not_found(socket_id))?;
+        if record.state != SocketState::Connected {
+            return Err(SocketTableError::not_connected(format!(
+                "socket {socket_id} is not connected"
+            )));
+        }
+        let message_oriented = record.spec.socket_type != SocketType::Stream;
+        let connection = record.connection_state.as_mut().ok_or_else(|| {
+            SocketTableError::not_connected(format!("socket {socket_id} is not connected"))
+        })?;
+        if connection.read_shutdown {
+            return Ok(None);
+        }
+        if connection.has_buffered_data() {
+            return Ok(if peek {
+                connection.peek_recv_message(max_bytes, message_oriented)
+            } else {
+                connection.read_recv_message(max_bytes, message_oriented)
+            });
+        }
+        if connection.peer_write_shutdown {
+            return Ok(None);
+        }
+        Err(SocketTableError::would_block(format!(
+            "socket {socket_id} has no readable data"
+        )))
+    }
+
+    pub fn next_message_rights_count(&self, socket_id: SocketId) -> SocketResult<usize> {
+        let table = lock_or_recover(&self.inner.state);
+        let record = table
+            .sockets
+            .get(&socket_id)
+            .ok_or_else(|| SocketTableError::not_found(socket_id))?;
+        let connection = record.connection_state.as_ref().ok_or_else(|| {
+            SocketTableError::not_connected(format!("socket {socket_id} is not connected"))
+        })?;
+        Ok(connection
+            .recv_buffer
+            .iter()
+            .take(1)
+            .map(|chunk| chunk.rights.len())
+            .sum())
     }
 
     pub fn shutdown(&self, socket_id: SocketId, how: SocketShutdown) -> SocketResult<SocketRecord> {
@@ -1813,6 +2091,11 @@ impl SocketTable {
                 snapshot.buffered_bytes = snapshot
                     .buffered_bytes
                     .saturating_add(connection.buffered_len());
+                if record.spec.socket_type != SocketType::Stream {
+                    snapshot.datagram_queue_len = snapshot
+                        .datagram_queue_len
+                        .saturating_add(connection.recv_buffer.len());
+                }
             }
             if let Some(datagram_state) = &record.datagram_state {
                 snapshot.datagram_queue_len = snapshot
@@ -1853,6 +2136,12 @@ fn validate_state_transition(current: SocketState, next: SocketState) -> SocketR
 }
 
 fn validate_connect_pair(socket: &SocketRecord, peer: &SocketRecord) -> SocketResult<()> {
+    if socket.spec != peer.spec {
+        return Err(SocketTableError::invalid_argument(format!(
+            "socket {} and peer {} have incompatible types",
+            socket.id, peer.id
+        )));
+    }
     if !supports_connection_lifecycle(socket.spec) {
         return Err(SocketTableError::invalid_argument(format!(
             "socket {} does not support stream connections",
@@ -1898,6 +2187,11 @@ fn default_datagram_state(spec: SocketSpec) -> Option<DatagramState> {
 
 fn supports_connection_lifecycle(spec: SocketSpec) -> bool {
     matches!(spec.socket_type, SocketType::Stream)
+        || (spec.domain == SocketDomain::Unix
+            && matches!(
+                spec.socket_type,
+                SocketType::Datagram | SocketType::SeqPacket
+            ))
 }
 
 fn supports_listener_lifecycle(spec: SocketSpec) -> bool {

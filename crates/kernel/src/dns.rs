@@ -171,6 +171,8 @@ impl DnsRecordResolution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnsResolverErrorKind {
     InvalidInput,
+    NxDomain,
+    NoData,
     LookupFailed,
 }
 
@@ -191,6 +193,20 @@ impl DnsResolverError {
     pub fn lookup_failed(message: impl Into<String>) -> Self {
         Self {
             kind: DnsResolverErrorKind::LookupFailed,
+            message: message.into(),
+        }
+    }
+
+    pub fn nx_domain(message: impl Into<String>) -> Self {
+        Self {
+            kind: DnsResolverErrorKind::NxDomain,
+            message: message.into(),
+        }
+    }
+
+    pub fn no_data(message: impl Into<String>) -> Self {
+        Self {
+            kind: DnsResolverErrorKind::NoData,
             message: message.into(),
         }
     }
@@ -462,13 +478,19 @@ fn worker_lookup_records(
             .lookup(&hostname, record_type)
             .await
             .map_err(|error| {
-                DnsResolverError::lookup_failed(format!(
-                    "failed to resolve DNS {record_type} record {hostname}: {error}"
-                ))
+                let message =
+                    format!("failed to resolve DNS {record_type} record {hostname}: {error}");
+                if error.is_nx_domain() {
+                    DnsResolverError::nx_domain(message)
+                } else if error.is_no_records_found() {
+                    DnsResolverError::no_data(message)
+                } else {
+                    DnsResolverError::lookup_failed(message)
+                }
             })?;
         let records = lookup.answers().to_vec();
         if records.is_empty() {
-            return Err(DnsResolverError::lookup_failed(format!(
+            return Err(DnsResolverError::no_data(format!(
                 "failed to resolve DNS {record_type} record {hostname}"
             )));
         }
@@ -586,7 +608,7 @@ pub fn resolve_dns_records(
     );
     let records = resolver.lookup_records(&request)?;
     if records.is_empty() {
-        return Err(DnsResolverError::lookup_failed(format!(
+        return Err(DnsResolverError::no_data(format!(
             "failed to resolve DNS {record_type} record {normalized_hostname}"
         )));
     }

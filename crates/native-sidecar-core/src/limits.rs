@@ -49,6 +49,11 @@ pub const DEFAULT_WASM_CAPTURED_OUTPUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_WASM_SYNC_READ_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_WASM_PREWARM_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_WASM_RUNNER_HEAP_LIMIT_MB: u32 = 2048;
+pub const DEFAULT_PROCESS_PENDING_STDIN_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_PROCESS_MAX_SPAWN_FILE_ACTIONS: usize = 4096;
+pub const DEFAULT_PROCESS_MAX_SPAWN_FILE_ACTION_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_PROCESS_PENDING_EVENT_COUNT: usize = 10_000;
+pub const DEFAULT_PROCESS_PENDING_EVENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// All operator-tunable VM-scoped limits. Fields are concrete values; the `Default` impls own the
 /// numbers and equal today's hardcoded constants, so unset operator config leaves behavior
@@ -64,6 +69,7 @@ pub struct VmLimits {
     pub js_runtime: JsRuntimeLimits,
     pub python: PythonLimits,
     pub wasm: WasmLimits,
+    pub process: ProcessLimits,
 }
 
 pub fn virtual_os_cpu_count(resource_limits: &ResourceLimits) -> usize {
@@ -157,6 +163,20 @@ pub struct WasmLimits {
     pub runner_heap_limit_mb: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessLimits {
+    /// Maximum file actions decoded for one posix_spawn request.
+    pub max_spawn_file_actions: usize,
+    /// Maximum serialized file-action bytes accepted for one spawn request.
+    pub max_spawn_file_action_bytes: usize,
+    /// Host-side bytes accepted for pipe-backed stdin but not yet written.
+    pub pending_stdin_bytes: usize,
+    /// Maximum queued process events at each sidecar queue stage.
+    pub pending_event_count: usize,
+    /// Maximum aggregate payload bytes retained at each process-event stage.
+    pub pending_event_bytes: usize,
+}
+
 impl Default for HttpLimits {
     fn default() -> Self {
         Self {
@@ -235,6 +255,18 @@ impl Default for WasmLimits {
             sync_read_limit_bytes: DEFAULT_WASM_SYNC_READ_LIMIT_BYTES,
             prewarm_timeout_ms: DEFAULT_WASM_PREWARM_TIMEOUT_MS,
             runner_heap_limit_mb: DEFAULT_WASM_RUNNER_HEAP_LIMIT_MB,
+        }
+    }
+}
+
+impl Default for ProcessLimits {
+    fn default() -> Self {
+        Self {
+            max_spawn_file_actions: DEFAULT_PROCESS_MAX_SPAWN_FILE_ACTIONS,
+            max_spawn_file_action_bytes: DEFAULT_PROCESS_MAX_SPAWN_FILE_ACTION_BYTES,
+            pending_stdin_bytes: DEFAULT_PROCESS_PENDING_STDIN_BYTES,
+            pending_event_count: DEFAULT_PROCESS_PENDING_EVENT_COUNT,
+            pending_event_bytes: DEFAULT_PROCESS_PENDING_EVENT_BYTES,
         }
     }
 }
@@ -416,6 +448,33 @@ pub fn vm_limits_from_config(
                 .map_err(|_| integer_too_large("limits.wasm.runnerHeapLimitMb", value))?;
         }
     }
+    if let Some(process) = config.process.as_ref() {
+        set_usize(
+            &mut limits.process.max_spawn_file_actions,
+            process.max_spawn_file_actions,
+            "limits.process.maxSpawnFileActions",
+        )?;
+        set_usize(
+            &mut limits.process.max_spawn_file_action_bytes,
+            process.max_spawn_file_action_bytes,
+            "limits.process.maxSpawnFileActionBytes",
+        )?;
+        set_usize(
+            &mut limits.process.pending_stdin_bytes,
+            process.pending_stdin_bytes,
+            "limits.process.pendingStdinBytes",
+        )?;
+        set_usize(
+            &mut limits.process.pending_event_count,
+            process.pending_event_count,
+            "limits.process.pendingEventCount",
+        )?;
+        set_usize(
+            &mut limits.process.pending_event_bytes,
+            process.pending_event_bytes,
+            "limits.process.pendingEventBytes",
+        )?;
+    }
 
     validate_vm_limits(&limits, sidecar_max_frame_bytes)?;
     Ok(limits)
@@ -566,6 +625,61 @@ fn integer_too_large(key: &str, value: u64) -> SidecarCoreError {
     SidecarCoreError::new(format!("{key} value {value} does not fit this platform"))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        vm_limits_from_config, DEFAULT_PROCESS_MAX_SPAWN_FILE_ACTIONS,
+        DEFAULT_PROCESS_MAX_SPAWN_FILE_ACTION_BYTES,
+    };
+    use agentos_vm_config::{ProcessLimitsConfig, VmLimitsConfig};
+
+    #[test]
+    fn process_spawn_action_limits_have_bounded_defaults_and_accept_overrides() {
+        let defaults = vm_limits_from_config(None, 64 * 1024 * 1024).expect("default limits");
+        assert_eq!(
+            defaults.process.max_spawn_file_actions,
+            DEFAULT_PROCESS_MAX_SPAWN_FILE_ACTIONS
+        );
+        assert_eq!(
+            defaults.process.max_spawn_file_action_bytes,
+            DEFAULT_PROCESS_MAX_SPAWN_FILE_ACTION_BYTES
+        );
+
+        let config = VmLimitsConfig {
+            process: Some(ProcessLimitsConfig {
+                max_spawn_file_actions: Some(7),
+                max_spawn_file_action_bytes: Some(321),
+                ..ProcessLimitsConfig::default()
+            }),
+            ..VmLimitsConfig::default()
+        };
+        let overridden = vm_limits_from_config(Some(&config), 64 * 1024 * 1024).expect("overrides");
+        assert_eq!(overridden.process.max_spawn_file_actions, 7);
+        assert_eq!(overridden.process.max_spawn_file_action_bytes, 321);
+
+        for (max_actions, max_bytes, field) in [
+            (Some(0), Some(321), "limits.process.max_spawn_file_actions"),
+            (
+                Some(7),
+                Some(0),
+                "limits.process.max_spawn_file_action_bytes",
+            ),
+        ] {
+            let config = VmLimitsConfig {
+                process: Some(ProcessLimitsConfig {
+                    max_spawn_file_actions: max_actions,
+                    max_spawn_file_action_bytes: max_bytes,
+                    ..ProcessLimitsConfig::default()
+                }),
+                ..VmLimitsConfig::default()
+            };
+            let error = vm_limits_from_config(Some(&config), 64 * 1024 * 1024)
+                .expect_err("zero process spawn limit must be rejected");
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+}
+
 /// Cross-field validation. Fail-by-default: reject any configuration that would deadlock or
 /// violate the wire frame budget with an explicit, actionable message.
 pub fn validate_vm_limits(
@@ -591,7 +705,7 @@ pub fn validate_vm_limits(
         )));
     }
 
-    let nonzero_usize: [(&str, usize); 13] = [
+    let nonzero_usize: [(&str, usize); 18] = [
         (
             "limits.tools.max_registered_toolkits",
             limits.tools.max_registered_toolkits,
@@ -643,6 +757,26 @@ pub fn validate_vm_limits(
         (
             "limits.wasm.captured_output_limit_bytes",
             limits.wasm.captured_output_limit_bytes,
+        ),
+        (
+            "limits.process.max_spawn_file_actions",
+            limits.process.max_spawn_file_actions,
+        ),
+        (
+            "limits.process.max_spawn_file_action_bytes",
+            limits.process.max_spawn_file_action_bytes,
+        ),
+        (
+            "limits.process.pending_stdin_bytes",
+            limits.process.pending_stdin_bytes,
+        ),
+        (
+            "limits.process.pending_event_count",
+            limits.process.pending_event_count,
+        ),
+        (
+            "limits.process.pending_event_bytes",
+            limits.process.pending_event_bytes,
         ),
     ];
     for (key, value) in nonzero_usize {

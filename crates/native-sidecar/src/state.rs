@@ -9,11 +9,15 @@ use crate::protocol::{
     SignalHandlerRegistration, SoftwareDescriptor, WasmPermissionTier,
 };
 use crate::wire::DEFAULT_MAX_FRAME_BYTES;
-use agentos_bridge::{BridgeTypes, FilesystemSnapshot};
+use agentos_bridge::{
+    queue_tracker::{self, QueueGauge, TrackedLimit},
+    BridgeTypes, FilesystemSnapshot,
+};
 use agentos_execution::{
     v8_host::V8SessionHandle, JavascriptExecution, JavascriptSyncRpcRequest, PythonExecution,
     PythonVfsRpcRequest, WasmExecution,
 };
+use agentos_kernel::fd_table::TransferredFd;
 use agentos_kernel::kernel::{KernelProcessHandle, KernelVm};
 use agentos_kernel::mount_table::MountTable;
 use agentos_kernel::root_fs::RootFilesystemMode;
@@ -25,6 +29,7 @@ use rusqlite::Connection;
 use rustls::{ClientConnection, ServerConnection, StreamOwned};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use socket2::Socket;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -32,9 +37,9 @@ use std::fs::File;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -46,6 +51,215 @@ pub(crate) type BridgeError<B> = <B as BridgeTypes>::Error;
 pub(crate) type SidecarKernel = KernelVm<MountTable>;
 pub(crate) type KernelSocketReadinessRegistry =
     Arc<Mutex<BTreeMap<SocketId, KernelSocketReadinessTarget>>>;
+pub(crate) type HostNetTransferDescriptionRegistry =
+    Arc<Mutex<BTreeMap<usize, HostNetTransferDescription>>>;
+
+/// One VM-wide retained-byte envelope shared by every process queue of a
+/// particular class. Per-process limits remain independently enforced; this
+/// aggregate prevents `maxProcesses` from multiplying the VM's memory bound.
+#[derive(Debug)]
+pub(crate) struct VmPendingByteBudget {
+    used: AtomicUsize,
+    limit: usize,
+    gauge: Arc<QueueGauge>,
+}
+
+impl VmPendingByteBudget {
+    pub(crate) fn new(limit: usize, tracked_limit: TrackedLimit) -> Arc<Self> {
+        Arc::new(Self {
+            used: AtomicUsize::new(0),
+            limit,
+            gauge: queue_tracker::register_queue(tracked_limit, limit),
+        })
+    }
+
+    pub(crate) fn try_reserve(&self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let reserved = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(bytes)
+                    .filter(|next| *next <= self.limit)
+            });
+        match reserved {
+            Ok(previous) => {
+                self.gauge.observe_depth(previous.saturating_add(bytes));
+                true
+            }
+            Err(current) => {
+                self.gauge.observe_depth(current);
+                false
+            }
+        }
+    }
+
+    pub(crate) fn release(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_sub(bytes) else {
+                tracing::error!(
+                    released_bytes = bytes,
+                    accounted_bytes = current,
+                    limit = self.limit,
+                    "pending-byte aggregate release exceeded accounted usage"
+                );
+                self.gauge.observe_depth(current);
+                return;
+            };
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.gauge.observe_depth(next);
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct HostNetTransferDescription {
+    pub(crate) handles: Weak<()>,
+    pub(crate) connected: bool,
+}
+
+#[derive(Debug)]
+struct RealIntervalTimerState {
+    deadline: Option<Instant>,
+    interval: Duration,
+    pending_expiry: bool,
+    shutdown: bool,
+}
+
+/// Sidecar-clocked ITIMER_REAL state. One bounded worker is created for each
+/// WASM process, and reconfiguration wakes that worker instead of spawning an
+/// unbounded series of sleeping timer threads.
+pub(crate) struct ActiveRealIntervalTimer {
+    state: Arc<(Mutex<RealIntervalTimerState>, Condvar)>,
+}
+
+impl ActiveRealIntervalTimer {
+    pub(crate) fn new(start_worker: bool) -> Self {
+        let state = Arc::new((
+            Mutex::new(RealIntervalTimerState {
+                deadline: None,
+                interval: Duration::ZERO,
+                pending_expiry: false,
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ));
+        if start_worker {
+            let worker_state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let (lock, ready) = &*worker_state;
+                let mut timer = lock.lock().unwrap_or_else(|error| error.into_inner());
+                loop {
+                    if timer.shutdown {
+                        break;
+                    }
+                    let Some(deadline) = timer.deadline else {
+                        timer = ready.wait(timer).unwrap_or_else(|error| error.into_inner());
+                        continue;
+                    };
+                    let now = Instant::now();
+                    if now < deadline {
+                        let (next, _) = ready
+                            .wait_timeout(timer, deadline.saturating_duration_since(now))
+                            .unwrap_or_else(|error| error.into_inner());
+                        timer = next;
+                        continue;
+                    }
+
+                    if timer.interval.is_zero() {
+                        timer.deadline = None;
+                    } else {
+                        let interval = timer.interval;
+                        let mut next = deadline;
+                        while next <= now {
+                            next = next.checked_add(interval).unwrap_or(now + interval);
+                        }
+                        timer.deadline = Some(next);
+                    }
+                    // Standard SIGALRM instances coalesce while pending. The
+                    // runner drains this bit through process.take_signal at
+                    // WASM syscall boundaries, including blocking sleeps.
+                    timer.pending_expiry = true;
+                }
+            });
+        }
+        Self { state }
+    }
+
+    pub(crate) fn get(&self) -> (u64, u64) {
+        let timer = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        real_interval_timer_values(&timer, Instant::now())
+    }
+
+    pub(crate) fn set(&self, value_us: u64, interval_us: u64) -> (u64, u64) {
+        let (lock, ready) = &*self.state;
+        let mut timer = lock.lock().unwrap_or_else(|error| error.into_inner());
+        let now = Instant::now();
+        let previous = real_interval_timer_values(&timer, now);
+        timer.deadline = (value_us != 0).then(|| now + Duration::from_micros(value_us));
+        timer.interval = Duration::from_micros(interval_us);
+        ready.notify_all();
+        previous
+    }
+
+    pub(crate) fn take_expiry(&self) -> bool {
+        let mut timer = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        std::mem::take(&mut timer.pending_expiry)
+    }
+}
+
+fn real_interval_timer_values(timer: &RealIntervalTimerState, now: Instant) -> (u64, u64) {
+    let remaining = timer
+        .deadline
+        .map(|deadline| deadline.saturating_duration_since(now).as_micros())
+        .unwrap_or_default()
+        .min(u128::from(u64::MAX)) as u64;
+    let interval = timer.interval.as_micros().min(u128::from(u64::MAX)) as u64;
+    (remaining, interval)
+}
+
+impl Drop for ActiveRealIntervalTimer {
+    fn drop(&mut self) {
+        let (lock, ready) = &*self.state;
+        let mut timer = lock.lock().unwrap_or_else(|error| error.into_inner());
+        timer.shutdown = true;
+        ready.notify_all();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -62,6 +276,7 @@ pub(crate) const WASM_COMMAND: &str = "wasm";
 pub(crate) const PYTHON_VFS_RPC_GUEST_ROOT: &str = "/";
 pub(crate) const EXECUTION_SANDBOX_ROOT_ENV: &str = "AGENTOS_SANDBOX_ROOT";
 pub(crate) const WASM_STDIO_SYNC_RPC_ENV: &str = "AGENTOS_WASI_STDIO_SYNC_RPC";
+pub(crate) const WASM_EXEC_COMMIT_RPC_ENV: &str = "AGENTOS_WASM_EXEC_COMMIT_RPC";
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) const HOST_REALPATH_MAX_SYMLINK_DEPTH: usize = 40;
@@ -326,6 +541,8 @@ pub(crate) struct VmState {
     /// Operator-tunable VM-scoped runtime limits. Immutable for the VM's lifetime;
     /// `ConfigureVm` does not mutate limits.
     pub(crate) limits: crate::limits::VmLimits,
+    pub(crate) pending_stdin_bytes_budget: Arc<VmPendingByteBudget>,
+    pub(crate) pending_event_bytes_budget: Arc<VmPendingByteBudget>,
     pub(crate) dns: VmDnsConfig,
     pub(crate) listen_policy: VmListenPolicy,
     pub(crate) create_loopback_exempt_ports: BTreeSet<u16>,
@@ -337,6 +554,11 @@ pub(crate) struct VmState {
     pub(crate) host_cwd: PathBuf,
     pub(crate) kernel: SidecarKernel,
     pub(crate) kernel_socket_readiness: KernelSocketReadinessRegistry,
+    /// Sidecar-only host-network descriptions currently retained by an opaque
+    /// SCM_RIGHTS transfer. Weak entries make queue discard/receive lifecycle
+    /// automatic while allowing VM-wide limit accounting to see descriptions
+    /// that temporarily have no process-map entry.
+    pub(crate) host_net_transfer_descriptions: HostNetTransferDescriptionRegistry,
     pub(crate) loaded_snapshot: Option<FilesystemSnapshot>,
     pub(crate) configuration: VmConfiguration,
     pub(crate) layers: VmLayerStore,
@@ -365,7 +587,9 @@ pub(crate) struct VmState {
     /// Memory is bounded by the shadow tree itself, which is capped by the
     /// kernel filesystem inode/byte resource limits that bound what the walk
     /// can materialize.
-    pub(crate) shadow_sync_inventory: BTreeSet<String>,
+    pub(crate) shadow_sync_inventory: BTreeMap<String, ShadowSyncInventoryEntry>,
+    pub(crate) unix_address_registry: GuestUnixAddressRegistry,
+    pub(crate) unix_socket_host_dir: PathBuf,
 }
 
 /// Launch parameters for one projected agent package.
@@ -382,6 +606,37 @@ pub(crate) struct ExitedProcessSnapshot {
     pub(crate) process: crate::protocol::ProcessSnapshotEntry,
 }
 
+/// Filesystem object kind captured during a shadow-root inventory walk.
+///
+/// Tracking the kind as well as the path is required for Linux replacement
+/// semantics: a regular file replacing a symlink (or a directory replacing a
+/// file) must replace the directory entry itself, never follow the stale
+/// object that happened to occupy the same pathname in the kernel VFS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShadowNodeType {
+    Directory,
+    File,
+    Symlink,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShadowSyncInventoryEntry {
+    pub(crate) node_type: ShadowNodeType,
+    /// The previous kernel entry could not be removed. Keeping the tombstone
+    /// makes the next walk retry instead of permanently forgetting a failed
+    /// reconciliation.
+    pub(crate) deletion_pending: bool,
+}
+
+impl ShadowSyncInventoryEntry {
+    pub(crate) fn present(node_type: ShadowNodeType) -> Self {
+        Self {
+            node_type,
+            deletion_pending: false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DNS configuration
 // ---------------------------------------------------------------------------
@@ -394,7 +649,10 @@ pub(crate) struct VmDnsConfig {
 
 #[derive(Debug, Clone)]
 pub(crate) struct JavascriptSocketPathContext {
-    pub(crate) sandbox_root: PathBuf,
+    pub(crate) unix_abstract_namespace: [u8; 32],
+    pub(crate) unix_socket_host_dir: PathBuf,
+    pub(crate) unix_bound_addresses: GuestUnixAddressRegistry,
+    pub(crate) host_net_transfer_descriptions: HostNetTransferDescriptionRegistry,
     pub(crate) mounts: Vec<MountDescriptor>,
     pub(crate) listen_policy: VmListenPolicy,
     pub(crate) loopback_exempt_ports: BTreeSet<u16>,
@@ -406,6 +664,27 @@ pub(crate) struct JavascriptSocketPathContext {
     pub(crate) used_tcp_guest_ports: BTreeMap<JavascriptSocketFamily, BTreeSet<u16>>,
     pub(crate) used_udp_guest_ports: BTreeMap<JavascriptSocketFamily, BTreeSet<u16>>,
 }
+
+#[derive(Debug, Clone)]
+pub(crate) struct GuestUnixAddress {
+    pub(crate) path: String,
+    pub(crate) abstract_path_hex: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GuestUnixAddressRegistryEntry {
+    pub(crate) host_address_key: String,
+    pub(crate) address: GuestUnixAddress,
+    pub(crate) guest_device_inode: Option<(u64, u64)>,
+    pub(crate) host_path: Option<PathBuf>,
+    pub(crate) generation: u64,
+    pub(crate) active_bindings: usize,
+    pub(crate) queued_by_target: BTreeMap<String, usize>,
+    pub(crate) pending_connections: VecDeque<Arc<GuestUnixConnectionState>>,
+}
+
+pub(crate) type GuestUnixAddressRegistry =
+    Arc<Mutex<BTreeMap<String, GuestUnixAddressRegistryEntry>>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct JavascriptHttpLoopbackTarget {
@@ -477,13 +756,24 @@ pub(crate) struct PendingKernelStdin {
 }
 
 impl PendingKernelStdin {
+    const CHUNK_BYTES: usize = 64 * 1024;
+
     pub(crate) fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
 
     pub(crate) fn push(&mut self, chunk: &[u8]) {
         self.total += chunk.len();
-        self.chunks.push_back(chunk.to_vec());
+        let mut remaining = chunk;
+        if let Some(back) = self.chunks.back_mut() {
+            let available = Self::CHUNK_BYTES.saturating_sub(back.len());
+            let take = available.min(remaining.len());
+            back.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+        }
+        for part in remaining.chunks(Self::CHUNK_BYTES) {
+            self.chunks.push_back(part.to_vec());
+        }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -501,6 +791,8 @@ pub(crate) struct ActiveProcess {
     /// Backlog for pipe-backed kernel stdin awaiting pipe capacity; see
     /// [`PendingKernelStdin`].
     pub(crate) pending_kernel_stdin: PendingKernelStdin,
+    pub(crate) pending_kernel_stdin_gauge: Arc<QueueGauge>,
+    pub(crate) vm_pending_stdin_bytes_budget: Arc<VmPendingByteBudget>,
     /// For a TTY (PTY-backed) process, the master-end fd whose output buffer
     /// carries cooked-mode echo plus ONLCR-processed guest output. When set,
     /// this master output is the single ordered output stream surfaced to the
@@ -516,8 +808,24 @@ pub(crate) struct ActiveProcess {
     pub(crate) mapped_host_fds: BTreeMap<u32, ActiveMappedHostFd>,
     pub(crate) next_mapped_host_fd: u32,
     pub(crate) pending_execution_events: VecDeque<ActiveExecutionEvent>,
+    pub(crate) pending_execution_event_bytes: usize,
+    pub(crate) pending_execution_event_count_limit: usize,
+    pub(crate) pending_execution_event_bytes_limit: usize,
+    pub(crate) pending_execution_event_count_gauge: Arc<QueueGauge>,
+    pub(crate) pending_execution_event_bytes_gauge: Arc<QueueGauge>,
+    pub(crate) vm_pending_event_bytes_budget: Arc<VmPendingByteBudget>,
     pub(crate) pending_self_signal_exit: Option<i32>,
-    pub(crate) pending_wasm_signals: VecDeque<i32>,
+    /// Actual terminating signal observed from the runtime process (or the
+    /// signal used for a shared-runtime synthetic exit). This is distinct from
+    /// a requested kill signal: handlers may catch one signal and later exit
+    /// for another reason.
+    pub(crate) exit_signal: Option<i32>,
+    pub(crate) exit_core_dumped: bool,
+    /// Pending standard signals use a set, matching Linux's coalescing rule:
+    /// multiple instances of the same standard signal occupy one pending bit.
+    pub(crate) pending_wasm_signals: BTreeSet<i32>,
+    pub(crate) pending_wasm_signals_gauge: Arc<QueueGauge>,
+    pub(crate) real_interval_timer: ActiveRealIntervalTimer,
     pub(crate) child_processes: BTreeMap<String, ActiveProcess>,
     pub(crate) next_child_process_id: usize,
     pub(crate) http_servers: BTreeMap<u64, ActiveHttpServer>,
@@ -839,7 +1147,7 @@ pub(crate) struct KernelSocketReadinessTarget {
 pub(crate) struct ActiveTcpSocket {
     pub(crate) stream: Option<Arc<Mutex<TcpStream>>>,
     pub(crate) pending_read_stream: Option<Arc<Mutex<Option<TcpStream>>>>,
-    pub(crate) events: Option<Receiver<JavascriptTcpSocketEvent>>,
+    pub(crate) events: Option<Arc<Mutex<Receiver<JavascriptTcpSocketEvent>>>>,
     pub(crate) event_sender: Option<Sender<JavascriptTcpSocketEvent>>,
     pub(crate) event_pusher: Arc<Mutex<Option<JavascriptSocketEventPusher>>>,
     pub(crate) kernel_socket_id: Option<SocketId>,
@@ -856,6 +1164,19 @@ pub(crate) struct ActiveTcpSocket {
     pub(crate) saw_local_shutdown: Arc<AtomicBool>,
     pub(crate) saw_remote_end: Arc<AtomicBool>,
     pub(crate) close_notified: Arc<AtomicBool>,
+    /// Bytes already read from the transport but not yet consumed by the
+    /// shared open socket description. Keeping this in the sidecar (rather
+    /// than per runner fd) preserves dup/SCM_RIGHTS read and MSG_PEEK
+    /// semantics across processes.
+    pub(crate) read_buffer: Arc<Mutex<VecDeque<u8>>>,
+    /// One strong reference per guest-visible open socket description. This is
+    /// separate from transport/TLS worker Arcs so SCM_RIGHTS can decide when a
+    /// close is the final description close.
+    pub(crate) description_handles: Arc<()>,
+    /// Kernel open-description guard used after this socket first crosses
+    /// SCM_RIGHTS. It keeps owner-0 kernel sockets alive while queued or held
+    /// by another process and lets the kernel prune discarded transfers.
+    pub(crate) kernel_transfer_guard: Option<TransferredFd>,
 }
 
 #[derive(Debug)]
@@ -992,6 +1313,10 @@ pub(crate) struct ActiveTcpListener {
     pub(crate) guest_local_addr: SocketAddr,
     pub(crate) backlog: usize,
     pub(crate) active_connection_ids: BTreeSet<String>,
+    /// One strong reference per guest-visible listener description, including
+    /// descriptors queued in SCM_RIGHTS messages.
+    pub(crate) description_handles: Arc<()>,
+    pub(crate) kernel_transfer_guard: Option<TransferredFd>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,28 +1337,66 @@ pub(crate) struct PendingUnixSocket {
     pub(crate) stream: UnixStream,
     pub(crate) local_path: Option<String>,
     pub(crate) remote_path: Option<String>,
+    pub(crate) local_abstract_path_hex: Option<String>,
+    pub(crate) remote_abstract_path_hex: Option<String>,
+    pub(crate) connection_guard: PendingUnixConnectionGuard,
+}
+
+#[derive(Debug)]
+pub(crate) struct GuestUnixConnectionState {
+    pub(crate) accepted_peer_open: AtomicBool,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingUnixConnectionGuard {
+    pub(crate) state: Option<Arc<GuestUnixConnectionState>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct UnixSocketReadState {
+    /// Bytes already removed from the host socket but not yet consumed by the
+    /// guest open socket description. The reader never grows this past
+    /// `max_buffered_bytes`, so an idle guest applies backpressure to the host
+    /// socket instead of growing an unbounded sidecar queue.
+    pub(crate) bytes: VecDeque<u8>,
+    pub(crate) terminal_events: VecDeque<JavascriptTcpSocketEvent>,
+    pub(crate) max_buffered_bytes: usize,
+    pub(crate) warned_near_limit: bool,
+    pub(crate) closed: bool,
 }
 
 #[derive(Debug)]
 pub(crate) struct ActiveUnixSocket {
     pub(crate) stream: Arc<Mutex<UnixStream>>,
-    pub(crate) events: Receiver<JavascriptTcpSocketEvent>,
-    pub(crate) event_sender: Sender<JavascriptTcpSocketEvent>,
+    pub(crate) read_state: Arc<(Mutex<UnixSocketReadState>, Condvar)>,
     pub(crate) event_pusher: Arc<Mutex<Option<JavascriptSocketEventPusher>>>,
     pub(crate) listener_id: Option<String>,
     pub(crate) local_path: Option<String>,
     pub(crate) remote_path: Option<String>,
+    pub(crate) local_abstract_path_hex: Option<String>,
+    pub(crate) remote_abstract_path_hex: Option<String>,
+    pub(crate) local_registry_binding_id: Option<String>,
+    pub(crate) remote_registry_binding_id: Option<String>,
+    pub(crate) connection_state: Option<Arc<GuestUnixConnectionState>>,
+    pub(crate) private_host_path: Option<PathBuf>,
     pub(crate) saw_local_shutdown: Arc<AtomicBool>,
     pub(crate) saw_remote_end: Arc<AtomicBool>,
     pub(crate) close_notified: Arc<AtomicBool>,
+    pub(crate) description_handles: Arc<()>,
 }
 
 #[derive(Debug)]
 pub(crate) struct ActiveUnixListener {
-    pub(crate) listener: UnixListener,
+    pub(crate) listener: Option<UnixListener>,
+    pub(crate) bound_socket: Option<Socket>,
     pub(crate) path: String,
+    pub(crate) abstract_path_hex: Option<String>,
+    pub(crate) registry_binding_id: String,
+    pub(crate) private_host_path: Option<PathBuf>,
+    pub(crate) guest_node_path: Option<String>,
     pub(crate) backlog: usize,
     pub(crate) active_connection_ids: BTreeSet<String>,
+    pub(crate) description_handles: Arc<()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,6 +1464,9 @@ pub(crate) struct ActiveUdpSocket {
     pub(crate) guest_local_addr: Option<SocketAddr>,
     pub(crate) recv_buffer_size: usize,
     pub(crate) send_buffer_size: usize,
+    /// One strong reference per guest-visible datagram socket description.
+    pub(crate) description_handles: Arc<()>,
+    pub(crate) kernel_transfer_guard: Option<TransferredFd>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,7 +1485,11 @@ pub(crate) enum ActiveExecution {
 pub(crate) struct ToolExecution {
     pub(crate) cancelled: Arc<AtomicBool>,
     pub(crate) pending_events: Arc<Mutex<VecDeque<ActiveExecutionEvent>>>,
-    pub(crate) events_overflowed: Arc<AtomicBool>,
+    pub(crate) event_overflow_reason: Arc<Mutex<Option<String>>>,
+    pub(crate) pending_event_bytes: Arc<AtomicUsize>,
+    pub(crate) pending_event_count_limit: Arc<AtomicUsize>,
+    pub(crate) pending_event_bytes_limit: Arc<AtomicUsize>,
+    pub(crate) vm_pending_event_bytes_budget: Arc<VmPendingByteBudget>,
 }
 
 impl Default for ToolExecution {
@@ -1127,7 +1497,18 @@ impl Default for ToolExecution {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             pending_events: Arc::new(Mutex::new(VecDeque::new())),
-            events_overflowed: Arc::new(AtomicBool::new(false)),
+            event_overflow_reason: Arc::new(Mutex::new(None)),
+            pending_event_bytes: Arc::new(AtomicUsize::new(0)),
+            pending_event_count_limit: Arc::new(AtomicUsize::new(
+                agentos_native_sidecar_core::limits::DEFAULT_PROCESS_PENDING_EVENT_COUNT,
+            )),
+            pending_event_bytes_limit: Arc::new(AtomicUsize::new(
+                agentos_native_sidecar_core::limits::DEFAULT_PROCESS_PENDING_EVENT_BYTES,
+            )),
+            vm_pending_event_bytes_budget: VmPendingByteBudget::new(
+                agentos_native_sidecar_core::limits::DEFAULT_PROCESS_PENDING_EVENT_BYTES,
+                TrackedLimit::PendingExecutionEventBytes,
+            ),
         }
     }
 }

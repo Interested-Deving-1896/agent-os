@@ -49,7 +49,12 @@ export interface VirtualFileSystem {
 	lstat(path: string): Promise<VirtualStat>;
 	link(oldPath: string, newPath: string): Promise<void>;
 	chmod(path: string, mode: number): Promise<void>;
-	chown(path: string, uid: number, gid: number): Promise<void>;
+	chown(
+		path: string,
+		uid: number,
+		gid: number,
+		options?: { followSymlinks?: boolean },
+	): Promise<void>;
 	utimes(path: string, atime: number, mtime: number): Promise<void>;
 	truncate(path: string, length: number): Promise<void>;
 	pread(path: string, offset: number, length: number): Promise<Uint8Array>;

@@ -1,6 +1,6 @@
 use crate::fd_table::{
-    FdResult, FileDescription, ProcessFdTable, SharedFileDescription, FILETYPE_PIPE, O_RDONLY,
-    O_WRONLY,
+    allocate_file_description_id, FdResult, FileDescription, ProcessFdTable, SharedFileDescription,
+    FILETYPE_PIPE, O_RDONLY, O_WRONLY,
 };
 use crate::poll::{PollEvents, PollNotifier, POLLERR, POLLHUP, POLLIN, POLLOUT};
 use std::collections::{BTreeMap, VecDeque};
@@ -86,12 +86,36 @@ struct PendingRead {
     result: Option<Option<Vec<u8>>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PipeState {
     buffer: VecDeque<Vec<u8>>,
     closed_read: bool,
     closed_write: bool,
     waiting_reads: VecDeque<u64>,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+}
+
+impl Default for PipeState {
+    fn default() -> Self {
+        Self {
+            buffer: VecDeque::new(),
+            closed_read: false,
+            closed_write: false,
+            waiting_reads: VecDeque::new(),
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipeMetadata {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Debug)]
@@ -100,7 +124,6 @@ struct PipeManagerState {
     desc_to_pipe: BTreeMap<u64, PipeRef>,
     waiters: BTreeMap<u64, PendingRead>,
     next_pipe_id: u64,
-    next_desc_id: u64,
     next_waiter_id: u64,
 }
 
@@ -111,7 +134,6 @@ impl Default for PipeManagerState {
             desc_to_pipe: BTreeMap::new(),
             waiters: BTreeMap::new(),
             next_pipe_id: 1,
-            next_desc_id: 100_000,
             next_waiter_id: 1,
         }
     }
@@ -158,10 +180,8 @@ impl PipeManager {
         let pipe_id = state.next_pipe_id;
         state.next_pipe_id += 1;
 
-        let read_id = state.next_desc_id;
-        state.next_desc_id += 1;
-        let write_id = state.next_desc_id;
-        state.next_desc_id += 1;
+        let read_id = allocate_file_description_id();
+        let write_id = allocate_file_description_id();
 
         state.pipes.insert(pipe_id, PipeState::default());
         state.desc_to_pipe.insert(
@@ -504,6 +524,48 @@ impl PipeManager {
             .desc_to_pipe
             .get(&description_id)
             .map(|pipe_ref| pipe_ref.pipe_id)
+    }
+
+    pub fn metadata(&self, description_id: u64) -> Option<PipeMetadata> {
+        let state = lock_or_recover(&self.inner.state);
+        let pipe_id = state.desc_to_pipe.get(&description_id)?.pipe_id;
+        let pipe = state.pipes.get(&pipe_id)?;
+        Some(PipeMetadata {
+            mode: pipe.mode,
+            uid: pipe.uid,
+            gid: pipe.gid,
+        })
+    }
+
+    pub fn set_owner(&self, description_id: u64, uid: u32, gid: u32) -> PipeResult<()> {
+        let mut state = lock_or_recover(&self.inner.state);
+        let pipe_id = state
+            .desc_to_pipe
+            .get(&description_id)
+            .ok_or_else(|| PipeError::bad_file_descriptor("not a pipe end"))?
+            .pipe_id;
+        let pipe = state
+            .pipes
+            .get_mut(&pipe_id)
+            .ok_or_else(|| PipeError::bad_file_descriptor("pipe not found"))?;
+        pipe.uid = uid;
+        pipe.gid = gid;
+        Ok(())
+    }
+
+    pub fn chmod(&self, description_id: u64, mode: u32) -> PipeResult<()> {
+        let mut state = lock_or_recover(&self.inner.state);
+        let pipe_id = state
+            .desc_to_pipe
+            .get(&description_id)
+            .ok_or_else(|| PipeError::bad_file_descriptor("not a pipe end"))?
+            .pipe_id;
+        let pipe = state
+            .pipes
+            .get_mut(&pipe_id)
+            .ok_or_else(|| PipeError::bad_file_descriptor("pipe not found"))?;
+        pipe.mode = mode & 0o7777;
+        Ok(())
     }
 
     pub fn pipe_count(&self) -> usize {

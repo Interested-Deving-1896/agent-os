@@ -111,7 +111,7 @@ mod service {
             ActiveCipherSession, ActiveDiffieHellmanSession, ActiveEcdhSession, ActiveExecution,
             ActiveExecutionEvent, ActiveProcess, ActiveSqliteDatabase, ActiveSqliteStatement,
             ActiveTcpListener, ActiveUdpSocket, ProcessEventEnvelope, SidecarKernel, ToolExecution,
-            VmListenPolicy, EXECUTION_SANDBOX_ROOT_ENV, JAVASCRIPT_COMMAND,
+            VmPendingByteBudget, EXECUTION_SANDBOX_ROOT_ENV, JAVASCRIPT_COMMAND,
             LOOPBACK_EXEMPT_PORTS_ENV, PYTHON_COMMAND, VM_DNS_SERVERS_METADATA_KEY,
             VM_LISTEN_ALLOW_PRIVILEGED_METADATA_KEY, VM_LISTEN_PORT_MAX_METADATA_KEY,
             VM_LISTEN_PORT_MIN_METADATA_KEY, WASM_COMMAND, WASM_STDIO_SYNC_RPC_ENV,
@@ -297,12 +297,18 @@ ykAheWCsAteSEWVc0w==\n\
             process_id: &str,
         ) {
             let kernel_handle = create_kernel_process_handle_for_tests();
+            let vm = sidecar.vms.get(vm_id).expect("test vm");
+            let process_limits = vm.limits.process.clone();
+            let stdin_budget = Arc::clone(&vm.pending_stdin_bytes_budget);
+            let event_budget = Arc::clone(&vm.pending_event_bytes_budget);
             let process = ActiveProcess::new(
                 kernel_handle.pid(),
                 kernel_handle,
                 GuestRuntimeKind::JavaScript,
                 ActiveExecution::Tool(ToolExecution::default()),
-            );
+            )
+            .with_process_event_limits(&process_limits)
+            .with_vm_pending_byte_budgets(stdin_budget, event_budget);
             sidecar
                 .vms
                 .get_mut(vm_id)
@@ -487,16 +493,27 @@ ykAheWCsAteSEWVc0w==\n\
 
         fn tool_execution_event_overflow_is_reported() {
             let tool_execution = ToolExecution::default();
-            for _ in 0..MAX_PROCESS_EVENT_QUEUE {
-                assert!(crate::execution::send_tool_process_event(
-                    &tool_execution.pending_events,
-                    &tool_execution.events_overflowed,
-                    ActiveExecutionEvent::Stdout(Vec::new()),
-                ));
-            }
-            assert!(!crate::execution::send_tool_process_event(
+            tool_execution
+                .pending_event_count_limit
+                .store(1, Ordering::Release);
+            assert!(crate::execution::send_tool_process_event(
+                &tool_execution.cancelled,
                 &tool_execution.pending_events,
-                &tool_execution.events_overflowed,
+                &tool_execution.event_overflow_reason,
+                &tool_execution.pending_event_bytes,
+                &tool_execution.pending_event_count_limit,
+                &tool_execution.pending_event_bytes_limit,
+                &tool_execution.vm_pending_event_bytes_budget,
+                ActiveExecutionEvent::Stdout(Vec::new()),
+            ));
+            assert!(!crate::execution::send_tool_process_event(
+                &tool_execution.cancelled,
+                &tool_execution.pending_events,
+                &tool_execution.event_overflow_reason,
+                &tool_execution.pending_event_bytes,
+                &tool_execution.pending_event_count_limit,
+                &tool_execution.pending_event_bytes_limit,
+                &tool_execution.vm_pending_event_bytes_budget,
                 ActiveExecutionEvent::Exited(0),
             ));
 
@@ -507,24 +524,312 @@ ykAheWCsAteSEWVc0w==\n\
             let local = tokio::task::LocalSet::new();
             runtime.block_on(local.run_until(async move {
                 let mut execution = ActiveExecution::Tool(tool_execution);
-                for _ in 0..MAX_PROCESS_EVENT_QUEUE {
-                    assert!(matches!(
-                        execution
-                            .poll_event(Duration::ZERO)
-                            .await
-                            .expect("poll queued tool event"),
-                        Some(ActiveExecutionEvent::Stdout(_))
-                    ));
-                }
+                assert!(matches!(
+                    execution
+                        .poll_event(Duration::ZERO)
+                        .await
+                        .expect("poll queued tool event"),
+                    Some(ActiveExecutionEvent::Stdout(_))
+                ));
                 let error = execution
                     .poll_event(Duration::ZERO)
                     .await
                     .expect_err("tool event overflow should be reported");
                 assert!(
-                    error.to_string().contains("process event queue exceeded"),
+                    error
+                        .to_string()
+                        .contains("limits.process.pendingEventCount"),
                     "unexpected overflow error: {error}"
                 );
             }));
+
+            let tool_execution = ToolExecution::default();
+            tool_execution
+                .pending_event_bytes_limit
+                .store(8, Ordering::Release);
+            assert!(!crate::execution::send_tool_process_event(
+                &tool_execution.cancelled,
+                &tool_execution.pending_events,
+                &tool_execution.event_overflow_reason,
+                &tool_execution.pending_event_bytes,
+                &tool_execution.pending_event_count_limit,
+                &tool_execution.pending_event_bytes_limit,
+                &tool_execution.vm_pending_event_bytes_budget,
+                ActiveExecutionEvent::Stdout(vec![0; 9]),
+            ));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("create tokio runtime");
+            runtime.block_on(async move {
+                let mut execution = ActiveExecution::Tool(tool_execution);
+                let error = execution
+                    .poll_event(Duration::ZERO)
+                    .await
+                    .expect_err("tool byte overflow should be reported");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("limits.process.pendingEventBytes"),
+                    "unexpected overflow error: {error}"
+                );
+            });
+        }
+
+        fn vm_pending_event_bytes_are_shared_and_reclaimed() {
+            let event_envelope_bytes = ActiveExecutionEvent::Stdout(Vec::new()).retained_bytes();
+            let aggregate_limit = event_envelope_bytes.saturating_mul(2).saturating_add(10);
+            let event_budget = VmPendingByteBudget::new(
+                aggregate_limit,
+                agentos_bridge::queue_tracker::TrackedLimit::PendingExecutionEventBytes,
+            );
+            let stdin_budget = VmPendingByteBudget::new(
+                64,
+                agentos_bridge::queue_tracker::TrackedLimit::PendingKernelStdinBytes,
+            );
+            let mut limits = agentos_native_sidecar_core::limits::ProcessLimits::default();
+            limits.pending_event_bytes = aggregate_limit;
+
+            let mut child_one = {
+                let kernel_handle = create_kernel_process_handle_for_tests();
+                ActiveProcess::new(
+                    kernel_handle.pid(),
+                    kernel_handle,
+                    GuestRuntimeKind::WebAssembly,
+                    ActiveExecution::Tool(ToolExecution::default()),
+                )
+                .with_process_event_limits(&limits)
+                .with_vm_pending_byte_budgets(Arc::clone(&stdin_budget), Arc::clone(&event_budget))
+            };
+            let mut child_two = {
+                let kernel_handle = create_kernel_process_handle_for_tests();
+                ActiveProcess::new(
+                    kernel_handle.pid(),
+                    kernel_handle,
+                    GuestRuntimeKind::WebAssembly,
+                    ActiveExecution::Tool(ToolExecution::default()),
+                )
+                .with_process_event_limits(&limits)
+                .with_vm_pending_byte_budgets(Arc::clone(&stdin_budget), Arc::clone(&event_budget))
+            };
+
+            child_one
+                .queue_pending_execution_event(ActiveExecutionEvent::Stdout(vec![1; 6]))
+                .expect("first child should reserve six VM event bytes");
+            child_two
+                .queue_pending_execution_event(ActiveExecutionEvent::Stdout(vec![2; 4]))
+                .expect("second child should consume the remaining VM event bytes");
+            let error = child_two
+                .queue_pending_execution_event(ActiveExecutionEvent::Stdout(vec![3]))
+                .expect_err("aggregate event bytes must reject a third enqueue");
+            assert!(
+                error
+                    .to_string()
+                    .contains("limits.process.pendingEventBytes"),
+                "unexpected aggregate event error: {error}"
+            );
+            assert_eq!(event_budget.used(), aggregate_limit);
+
+            assert!(matches!(
+                child_one.pop_pending_execution_event(),
+                Some(ActiveExecutionEvent::Stdout(bytes)) if bytes.len() == 6
+            ));
+            assert_eq!(
+                event_budget.used(),
+                event_envelope_bytes + 4,
+                "pop must release its bytes"
+            );
+            child_two
+                .queue_pending_execution_event(ActiveExecutionEvent::Stdout(vec![4; 6]))
+                .expect("released event capacity should be reusable by a sibling");
+            assert_eq!(event_budget.used(), aggregate_limit);
+
+            drop(child_two);
+            assert_eq!(
+                event_budget.used(),
+                0,
+                "process teardown must reclaim all of its pending events"
+            );
+
+            let tool_one = ToolExecution::default()
+                .with_vm_pending_event_bytes_budget(Arc::clone(&event_budget));
+            let tool_two = ToolExecution::default()
+                .with_vm_pending_event_bytes_budget(Arc::clone(&event_budget));
+            assert!(crate::execution::send_tool_process_event(
+                &tool_one.cancelled,
+                &tool_one.pending_events,
+                &tool_one.event_overflow_reason,
+                &tool_one.pending_event_bytes,
+                &tool_one.pending_event_count_limit,
+                &tool_one.pending_event_bytes_limit,
+                &tool_one.vm_pending_event_bytes_budget,
+                ActiveExecutionEvent::Stdout(vec![5; 6]),
+            ));
+            assert!(crate::execution::send_tool_process_event(
+                &tool_two.cancelled,
+                &tool_two.pending_events,
+                &tool_two.event_overflow_reason,
+                &tool_two.pending_event_bytes,
+                &tool_two.pending_event_count_limit,
+                &tool_two.pending_event_bytes_limit,
+                &tool_two.vm_pending_event_bytes_budget,
+                ActiveExecutionEvent::Stdout(vec![6; 4]),
+            ));
+            assert!(!crate::execution::send_tool_process_event(
+                &tool_two.cancelled,
+                &tool_two.pending_events,
+                &tool_two.event_overflow_reason,
+                &tool_two.pending_event_bytes,
+                &tool_two.pending_event_count_limit,
+                &tool_two.pending_event_bytes_limit,
+                &tool_two.vm_pending_event_bytes_budget,
+                ActiveExecutionEvent::Stdout(vec![7]),
+            ));
+            drop(tool_one);
+            assert_eq!(event_budget.used(), event_envelope_bytes + 4);
+            drop(tool_two);
+            assert_eq!(
+                event_budget.used(),
+                0,
+                "tool teardown must reclaim background-produced events"
+            );
+        }
+
+        fn vm_pending_stdin_bytes_release_on_partial_flush_clear_and_teardown() {
+            let mut config = KernelVmConfig::new("vm-pending-stdin-budget");
+            config.permissions = Permissions::allow_all();
+            let mut kernel = SidecarKernel::new(MountTable::new(MemoryFileSystem::new()), config);
+            kernel
+                .register_driver(CommandDriver::new(
+                    EXECUTION_DRIVER_NAME,
+                    [JAVASCRIPT_COMMAND],
+                ))
+                .expect("register execution driver");
+            let first_handle = kernel
+                .spawn_process(
+                    JAVASCRIPT_COMMAND,
+                    Vec::new(),
+                    SpawnOptions {
+                        requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                        ..SpawnOptions::default()
+                    },
+                )
+                .expect("spawn first kernel child");
+            let second_handle = kernel
+                .spawn_process(
+                    JAVASCRIPT_COMMAND,
+                    Vec::new(),
+                    SpawnOptions {
+                        requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                        ..SpawnOptions::default()
+                    },
+                )
+                .expect("spawn second kernel child");
+
+            let stdin_budget = VmPendingByteBudget::new(
+                150_000,
+                agentos_bridge::queue_tracker::TrackedLimit::PendingKernelStdinBytes,
+            );
+            let event_budget = VmPendingByteBudget::new(
+                1024,
+                agentos_bridge::queue_tracker::TrackedLimit::PendingExecutionEventBytes,
+            );
+            let mut limits = agentos_native_sidecar_core::limits::ProcessLimits::default();
+            limits.pending_stdin_bytes = 200_000;
+            let first_pid = first_handle.pid();
+            let second_pid = second_handle.pid();
+            let mut child_one = ActiveProcess::new(
+                first_pid,
+                first_handle,
+                GuestRuntimeKind::WebAssembly,
+                ActiveExecution::Tool(ToolExecution::default()),
+            )
+            .with_process_event_limits(&limits)
+            .with_vm_pending_byte_budgets(Arc::clone(&stdin_budget), Arc::clone(&event_budget));
+            let mut child_two = ActiveProcess::new(
+                second_pid,
+                second_handle,
+                GuestRuntimeKind::WebAssembly,
+                ActiveExecution::Tool(ToolExecution::default()),
+            )
+            .with_process_event_limits(&limits)
+            .with_vm_pending_byte_budgets(Arc::clone(&stdin_budget), Arc::clone(&event_budget));
+            child_one.kernel_stdin_writer_fd = Some(
+                crate::execution::install_kernel_stdin_pipe(&mut kernel, first_pid)
+                    .expect("install first stdin pipe"),
+            );
+            child_two.kernel_stdin_writer_fd = Some(
+                crate::execution::install_kernel_stdin_pipe(&mut kernel, second_pid)
+                    .expect("install second stdin pipe"),
+            );
+
+            let pipe_capacity = agentos_kernel::pipe_manager::MAX_PIPE_BUFFER_BYTES;
+            crate::execution::write_kernel_process_stdin(
+                &mut kernel,
+                &mut child_one,
+                &vec![1; pipe_capacity + 12_000],
+                limits.pending_stdin_bytes,
+            )
+            .expect("first child should partially flush into its pipe");
+            crate::execution::write_kernel_process_stdin(
+                &mut kernel,
+                &mut child_two,
+                &vec![2; pipe_capacity + 8_000],
+                limits.pending_stdin_bytes,
+            )
+            .expect("second child should partially flush into its pipe");
+            assert_eq!(
+                stdin_budget.used(),
+                20_000,
+                "only the unflushed tails should remain charged"
+            );
+
+            let error = crate::execution::write_kernel_process_stdin(
+                &mut kernel,
+                &mut child_two,
+                &vec![3; 135_000],
+                limits.pending_stdin_bytes,
+            )
+            .expect_err("combined child backlogs must obey the VM byte budget");
+            assert!(
+                error
+                    .to_string()
+                    .contains("limits.process.pendingStdinBytes"),
+                "unexpected aggregate stdin error: {error}"
+            );
+            assert_eq!(stdin_budget.used(), 20_000);
+
+            let drained = kernel
+                .fd_read(EXECUTION_DRIVER_NAME, first_pid, 0, 6_000)
+                .expect("drain first child pipe");
+            assert_eq!(drained.len(), 6_000);
+            crate::execution::flush_pending_kernel_stdin(&mut kernel, &mut child_one)
+                .expect("flush first child tail into released pipe capacity");
+            assert_eq!(
+                stdin_budget.used(),
+                14_000,
+                "partial flush must release exactly the written bytes"
+            );
+
+            crate::execution::write_kernel_process_stdin(
+                &mut kernel,
+                &mut child_two,
+                &vec![4; 135_000],
+                limits.pending_stdin_bytes,
+            )
+            .expect("capacity released by one child should be reusable by another");
+            assert_eq!(stdin_budget.used(), 149_000);
+
+            drop(child_two);
+            assert_eq!(
+                stdin_budget.used(),
+                6_000,
+                "child teardown must reclaim its entire stdin tail"
+            );
+            child_one.kernel_stdin_writer_fd = None;
+            crate::execution::flush_pending_kernel_stdin(&mut kernel, &mut child_one)
+                .expect("missing writer should clear the remaining stdin backlog");
+            assert_eq!(stdin_budget.used(), 0, "clear must release all bytes");
         }
 
         fn wasm_signal_queue_is_bounded() {
@@ -535,19 +840,18 @@ ykAheWCsAteSEWVc0w==\n\
                 GuestRuntimeKind::WebAssembly,
                 ActiveExecution::Tool(ToolExecution::default()),
             );
-            for _ in 0..MAX_PROCESS_EVENT_QUEUE {
+            for _ in 0..(MAX_PROCESS_EVENT_QUEUE * 2) {
                 process
                     .queue_pending_wasm_signal(nix::libc::SIGUSR1)
-                    .expect("signal queue should accept entries up to its bound");
+                    .expect("repeated standard signals should coalesce");
             }
-            let error = process
-                .queue_pending_wasm_signal(nix::libc::SIGUSR1)
-                .expect_err("signal queue should reject overflow");
-            assert!(
-                error.to_string().contains("process event queue exceeded"),
-                "unexpected overflow error: {error}"
-            );
-            assert_eq!(process.pending_wasm_signals.len(), MAX_PROCESS_EVENT_QUEUE);
+            assert_eq!(process.pending_wasm_signals.len(), 1);
+            for signal in 1..=64 {
+                process
+                    .queue_pending_wasm_signal(signal)
+                    .expect("distinct supported signals fit the finite signal set");
+            }
+            assert!(process.pending_wasm_signals.len() <= 64);
         }
 
         fn descendant_transfer_overflow_preserves_global_queue() {
@@ -618,6 +922,111 @@ ykAheWCsAteSEWVc0w==\n\
                     .process_id,
                 "root-proc/child-1"
             );
+        }
+
+        fn descendant_transfer_byte_overflow_restores_current_and_deferred_envelopes() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate sidecar");
+            let vm_id = create_vm_with_metadata(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+                BTreeMap::new(),
+            )
+            .expect("create vm");
+            insert_tool_process(&mut sidecar, &vm_id, "root-proc");
+
+            let existing = ActiveExecutionEvent::Stdout(Vec::new());
+            let mut limits = agentos_native_sidecar_core::limits::ProcessLimits::default();
+            limits.pending_event_bytes = existing.retained_bytes();
+            let kernel_handle = create_kernel_process_handle_for_tests();
+            let mut child = ActiveProcess::new(
+                kernel_handle.pid(),
+                kernel_handle,
+                GuestRuntimeKind::JavaScript,
+                ActiveExecution::Tool(ToolExecution::default()),
+            )
+            .with_process_event_limits(&limits);
+            child
+                .queue_pending_execution_event(existing)
+                .expect("fill child retained-byte limit while leaving count capacity");
+            sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("test vm")
+                .active_processes
+                .get_mut("root-proc")
+                .expect("root process")
+                .child_processes
+                .insert(String::from("child-1"), child);
+
+            let envelope = |process_id: &str, marker: u8| ProcessEventEnvelope {
+                connection_id: connection_id.clone(),
+                session_id: session_id.clone(),
+                vm_id: vm_id.clone(),
+                process_id: process_id.to_owned(),
+                event: ActiveExecutionEvent::Stdout(vec![marker]),
+            };
+            let expected = vec![
+                (String::from("other-before"), 1u8),
+                (String::from("root-proc/child-1"), 2u8),
+                (String::from("other-after"), 3u8),
+            ];
+            let signature = |sidecar: &NativeSidecar<RecordingBridge>| {
+                sidecar
+                    .pending_process_events
+                    .iter()
+                    .map(|envelope| {
+                        let ActiveExecutionEvent::Stdout(bytes) = &envelope.event else {
+                            panic!("expected stdout envelope");
+                        };
+                        (envelope.process_id.clone(), bytes[0])
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            for queued in [
+                envelope("other-before", 1),
+                envelope("root-proc/child-1", 2),
+                envelope("other-after", 3),
+            ] {
+                sidecar
+                    .queue_pending_process_event(queued)
+                    .expect("seed pending event order");
+            }
+            let error = sidecar
+                .drain_queued_descendant_javascript_child_process_events(
+                    &vm_id,
+                    "root-proc",
+                    &["child-1"],
+                )
+                .expect_err("child byte limit should reject transfer");
+            assert!(error.to_string().contains("pendingEventBytes"));
+            assert_eq!(signature(&sidecar), expected);
+
+            sidecar.pending_process_events.clear();
+            sidecar.observe_pending_process_event_depth();
+            for queued in [
+                envelope("other-before", 1),
+                envelope("root-proc/child-1", 2),
+                envelope("other-after", 3),
+            ] {
+                sidecar
+                    .process_event_sender
+                    .try_send(queued)
+                    .expect("seed receiver event order");
+            }
+            let error = sidecar
+                .drain_queued_descendant_javascript_child_process_events(
+                    &vm_id,
+                    "root-proc",
+                    &["child-1"],
+                )
+                .expect_err("receiver transfer should preserve a byte-limit failure");
+            assert!(error.to_string().contains("pendingEventBytes"));
+            assert_eq!(signature(&sidecar), expected);
         }
 
         fn exit_trailing_requeue_preserves_exit_when_queue_is_full() {
@@ -928,6 +1337,7 @@ ykAheWCsAteSEWVc0w==\n\
                     vm_id,
                     context_id: context.context_id,
                     argv: vec![String::from("./entry.mjs")],
+                    argv0: None,
                     env: BTreeMap::new(),
                     cwd,
                     limits: Default::default(),
@@ -1892,6 +2302,7 @@ ykAheWCsAteSEWVc0w==\n\
                     vm_id: vm_id.to_owned(),
                     context_id: context.context_id,
                     argv: vec![String::from("./entry.mjs")],
+                    argv0: None,
                     env: env.clone(),
                     cwd: cwd.to_path_buf(),
                     inline_code: None,
@@ -2151,7 +2562,7 @@ ykAheWCsAteSEWVc0w==\n\
                 let next_event = {
                     let vm = sidecar.vms.get_mut(vm_id).expect("active vm");
                     vm.active_processes.get_mut(process_id).and_then(|process| {
-                        if let Some(event) = process.pending_execution_events.pop_front() {
+                        if let Some(event) = process.pop_pending_execution_event() {
                             Some(event)
                         } else {
                             process
@@ -2220,7 +2631,7 @@ ykAheWCsAteSEWVc0w==\n\
                         let Some(process) = vm.active_processes.get_mut(&process_id) else {
                             continue;
                         };
-                        if let Some(event) = process.pending_execution_events.pop_front() {
+                        if let Some(event) = process.pop_pending_execution_event() {
                             Some(event)
                         } else {
                             process
@@ -2271,7 +2682,7 @@ ykAheWCsAteSEWVc0w==\n\
                 let next_event = {
                     let vm = sidecar.vms.get_mut(vm_id).expect("active vm");
                     vm.active_processes.get_mut(process_id).and_then(|process| {
-                        if let Some(event) = process.pending_execution_events.pop_front() {
+                        if let Some(event) = process.pop_pending_execution_event() {
                             Some(event)
                         } else {
                             process
@@ -2566,6 +2977,7 @@ ykAheWCsAteSEWVc0w==\n\
                     vm_id: vm_id.to_owned(),
                     context_id: context.context_id,
                     argv: vec![String::from("./entry.mjs")],
+                    argv0: None,
                     env: BTreeMap::new(),
                     cwd: cwd.to_path_buf(),
                     inline_code: None,
@@ -3339,6 +3751,8 @@ ykAheWCsAteSEWVc0w==\n\
                     guest_local_addr: SocketAddr::from(([127, 0, 0, 1], 49993)),
                     backlog: listener.backlog,
                     active_connection_ids: std::collections::BTreeSet::new(),
+                    description_handles: std::sync::Arc::clone(&listener.description_handles),
+                    kernel_transfer_guard: listener.kernel_transfer_guard.clone(),
                 }
             };
             process
@@ -3357,6 +3771,8 @@ ykAheWCsAteSEWVc0w==\n\
                     guest_local_addr: Some(SocketAddr::from(([127, 0, 0, 1], 49994))),
                     recv_buffer_size: socket.recv_buffer_size,
                     send_buffer_size: socket.send_buffer_size,
+                    description_handles: std::sync::Arc::clone(&socket.description_handles),
+                    kernel_transfer_guard: socket.kernel_transfer_guard.clone(),
                 }
             };
             process
@@ -5465,6 +5881,7 @@ ykAheWCsAteSEWVc0w==\n\
                     vm_id: vm_id.clone(),
                     context_id: context.context_id,
                     argv: vec![String::from("./entry.mjs")],
+                    argv0: None,
                     env: BTreeMap::from([(
                         String::from("AGENTOS_ALLOWED_NODE_BUILTINS"),
                         String::from(
@@ -5635,6 +6052,7 @@ ykAheWCsAteSEWVc0w==\n\
                     vm_id: vm_id.clone(),
                     context_id: context.context_id,
                     argv: vec![String::from("./entry.mjs")],
+                    argv0: None,
                     env: BTreeMap::new(),
                     cwd: cwd.clone(),
                     inline_code: None,
@@ -6202,6 +6620,7 @@ ykAheWCsAteSEWVc0w==\n\
                             socket_id: None,
                             command: None,
                             args: Vec::new(),
+                            argv0: None,
                             cwd: None,
                             env: BTreeMap::new(),
                             shell: false,
@@ -6247,6 +6666,7 @@ ykAheWCsAteSEWVc0w==\n\
                             socket_id: None,
                             command: None,
                             args: Vec::new(),
+                            argv0: None,
                             cwd: None,
                             env: BTreeMap::new(),
                             shell: false,
@@ -9734,7 +10154,7 @@ ykAheWCsAteSEWVc0w==\n\
                     vm.active_processes
                         .get_mut("proc-wasm-pty")
                         .and_then(|process| {
-                            if let Some(event) = process.pending_execution_events.pop_front() {
+                            if let Some(event) = process.pop_pending_execution_event() {
                                 Some(event)
                             } else {
                                 process
@@ -9987,7 +10407,1362 @@ ykAheWCsAteSEWVc0w==\n\
                     .contains("command not found: definitely-not-a-command"),
                 "missing command error should mention the command: {error}"
             );
+
+            // execve resolves a literal relative/absolute pathname and must
+            // not reuse spawnp's basename fallback. `/workspace/echo` does not
+            // exist even though an `echo` command is installed on PATH.
+            let exact_missing = sidecar.resolve_javascript_child_process_execution_with_mode(
+                vm,
+                &BTreeMap::new(),
+                &vm.guest_cwd,
+                &vm.host_cwd,
+                &crate::protocol::JavascriptChildProcessSpawnRequest {
+                    command: String::from("/workspace/echo"),
+                    args: Vec::new(),
+                    options: crate::protocol::JavascriptChildProcessSpawnOptions::default(),
+                },
+                true,
+                None,
+            );
+            let error = exact_missing.expect_err("execve path must not fall back through PATH");
+            assert!(
+                error
+                    .to_string()
+                    .contains("command not found: /workspace/echo"),
+                "exact-path error should retain the literal pathname: {error}"
+            );
         }
+
+        fn local_wasm_exec_commit_uses_exact_guest_env_and_preserves_process_state() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let kernel_handle = {
+                let vm = sidecar.vms.get_mut(&vm_id).expect("created vm");
+                vm.kernel
+                    .write_file("/replacement.wasm", b"\0asm\x01\0\0\0".to_vec())
+                    .expect("write replacement module");
+                vm.kernel
+                    .chmod("/replacement.wasm", 0o755)
+                    .expect("mark replacement executable");
+                vm.kernel
+                    .write_file("/interpreter.wasm", b"\0asm\x01\0\0\0".to_vec())
+                    .expect("write script interpreter module");
+                vm.kernel
+                    .chmod("/interpreter.wasm", 0o755)
+                    .expect("mark script interpreter executable");
+                vm.kernel
+                    .write_file(
+                        "/script",
+                        b"#!/interpreter.wasm one optional argument\n".to_vec(),
+                    )
+                    .expect("write executable script");
+                vm.kernel
+                    .chmod("/script", 0o755)
+                    .expect("mark script executable");
+                vm.kernel
+                    .spawn_process(
+                        WASM_COMMAND,
+                        vec![String::from("old-argv")],
+                        SpawnOptions {
+                            requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                            env: BTreeMap::from([(String::from("STALE"), String::from("old"))]),
+                            cwd: Some(String::from("/")),
+                            ..SpawnOptions::default()
+                        },
+                    )
+                    .expect("spawn kernel process")
+            };
+            let kernel_pid = kernel_handle.pid();
+            let mut process = ActiveProcess::new(
+                kernel_pid,
+                kernel_handle,
+                GuestRuntimeKind::WebAssembly,
+                ActiveExecution::Tool(ToolExecution::default()),
+            )
+            .with_guest_cwd(String::from("/"))
+            .with_env(BTreeMap::from([(
+                String::from("STALE"),
+                String::from("old"),
+            )]));
+            process.host_write_dirty = true;
+            process.pending_self_signal_exit = Some(nix::libc::SIGTERM);
+            process
+                .queue_pending_wasm_signal(nix::libc::SIGUSR1)
+                .expect("queue pending signal");
+            process
+                .queue_pending_execution_event(ActiveExecutionEvent::Stdout(b"before".to_vec()))
+                .expect("queue pre-exec output");
+            process
+                .queue_pending_execution_event(ActiveExecutionEvent::Exited(9))
+                .expect("queue stale old-image exit");
+            sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("created vm")
+                .active_processes
+                .insert(String::from("exec-process"), process);
+
+            // The WASM runner precompiles the shebang interpreter and sends
+            // its Linux-rewritten argv with the original script pathname.
+            // Native commit must validate the interpreter chain rather than
+            // reject the script merely because its own header is not WASM.
+            sidecar
+                .exec_javascript_process_image(
+                    &vm_id,
+                    "exec-process",
+                    &[],
+                    crate::protocol::JavascriptChildProcessSpawnRequest {
+                        command: String::from("/script"),
+                        args: vec![
+                            String::from("one optional argument"),
+                            String::from("/script"),
+                            String::from("script-argument"),
+                        ],
+                        options: crate::protocol::JavascriptChildProcessSpawnOptions {
+                            argv0: Some(String::from("/interpreter.wasm")),
+                            env: BTreeMap::from([(
+                                String::from("SCRIPT_ONLY"),
+                                String::from("yes"),
+                            )]),
+                            local_replacement: true,
+                            ..Default::default()
+                        },
+                    },
+                )
+                .expect("commit local WASM shebang exec");
+            {
+                let vm = sidecar.vms.get_mut(&vm_id).expect("created vm");
+                assert_eq!(
+                    vm.kernel
+                        .read_file_for_process(
+                            EXECUTION_DRIVER_NAME,
+                            kernel_pid,
+                            &format!("/proc/{kernel_pid}/cmdline"),
+                        )
+                        .expect("read shebang-rewritten argv"),
+                    b"/interpreter.wasm\0one optional argument\0/script\0script-argument\0"
+                        .to_vec()
+                );
+            }
+
+            let replacement_env = BTreeMap::from([(String::from("ONLY"), String::from("new"))]);
+            sidecar
+                .exec_javascript_process_image(
+                    &vm_id,
+                    "exec-process",
+                    &[],
+                    crate::protocol::JavascriptChildProcessSpawnRequest {
+                        command: String::from("replacement.wasm"),
+                        args: vec![String::from("argument")],
+                        options: crate::protocol::JavascriptChildProcessSpawnOptions {
+                            argv0: Some(String::new()),
+                            env: replacement_env.clone(),
+                            local_replacement: true,
+                            ..Default::default()
+                        },
+                    },
+                )
+                .expect("commit local WASM exec");
+
+            {
+                let vm = sidecar.vms.get(&vm_id).expect("created vm");
+                let process = vm
+                    .active_processes
+                    .get("exec-process")
+                    .expect("exec process remains active");
+                assert_eq!(process.kernel_pid, kernel_pid, "exec must retain PID");
+                assert_eq!(process.env, replacement_env);
+                assert!(!process.env.contains_key("STALE"));
+                assert!(
+                    process.env.keys().all(|key| !key.starts_with("AGENTOS_")),
+                    "executor bootstrap env must not leak into guest envp: {:?}",
+                    process.env
+                );
+                assert!(
+                    process.host_write_dirty,
+                    "exec must preserve dirty VFS state"
+                );
+                assert_eq!(process.pending_self_signal_exit, Some(nix::libc::SIGTERM));
+                assert!(process.pending_wasm_signals.contains(&nix::libc::SIGUSR1));
+                assert_eq!(process.pending_execution_events.len(), 1);
+                assert!(matches!(
+                    process.pending_execution_events.front(),
+                    Some(ActiveExecutionEvent::Stdout(bytes)) if bytes == b"before"
+                ));
+            }
+
+            let vm = sidecar.vms.get_mut(&vm_id).expect("created vm");
+            let kernel_process = vm
+                .kernel
+                .list_processes()
+                .get(&kernel_pid)
+                .cloned()
+                .expect("kernel process remains active");
+            assert_eq!(kernel_process.command, "");
+            assert_eq!(
+                vm.kernel
+                    .read_file_for_process(
+                        EXECUTION_DRIVER_NAME,
+                        kernel_pid,
+                        &format!("/proc/{kernel_pid}/environ"),
+                    )
+                    .expect("read exact post-exec environment"),
+                b"ONLY=new\0".to_vec()
+            );
+            assert_eq!(
+                vm.kernel
+                    .read_file_for_process(
+                        EXECUTION_DRIVER_NAME,
+                        kernel_pid,
+                        &format!("/proc/{kernel_pid}/cmdline"),
+                    )
+                    .expect("read exact post-exec argv"),
+                b"\0argument\0".to_vec()
+            );
+
+            let fd_replacement_env =
+                BTreeMap::from([(String::from("FD_ONLY"), String::from("yes"))]);
+            sidecar
+                .commit_wasm_fd_process_image(
+                    &vm_id,
+                    "exec-process",
+                    &[],
+                    crate::protocol::JavascriptChildProcessSpawnRequest {
+                        // This path deliberately does not exist in the VFS.
+                        // The trusted runner owns and prevalidates the live FD
+                        // image, so commit must never reopen this display path.
+                        command: String::from("/proc/self/fd/1048576"),
+                        args: vec![String::from("fd-argument")],
+                        options: crate::protocol::JavascriptChildProcessSpawnOptions {
+                            argv0: Some(String::from("fd-custom-argv0")),
+                            executable_fd: Some(1_048_576),
+                            env: fd_replacement_env.clone(),
+                            local_replacement: true,
+                            ..Default::default()
+                        },
+                    },
+                )
+                .expect("commit prevalidated runner-owned fd image");
+            let vm = sidecar.vms.get_mut(&vm_id).expect("created vm");
+            assert_eq!(
+                vm.active_processes
+                    .get("exec-process")
+                    .expect("exec process remains active")
+                    .env,
+                fd_replacement_env
+            );
+            assert_eq!(
+                vm.kernel
+                    .read_file_for_process(
+                        EXECUTION_DRIVER_NAME,
+                        kernel_pid,
+                        &format!("/proc/{kernel_pid}/cmdline"),
+                    )
+                    .expect("read fd-image argv"),
+                b"fd-custom-argv0\0fd-argument\0".to_vec()
+            );
+        }
+
+        fn prepare_cross_runtime_exec_fixture() -> (NativeSidecar<RecordingBridge>, String, u32) {
+            assert_node_available();
+
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            sidecar.javascript_engine.set_import_cache_base_dir(
+                vm_id.clone(),
+                sidecar.cache_root.join("cross-runtime-exec-import-cache"),
+            );
+
+            let (kernel_handle, host_cwd) = {
+                let vm = sidecar.vms.get_mut(&vm_id).expect("created vm");
+                vm.kernel.mkdir("/work", true).expect("create work dir");
+                vm.kernel
+                    .write_file(
+                        "/work/replacement.js",
+                        br#"#!/usr/bin/env node
+const fs = require("node:fs");
+const snapshot = {
+  argv: process.argv,
+  argv0: process.argv0,
+  cwd: process.cwd(),
+  pid: process.pid,
+  only: process.env.ONLY ?? null,
+  stale: process.env.STALE ?? null,
+  fd: fs.readFileSync(`/proc/${process.pid}/fd/9`, "utf8"),
+  cmdline: fs.readFileSync(`/proc/${process.pid}/cmdline`).toString("base64"),
+  environ: fs.readFileSync(`/proc/${process.pid}/environ`).toString("base64"),
+};
+process.stdout.write(`${JSON.stringify(snapshot)}\n`);
+"#
+                        .to_vec(),
+                    )
+                    .expect("write replacement javascript");
+                vm.kernel
+                    .chmod("/work/replacement.js", 0o755)
+                    .expect("mark replacement executable");
+                vm.kernel
+                    .write_file("/work/fd-data", b"preserved-fd".to_vec())
+                    .expect("write inherited fd fixture");
+                let kernel_handle = vm
+                    .kernel
+                    .spawn_process(
+                        WASM_COMMAND,
+                        vec![String::from("old-image")],
+                        SpawnOptions {
+                            requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                            env: BTreeMap::from([(String::from("STALE"), String::from("old"))]),
+                            cwd: Some(String::from("/work")),
+                            ..SpawnOptions::default()
+                        },
+                    )
+                    .expect("spawn old kernel image");
+                let kernel_pid = kernel_handle.pid();
+                let opened_fd = vm
+                    .kernel
+                    .fd_open(EXECUTION_DRIVER_NAME, kernel_pid, "/work/fd-data", 0, None)
+                    .expect("open inherited file");
+                vm.kernel
+                    .fd_dup2(EXECUTION_DRIVER_NAME, kernel_pid, opened_fd, 9)
+                    .expect("install inherited fd 9");
+                if opened_fd != 9 {
+                    vm.kernel
+                        .fd_close(EXECUTION_DRIVER_NAME, kernel_pid, opened_fd)
+                        .expect("close extra inherited fd");
+                }
+                (kernel_handle, vm.cwd.join("work"))
+            };
+            let kernel_pid = kernel_handle.pid();
+            let mut process = ActiveProcess::new(
+                kernel_pid,
+                kernel_handle,
+                GuestRuntimeKind::WebAssembly,
+                ActiveExecution::Tool(ToolExecution::default()),
+            )
+            .with_guest_cwd(String::from("/work"))
+            .with_host_cwd(host_cwd)
+            .with_env(BTreeMap::from([(
+                String::from("STALE"),
+                String::from("old"),
+            )]));
+            process
+                .queue_pending_execution_event(ActiveExecutionEvent::Stdout(
+                    b"old-image-output-before-exec\n".to_vec(),
+                ))
+                .expect("queue observable pre-exec output");
+            process
+                .queue_pending_execution_event(ActiveExecutionEvent::Exited(91))
+                .expect("queue stale old-image exit");
+            sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("created vm")
+                .active_processes
+                .insert(String::from("exec-process"), process);
+
+            (sidecar, vm_id, kernel_pid)
+        }
+
+        fn cross_runtime_exec_starts_after_committed_linux_process_state() {
+            let (mut sidecar, vm_id, kernel_pid) = prepare_cross_runtime_exec_fixture();
+            let replacement_env = BTreeMap::from([(String::from("ONLY"), String::from("new"))]);
+
+            sidecar
+                .exec_javascript_process_image(
+                    &vm_id,
+                    "exec-process",
+                    &[],
+                    crate::protocol::JavascriptChildProcessSpawnRequest {
+                        command: String::from("replacement.js"),
+                        args: vec![String::from("arg-one")],
+                        options: crate::protocol::JavascriptChildProcessSpawnOptions {
+                            argv0: Some(String::from("replacement-argv0")),
+                            env: replacement_env.clone(),
+                            ..Default::default()
+                        },
+                    },
+                )
+                .expect("commit and start cross-runtime exec");
+
+            {
+                let vm = sidecar.vms.get(&vm_id).expect("created vm");
+                let process = vm
+                    .active_processes
+                    .get("exec-process")
+                    .expect("replacement process remains active");
+                assert_eq!(process.kernel_pid, kernel_pid, "exec must preserve PID");
+                assert_eq!(process.runtime, GuestRuntimeKind::JavaScript);
+                assert_eq!(process.guest_cwd, "/work");
+                assert_eq!(process.env, replacement_env);
+                assert!(
+                    process
+                        .pending_execution_events
+                        .iter()
+                        .all(|event| !matches!(
+                            event,
+                            ActiveExecutionEvent::Exited(91)
+                                | ActiveExecutionEvent::JavascriptSyncRpcRequest(_)
+                                | ActiveExecutionEvent::PythonVfsRpcRequest(_)
+                                | ActiveExecutionEvent::SignalState { .. }
+                        )),
+                    "old-image continuation events must not survive exec"
+                );
+            }
+
+            let (stdout, stderr, exit_code) =
+                drain_process_output(&mut sidecar, &vm_id, "exec-process");
+            assert_eq!(exit_code, Some(0), "stderr: {stderr}");
+            assert_eq!(stderr, "");
+            let mut lines = stdout.lines();
+            assert_eq!(lines.next(), Some("old-image-output-before-exec"));
+            let snapshot: Value =
+                serde_json::from_str(lines.next().expect("replacement state snapshot"))
+                    .expect("parse replacement state snapshot");
+            assert_eq!(
+                lines.next(),
+                None,
+                "unexpected replacement output: {stdout}"
+            );
+            assert_eq!(snapshot["argv0"], json!("replacement-argv0"));
+            assert_eq!(snapshot["argv"][1], json!("/work/replacement.js"));
+            assert_eq!(snapshot["argv"][2], json!("arg-one"));
+            assert_eq!(snapshot["cwd"], json!("/work"));
+            assert_eq!(snapshot["pid"], json!(kernel_pid));
+            assert_eq!(snapshot["only"], json!("new"));
+            assert_eq!(snapshot["stale"], Value::Null);
+            assert_eq!(snapshot["fd"], json!("preserved-fd"));
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(snapshot["cmdline"].as_str().expect("cmdline base64"))
+                    .expect("decode cmdline"),
+                b"replacement-argv0\0arg-one\0"
+            );
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(snapshot["environ"].as_str().expect("environ base64"))
+                    .expect("decode environ"),
+                b"ONLY=new\0"
+            );
+        }
+
+        fn cross_runtime_exec_start_failure_is_fatal_after_kernel_commit() {
+            let (mut sidecar, vm_id, kernel_pid) = prepare_cross_runtime_exec_fixture();
+            sidecar.fail_next_exec_start_after_commit = true;
+
+            sidecar
+                .exec_javascript_process_image(
+                    &vm_id,
+                    "exec-process",
+                    &[],
+                    crate::protocol::JavascriptChildProcessSpawnRequest {
+                        command: String::from("replacement.js"),
+                        args: vec![String::from("fatal-argument")],
+                        options: crate::protocol::JavascriptChildProcessSpawnOptions {
+                            argv0: Some(String::from("fatal-argv0")),
+                            env: BTreeMap::from([(
+                                String::from("FATAL_ONLY"),
+                                String::from("yes"),
+                            )]),
+                            ..Default::default()
+                        },
+                    },
+                )
+                .expect("post-commit start failure must not return into the old image");
+
+            assert!(!sidecar.fail_next_exec_start_after_commit);
+            let vm = sidecar.vms.get_mut(&vm_id).expect("created vm");
+            let kernel_process = vm
+                .kernel
+                .list_processes()
+                .get(&kernel_pid)
+                .cloned()
+                .expect("fatal replacement remains a waitable zombie");
+            assert_eq!(kernel_process.command, "fatal-argv0");
+            assert_eq!(kernel_process.exit_code, Some(127));
+            let process = vm
+                .active_processes
+                .get_mut("exec-process")
+                .expect("fatal replacement remains queued for cleanup");
+            assert_eq!(process.runtime, GuestRuntimeKind::JavaScript);
+            assert_eq!(process.guest_cwd, "/work");
+            assert_eq!(
+                process.env,
+                BTreeMap::from([(String::from("FATAL_ONLY"), String::from("yes"))])
+            );
+            assert_eq!(process.kernel_pid, kernel_pid);
+            assert_eq!(
+                process.kernel_handle.wait(Duration::ZERO),
+                Some(127),
+                "a post-commit start failure must kill the replacement image"
+            );
+            assert!(process.pending_execution_events.iter().any(|event| {
+                matches!(event, ActiveExecutionEvent::Stderr(message)
+                    if String::from_utf8_lossy(message).contains("failed to start"))
+            }));
+            assert!(process
+                .pending_execution_events
+                .iter()
+                .any(|event| matches!(event, ActiveExecutionEvent::Exited(127))));
+            assert!(!process
+                .pending_execution_events
+                .iter()
+                .any(|event| matches!(event, ActiveExecutionEvent::Exited(91))));
+        }
+
+        fn posix_spawn_file_actions_run_before_exact_exec_resolution() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("agentos-native-sidecar-posix-spawn-order");
+            insert_fake_javascript_parent_process(&mut sidecar, &vm_id, &cwd, "posix-spawn-parent");
+            {
+                let vm = sidecar.vms.get_mut(&vm_id).expect("created vm");
+                vm.kernel
+                    .write_file("/truncated-script", b"#!/missing-interpreter\n".to_vec())
+                    .expect("write exact script fixture");
+                vm.kernel
+                    .chmod("/truncated-script", 0o755)
+                    .expect("mark exact script executable");
+            }
+            let open_action =
+                |guest_fd, path: &str, oflag| crate::protocol::JavascriptPosixSpawnFileAction {
+                    command: 3,
+                    guest_fd: Some(guest_fd),
+                    fd: guest_fd,
+                    source_fd: -1,
+                    guest_source_fd: None,
+                    oflag,
+                    mode: 0o600,
+                    path: path.to_owned(),
+                    close_from_guest_fds: Vec::new(),
+                };
+
+            let error = sidecar
+                .spawn_javascript_child_process(
+                    &vm_id,
+                    "posix-spawn-parent",
+                    crate::protocol::JavascriptChildProcessSpawnRequest {
+                        command: String::from("/missing-executable"),
+                        args: Vec::new(),
+                        options: crate::protocol::JavascriptChildProcessSpawnOptions {
+                            spawn_exact_path: true,
+                            spawn_file_actions: vec![open_action(
+                                40,
+                                "/created-before-enoent",
+                                0x1000_0000 | (1 << 12) | (4 << 12),
+                            )],
+                            ..Default::default()
+                        },
+                    },
+                )
+                .expect_err("missing exact executable must fail");
+            assert!(error.to_string().contains("ENOENT"), "{error}");
+            assert!(
+                sidecar
+                    .vms
+                    .get(&vm_id)
+                    .expect("created vm")
+                    .kernel
+                    .exists("/created-before-enoent")
+                    .expect("query created file"),
+                "Linux keeps successful O_CREAT actions when the later exec fails"
+            );
+
+            let error = sidecar
+                .spawn_javascript_child_process(
+                    &vm_id,
+                    "posix-spawn-parent",
+                    crate::protocol::JavascriptChildProcessSpawnRequest {
+                        command: String::from("/truncated-script"),
+                        args: Vec::new(),
+                        options: crate::protocol::JavascriptChildProcessSpawnOptions {
+                            spawn_exact_path: true,
+                            spawn_file_actions: vec![open_action(
+                                41,
+                                "/truncated-script",
+                                0x1000_0000 | (8 << 12),
+                            )],
+                            ..Default::default()
+                        },
+                    },
+                )
+                .expect_err("truncating the target must affect exact image resolution");
+            assert!(error.to_string().contains("ENOEXEC"), "{error}");
+            assert_eq!(
+                sidecar
+                    .vms
+                    .get_mut(&vm_id)
+                    .expect("created vm")
+                    .kernel
+                    .read_file("/truncated-script")
+                    .expect("read truncated script"),
+                b""
+            );
+        }
+
+        fn dirty_host_shadow_sync_precedes_top_level_and_nested_spawn_actions() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let top_host_cwd = temp_dir("agentos-native-sidecar-posix-spawn-shadow-top");
+            insert_fake_javascript_parent_process(
+                &mut sidecar,
+                &vm_id,
+                &top_host_cwd,
+                "posix-spawn-shadow-parent",
+            );
+            write_fixture(
+                &top_host_cwd.join("truncate-before-failed-exec"),
+                b"host-dirty",
+            );
+            sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("created vm")
+                .active_processes
+                .get_mut("posix-spawn-shadow-parent")
+                .expect("top-level parent")
+                .host_write_dirty = true;
+
+            let open_action =
+                |guest_fd, path: &str, oflag| crate::protocol::JavascriptPosixSpawnFileAction {
+                    command: 3,
+                    guest_fd: Some(guest_fd),
+                    fd: guest_fd,
+                    source_fd: -1,
+                    guest_source_fd: None,
+                    oflag,
+                    mode: 0o600,
+                    path: path.to_owned(),
+                    close_from_guest_fds: Vec::new(),
+                };
+            let exact_request =
+                |command: &str, action| crate::protocol::JavascriptChildProcessSpawnRequest {
+                    command: command.to_owned(),
+                    args: Vec::new(),
+                    options: crate::protocol::JavascriptChildProcessSpawnOptions {
+                        spawn_exact_path: true,
+                        spawn_file_actions: vec![action],
+                        ..Default::default()
+                    },
+                };
+
+            let error = sidecar
+                .spawn_javascript_child_process(
+                    &vm_id,
+                    "posix-spawn-shadow-parent",
+                    exact_request(
+                        "/missing-after-shadow-truncate",
+                        open_action(50, "/truncate-before-failed-exec", 0x1000_0000 | (8 << 12)),
+                    ),
+                )
+                .expect_err("the later exact exec must fail");
+            assert!(error.to_string().contains("ENOENT"), "{error}");
+            assert_eq!(
+                sidecar
+                    .vms
+                    .get_mut(&vm_id)
+                    .expect("created vm")
+                    .kernel
+                    .read_file("/truncate-before-failed-exec")
+                    .expect("read file-action target after failed exec"),
+                b"",
+                "the pre-exec host sync must not run again after O_TRUNC"
+            );
+
+            let nested_host_cwd = temp_dir("agentos-native-sidecar-posix-spawn-shadow-nested");
+            fs::create_dir(nested_host_cwd.join("host-only-directory"))
+                .expect("create host-only nested directory");
+            let nested_module = nested_host_cwd.join("success.wasm");
+            let nested_module_bytes = wat::parse_str(r#"(module (func (export "_start")))"#)
+                .expect("compile successful nested module");
+            write_fixture(&nested_module, &nested_module_bytes);
+            let mut module_permissions = fs::metadata(&nested_module)
+                .expect("stat successful nested module")
+                .permissions();
+            module_permissions.set_mode(0o755);
+            fs::set_permissions(&nested_module, module_permissions)
+                .expect("mark successful nested module executable");
+            let staged_nested_module = sidecar
+                .vms
+                .get(&vm_id)
+                .expect("created vm")
+                .cwd
+                .join("success.wasm");
+            write_fixture(&staged_nested_module, &nested_module_bytes);
+            let mut staged_module_permissions = fs::metadata(&staged_nested_module)
+                .expect("stat staged successful nested module")
+                .permissions();
+            staged_module_permissions.set_mode(0o755);
+            fs::set_permissions(&staged_nested_module, staged_module_permissions)
+                .expect("mark staged successful nested module executable");
+
+            let (nested_handle, nested_env) = {
+                let vm = sidecar.vms.get_mut(&vm_id).expect("created vm");
+                let root_pid = vm
+                    .active_processes
+                    .get("posix-spawn-shadow-parent")
+                    .expect("root parent")
+                    .kernel_pid;
+                let handle = vm
+                    .kernel
+                    .spawn_process(
+                        JAVASCRIPT_COMMAND,
+                        vec![String::from("nested-shadow-parent")],
+                        SpawnOptions {
+                            requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                            parent_pid: Some(root_pid),
+                            cwd: Some(String::from("/")),
+                            ..SpawnOptions::default()
+                        },
+                    )
+                    .expect("spawn nested kernel parent");
+                (handle, vm.guest_env.clone())
+            };
+            let nested_pid = nested_handle.pid();
+            let mut nested_parent = ActiveProcess::new(
+                nested_pid,
+                nested_handle,
+                GuestRuntimeKind::JavaScript,
+                ActiveExecution::Tool(ToolExecution::default()),
+            )
+            .with_guest_cwd(String::from("/"))
+            .with_env(nested_env)
+            .with_host_cwd(nested_host_cwd);
+            nested_parent.host_write_dirty = true;
+            sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("created vm")
+                .active_processes
+                .get_mut("posix-spawn-shadow-parent")
+                .expect("root parent")
+                .child_processes
+                .insert(String::from("nested-shadow-parent"), nested_parent);
+
+            sidecar
+                .spawn_descendant_javascript_child_process_for_test(
+                    &vm_id,
+                    "posix-spawn-shadow-parent",
+                    &["nested-shadow-parent"],
+                    exact_request(
+                        "/success.wasm",
+                        open_action(
+                            51,
+                            "/host-only-directory/created-before-successful-exec",
+                            0x1000_0000 | (1 << 12) | (4 << 12),
+                        ),
+                    ),
+                )
+                .expect("nested exact spawn succeeds after syncing its dirty host shadow");
+            assert!(
+                sidecar
+                    .vms
+                    .get(&vm_id)
+                    .expect("created vm")
+                    .kernel
+                    .exists("/host-only-directory/created-before-successful-exec")
+                    .expect("query nested O_CREAT side effect"),
+                "the O_CREAT side effect must survive successful exec"
+            );
+        }
+
+        fn write_posix_spawnp_fixture(
+            sidecar: &mut NativeSidecar<RecordingBridge>,
+            vm_id: &str,
+            guest_path: &str,
+            contents: impl AsRef<[u8]>,
+            mode: u32,
+        ) {
+            let contents = contents.as_ref();
+            let host_path = {
+                let vm = sidecar.vms.get_mut(vm_id).expect("created vm");
+                let parent = Path::new(guest_path)
+                    .parent()
+                    .and_then(Path::to_str)
+                    .expect("fixture parent path");
+                if parent != "/" {
+                    vm.kernel
+                        .mkdir(parent, true)
+                        .expect("create fixture guest parent");
+                }
+                vm.kernel
+                    .write_file(guest_path, contents.to_vec())
+                    .expect("write guest fixture");
+                vm.kernel
+                    .chmod(guest_path, mode)
+                    .expect("chmod guest fixture");
+                vm.cwd.join(guest_path.trim_start_matches('/'))
+            };
+
+            fs::create_dir_all(host_path.parent().expect("fixture host parent"))
+                .expect("create fixture host parent");
+            write_fixture(&host_path, contents);
+            let mut permissions = fs::metadata(&host_path)
+                .expect("stat host fixture")
+                .permissions();
+            permissions.set_mode(mode);
+            fs::set_permissions(&host_path, permissions).expect("chmod host fixture");
+        }
+
+        fn posix_spawnp_request(
+            command: &str,
+            search_path: &str,
+            args: &[&str],
+        ) -> crate::protocol::JavascriptChildProcessSpawnRequest {
+            crate::protocol::JavascriptChildProcessSpawnRequest {
+                command: command.to_owned(),
+                args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+                options: crate::protocol::JavascriptChildProcessSpawnOptions {
+                    argv0: Some(String::from("caller-argv0")),
+                    spawn_search_path: Some(search_path.to_owned()),
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn spawn_posix_spawnp_fixture(
+            sidecar: &mut NativeSidecar<RecordingBridge>,
+            vm_id: &str,
+            nested: bool,
+            request: crate::protocol::JavascriptChildProcessSpawnRequest,
+        ) -> Result<Value, SidecarError> {
+            if nested {
+                sidecar.spawn_descendant_javascript_child_process_for_test(
+                    vm_id,
+                    "posix-spawnp-parent",
+                    &["posix-spawnp-nested-parent"],
+                    request,
+                )
+            } else {
+                sidecar.spawn_javascript_child_process(vm_id, "posix-spawnp-parent", request)
+            }
+        }
+
+        fn posix_spawnp_path_and_recursive_shebang_match_linux() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let host_cwd = sidecar.vms.get(&vm_id).expect("created vm").cwd.clone();
+            insert_fake_javascript_parent_process(
+                &mut sidecar,
+                &vm_id,
+                &host_cwd,
+                "posix-spawnp-parent",
+            );
+
+            let (nested_handle, nested_env) = {
+                let vm = sidecar.vms.get_mut(&vm_id).expect("created vm");
+                let root_pid = vm
+                    .active_processes
+                    .get("posix-spawnp-parent")
+                    .expect("root parent")
+                    .kernel_pid;
+                let handle = vm
+                    .kernel
+                    .spawn_process(
+                        JAVASCRIPT_COMMAND,
+                        vec![String::from("posix-spawnp-nested-parent")],
+                        SpawnOptions {
+                            requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                            parent_pid: Some(root_pid),
+                            cwd: Some(String::from("/")),
+                            ..SpawnOptions::default()
+                        },
+                    )
+                    .expect("spawn nested kernel parent");
+                (handle, vm.guest_env.clone())
+            };
+            let nested_pid = nested_handle.pid();
+            sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("created vm")
+                .active_processes
+                .get_mut("posix-spawnp-parent")
+                .expect("root parent")
+                .child_processes
+                .insert(
+                    String::from("posix-spawnp-nested-parent"),
+                    ActiveProcess::new(
+                        nested_pid,
+                        nested_handle,
+                        GuestRuntimeKind::JavaScript,
+                        ActiveExecution::Tool(ToolExecution::default()),
+                    )
+                    .with_guest_cwd(String::from("/"))
+                    .with_env(nested_env)
+                    .with_host_cwd(host_cwd),
+                );
+
+            let wasm = wat::parse_str(r#"(module (func (export "_start")))"#)
+                .expect("compile WASM fixture");
+            for (path, contents, mode) in [
+                ("/empty.wasm", wasm.as_slice(), 0o755),
+                ("/ spaced /space.wasm", wasm.as_slice(), 0o755),
+                ("/denied/tool", wasm.as_slice(), 0o644),
+                ("/allowed/tool", wasm.as_slice(), 0o755),
+                ("/denied2/tool", wasm.as_slice(), 0o644),
+                ("/interpreter.wasm", wasm.as_slice(), 0o755),
+            ] {
+                write_posix_spawnp_fixture(&mut sidecar, &vm_id, path, contents, mode);
+            }
+            for (path, contents) in [
+                ("/scripts/simple", b"#!/interpreter.wasm\n".as_slice()),
+                (
+                    "/scripts/optional",
+                    b"#!/interpreter.wasm --flag with space\n".as_slice(),
+                ),
+                (
+                    "/scripts/inner",
+                    b"#!/interpreter.wasm --inner\n".as_slice(),
+                ),
+                ("/scripts/nested", b"#!/scripts/inner --outer\n".as_slice()),
+                ("/scripts/missing", b"#!/missing-interpreter\n".as_slice()),
+            ] {
+                write_posix_spawnp_fixture(&mut sidecar, &vm_id, path, contents, 0o755);
+            }
+
+            sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("created vm")
+                .command_guest_paths
+                .insert(
+                    String::from("registered-only"),
+                    String::from("/registered-only"),
+                );
+
+            for nested in [false, true] {
+                let scope = if nested { "nested" } else { "top-level" };
+
+                let error = spawn_posix_spawnp_fixture(
+                    &mut sidecar,
+                    &vm_id,
+                    nested,
+                    posix_spawnp_request("registered-only", "/excluded", &[]),
+                )
+                .expect_err("an explicit PATH must exclude registered commands outside PATH");
+                assert!(
+                    error.to_string().contains("ENOENT"),
+                    "{scope} excluded registered command returned {error}"
+                );
+
+                let empty_entry = spawn_posix_spawnp_fixture(
+                    &mut sidecar,
+                    &vm_id,
+                    nested,
+                    posix_spawnp_request("empty.wasm", "", &[]),
+                )
+                .unwrap_or_else(|error| panic!("{scope} PATH=\"\" failed: {error}"));
+                assert_eq!(empty_entry["args"], json!(["caller-argv0"]));
+
+                let empty_segment = spawn_posix_spawnp_fixture(
+                    &mut sidecar,
+                    &vm_id,
+                    nested,
+                    posix_spawnp_request("empty.wasm", ":/missing", &[]),
+                )
+                .unwrap_or_else(|error| panic!("{scope} empty PATH segment failed: {error}"));
+                assert_eq!(empty_segment["args"], json!(["caller-argv0"]));
+
+                let whitespace_entry = spawn_posix_spawnp_fixture(
+                    &mut sidecar,
+                    &vm_id,
+                    nested,
+                    posix_spawnp_request("space.wasm", "/ spaced ", &[]),
+                )
+                .unwrap_or_else(|error| panic!("{scope} literal whitespace PATH failed: {error}"));
+                assert_eq!(whitespace_entry["args"], json!(["caller-argv0"]));
+
+                let allowed_after_denied = spawn_posix_spawnp_fixture(
+                    &mut sidecar,
+                    &vm_id,
+                    nested,
+                    posix_spawnp_request("tool", "/denied:/allowed", &[]),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{scope} EACCES continuation to valid candidate failed: {error}")
+                });
+                assert_eq!(allowed_after_denied["command"], json!("/allowed/tool"));
+
+                let error = spawn_posix_spawnp_fixture(
+                    &mut sidecar,
+                    &vm_id,
+                    nested,
+                    posix_spawnp_request("tool", "/denied:/denied2", &[]),
+                )
+                .expect_err("all denied PATH candidates must fail");
+                assert!(
+                    error.to_string().contains("EACCES"),
+                    "{scope} all-denied PATH returned {error}"
+                );
+
+                let simple = spawn_posix_spawnp_fixture(
+                    &mut sidecar,
+                    &vm_id,
+                    nested,
+                    posix_spawnp_request("simple", "/scripts", &["tail"]),
+                )
+                .unwrap_or_else(|error| panic!("{scope} PATH shebang failed: {error}"));
+                assert_eq!(
+                    simple["args"],
+                    json!(["/interpreter.wasm", "/scripts/simple", "tail"])
+                );
+
+                let optional = spawn_posix_spawnp_fixture(
+                    &mut sidecar,
+                    &vm_id,
+                    nested,
+                    posix_spawnp_request("optional", "/scripts", &["tail"]),
+                )
+                .unwrap_or_else(|error| panic!("{scope} optional shebang arg failed: {error}"));
+                assert_eq!(
+                    optional["args"],
+                    json!([
+                        "/interpreter.wasm",
+                        "--flag with space",
+                        "/scripts/optional",
+                        "tail"
+                    ])
+                );
+
+                let recursive = spawn_posix_spawnp_fixture(
+                    &mut sidecar,
+                    &vm_id,
+                    nested,
+                    posix_spawnp_request("nested", "/scripts", &["tail"]),
+                )
+                .unwrap_or_else(|error| panic!("{scope} nested shebang failed: {error}"));
+                assert_eq!(
+                    recursive["args"],
+                    json!([
+                        "/interpreter.wasm",
+                        "--inner",
+                        "/scripts/inner",
+                        "--outer",
+                        "/scripts/nested",
+                        "tail"
+                    ])
+                );
+
+                let error = spawn_posix_spawnp_fixture(
+                    &mut sidecar,
+                    &vm_id,
+                    nested,
+                    posix_spawnp_request("missing", "/scripts", &[]),
+                )
+                .expect_err("missing shebang interpreter must fail");
+                assert!(
+                    error.to_string().contains("ENOENT"),
+                    "{scope} missing interpreter returned {error}"
+                );
+            }
+        }
+
+        fn repeated_malformed_wasm_spawns_restore_top_level_and_nested_baselines() {
+            let mut sidecar = create_test_sidecar();
+            let (connection_id, session_id) =
+                authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
+            let vm_id = create_vm(
+                &mut sidecar,
+                &connection_id,
+                &session_id,
+                PermissionsPolicy::allow_all(),
+            )
+            .expect("create vm");
+            let cwd = temp_dir("agentos-native-sidecar-malformed-wasm-spawn");
+            insert_fake_javascript_parent_process(
+                &mut sidecar,
+                &vm_id,
+                &cwd,
+                "malformed-wasm-parent",
+            );
+            let malformed_wasm = b"\0asm\x01\0\0\0\xff";
+            let successful_wasm = wat::parse_str(r#"(module (func (export "_start")))"#)
+                .expect("compile successful WASM fixture");
+            {
+                let vm = sidecar.vms.get_mut(&vm_id).expect("created vm");
+                write_fixture(&vm.cwd.join("malformed.wasm"), malformed_wasm);
+                let successful_host_path = vm.cwd.join("success.wasm");
+                write_fixture(&successful_host_path, &successful_wasm);
+                let mut successful_permissions = fs::metadata(&successful_host_path)
+                    .expect("stat successful WASM fixture")
+                    .permissions();
+                successful_permissions.set_mode(0o755);
+                fs::set_permissions(&successful_host_path, successful_permissions)
+                    .expect("mark host successful WASM fixture executable");
+                vm.kernel
+                    .write_file("/malformed.wasm", malformed_wasm.to_vec())
+                    .expect("write malformed WASM fixture");
+                vm.kernel
+                    .chmod("/malformed.wasm", 0o755)
+                    .expect("mark malformed WASM executable");
+                vm.kernel
+                    .write_file("/success.wasm", successful_wasm)
+                    .expect("write successful WASM fixture");
+                vm.kernel
+                    .chmod("/success.wasm", 0o755)
+                    .expect("mark successful WASM executable");
+            }
+            let malformed_request = || crate::protocol::JavascriptChildProcessSpawnRequest {
+                command: String::from("/malformed.wasm"),
+                args: Vec::new(),
+                options: crate::protocol::JavascriptChildProcessSpawnOptions {
+                    spawn_exact_path: true,
+                    ..Default::default()
+                },
+            };
+
+            let top_level_baseline = sidecar
+                .vms
+                .get(&vm_id)
+                .expect("created vm")
+                .kernel
+                .resource_snapshot();
+            let context_baseline = (
+                sidecar.javascript_engine.context_count_for_test(),
+                sidecar.wasm_engine.context_count_for_test(),
+                sidecar.wasm_engine.javascript_context_count_for_test(),
+                sidecar.python_engine.context_count_for_test(),
+                sidecar.python_engine.javascript_context_count_for_test(),
+            );
+            for iteration in 0..8 {
+                if sidecar
+                    .spawn_javascript_child_process(
+                        &vm_id,
+                        "malformed-wasm-parent",
+                        malformed_request(),
+                    )
+                    .is_ok()
+                {
+                    panic!("top-level malformed WASM spawn iteration {iteration} succeeded");
+                }
+                let vm = sidecar.vms.get(&vm_id).expect("created vm");
+                assert_eq!(
+                    vm.kernel.resource_snapshot(),
+                    top_level_baseline,
+                    "top-level iteration {iteration} leaked a process or fd"
+                );
+                assert!(
+                    vm.active_processes
+                        .get("malformed-wasm-parent")
+                        .expect("root parent")
+                        .child_processes
+                        .is_empty(),
+                    "failed top-level spawn must not register a child"
+                );
+                assert_eq!(
+                    (
+                        sidecar.javascript_engine.context_count_for_test(),
+                        sidecar.wasm_engine.context_count_for_test(),
+                        sidecar.wasm_engine.javascript_context_count_for_test(),
+                        sidecar.python_engine.context_count_for_test(),
+                        sidecar.python_engine.javascript_context_count_for_test(),
+                    ),
+                    context_baseline,
+                    "top-level iteration {iteration} leaked an execution context"
+                );
+            }
+
+            let (nested_handle, nested_env, nested_host_cwd) = {
+                let vm = sidecar.vms.get_mut(&vm_id).expect("created vm");
+                let root_pid = vm
+                    .active_processes
+                    .get("malformed-wasm-parent")
+                    .expect("root parent")
+                    .kernel_pid;
+                let handle = vm
+                    .kernel
+                    .spawn_process(
+                        JAVASCRIPT_COMMAND,
+                        vec![String::from("nested-parent")],
+                        SpawnOptions {
+                            requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                            parent_pid: Some(root_pid),
+                            cwd: Some(String::from("/")),
+                            ..SpawnOptions::default()
+                        },
+                    )
+                    .expect("spawn nested kernel parent");
+                (handle, vm.guest_env.clone(), vm.cwd.clone())
+            };
+            let nested_pid = nested_handle.pid();
+            sidecar
+                .vms
+                .get_mut(&vm_id)
+                .expect("created vm")
+                .active_processes
+                .get_mut("malformed-wasm-parent")
+                .expect("root parent")
+                .child_processes
+                .insert(
+                    String::from("nested-parent"),
+                    ActiveProcess::new(
+                        nested_pid,
+                        nested_handle,
+                        GuestRuntimeKind::JavaScript,
+                        ActiveExecution::Tool(ToolExecution::default()),
+                    )
+                    .with_guest_cwd(String::from("/"))
+                    .with_env(nested_env)
+                    .with_host_cwd(nested_host_cwd),
+                );
+
+            let nested_baseline = sidecar
+                .vms
+                .get(&vm_id)
+                .expect("created vm")
+                .kernel
+                .resource_snapshot();
+            for iteration in 0..8 {
+                if sidecar
+                    .spawn_descendant_javascript_child_process_for_test(
+                        &vm_id,
+                        "malformed-wasm-parent",
+                        &["nested-parent"],
+                        malformed_request(),
+                    )
+                    .is_ok()
+                {
+                    panic!("nested malformed WASM spawn iteration {iteration} succeeded");
+                }
+                let vm = sidecar.vms.get(&vm_id).expect("created vm");
+                assert_eq!(
+                    vm.kernel.resource_snapshot(),
+                    nested_baseline,
+                    "nested iteration {iteration} leaked a process or fd"
+                );
+                assert!(
+                    vm.active_processes
+                        .get("malformed-wasm-parent")
+                        .expect("root parent")
+                        .child_processes
+                        .get("nested-parent")
+                        .expect("nested parent")
+                        .child_processes
+                        .is_empty(),
+                    "failed nested spawn must not register a child"
+                );
+                assert_eq!(
+                    (
+                        sidecar.javascript_engine.context_count_for_test(),
+                        sidecar.wasm_engine.context_count_for_test(),
+                        sidecar.wasm_engine.javascript_context_count_for_test(),
+                        sidecar.python_engine.context_count_for_test(),
+                        sidecar.python_engine.javascript_context_count_for_test(),
+                    ),
+                    context_baseline,
+                    "nested iteration {iteration} leaked an execution context"
+                );
+            }
+
+            let successful_request = || crate::protocol::JavascriptChildProcessSpawnRequest {
+                command: String::from("/success.wasm"),
+                args: Vec::new(),
+                options: crate::protocol::JavascriptChildProcessSpawnOptions {
+                    spawn_exact_path: true,
+                    ..Default::default()
+                },
+            };
+            for iteration in 0..4 {
+                let spawned = sidecar
+                    .spawn_javascript_child_process(
+                        &vm_id,
+                        "malformed-wasm-parent",
+                        successful_request(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("successful WASM spawn iteration {iteration} failed: {error}")
+                    });
+                let child_id = spawned["childId"]
+                    .as_str()
+                    .expect("successful spawn child id")
+                    .to_owned();
+                assert_eq!(
+                    (
+                        sidecar.javascript_engine.context_count_for_test(),
+                        sidecar.wasm_engine.context_count_for_test(),
+                        sidecar.wasm_engine.javascript_context_count_for_test(),
+                        sidecar.python_engine.context_count_for_test(),
+                        sidecar.python_engine.javascript_context_count_for_test(),
+                    ),
+                    context_baseline,
+                    "successful spawn iteration {iteration} retained one-shot context metadata"
+                );
+
+                let mut reaped = false;
+                for _ in 0..64 {
+                    let event = sidecar
+                        .poll_javascript_child_process(
+                            &vm_id,
+                            "malformed-wasm-parent",
+                            &child_id,
+                            250,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("successful child poll iteration {iteration} failed: {error}")
+                        });
+                    if event.get("type").and_then(Value::as_str) == Some("exit") {
+                        assert_eq!(event["exitCode"], Value::from(0));
+                        reaped = true;
+                        break;
+                    }
+                }
+                assert!(
+                    reaped,
+                    "successful spawn iteration {iteration} did not exit"
+                );
+                assert_eq!(
+                    (
+                        sidecar.javascript_engine.context_count_for_test(),
+                        sidecar.wasm_engine.context_count_for_test(),
+                        sidecar.wasm_engine.javascript_context_count_for_test(),
+                        sidecar.python_engine.context_count_for_test(),
+                        sidecar.python_engine.javascript_context_count_for_test(),
+                    ),
+                    context_baseline,
+                    "successful spawn/reap iteration {iteration} leaked an execution context"
+                );
+            }
+        }
+
         fn javascript_child_process_shell_mode_without_guest_sh_fails_loudly() {
             let mut sidecar = create_test_sidecar();
             let (connection_id, session_id) =
@@ -11414,6 +13189,7 @@ export async function loadPyodide() {
                         socket_id: None,
                         command: None,
                         args: Vec::new(),
+                        argv0: None,
                         cwd: None,
                         env: BTreeMap::new(),
                         shell: false,
@@ -11449,6 +13225,7 @@ export async function loadPyodide() {
                         socket_id: None,
                         command: None,
                         args: Vec::new(),
+                        argv0: None,
                         cwd: None,
                         env: BTreeMap::new(),
                         shell: false,
@@ -11528,6 +13305,7 @@ await new Promise(() => {});
                     vm_id: vm_id.clone(),
                     context_id: context.context_id,
                     argv: vec![String::from("./entry.mjs")],
+                    argv0: None,
                     env: BTreeMap::from([(
                         String::from("AGENTOS_NODE_SYNC_RPC_ENABLE"),
                         String::from("1"),
@@ -12032,6 +13810,7 @@ console.log(
                 vm_id: vm_id.clone(),
                 context_id: context.context_id,
                 argv: vec![String::from("./entry.mjs")],
+                argv0: None,
                 env: BTreeMap::from([(
                     String::from("AGENTOS_ALLOWED_NODE_BUILTINS"),
                     String::from(
@@ -13223,6 +15002,7 @@ await new Promise(() => {});
                 vm_id: vm_id.clone(),
                 context_id: context.context_id,
                 argv: vec![String::from("./entry.mjs")],
+                argv0: None,
                 env: BTreeMap::from([(
                     String::from("AGENTOS_ALLOWED_NODE_BUILTINS"),
                     String::from(
@@ -15426,6 +17206,7 @@ console.log(JSON.stringify({ lookup, resolve4 }));
                 vm_id: vm_id.clone(),
                 context_id: context.context_id,
                 argv: vec![String::from("./entry.mjs")],
+                argv0: None,
                 env: BTreeMap::from([(
                     String::from("AGENTOS_ALLOWED_NODE_BUILTINS"),
                     String::from(
@@ -15619,6 +17400,7 @@ process.exit(0);
                 vm_id: vm_id.clone(),
                 context_id: context.context_id,
                 argv: vec![String::from("./entry.mjs")],
+                argv0: None,
                 env: BTreeMap::from([(
                     String::from("AGENTOS_ALLOWED_NODE_BUILTINS"),
                     String::from(
@@ -16321,6 +18103,7 @@ process.exit(0);
                 vm_id: vm_id.clone(),
                 context_id: context.context_id,
                 argv: vec![String::from("./entry.mjs")],
+                argv0: None,
                 env: BTreeMap::from([(
                     String::from("AGENTOS_ALLOWED_NODE_BUILTINS"),
                     String::from(
@@ -19985,6 +21768,7 @@ console.log(`BODY:${{body}}`);
                 vm_id: vm_id.clone(),
                 context_id: context.context_id,
                 argv: vec![String::from("./entry.mjs")],
+                argv0: None,
                 env: BTreeMap::from([(
                     String::from("AGENTOS_ALLOWED_NODE_BUILTINS"),
                     String::from(
@@ -20029,20 +21813,11 @@ console.log(`BODY:${{body}}`);
             let bridge = sidecar.bridge.clone();
             let dns = sidecar.vms.get(&vm_id).expect("javascript vm").dns.clone();
             let limits = ResourceLimits::default();
-            let socket_paths = JavascriptSocketPathContext {
-                sandbox_root: cwd.clone(),
-                mounts: Vec::new(),
-                listen_policy: VmListenPolicy::default(),
-                loopback_exempt_ports: BTreeSet::new(),
-                tcp_loopback_guest_to_host_ports: BTreeMap::new(),
-                http_loopback_targets: BTreeMap::new(),
-                udp_loopback_guest_to_host_ports: BTreeMap::new(),
-                udp_loopback_host_to_guest_ports: BTreeMap::new(),
-                used_tcp_guest_ports: BTreeMap::new(),
-                used_udp_guest_ports: BTreeMap::new(),
-            };
+            let socket_paths = build_javascript_socket_path_context(
+                sidecar.vms.get(&vm_id).expect("javascript vm"),
+            )
+            .expect("build Unix socket path context");
             let socket_path = "/tmp/secure-exec.sock";
-            let host_socket_path = cwd.join("tmp/secure-exec.sock");
 
             let listen = {
                 let counts = sidecar
@@ -20078,7 +21853,10 @@ console.log(`BODY:${{body}}`);
                 .expect("listen on unix socket")
             };
             let server_id = listen["serverId"].as_str().expect("server id").to_string();
-            assert_eq!(listen["path"], Value::String(String::from(socket_path)));
+            assert_eq!(
+                listen["localPath"],
+                Value::String(String::from(socket_path))
+            );
             {
                 let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
                 assert!(
@@ -20088,7 +21866,23 @@ console.log(`BODY:${{body}}`);
                     "kernel did not expose unix socket path"
                 );
             }
+            let host_socket_path = socket_paths
+                .unix_bound_addresses
+                .lock()
+                .expect("Unix address registry")
+                .values()
+                .next()
+                .and_then(|entry| entry.host_path.clone())
+                .expect("pathname Unix host path");
             assert!(host_socket_path.exists(), "host unix socket path missing");
+            assert!(
+                host_socket_path.starts_with(&socket_paths.unix_socket_host_dir),
+                "host Unix socket escaped the per-VM private directory"
+            );
+            assert!(
+                !host_socket_path.starts_with(&cwd),
+                "host Unix socket leaked into the JavaScript working directory"
+            );
 
             let listener_lookup = sidecar
                 .dispatch_blocking(request(
@@ -20554,6 +22348,82 @@ console.log(`BODY:${{body}}`);
                 .expect("close unix listener");
             }
 
+            for (request_id, method, args, expected_resource) in [
+                (
+                    17_u64,
+                    "net.listen",
+                    vec![json!({ "path": "/tmp/denied.sock", "backlog": 1 })],
+                    "unix:/tmp/denied.sock",
+                ),
+                (
+                    18_u64,
+                    "net.listen",
+                    vec![json!({ "abstractPathHex": "64656e696564", "backlog": 1 })],
+                    "unix:abstract:64656e696564",
+                ),
+                (
+                    19_u64,
+                    "net.connect",
+                    vec![json!({ "path": socket_path })],
+                    "unix:/tmp/secure-exec.sock",
+                ),
+                (
+                    20_u64,
+                    "net.connect",
+                    vec![json!({ "abstractPathHex": "64656e696564" })],
+                    "unix:abstract:64656e696564",
+                ),
+            ] {
+                bridge
+                    .inspect(|bridge| {
+                        bridge.push_permission_decision(agentos_bridge::PermissionDecision::deny(
+                            "Unix sockets denied",
+                        ));
+                    })
+                    .expect("seed denied Unix socket permission");
+                let counts = sidecar
+                    .vms
+                    .get(&vm_id)
+                    .and_then(|vm| vm.active_processes.get("proc-js-unix"))
+                    .expect("unix process")
+                    .network_resource_counts();
+                let vm = sidecar.vms.get_mut(&vm_id).expect("javascript vm");
+                let process = vm
+                    .active_processes
+                    .get_mut("proc-js-unix")
+                    .expect("unix process");
+                let error = service_javascript_net_sync_rpc(
+                    &bridge,
+                    &vm_id,
+                    &dns,
+                    &socket_paths,
+                    &mut vm.kernel,
+                    process,
+                    &JavascriptSyncRpcRequest {
+                        raw_bytes_args: std::collections::HashMap::new(),
+                        id: request_id,
+                        method: String::from(method),
+                        args,
+                    },
+                    &limits,
+                    counts,
+                )
+                .expect_err("denied Unix socket operation must fail");
+                assert!(
+                    error.to_string().contains("EACCES"),
+                    "denied Unix socket operation returned {error}"
+                );
+                let expected_check = format!("net:{vm_id}:{expected_resource}");
+                bridge
+                    .inspect(|bridge| {
+                        assert_eq!(
+                            bridge.permission_checks.last().map(String::as_str),
+                            Some(expected_check.as_str()),
+                        );
+                    })
+                    .expect("inspect Unix socket permission request");
+            }
+
             sidecar
                 .dispose_vm_internal_blocking(
                     &connection_id,
@@ -20562,6 +22432,10 @@ console.log(`BODY:${{body}}`);
                     DisposeReason::Requested,
                 )
                 .expect("dispose unix vm");
+            assert!(
+                !socket_paths.unix_socket_host_dir.exists(),
+                "VM disposal must remove the private Unix socket namespace"
+            );
         }
         fn javascript_child_process_rpc_spawns_nested_node_processes_inside_vm_kernel() {
             assert_node_available();
@@ -20657,6 +22531,7 @@ console.log(JSON.stringify({
                 vm_id: vm_id.clone(),
                 context_id: context.context_id,
                 argv: vec![String::from("./entry.mjs")],
+                argv0: None,
                 env: BTreeMap::from([(
                     String::from("AGENTOS_ALLOWED_NODE_BUILTINS"),
                     String::from(
@@ -20872,6 +22747,7 @@ console.log(JSON.stringify({
                     vm_id: vm_id.clone(),
                     context_id: context.context_id,
                     argv: vec![String::from("./entry.mjs")],
+                    argv0: None,
                     env: BTreeMap::from([(
                         String::from("AGENTOS_ALLOWED_NODE_BUILTINS"),
                         String::from(
@@ -21265,6 +23141,7 @@ console.log(JSON.stringify({
             tool_execution_event_overflow_is_reported();
             wasm_signal_queue_is_bounded();
             descendant_transfer_overflow_preserves_global_queue();
+            descendant_transfer_byte_overflow_restores_current_and_deferred_envelopes();
             exit_trailing_requeue_preserves_exit_when_queue_is_full();
             javascript_child_process_poll_reports_echild_when_child_disappears_after_drain();
             javascript_child_process_internal_bootstrap_env_is_allowlisted();
@@ -21304,7 +23181,49 @@ console.log(JSON.stringify({
             tool_execution_event_overflow_is_reported();
             wasm_signal_queue_is_bounded();
             descendant_transfer_overflow_preserves_global_queue();
+            descendant_transfer_byte_overflow_restores_current_and_deferred_envelopes();
             exit_trailing_requeue_preserves_exit_when_queue_is_full();
+        }
+
+        #[test]
+        fn service_vm_pending_process_byte_budgets_are_aggregate() {
+            vm_pending_event_bytes_are_shared_and_reclaimed();
+            vm_pending_stdin_bytes_release_on_partial_flush_clear_and_teardown();
+        }
+
+        #[test]
+        fn service_local_wasm_exec_matches_linux_process_state() {
+            local_wasm_exec_commit_uses_exact_guest_env_and_preserves_process_state();
+        }
+
+        #[test]
+        fn service_cross_runtime_exec_is_atomic_at_kernel_commit() {
+            cross_runtime_exec_starts_after_committed_linux_process_state();
+        }
+
+        #[test]
+        fn service_cross_runtime_exec_start_failure_is_post_commit_fatal() {
+            cross_runtime_exec_start_failure_is_fatal_after_kernel_commit();
+        }
+
+        #[test]
+        fn service_posix_spawn_actions_precede_exact_exec_resolution() {
+            posix_spawn_file_actions_run_before_exact_exec_resolution();
+        }
+
+        #[test]
+        fn service_dirty_host_shadow_sync_precedes_spawn_actions() {
+            dirty_host_shadow_sync_precedes_top_level_and_nested_spawn_actions();
+        }
+
+        #[test]
+        fn service_posix_spawnp_path_and_recursive_shebang_match_linux() {
+            posix_spawnp_path_and_recursive_shebang_match_linux();
+        }
+
+        #[test]
+        fn service_rejected_wasm_spawns_restore_kernel_resource_baselines() {
+            repeated_malformed_wasm_spawns_restore_top_level_and_nested_baselines();
         }
 
         #[test]

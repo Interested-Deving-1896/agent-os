@@ -590,6 +590,16 @@ impl VirtualFileSystem for JsBridgeFilesystem {
     }
 
     fn chown(&mut self, path: &str, uid: u32, gid: u32) -> VfsResult<()> {
+        self.chown_spec(path, uid, gid, true)
+    }
+
+    fn chown_spec(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+        follow_symlinks: bool,
+    ) -> VfsResult<()> {
         self.request_path(
             "chown",
             path,
@@ -597,6 +607,7 @@ impl VirtualFileSystem for JsBridgeFilesystem {
                 "path": path,
                 "uid": uid,
                 "gid": gid,
+                "followSymlinks": follow_symlinks,
             }),
         )?;
         Ok(())

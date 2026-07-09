@@ -189,7 +189,6 @@ dependencies = [
  "rusqlite",
  "rustix 1.1.4",
  "rustls 0.23.41",
- "rustls-native-certs",
  "rustls-pemfile",
  "scrypt",
  "serde",
@@ -208,7 +207,6 @@ dependencies = [
  "url",
  "v8",
  "wat",
- "webpki-root-certs",
 ]
 
 [[package]]
@@ -238,6 +236,7 @@ dependencies = [
  "agentos-vm-config",
  "base64 0.22.1",
  "serde_json",
+ "webpki-root-certs",
 ]
 
 [[package]]
@@ -2509,6 +2508,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2577,6 +2585,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

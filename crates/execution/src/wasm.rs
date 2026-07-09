@@ -37,6 +37,12 @@ const WASM_WARMUP_DEBUG_ENV: &str = "AGENTOS_WASM_WARMUP_DEBUG";
 pub const WASM_MAX_FUEL_ENV: &str = "AGENTOS_WASM_MAX_FUEL";
 pub const WASM_MAX_MEMORY_BYTES_ENV: &str = "AGENTOS_WASM_MAX_MEMORY_BYTES";
 pub const WASM_MAX_STACK_BYTES_ENV: &str = "AGENTOS_WASM_MAX_STACK_BYTES";
+pub const WASM_MAX_MODULE_FILE_BYTES_ENV: &str = "AGENTOS_WASM_MAX_MODULE_FILE_BYTES";
+const WASM_MAX_OPEN_FDS_ENV: &str = "AGENTOS_WASM_MAX_OPEN_FDS";
+const WASM_MAX_SPAWN_FILE_ACTIONS_ENV: &str = "AGENTOS_WASM_MAX_SPAWN_FILE_ACTIONS";
+const WASM_MAX_SPAWN_FILE_ACTION_BYTES_ENV: &str = "AGENTOS_WASM_MAX_SPAWN_FILE_ACTION_BYTES";
+const WASM_MAX_SOCKETS_ENV: &str = "AGENTOS_WASM_MAX_SOCKETS";
+const WASM_MAX_BLOCKING_READ_MS_ENV: &str = "AGENTOS_WASM_MAX_BLOCKING_READ_MS";
 const WASM_WARMUP_METRICS_PREFIX: &str = "__AGENTOS_WASM_WARMUP_METRICS__:";
 const WASM_SIGNAL_STATE_PREFIX: &str = "__AGENTOS_WASM_SIGNAL_STATE__:";
 const WASM_WARMUP_MARKER_VERSION: &str = "1";
@@ -110,14 +116,6 @@ const WASM_SIDECAR_ROUTED_FS_SYNC_METHODS: &[&str] = &[
     "fs.writeFileSync",
     "fs.writeSync",
 ];
-const WASM_SIDECAR_ROUTED_KERNEL_SYNC_METHODS: &[&str] = &[
-    "__kernel_isatty",
-    "__kernel_poll",
-    "__kernel_stdin_read",
-    "__kernel_stdio_write",
-    "__kernel_tty_size",
-    "__pty_set_raw_mode",
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WasmSignalDispositionAction {
@@ -182,6 +180,19 @@ pub struct WasmExecutionLimits {
     /// fails closed; runtime V8 stack-limit enforcement is a follow-up — see
     /// [`resolve_wasm_stack_limit_bytes`].
     pub max_stack_bytes: Option<u64>,
+    /// Maximum executable image bytes accepted for initial and replacement
+    /// modules. The trusted runner needs the typed value for fexecve preads.
+    pub max_module_file_bytes: Option<u64>,
+    /// Maximum number of file actions decoded for one posix_spawn call.
+    pub max_spawn_file_actions: Option<u64>,
+    /// Maximum serialized file-action bytes accepted for one posix_spawn call.
+    pub max_spawn_file_action_bytes: Option<u64>,
+    /// Maximum guest-visible open descriptors, including runner-owned sockets.
+    pub max_open_fds: Option<u64>,
+    /// Maximum runner-owned guest sockets.
+    pub max_sockets: Option<u64>,
+    /// Maximum time a blocking runner syscall may cooperatively wait.
+    pub max_blocking_read_ms: Option<u64>,
     /// Best-effort warmup/compile-cache timeout in ms.
     pub prewarm_timeout_ms: Option<u64>,
     /// V8 heap cap for the trusted JS runner isolate that hosts WASI/WASM.
@@ -275,6 +286,7 @@ pub enum WasmExecutionError {
         stderr: String,
     },
     Spawn(std::io::Error),
+    Control(std::io::Error),
     RpcResponse(String),
     StdinClosed,
     Stdin(std::io::Error),
@@ -369,6 +381,7 @@ impl fmt::Display for WasmExecutionError {
                 }
             }
             Self::Spawn(err) => write!(f, "failed to start guest WebAssembly runtime: {err}"),
+            Self::Control(err) => write!(f, "failed to control guest WebAssembly runtime: {err}"),
             Self::RpcResponse(message) => {
                 write!(
                     f,
@@ -405,6 +418,8 @@ pub struct WasmExecution {
     pending_events: VecDeque<WasmExecutionEvent>,
     stdout_stream_buffer: Vec<u8>,
     stderr_stream_buffer: Vec<u8>,
+    max_stack_bytes: Option<u64>,
+    pending_v8_stack_overflow: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -445,6 +460,17 @@ impl WasmExecution {
         self.inner.uses_shared_v8_runtime()
     }
 
+    pub fn start_prepared(&mut self) -> Result<(), WasmExecutionError> {
+        self.inner.start_prepared().map_err(map_javascript_error)?;
+        self.execution_started_at = Instant::now();
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    pub fn is_prepared_for_start(&self) -> bool {
+        self.inner.is_prepared_for_start()
+    }
+
     pub fn write_stdin(&mut self, chunk: &[u8]) -> Result<(), WasmExecutionError> {
         self.inner.write_stdin(chunk).map_err(map_javascript_error)
     }
@@ -479,6 +505,14 @@ impl WasmExecution {
         self.inner.terminate().map_err(map_javascript_error)
     }
 
+    pub fn pause(&self) -> Result<(), WasmExecutionError> {
+        self.inner.pause().map_err(map_javascript_error)
+    }
+
+    pub fn resume(&self) -> Result<(), WasmExecutionError> {
+        self.inner.resume().map_err(map_javascript_error)
+    }
+
     pub fn respond_sync_rpc_success(
         &mut self,
         id: u64,
@@ -486,6 +520,22 @@ impl WasmExecution {
     ) -> Result<(), WasmExecutionError> {
         self.inner
             .respond_sync_rpc_success(id, result)
+            .map_err(map_javascript_error)
+    }
+
+    pub fn claim_sync_rpc_response(&mut self, id: u64) -> Result<bool, WasmExecutionError> {
+        self.inner
+            .claim_sync_rpc_response(id)
+            .map_err(map_javascript_error)
+    }
+
+    pub fn respond_claimed_sync_rpc_success(
+        &mut self,
+        id: u64,
+        result: Value,
+    ) -> Result<(), WasmExecutionError> {
+        self.inner
+            .respond_claimed_sync_rpc_success(id, result)
             .map_err(map_javascript_error)
     }
 
@@ -507,6 +557,17 @@ impl WasmExecution {
     ) -> Result<(), WasmExecutionError> {
         self.inner
             .respond_sync_rpc_error(id, code, message)
+            .map_err(map_javascript_error)
+    }
+
+    pub fn respond_claimed_sync_rpc_error(
+        &mut self,
+        id: u64,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), WasmExecutionError> {
+        self.inner
+            .respond_claimed_sync_rpc_error(id, code, message)
             .map_err(map_javascript_error)
     }
 
@@ -689,7 +750,17 @@ impl WasmExecution {
                 self.enqueue_stream_chunk(StreamChannel::Stdout, chunk)?
             }
             JavascriptExecutionEvent::Stderr(chunk) => {
-                self.enqueue_stream_chunk(StreamChannel::Stderr, chunk)?
+                if self.max_stack_bytes.is_some() && is_v8_stack_overflow_stderr(&chunk) {
+                    let pending = self.pending_v8_stack_overflow.get_or_insert_with(Vec::new);
+                    ensure_wasm_output_capacity(
+                        pending.len(),
+                        chunk.len(),
+                        "pending stack-overflow stderr",
+                    )?;
+                    pending.extend_from_slice(&chunk);
+                } else {
+                    self.enqueue_stream_chunk(StreamChannel::Stderr, chunk)?
+                }
             }
             JavascriptExecutionEvent::SyncRpcRequest(request) => {
                 self.pending_events
@@ -706,6 +777,18 @@ impl WasmExecution {
                     });
             }
             JavascriptExecutionEvent::Exited(code) => {
+                if let Some(original) = self.pending_v8_stack_overflow.take() {
+                    let chunk = if code != 0 {
+                        configured_wasm_stack_limit_error(
+                            self.max_stack_bytes
+                                .expect("stack-overflow buffering requires a configured limit"),
+                        )
+                        .into_bytes()
+                    } else {
+                        original
+                    };
+                    self.enqueue_stream_chunk(StreamChannel::Stderr, chunk)?;
+                }
                 self.flush_stream_buffers();
                 self.pending_events
                     .push_back(WasmExecutionEvent::Exited(code));
@@ -876,9 +959,46 @@ impl WasmExecutionEngine {
         context
     }
 
+    /// Dispose the WASM context and the private JavaScript bridge context that
+    /// belongs to it. A started execution has already cloned all required
+    /// runtime state and remains valid after this returns.
+    pub fn dispose_context(&mut self, context_id: &str) -> bool {
+        let removed = self.contexts.remove(context_id).is_some();
+        if let Some(javascript_context_id) = self.javascript_context_ids.remove(context_id) {
+            self.javascript_engine
+                .dispose_context(&javascript_context_id);
+        }
+        removed
+    }
+
+    #[doc(hidden)]
+    pub fn context_count_for_test(&self) -> usize {
+        self.contexts.len()
+    }
+
+    #[doc(hidden)]
+    pub fn javascript_context_count_for_test(&self) -> usize {
+        self.javascript_engine.context_count_for_test()
+    }
+
     pub fn start_execution(
         &mut self,
         request: StartWasmExecutionRequest,
+    ) -> Result<WasmExecution, WasmExecutionError> {
+        self.create_execution(request, false)
+    }
+
+    pub fn prepare_execution(
+        &mut self,
+        request: StartWasmExecutionRequest,
+    ) -> Result<WasmExecution, WasmExecutionError> {
+        self.create_execution(request, true)
+    }
+
+    fn create_execution(
+        &mut self,
+        request: StartWasmExecutionRequest,
+        defer_execute: bool,
     ) -> Result<WasmExecution, WasmExecutionError> {
         let context = self
             .contexts
@@ -944,6 +1064,7 @@ impl WasmExecutionEngine {
                 frozen_time_ms,
                 prewarm_only: false,
                 warmup_metrics: warmup_metrics.as_deref(),
+                defer_execute,
             },
         )?;
         let child_pid = javascript_execution.child_pid();
@@ -968,6 +1089,8 @@ impl WasmExecutionEngine {
             pending_events: VecDeque::new(),
             stdout_stream_buffer: Vec::new(),
             stderr_stream_buffer: Vec::new(),
+            max_stack_bytes: request.limits.max_stack_bytes,
+            pending_v8_stack_overflow: None,
             internal_sync_rpc: WasmInternalSyncRpc {
                 module_guest_paths: wasm_guest_module_paths(
                     &resolved_module.specifier,
@@ -1019,6 +1142,7 @@ fn map_javascript_error(error: JavascriptExecutionError) -> WasmExecutionError {
         ),
         JavascriptExecutionError::RpcResponse(message) => WasmExecutionError::RpcResponse(message),
         JavascriptExecutionError::Terminate(error) => WasmExecutionError::Spawn(error),
+        JavascriptExecutionError::Control(error) => WasmExecutionError::Control(error),
         JavascriptExecutionError::StdinClosed => WasmExecutionError::StdinClosed,
         JavascriptExecutionError::Stdin(error) => WasmExecutionError::Stdin(error),
         JavascriptExecutionError::OutputBufferExceeded { stream, limit } => {
@@ -1533,8 +1657,7 @@ fn wasm_sync_rpc_method_routes_through_sidecar_kernel(
     internal_sync_rpc: &WasmInternalSyncRpc,
 ) -> bool {
     internal_sync_rpc.route_fs_through_sidecar
-        && (WASM_SIDECAR_ROUTED_FS_SYNC_METHODS.contains(&request.method.as_str())
-            || WASM_SIDECAR_ROUTED_KERNEL_SYNC_METHODS.contains(&request.method.as_str()))
+        && WASM_SIDECAR_ROUTED_FS_SYNC_METHODS.contains(&request.method.as_str())
 }
 
 fn translate_wasm_guest_path(
@@ -1950,6 +2073,20 @@ fn base64_decoded_len(base64: &str) -> Option<usize> {
     }
 }
 
+fn is_v8_stack_overflow_stderr(chunk: &[u8]) -> bool {
+    std::str::from_utf8(chunk).is_ok_and(|message| {
+        message.starts_with("RangeError: Maximum call stack size exceeded")
+            && message.contains("wasm-function")
+    })
+}
+
+fn configured_wasm_stack_limit_error(limit: u64) -> String {
+    format!(
+        "WebAssembly guest exhausted its configured stack budget ({limit} bytes); \
+raise limits.resources.maxWasmStackBytes to allow deeper guest call stacks.\n"
+    )
+}
+
 fn append_wasm_captured_output(
     buffer: &mut Vec<u8>,
     chunk: &[u8],
@@ -2177,6 +2314,7 @@ struct WasmJavascriptExecutionOptions<'a> {
     frozen_time_ms: u128,
     prewarm_only: bool,
     warmup_metrics: Option<&'a [u8]>,
+    defer_execute: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2286,30 +2424,35 @@ fn start_wasm_javascript_execution(
         }
     };
 
-    javascript_engine
-        .start_execution(StartJavascriptExecutionRequest {
-            vm_id: request.vm_id.clone(),
-            context_id: javascript_context_id.to_owned(),
-            argv: vec![String::from(WASM_INLINE_RUNNER_ENTRYPOINT)],
-            env,
-            cwd: request.cwd.clone(),
-            // Guest WASM fuel/memory caps are enforced from `request.limits`,
-            // and stack caps are validated there until runtime stack enforcement
-            // lands. These are separate from the runner's V8 heap: the trusted
-            // runner still has to compile the WASI runtime + guest module into
-            // its own isolate, which can overflow the 128 MiB per-guest default,
-            // so size the runner heap explicitly (operator-tunable).
-            limits: JavascriptExecutionLimits {
-                v8_heap_limit_mb: Some(wasm_runner_heap_limit_mb(request)),
-                ..JavascriptExecutionLimits::default()
-            },
-            // Forward the guest-runtime identity so the runner's shim sets
-            // process.* from typed config rather than env.
-            guest_runtime,
-            inline_code: Some(inline_code),
-            wasm_module_bytes: Some(wasm_module_bytes),
-        })
-        .map_err(map_javascript_error)
+    let javascript_request = StartJavascriptExecutionRequest {
+        vm_id: request.vm_id.clone(),
+        context_id: javascript_context_id.to_owned(),
+        argv: vec![String::from(WASM_INLINE_RUNNER_ENTRYPOINT)],
+        argv0: None,
+        env,
+        cwd: request.cwd.clone(),
+        // Guest WASM fuel/memory caps are enforced from `request.limits`,
+        // and stack caps are validated there until runtime stack enforcement
+        // lands. These are separate from the runner's V8 heap: the trusted
+        // runner still has to compile the WASI runtime + guest module into
+        // its own isolate, which can overflow the 128 MiB per-guest default,
+        // so size the runner heap explicitly (operator-tunable).
+        limits: JavascriptExecutionLimits {
+            v8_heap_limit_mb: Some(wasm_runner_heap_limit_mb(request)),
+            ..JavascriptExecutionLimits::default()
+        },
+        // Forward the guest-runtime identity so the runner's shim sets
+        // process.* from typed config rather than env.
+        guest_runtime,
+        inline_code: Some(inline_code),
+        wasm_module_bytes: Some(wasm_module_bytes),
+    };
+    if options.defer_execute {
+        javascript_engine.prepare_execution(javascript_request)
+    } else {
+        javascript_engine.start_execution(javascript_request)
+    }
+    .map_err(map_javascript_error)
 }
 
 struct WasmModuleBytesCache {
@@ -2388,6 +2531,36 @@ fn build_wasm_internal_env(
         WASM_MAX_MEMORY_BYTES_ENV,
         request.limits.max_memory_bytes,
     );
+    insert_optional_u64_env(
+        &mut internal_env,
+        WASM_MAX_MODULE_FILE_BYTES_ENV,
+        request.limits.max_module_file_bytes,
+    );
+    insert_optional_u64_env(
+        &mut internal_env,
+        WASM_MAX_OPEN_FDS_ENV,
+        request.limits.max_open_fds,
+    );
+    insert_optional_u64_env(
+        &mut internal_env,
+        WASM_MAX_SPAWN_FILE_ACTIONS_ENV,
+        request.limits.max_spawn_file_actions,
+    );
+    insert_optional_u64_env(
+        &mut internal_env,
+        WASM_MAX_SPAWN_FILE_ACTION_BYTES_ENV,
+        request.limits.max_spawn_file_action_bytes,
+    );
+    insert_optional_u64_env(
+        &mut internal_env,
+        WASM_MAX_SOCKETS_ENV,
+        request.limits.max_sockets,
+    );
+    insert_optional_u64_env(
+        &mut internal_env,
+        WASM_MAX_BLOCKING_READ_MS_ENV,
+        request.limits.max_blocking_read_ms,
+    );
     internal_env.insert(
         WASM_MODULE_PATH_ENV.to_string(),
         resolved_module.specifier.clone(),
@@ -2452,6 +2625,12 @@ fn scrub_migrated_wasm_limit_env(env: &mut BTreeMap<String, String>) {
         WASM_MAX_FUEL_ENV,
         WASM_MAX_MEMORY_BYTES_ENV,
         WASM_MAX_STACK_BYTES_ENV,
+        WASM_MAX_MODULE_FILE_BYTES_ENV,
+        WASM_MAX_OPEN_FDS_ENV,
+        WASM_MAX_SPAWN_FILE_ACTIONS_ENV,
+        WASM_MAX_SPAWN_FILE_ACTION_BYTES_ENV,
+        WASM_MAX_SOCKETS_ENV,
+        WASM_MAX_BLOCKING_READ_MS_ENV,
         "AGENTOS_WASM_PREWARM_TIMEOUT_MS",
         "AGENTOS_WASM_RUNNER_HEAP_LIMIT_MB",
     ] {
@@ -2711,6 +2890,16 @@ if (typeof globalThis !== "undefined") {{
             throw new Error("secure-exec WASM process kill bridge is unavailable");
           }}
           return _processKill.applySync(void 0, args);
+        case "process.exec":
+          if (typeof _processExec === "undefined") {{
+            throw new Error("secure-exec WASM process exec bridge is unavailable");
+          }}
+          return _processExec.applySync(void 0, args);
+        case "process.exec_fd_image_commit":
+          if (typeof _processExecFdImageCommit === "undefined") {{
+            throw new Error("secure-exec WASM process fd image commit bridge is unavailable");
+          }}
+          return _processExecFdImageCommit.applySync(void 0, args);
         case "child_process.write_stdin": {{
           if (typeof _childProcessStdinWrite === "undefined") {{
             throw new Error("secure-exec WASM child_process stdin bridge is unavailable");
@@ -2731,6 +2920,16 @@ if (typeof globalThis !== "undefined") {{
             throw new Error("secure-exec WASM net.connect bridge is unavailable");
           }}
           return _netSocketConnectRaw.applySync(void 0, args);
+        case "net.bind_unix":
+          if (typeof _netBindUnixRaw === "undefined") {{
+            throw new Error("secure-exec WASM net.bind_unix bridge is unavailable");
+          }}
+          return _netBindUnixRaw.applySync(void 0, args);
+        case "net.bind_connected_unix":
+          if (typeof _netBindConnectedUnixRaw === "undefined") {{
+            throw new Error("secure-exec WASM net.bind_connected_unix bridge is unavailable");
+          }}
+          return _netBindConnectedUnixRaw.applySync(void 0, args);
         case "net.reserve_tcp_port":
           if (typeof _netReserveTcpPortRaw === "undefined") {{
             throw new Error("secure-exec WASM net.reserve_tcp_port bridge is unavailable");
@@ -2751,11 +2950,26 @@ if (typeof globalThis !== "undefined") {{
             throw new Error("secure-exec WASM net.server_accept bridge is unavailable");
           }}
           return _netServerAcceptRaw.applySync(void 0, args);
+        case "net.server_close":
+          if (typeof _netServerCloseSyncRaw === "undefined") {{
+            throw new Error("secure-exec WASM net.server_close bridge is unavailable");
+          }}
+          return _netServerCloseSyncRaw.applySync(void 0, args);
         case "net.poll":
           if (typeof _netSocketPollRaw === "undefined") {{
             throw new Error("secure-exec WASM net.poll bridge is unavailable");
           }}
           return _netSocketPollRaw.applySync(void 0, args);
+        case "net.socket_read":
+          if (typeof _netSocketReadRaw === "undefined") {{
+            throw new Error("secure-exec WASM net.socket_read bridge is unavailable");
+          }}
+          return _netSocketReadRaw.applySync(void 0, args);
+        case "net.socket_wait_connect":
+          if (typeof _netSocketWaitConnectSyncRaw === "undefined") {{
+            throw new Error("secure-exec WASM net.socket_wait_connect bridge is unavailable");
+          }}
+          return _netSocketWaitConnectSyncRaw.applySync(void 0, args);
         case "net.write":
           if (typeof _netSocketWriteRaw === "undefined") {{
             throw new Error("secure-exec WASM net.write bridge is unavailable");
@@ -2861,6 +3075,55 @@ if (typeof globalThis !== "undefined") {{
             throw new Error("secure-exec WASM signal-drain bridge is unavailable");
           }}
           return _processTakeSignal.applySync(void 0, args);
+        case "process.getpgid":
+        case "process.setpgid":
+        case "process.waitpid_transition":
+        case "process.itimer_real":
+        case "process.fd_pipe":
+        case "process.fd_open":
+        case "process.path_open_at":
+        case "process.path_mkdir_at":
+        case "process.path_stat_at":
+        case "process.path_utimes_at":
+        case "process.path_chown_at":
+        case "process.path_link_at":
+        case "process.path_readlink_at":
+        case "process.path_remove_dir_at":
+        case "process.path_rename_at":
+        case "process.path_symlink_at":
+        case "process.path_unlink_at":
+        case "process.fd_snapshot":
+        case "process.fd_read":
+        case "process.fd_pread":
+        case "process.fd_write":
+        case "process.fd_pwrite":
+        case "process.fd_sync":
+        case "process.fd_datasync":
+        case "process.fd_readdir":
+        case "process.fd_close":
+        case "process.fd_stat":
+        case "process.fd_filestat":
+        case "process.fd_chmod":
+        case "process.fd_chown":
+        case "process.fd_truncate":
+        case "process.fd_set_flags":
+        case "process.fd_getfd":
+        case "process.fd_setfd":
+        case "process.fd_record_lock":
+        case "process.fd_record_lock_cancel":
+        case "process.fd_dup":
+        case "process.fd_dup2":
+        case "process.fd_dup_min":
+        case "process.fd_seek":
+        case "process.fd_chdir_path":
+        case "process.fd_socketpair":
+        case "process.fd_sendmsg_rights":
+        case "process.fd_recvmsg_rights":
+        case "process.fd_socket_shutdown":
+          if (typeof _processWasmSyncRpc === "undefined") {{
+            throw new Error("secure-exec WASM process-syscall bridge is unavailable");
+          }}
+          return _processWasmSyncRpc.applySync(void 0, [method, ...args]);
         default:
           throw new Error(`secure-exec WASM sync RPC method not implemented in V8 runtime: ${{method}}`);
       }}
@@ -2982,6 +3245,7 @@ fn prewarm_wasm_path(
             frozen_time_ms,
             prewarm_only: true,
             warmup_metrics: None,
+            defer_execute: false,
         },
     )
     .map_err(|error| match error {
@@ -3854,14 +4118,14 @@ mod tests {
         wasm_read_only_filesystem_error, wasm_runner_base_env, wasm_runner_heap_limit_mb,
         wasm_sandbox_root, wasm_snapshot_runner_base_env, wasm_sync_read_length,
         wasm_sync_rpc_error_code, wasm_sync_rpc_method_routes_through_sidecar_kernel,
-        GuestRuntimeConfig, JavascriptSyncRpcRequest, ResolvedWasmModule,
-        StartWasmExecutionRequest, Value, WasmExecutionError, WasmExecutionLimits,
-        WasmInternalSyncRpc, WasmPermissionTier, DEFAULT_WASM_PREWARM_TIMEOUT_MS,
-        DEFAULT_WASM_RUNNER_HEAP_LIMIT_MB, NODE_WASI_MODULE_SOURCE,
-        WASM_CAPTURED_OUTPUT_LIMIT_BYTES, WASM_MAX_FUEL_ENV, WASM_MAX_MEMORY_BYTES_ENV,
-        WASM_MAX_STACK_BYTES_ENV, WASM_PAGE_BYTES, WASM_SANDBOX_ROOT_ENV,
-        WASM_SIDECAR_ROUTED_FS_SYNC_METHODS, WASM_SIDECAR_ROUTED_KERNEL_SYNC_METHODS,
-        WASM_SYNC_READ_LIMIT_BYTES,
+        CreateWasmContextRequest, GuestRuntimeConfig, JavascriptSyncRpcRequest, ResolvedWasmModule,
+        StartWasmExecutionRequest, Value, WasmExecutionEngine, WasmExecutionError,
+        WasmExecutionLimits, WasmInternalSyncRpc, WasmPermissionTier,
+        DEFAULT_WASM_PREWARM_TIMEOUT_MS, DEFAULT_WASM_RUNNER_HEAP_LIMIT_MB,
+        NODE_WASI_MODULE_SOURCE, WASM_CAPTURED_OUTPUT_LIMIT_BYTES, WASM_MAX_FUEL_ENV,
+        WASM_MAX_MEMORY_BYTES_ENV, WASM_MAX_MODULE_FILE_BYTES_ENV, WASM_MAX_SPAWN_FILE_ACTIONS_ENV,
+        WASM_MAX_SPAWN_FILE_ACTION_BYTES_ENV, WASM_MAX_STACK_BYTES_ENV, WASM_PAGE_BYTES,
+        WASM_SANDBOX_ROOT_ENV, WASM_SIDECAR_ROUTED_FS_SYNC_METHODS, WASM_SYNC_READ_LIMIT_BYTES,
     };
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::fs;
@@ -3869,6 +4133,30 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[test]
+    fn dispose_context_reclaims_wasm_and_nested_javascript_metadata() {
+        let mut engine = WasmExecutionEngine::default();
+        let baseline = (
+            engine.context_count_for_test(),
+            engine.javascript_context_count_for_test(),
+        );
+        let context = engine.create_context(CreateWasmContextRequest {
+            vm_id: String::from("vm-wasm-context-dispose"),
+            module_path: None,
+        });
+        assert_eq!(engine.context_count_for_test(), baseline.0 + 1);
+        assert_eq!(engine.javascript_context_count_for_test(), baseline.1 + 1);
+
+        assert!(engine.dispose_context(&context.context_id));
+        assert_eq!(
+            (
+                engine.context_count_for_test(),
+                engine.javascript_context_count_for_test(),
+            ),
+            baseline
+        );
+    }
 
     fn request_with_env(cwd: &Path, env: BTreeMap<String, String>) -> StartWasmExecutionRequest {
         // Translate the legacy `AGENTOS_WASM_*` limit env keys these tests still
@@ -3879,7 +4167,13 @@ mod tests {
             max_fuel: parse(WASM_MAX_FUEL_ENV),
             max_memory_bytes: parse(WASM_MAX_MEMORY_BYTES_ENV),
             max_stack_bytes: parse(WASM_MAX_STACK_BYTES_ENV),
+            max_module_file_bytes: None,
+            max_spawn_file_actions: None,
+            max_spawn_file_action_bytes: None,
             prewarm_timeout_ms: None,
+            max_open_fds: None,
+            max_sockets: None,
+            max_blocking_read_ms: None,
             runner_heap_limit_mb: None,
         };
         StartWasmExecutionRequest {
@@ -3954,6 +4248,14 @@ mod tests {
                     String::from("AGENTOS_WASM_RUNNER_HEAP_LIMIT_MB"),
                     String::from("999999"),
                 ),
+                (
+                    String::from(WASM_MAX_SPAWN_FILE_ACTIONS_ENV),
+                    String::from("999999"),
+                ),
+                (
+                    String::from(WASM_MAX_SPAWN_FILE_ACTION_BYTES_ENV),
+                    String::from("999999"),
+                ),
             ]),
             cwd: PathBuf::from("/tmp"),
             permission_tier: WasmPermissionTier::Full,
@@ -3966,7 +4268,13 @@ mod tests {
             max_fuel: Some(25),
             max_memory_bytes: Some(65_536),
             max_stack_bytes: Some(131_072),
+            max_module_file_bytes: Some(262_144),
+            max_spawn_file_actions: Some(7),
+            max_spawn_file_action_bytes: Some(321),
             prewarm_timeout_ms: Some(750),
+            max_open_fds: None,
+            max_sockets: None,
+            max_blocking_read_ms: None,
             runner_heap_limit_mb: Some(512),
         });
 
@@ -4029,7 +4337,13 @@ mod tests {
             max_fuel: Some(25),
             max_memory_bytes: Some(65_536),
             max_stack_bytes: Some(131_072),
+            max_module_file_bytes: Some(262_144),
+            max_spawn_file_actions: Some(7),
+            max_spawn_file_action_bytes: Some(321),
             prewarm_timeout_ms: Some(750),
+            max_open_fds: None,
+            max_sockets: None,
+            max_blocking_read_ms: None,
             runner_heap_limit_mb: Some(512),
         });
         let resolved_module = ResolvedWasmModule {
@@ -4044,6 +4358,18 @@ mod tests {
             internal_env.get(WASM_MAX_MEMORY_BYTES_ENV),
             Some(&String::from("65536"))
         );
+        assert_eq!(
+            internal_env.get(WASM_MAX_MODULE_FILE_BYTES_ENV),
+            Some(&String::from("262144"))
+        );
+        assert_eq!(
+            internal_env.get(WASM_MAX_SPAWN_FILE_ACTIONS_ENV),
+            Some(&String::from("7"))
+        );
+        assert_eq!(
+            internal_env.get(WASM_MAX_SPAWN_FILE_ACTION_BYTES_ENV),
+            Some(&String::from("321"))
+        );
         assert!(!internal_env.contains_key(WASM_MAX_STACK_BYTES_ENV));
         assert!(!internal_env.contains_key(WASM_MAX_FUEL_ENV));
         assert!(!internal_env.contains_key("AGENTOS_WASM_PREWARM_TIMEOUT_MS"));
@@ -4056,7 +4382,13 @@ mod tests {
             max_fuel: Some(25),
             max_memory_bytes: Some(65_536),
             max_stack_bytes: Some(131_072),
+            max_module_file_bytes: Some(262_144),
+            max_spawn_file_actions: Some(7),
+            max_spawn_file_action_bytes: Some(321),
             prewarm_timeout_ms: Some(750),
+            max_open_fds: None,
+            max_sockets: None,
+            max_blocking_read_ms: None,
             runner_heap_limit_mb: Some(512),
         });
         request
@@ -4072,6 +4404,7 @@ mod tests {
         assert_eq!(env.get("AGENTOS_TRACE_ID"), Some(&String::from("kept")));
         assert!(!env.contains_key(WASM_MAX_FUEL_ENV));
         assert!(!env.contains_key(WASM_MAX_MEMORY_BYTES_ENV));
+        assert!(!env.contains_key(WASM_MAX_MODULE_FILE_BYTES_ENV));
         assert!(!env.contains_key(WASM_MAX_STACK_BYTES_ENV));
         assert!(!env.contains_key("AGENTOS_WASM_PREWARM_TIMEOUT_MS"));
         assert!(!env.contains_key("AGENTOS_WASM_RUNNER_HEAP_LIMIT_MB"));
@@ -4083,7 +4416,13 @@ mod tests {
             max_fuel: Some(25),
             max_memory_bytes: Some(65_536),
             max_stack_bytes: Some(131_072),
+            max_module_file_bytes: Some(262_144),
+            max_spawn_file_actions: Some(7),
+            max_spawn_file_action_bytes: Some(321),
             prewarm_timeout_ms: Some(750),
+            max_open_fds: None,
+            max_sockets: None,
+            max_blocking_read_ms: None,
             runner_heap_limit_mb: Some(512),
         });
         request
@@ -4639,7 +4978,7 @@ mod tests {
     }
 
     #[test]
-    fn wasm_sidecar_managed_methods_route_to_kernel_sync_rpc() {
+    fn wasm_sidecar_managed_fs_methods_route_to_kernel_sync_rpc() {
         let mut standalone = WasmInternalSyncRpc {
             module_guest_paths: Vec::new(),
             module_host_path: PathBuf::from("/tmp/module.wasm"),
@@ -4674,18 +5013,6 @@ mod tests {
             assert!(
                 !wasm_sync_rpc_method_routes_through_sidecar_kernel(&request, &standalone),
                 "{method} should stay host-direct for standalone/prewarm WASI execution"
-            );
-        }
-
-        for method in WASM_SIDECAR_ROUTED_KERNEL_SYNC_METHODS {
-            let request = wasm_sync_rpc_request(method);
-            assert!(
-                wasm_sync_rpc_method_routes_through_sidecar_kernel(&request, &sidecar_managed),
-                "{method} should route through the sidecar kernel for managed WASI executions"
-            );
-            assert!(
-                !wasm_sync_rpc_method_routes_through_sidecar_kernel(&request, &standalone),
-                "{method} should stay local for standalone/prewarm WASI execution"
             );
         }
 
@@ -4729,6 +5056,33 @@ mod tests {
 
         assert!(bootstrap.contains("if (guestPath === \".\") {"));
         assert!(!bootstrap.contains("if (guestPath === \".\" || guestPath === \"/\") {"));
+    }
+
+    #[test]
+    fn wasm_runner_bootstrap_exposes_unix_socket_sync_rpcs() {
+        let bootstrap = build_wasm_runner_bootstrap(&BTreeMap::new(), None);
+
+        for (method, bridge) in [
+            ("net.bind_unix", "_netBindUnixRaw.applySync"),
+            (
+                "net.bind_connected_unix",
+                "_netBindConnectedUnixRaw.applySync",
+            ),
+            ("net.server_close", "_netServerCloseSyncRaw.applySync"),
+            (
+                "net.socket_wait_connect",
+                "_netSocketWaitConnectSyncRaw.applySync",
+            ),
+        ] {
+            assert!(
+                bootstrap.contains(&format!("case \"{method}\":")),
+                "missing WASM sync RPC case for {method}"
+            );
+            assert!(
+                bootstrap.contains(bridge),
+                "missing synchronous V8 bridge call for {method}"
+            );
+        }
     }
 
     #[test]

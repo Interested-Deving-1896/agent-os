@@ -64,6 +64,7 @@ const MAX_EVENT_READY_QUEUE: usize = 1;
 // frames from a busy turn should be buffered, so the writer only backpressures
 // when the host genuinely stops reading stdout rather than on every spike.
 const MAX_STDOUT_FRAME_QUEUE: usize = 4096;
+const MAX_LIMIT_WARNING_QUEUE: usize = 128;
 
 #[cfg(test)]
 fn request_frame(
@@ -163,12 +164,14 @@ async fn run_async(extensions: Vec<Box<dyn Extension>>) -> Result<(), Box<dyn Er
     // Forward limit-registry near-capacity warnings to the host: the global sink
     // fires (edge-triggered, from arbitrary threads) into this channel, and the
     // event loop below drains it and emits a `StructuredEvent` (name
-    // "limit_warning"). The unbounded sender is Send+Sync and lives for the whole
-    // process inside the global handler, so the receiver never sees a hangup.
+    // "limit_warning"). Keep the host-visible warning path bounded too: a
+    // broken consumer must not turn observability into an unbounded heap sink.
     let (limit_warning_tx, mut limit_warning_rx) =
-        unbounded_channel::<agentos_bridge::queue_tracker::LimitWarning>();
+        channel::<agentos_bridge::queue_tracker::LimitWarning>(MAX_LIMIT_WARNING_QUEUE);
     agentos_bridge::queue_tracker::set_limit_warning_handler(Box::new(move |warning| {
-        let _ = limit_warning_tx.send(warning.clone());
+        if let Err(error) = limit_warning_tx.try_send(warning.clone()) {
+            eprintln!("failed to enqueue AgentOS limit warning: {error}");
+        }
     }));
     let callback_transport = Arc::new(FrameSidecarRequestTransport::new(write_tx.clone()));
     sidecar.set_sidecar_request_transport(callback_transport.clone());

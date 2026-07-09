@@ -1,0 +1,56 @@
+Make fdopendir defer directory reads like native Linux libc.
+
+Cloudlibc eagerly filled its readdir buffer inside fdopendir. If a directory
+was removed after opendir but before the first readdir, the guest returned
+stale dot entries while Linux getdents returned EOF. Validate the descriptor
+with fd_fdstat_get and leave the stream buffer empty until readdir.
+
+--- a/libc-bottom-half/cloudlibc/src/libc/dirent/fdopendir.c
++++ b/libc-bottom-half/cloudlibc/src/libc/dirent/fdopendir.c
+@@ -10,6 +10,15 @@
+ #include "dirent_impl.h"
+ 
+ DIR *fdopendir(int fd) {
++  // Validate the descriptor without reading directory data. Native Linux
++  // fdopendir does not prefetch getdents, so namespace changes made before
++  // the first readdir must be observed by that first read.
++  __wasi_fdstat_t fdstat;
++  __wasi_errno_t error = __wasi_fd_fdstat_get(fd, &fdstat);
++  if (error != 0 || fdstat.fs_filetype != __WASI_FILETYPE_DIRECTORY) {
++    errno = error != 0 ? error : __WASI_ERRNO_NOTDIR;
++    return NULL;
++  }
+   // Allocate new directory object and read buffer.
+   DIR *dirp = malloc(sizeof(*dirp));
+   if (dirp == NULL)
+@@ -19,24 +28,16 @@
+     return NULL;
+   }
+ 
+-  // Ensure that this is really a directory by already loading the first
+-  // chunk of data.
+-  __wasi_errno_t error =
+-      // TODO: Remove the cast on `dirp->buffer` once the witx is updated with char8 support.
+-      __wasi_fd_readdir(fd, (uint8_t *)dirp->buffer, DIRENT_DEFAULT_BUFFER_SIZE,
+-                                __WASI_DIRCOOKIE_START, &dirp->buffer_used);
+-  if (error != 0) {
+-    free(dirp->buffer);
+-    free(dirp);
+-    errno = error;
+-    return NULL;
+-  }
+-
+   // Initialize other members.
+   dirp->fd = fd;
+   dirp->cookie = __WASI_DIRCOOKIE_START;
+-  dirp->buffer_processed = 0;
+   dirp->buffer_size = DIRENT_DEFAULT_BUFFER_SIZE;
++  // Cloudlibc uses processed == used == capacity as its "refill on next
++  // readdir" sentinel. Leaving processed at zero would make readdir parse
++  // the uninitialized malloc buffer as __wasi_dirent_t records; a random
++  // d_namlen can then make its buffer-growth loop run forever.
++  dirp->buffer_processed = DIRENT_DEFAULT_BUFFER_SIZE;
++  dirp->buffer_used = DIRENT_DEFAULT_BUFFER_SIZE;
+   dirp->dirent = NULL;
+   dirp->dirent_size = 1;
+   return dirp;

@@ -509,6 +509,9 @@ pub struct StartJavascriptExecutionRequest {
     pub vm_id: String,
     pub context_id: String,
     pub argv: Vec<String>,
+    /// Explicit process argv[0]. `Some("")` is distinct from `None` and must be
+    /// preserved for Node child_process compatibility.
+    pub argv0: Option<String>,
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
     /// Per-execution runtime limits (see [`JavascriptExecutionLimits`]).
@@ -1554,6 +1557,7 @@ pub enum JavascriptExecutionError {
     ExpiredSyncRpcRequest(u64),
     RpcResponse(String),
     Terminate(std::io::Error),
+    Control(std::io::Error),
     StdinClosed,
     Stdin(std::io::Error),
     OutputBufferExceeded { stream: &'static str, limit: usize },
@@ -1598,6 +1602,7 @@ impl fmt::Display for JavascriptExecutionError {
             Self::Terminate(err) => {
                 write!(f, "failed to terminate guest JavaScript runtime: {err}")
             }
+            Self::Control(err) => write!(f, "failed to control guest JavaScript runtime: {err}"),
             Self::StdinClosed => f.write_str("guest JavaScript stdin is already closed"),
             Self::Stdin(err) => write!(f, "failed to write guest stdin: {err}"),
             Self::OutputBufferExceeded { stream, limit } => {
@@ -1624,12 +1629,28 @@ pub struct JavascriptExecution {
     kernel_stdin: Arc<LocalKernelStdinBridge>,
     _import_cache_guard: Arc<NodeImportCacheCleanup>,
     v8_session: V8SessionHandle,
+    /// Fully prepared V8 execute request. Cross-runtime execve prepares the
+    /// replacement isolate and its bridge before committing kernel process
+    /// state, but must not enqueue guest code until that commit is complete.
+    prepared_execute: Option<PreparedJavascriptExecute>,
     /// Host-direct module resolver state, used ONLY by the standalone `wait()`
     /// loop. The real VM runtime resolves modules against the kernel VFS on the
     /// sidecar service loop and never reaches this; but `wait()` runs without a
     /// kernel (dev/test harness), so it services module-resolution sync RPCs
     /// host-directly from the request's path translator.
     module_resolution: Mutex<(GuestPathTranslator, LocalModuleResolutionCache)>,
+}
+
+#[derive(Debug)]
+struct PreparedJavascriptExecute {
+    mode: u8,
+    file_path: String,
+    bridge_code: String,
+    post_restore_script: String,
+    userland_code: String,
+    high_resolution_time: bool,
+    user_code: String,
+    wasm_module_bytes: Option<Arc<Vec<u8>>>,
 }
 
 impl JavascriptExecution {
@@ -1647,6 +1668,35 @@ impl JavascriptExecution {
 
     pub fn uses_shared_v8_runtime(&self) -> bool {
         true
+    }
+
+    /// Enqueue a replacement image that was fully prepared without running
+    /// guest code. This is the final step of an atomic cross-runtime execve and
+    /// must only be called after the kernel and sidecar process state commit.
+    pub fn start_prepared(&mut self) -> Result<(), JavascriptExecutionError> {
+        let prepared = self.prepared_execute.take().ok_or_else(|| {
+            JavascriptExecutionError::Spawn(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "JavaScript execution is not awaiting a prepared start",
+            ))
+        })?;
+        self.v8_session
+            .execute(
+                prepared.mode,
+                prepared.file_path,
+                prepared.bridge_code,
+                prepared.post_restore_script,
+                prepared.userland_code,
+                prepared.high_resolution_time,
+                prepared.user_code,
+                prepared.wasm_module_bytes,
+            )
+            .map_err(JavascriptExecutionError::Spawn)
+    }
+
+    #[doc(hidden)]
+    pub fn is_prepared_for_start(&self) -> bool {
+        self.prepared_execute.is_some()
     }
 
     pub fn write_stdin(&mut self, chunk: &[u8]) -> Result<(), JavascriptExecutionError> {
@@ -1707,6 +1757,18 @@ impl JavascriptExecution {
             .map_err(JavascriptExecutionError::Terminate)
     }
 
+    pub fn pause(&self) -> Result<(), JavascriptExecutionError> {
+        self.v8_session
+            .pause()
+            .map_err(JavascriptExecutionError::Control)
+    }
+
+    pub fn resume(&self) -> Result<(), JavascriptExecutionError> {
+        self.v8_session
+            .resume()
+            .map_err(JavascriptExecutionError::Control)
+    }
+
     pub fn send_stream_event(
         &self,
         event_type: &str,
@@ -1738,6 +1800,24 @@ impl JavascriptExecution {
             phase_start.elapsed(),
         );
 
+        self.respond_claimed_sync_rpc_success(id, result)
+    }
+
+    /// Atomically claim the exact pending sync RPC before a caller performs a
+    /// destructive operation on its behalf. A timed-out or replaced request
+    /// must not consume bytes that belong to the guest's next retry.
+    pub fn claim_sync_rpc_response(&mut self, id: u64) -> Result<bool, JavascriptExecutionError> {
+        match self.clear_pending_sync_rpc(id)? {
+            PendingSyncRpcResolution::Pending => Ok(true),
+            PendingSyncRpcResolution::TimedOut | PendingSyncRpcResolution::Missing => Ok(false),
+        }
+    }
+
+    pub fn respond_claimed_sync_rpc_success(
+        &mut self,
+        id: u64,
+        result: Value,
+    ) -> Result<(), JavascriptExecutionError> {
         let phase_start = Instant::now();
         let payload = translate_legacy_bridge_value_to_v8(&result);
         record_sync_bridge_phase(
@@ -1808,6 +1888,15 @@ impl JavascriptExecution {
             PendingSyncRpcResolution::Missing => {}
         }
 
+        self.respond_claimed_sync_rpc_error(id, code, message)
+    }
+
+    pub fn respond_claimed_sync_rpc_error(
+        &mut self,
+        id: u64,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), JavascriptExecutionError> {
         let error_msg = format!("{}: {}", code.into(), message.into());
         self.v8_session
             .send_bridge_response(id, 1, error_msg.into_bytes())
@@ -2126,11 +2215,30 @@ impl JavascriptExecutionEngine {
         context
     }
 
+    /// Dispose an execution context once its final start/prepare operation has
+    /// consumed the metadata. Live executions own their resolved runtime state
+    /// independently and do not consult this registry after creation.
+    pub fn dispose_context(&mut self, context_id: &str) -> bool {
+        self.contexts.remove(context_id).is_some()
+    }
+
+    #[doc(hidden)]
+    pub fn context_count_for_test(&self) -> usize {
+        self.contexts.len()
+    }
+
     pub fn start_execution(
         &mut self,
         request: StartJavascriptExecutionRequest,
     ) -> Result<JavascriptExecution, JavascriptExecutionError> {
         self.start_execution_with_module_reader(request, None, None)
+    }
+
+    pub fn prepare_execution(
+        &mut self,
+        request: StartJavascriptExecutionRequest,
+    ) -> Result<JavascriptExecution, JavascriptExecutionError> {
+        self.prepare_execution_with_module_reader(request, None, None)
     }
 
     fn ensure_v8_host(&mut self) -> Result<(), JavascriptExecutionError> {
@@ -2195,6 +2303,28 @@ impl JavascriptExecutionEngine {
         request: StartJavascriptExecutionRequest,
         module_reader: Option<Box<dyn ModuleFsReader + Send>>,
         guest_reader: Option<Box<dyn agentos_v8_runtime::execution::GuestModuleReader>>,
+    ) -> Result<JavascriptExecution, JavascriptExecutionError> {
+        self.create_execution_with_module_reader(request, module_reader, guest_reader, false)
+    }
+
+    /// Prepare an execution through every fallible image-loading step without
+    /// enqueueing guest code in V8. Used by execve when the replacement runtime
+    /// differs from the current runtime.
+    pub fn prepare_execution_with_module_reader(
+        &mut self,
+        request: StartJavascriptExecutionRequest,
+        module_reader: Option<Box<dyn ModuleFsReader + Send>>,
+        guest_reader: Option<Box<dyn agentos_v8_runtime::execution::GuestModuleReader>>,
+    ) -> Result<JavascriptExecution, JavascriptExecutionError> {
+        self.create_execution_with_module_reader(request, module_reader, guest_reader, true)
+    }
+
+    fn create_execution_with_module_reader(
+        &mut self,
+        request: StartJavascriptExecutionRequest,
+        module_reader: Option<Box<dyn ModuleFsReader + Send>>,
+        guest_reader: Option<Box<dyn agentos_v8_runtime::execution::GuestModuleReader>>,
+        defer_execute: bool,
     ) -> Result<JavascriptExecution, JavascriptExecutionError> {
         let context = self
             .contexts
@@ -2349,6 +2479,7 @@ impl JavascriptExecutionEngine {
             user_code,
             &guest_entrypoint,
             &process_argv,
+            request.argv0.as_deref(),
             translator.guest_cwd(),
             &request.env,
             heap_limit_mb,
@@ -2401,19 +2532,33 @@ impl JavascriptExecutionEngine {
         record_js_start_phase("js_start_install_module_reader", phase_start.elapsed());
 
         let phase_start = Instant::now();
-        // Execute bridge code + user code in the V8 isolate
-        v8_session
-            .execute(
-                if use_module_mode { 1 } else { 0 },
-                guest_entrypoint.clone(),
-                V8RuntimeHost::bridge_code().to_owned(),
-                String::new(),
-                snapshot_userland_code,
-                request.guest_runtime.high_resolution_time,
-                user_code,
-                request.wasm_module_bytes.clone(),
-            )
-            .map_err(JavascriptExecutionError::Spawn)?;
+        let prepared_execute = PreparedJavascriptExecute {
+            mode: if use_module_mode { 1 } else { 0 },
+            file_path: guest_entrypoint.clone(),
+            bridge_code: V8RuntimeHost::bridge_code().to_owned(),
+            post_restore_script: String::new(),
+            userland_code: snapshot_userland_code,
+            high_resolution_time: request.guest_runtime.high_resolution_time,
+            user_code,
+            wasm_module_bytes: request.wasm_module_bytes.clone(),
+        };
+        let prepared_execute = if defer_execute {
+            Some(prepared_execute)
+        } else {
+            v8_session
+                .execute(
+                    prepared_execute.mode,
+                    prepared_execute.file_path,
+                    prepared_execute.bridge_code,
+                    prepared_execute.post_restore_script,
+                    prepared_execute.userland_code,
+                    prepared_execute.high_resolution_time,
+                    prepared_execute.user_code,
+                    prepared_execute.wasm_module_bytes,
+                )
+                .map_err(JavascriptExecutionError::Spawn)?;
+            None
+        };
         registration_guard.disarm();
         record_js_start_phase("js_start_send_execute", phase_start.elapsed());
 
@@ -2425,6 +2570,7 @@ impl JavascriptExecutionEngine {
             kernel_stdin,
             _import_cache_guard: import_cache_guard,
             v8_session,
+            prepared_execute,
             module_resolution: Mutex::new((
                 standalone_translator,
                 LocalModuleResolutionCache::default(),
@@ -2969,6 +3115,7 @@ fn prepend_v8_runtime_shim(
     user_code: String,
     entrypoint: &str,
     argv: &[String],
+    argv0: Option<&str>,
     cwd: &str,
     env: &BTreeMap<String, String>,
     // V8 heap cap in MB (`0` = engine default). Threaded from the typed wire
@@ -2980,6 +3127,8 @@ fn prepend_v8_runtime_shim(
     guest_runtime: &GuestRuntimeConfig,
 ) -> String {
     let argv_json = serde_json::to_string(argv).unwrap_or_else(|_| String::from("[\"node\"]"));
+    let argv0_json = serde_json::to_string(&argv0.unwrap_or("node"))
+        .unwrap_or_else(|_| String::from("\"node\""));
     let entry_json =
         serde_json::to_string(entrypoint).unwrap_or_else(|_| String::from("\"/<entry>\""));
     let cwd_json = serde_json::to_string(cwd).unwrap_or_else(|_| String::from("\"/\""));
@@ -3026,6 +3175,7 @@ fn prepend_v8_runtime_shim(
     writable: true,
   }});
   const nextArgv = {argv_json};
+  const nextArgv0 = {argv0_json};
   const entryFile = {entry_json};
   const nextCwd = {cwd_json};
   const nextEnv = {env_json};
@@ -3043,6 +3193,7 @@ fn prepend_v8_runtime_shim(
         cwd: nextCwd,
         env: nextEnv,
         argv: nextArgv,
+        argv0: nextArgv0,
         high_resolution_time: nextHighResolutionTime,
       }}),
       writable: false,
@@ -3060,7 +3211,7 @@ fn prepend_v8_runtime_shim(
 
   if (typeof process !== "undefined") {{
     process.argv = nextArgv;
-    process.argv0 = nextArgv[0] || "node";
+    process.argv0 = nextArgv0;
     process.env = {{
       ...(process.env || {{}}),
       ...visibleEnv,
@@ -3346,7 +3497,6 @@ fn spawn_v8_event_bridge(
                         if method == "_log" {
                             if !send_javascript_event(
                                 &sender,
-                                &v8_session,
                                 &event_gauge,
                                 event_notify.as_deref(),
                                 JavascriptExecutionEvent::Stdout(output),
@@ -3356,7 +3506,6 @@ fn spawn_v8_event_bridge(
                         } else {
                             if !send_javascript_event(
                                 &sender,
-                                &v8_session,
                                 &event_gauge,
                                 event_notify.as_deref(),
                                 JavascriptExecutionEvent::Stderr(output),
@@ -3449,7 +3598,6 @@ fn spawn_v8_event_bridge(
                         };
                         if !send_javascript_event(
                             &sender,
-                            &v8_session,
                             &event_gauge,
                             event_notify.as_deref(),
                             JavascriptExecutionEvent::Stderr(error_msg.into_bytes()),
@@ -3484,13 +3632,7 @@ fn spawn_v8_event_bridge(
                 } else {
                     None
                 };
-                if !send_javascript_event(
-                    &sender,
-                    &v8_session,
-                    &event_gauge,
-                    event_notify.as_deref(),
-                    event,
-                ) {
+                if !send_javascript_event(&sender, &event_gauge, event_notify.as_deref(), event) {
                     break;
                 }
                 if let (Some((_, method)), Some(start)) = (sync_rpc, phase_start) {
@@ -3509,7 +3651,6 @@ fn spawn_v8_event_bridge(
             let phase_start = Instant::now();
             let sent = send_javascript_event(
                 &sender,
-                &v8_session,
                 &event_gauge,
                 event_notify.as_deref(),
                 JavascriptExecutionEvent::Exited(1),
@@ -3525,16 +3666,51 @@ fn spawn_v8_event_bridge(
 
 fn send_javascript_event(
     sender: &tokio::sync::mpsc::Sender<JavascriptExecutionEvent>,
-    v8_session: &V8SessionHandle,
     gauge: &agentos_bridge::queue_tracker::QueueGauge,
     notify: Option<&Notify>,
     event: JavascriptExecutionEvent,
 ) -> bool {
-    if javascript_event_payload_len(&event) > JAVASCRIPT_EVENT_PAYLOAD_LIMIT_BYTES {
-        let _ = v8_session.destroy();
-        return false;
+    match event {
+        JavascriptExecutionEvent::Stdout(chunk)
+            if chunk.len() > JAVASCRIPT_EVENT_PAYLOAD_LIMIT_BYTES =>
+        {
+            for chunk in chunk.chunks(JAVASCRIPT_EVENT_PAYLOAD_LIMIT_BYTES) {
+                if !send_single_javascript_event(
+                    sender,
+                    gauge,
+                    notify,
+                    JavascriptExecutionEvent::Stdout(chunk.to_vec()),
+                ) {
+                    return false;
+                }
+            }
+            true
+        }
+        JavascriptExecutionEvent::Stderr(chunk)
+            if chunk.len() > JAVASCRIPT_EVENT_PAYLOAD_LIMIT_BYTES =>
+        {
+            for chunk in chunk.chunks(JAVASCRIPT_EVENT_PAYLOAD_LIMIT_BYTES) {
+                if !send_single_javascript_event(
+                    sender,
+                    gauge,
+                    notify,
+                    JavascriptExecutionEvent::Stderr(chunk.to_vec()),
+                ) {
+                    return false;
+                }
+            }
+            true
+        }
+        event => send_single_javascript_event(sender, gauge, notify, event),
     }
+}
 
+fn send_single_javascript_event(
+    sender: &tokio::sync::mpsc::Sender<JavascriptExecutionEvent>,
+    gauge: &agentos_bridge::queue_tracker::QueueGauge,
+    notify: Option<&Notify>,
+    event: JavascriptExecutionEvent,
+) -> bool {
     // Apply backpressure instead of self-destructing when the host consumer is
     // slow. A burst of guest events that briefly outpaces the host draining this
     // channel is normal; previously a single `try_send` returning `Full` tore the
@@ -3556,17 +3732,6 @@ fn send_javascript_event(
             true
         }
         Err(_closed) => false,
-    }
-}
-
-fn javascript_event_payload_len(event: &JavascriptExecutionEvent) -> usize {
-    match event {
-        JavascriptExecutionEvent::Stdout(chunk) | JavascriptExecutionEvent::Stderr(chunk) => {
-            chunk.len()
-        }
-        JavascriptExecutionEvent::SyncRpcRequest(_)
-        | JavascriptExecutionEvent::SignalState { .. }
-        | JavascriptExecutionEvent::Exited(_) => 0,
     }
 }
 
@@ -7206,6 +7371,28 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn dispose_context_reclaims_one_shot_metadata_without_reusing_ids() {
+        let mut engine = JavascriptExecutionEngine::default();
+        let baseline = engine.context_count_for_test();
+        let first = engine.create_context(CreateJavascriptContextRequest {
+            vm_id: String::from("vm-context-dispose"),
+            bootstrap_module: None,
+            compile_cache_root: None,
+        });
+        assert_eq!(engine.context_count_for_test(), baseline + 1);
+        assert!(engine.dispose_context(&first.context_id));
+        assert_eq!(engine.context_count_for_test(), baseline);
+        assert!(!engine.dispose_context(&first.context_id));
+
+        let second = engine.create_context(CreateJavascriptContextRequest {
+            vm_id: String::from("vm-context-dispose"),
+            bootstrap_module: None,
+            compile_cache_root: None,
+        });
+        assert_ne!(first.context_id, second.context_id);
+    }
+
+    #[test]
     fn javascript_limits_are_read_from_typed_fields_and_env_is_inert() {
         // Misleading env values: a reader that still consulted `AGENTOS_*` would
         // observe these instead of the typed wire limits.
@@ -7232,6 +7419,7 @@ mod tests {
             ),
         ]);
         let request = StartJavascriptExecutionRequest {
+            argv0: None,
             guest_runtime: Default::default(),
             vm_id: String::from("vm-js"),
             context_id: String::from("ctx-js"),
@@ -7279,6 +7467,7 @@ mod tests {
     #[test]
     fn javascript_limits_fall_back_to_defaults_when_unset() {
         let request = StartJavascriptExecutionRequest {
+            argv0: None,
             guest_runtime: Default::default(),
             vm_id: String::from("vm-js"),
             context_id: String::from("ctx-js"),
@@ -7451,12 +7640,9 @@ mod tests {
     fn javascript_event_sender_reports_closed_receiver() {
         let (sender, receiver) = channel(1);
         drop(receiver);
-        let host = V8RuntimeHost::spawn().expect("spawn V8 runtime host");
-        let session = host.session_handle(String::from("closed-event-sender-test"));
         let gauge = register_queue(TrackedLimit::JavascriptEventChannel, 1);
         assert!(!send_javascript_event(
             &sender,
-            &session,
             &gauge,
             None,
             JavascriptExecutionEvent::Exited(1)
@@ -7479,7 +7665,6 @@ mod tests {
         let _session_receiver = host
             .register_session(&session_id)
             .expect("register event overflow session");
-        let session = host.session_handle(session_id.clone());
         let gauge = register_queue(TrackedLimit::JavascriptEventChannel, 1);
         let (sender, mut event_receiver) = channel(1);
 
@@ -7499,7 +7684,6 @@ mod tests {
         for _ in 0..SENDS {
             assert!(send_javascript_event(
                 &sender,
-                &session,
                 &gauge,
                 None,
                 JavascriptExecutionEvent::Stdout(Vec::new())
@@ -7517,39 +7701,31 @@ mod tests {
     }
 
     #[test]
-    fn javascript_event_sender_destroys_session_when_event_is_oversized() {
-        let host = V8RuntimeHost::spawn().expect("spawn V8 runtime host");
-        let session_id = format!(
-            "event-oversized-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time")
-                .as_nanos()
-        );
-        let receiver = host
-            .register_session(&session_id)
-            .expect("register oversized event session");
-        let session = host.session_handle(session_id.clone());
-        let (sender, _event_receiver) = channel(JAVASCRIPT_EVENT_CHANNEL_CAPACITY);
+    fn javascript_event_sender_chunks_oversized_output_without_data_loss() {
+        let (sender, mut event_receiver) = channel(JAVASCRIPT_EVENT_CHANNEL_CAPACITY);
         let gauge = register_queue(
             TrackedLimit::JavascriptEventChannel,
             JAVASCRIPT_EVENT_CHANNEL_CAPACITY,
         );
+        let payload = vec![b'x'; JAVASCRIPT_EVENT_PAYLOAD_LIMIT_BYTES + 17];
 
-        assert!(!send_javascript_event(
+        assert!(send_javascript_event(
             &sender,
-            &session,
             &gauge,
             None,
-            JavascriptExecutionEvent::Stdout(vec![0; JAVASCRIPT_EVENT_PAYLOAD_LIMIT_BYTES + 1])
+            JavascriptExecutionEvent::Stdout(payload.clone())
         ));
 
-        drop(receiver);
-        let recovered = host
-            .register_session(&session_id)
-            .expect("oversized event should destroy and deregister the session");
-        drop(recovered);
-        host.unregister_session(&session_id);
+        let first = event_receiver.blocking_recv().expect("first chunk");
+        let second = event_receiver.blocking_recv().expect("second chunk");
+        let joined = [first, second]
+            .into_iter()
+            .flat_map(|event| match event {
+                JavascriptExecutionEvent::Stdout(chunk) => chunk,
+                other => panic!("unexpected event: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(joined, payload);
     }
 
     #[test]
@@ -7637,6 +7813,7 @@ mod tests {
     fn javascript_cpu_time_limit_defaults_to_bounded_value() {
         let request = StartJavascriptExecutionRequest {
             limits: Default::default(),
+            argv0: None,
             guest_runtime: Default::default(),
             vm_id: String::from("vm-js-default-cpu"),
             context_id: String::from("ctx-js-default-cpu"),
@@ -7667,6 +7844,7 @@ mod tests {
         let execution = engine
             .start_execution(StartJavascriptExecutionRequest {
                 limits: Default::default(),
+                argv0: None,
                 guest_runtime: Default::default(),
                 vm_id: String::from("vm-drop-cleanup"),
                 context_id: context.context_id,
@@ -7687,6 +7865,49 @@ mod tests {
             .expect("execution drop should still destroy and deregister the session");
         drop(receiver);
         host.unregister_session(&session_id);
+    }
+
+    #[test]
+    fn prepared_execution_does_not_enqueue_guest_code_until_started() {
+        let temp = tempdir().expect("create temp dir");
+        let mut engine = JavascriptExecutionEngine::default();
+        let context = engine.create_context(CreateJavascriptContextRequest {
+            vm_id: String::from("vm-deferred-exec"),
+            bootstrap_module: None,
+            compile_cache_root: None,
+        });
+
+        let mut execution = engine
+            .prepare_execution(StartJavascriptExecutionRequest {
+                limits: Default::default(),
+                argv0: None,
+                guest_runtime: Default::default(),
+                vm_id: String::from("vm-deferred-exec"),
+                context_id: context.context_id,
+                argv: vec![String::from("./entry.mjs")],
+                env: BTreeMap::new(),
+                cwd: temp.path().to_path_buf(),
+                wasm_module_bytes: None,
+                inline_code: Some(String::from("process.stdout.write('started\\n');")),
+            })
+            .expect("prepare JavaScript execution");
+
+        assert!(execution.is_prepared_for_start());
+        assert_eq!(
+            execution
+                .poll_event_blocking(Duration::ZERO)
+                .expect("poll prepared execution"),
+            None,
+            "preparation must not enqueue any guest code"
+        );
+
+        execution
+            .start_prepared()
+            .expect("start prepared execution");
+        assert!(!execution.is_prepared_for_start());
+        let result = execution.wait().expect("wait for prepared execution");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, b"started\n");
     }
 
     // --- Timer cancellation / cap regression tests (U4: H2 bridge timers, M3

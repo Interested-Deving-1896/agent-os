@@ -531,6 +531,51 @@ fn assert_terminate_interrupts_sync_bridge_wait() -> io::Result<()> {
     Ok(())
 }
 
+fn assert_pause_preserves_synchronous_execution_stack() -> io::Result<()> {
+    let runtime = Arc::new(EmbeddedV8Runtime::new(Some(1))?);
+    let session_id = next_session_id();
+    let receiver = register_and_create_session(&runtime, &session_id)?;
+    let handle = runtime.session_handle(session_id.clone());
+
+    dispatch_execute(
+        runtime.as_ref(),
+        &session_id,
+        0,
+        "",
+        "_loadFileSync('/before-pause'); _loadFileSync('/after-resume');",
+    )?;
+
+    let first_call = wait_for_bridge_call(&receiver, &session_id);
+    let first_call_id = match first_call {
+        RuntimeEvent::BridgeCall { call_id, .. } => call_id,
+        other => panic!("expected first bridge call, got {other:?}"),
+    };
+    handle.pause()?;
+    handle.send_bridge_response(first_call_id, 0, Vec::new())?;
+
+    let event_while_paused = receiver.recv_timeout(Duration::from_millis(100));
+    handle.resume()?;
+    assert!(
+        event_while_paused.is_err(),
+        "paused synchronous execution must not advance to its next host call"
+    );
+
+    let second_call = wait_for_bridge_call(&receiver, &session_id);
+    let second_call_id = match second_call {
+        RuntimeEvent::BridgeCall { call_id, .. } => call_id,
+        other => panic!("expected second bridge call, got {other:?}"),
+    };
+    handle.send_bridge_response(second_call_id, 0, Vec::new())?;
+    assert_execution_ok(&receiver, &session_id);
+
+    handle.destroy()?;
+    runtime.unregister_session(&session_id);
+    wait_until("expected resumed session to drain cleanly", || {
+        runtime.session_count() == 0 && runtime.active_slot_count() == 0
+    });
+    Ok(())
+}
+
 fn assert_cpu_terminated_session_can_execute_again() -> io::Result<()> {
     let runtime = Arc::new(EmbeddedV8Runtime::new(Some(1))?);
     let session_id = next_session_id();
@@ -626,6 +671,7 @@ fn embedded_runtime_session_consolidated_behaviors() -> io::Result<()> {
     assert_queued_work_waits_for_slot_release()?;
     assert_shared_runtime_handles_share_concurrency_quota()?;
     assert_terminate_interrupts_sync_bridge_wait()?;
+    assert_pause_preserves_synchronous_execution_stack()?;
     assert_cpu_terminated_session_can_execute_again()?;
     assert_isolate_churn_recreates_embedded_sessions_without_segv()?;
     Ok(())

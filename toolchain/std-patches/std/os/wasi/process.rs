@@ -10,7 +10,38 @@
 
 use crate::os::wasi::io::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd, RawFd};
 use crate::process;
-use crate::sys::{AsInner, FromInner, IntoInner};
+use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner};
+
+const WASI_ERRNO_BADF: i32 = 8;
+
+/// WASI-specific child process descriptor mappings.
+#[stable(feature = "rust1", since = "1.0.0")]
+pub trait CommandExt: crate::sealed::Sealed {
+    /// Duplicates `source` onto `target` in the child before execution.
+    ///
+    /// The command owns `source` until spawning completes, and the extra source
+    /// descriptor is closed in the child after all mappings are applied.
+    #[stable(feature = "rust1", since = "1.0.0")]
+    fn fd_mapping(
+        &mut self,
+        source: OwnedFd,
+        target: RawFd,
+    ) -> crate::io::Result<&mut process::Command>;
+}
+
+#[stable(feature = "rust1", since = "1.0.0")]
+impl CommandExt for process::Command {
+    fn fd_mapping(
+        &mut self,
+        source: OwnedFd,
+        target: RawFd,
+    ) -> crate::io::Result<&mut process::Command> {
+        let target = u32::try_from(target)
+            .map_err(|_| crate::io::Error::from_raw_os_error(WASI_ERRNO_BADF))?;
+        self.as_inner_mut().fd_mapping(source, target)?;
+        Ok(self)
+    }
+}
 
 macro_rules! impl_child_pipe_fd {
     ($t:ty) => {

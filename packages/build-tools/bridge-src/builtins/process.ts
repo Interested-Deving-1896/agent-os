@@ -29,6 +29,9 @@ function readProcessConfig() {
       "node",
       "script.js"
     ],
+    argv0: typeof _processConfig !== "undefined" && typeof _processConfig.argv0 === "string"
+      ? _processConfig.argv0
+      : "node",
     execPath: typeof _processConfig !== "undefined" && _processConfig.execPath || "/usr/bin/node",
     pid: typeof _processConfig !== "undefined" && _processConfig.pid || 1,
     ppid: typeof _processConfig !== "undefined" && _processConfig.ppid || 0,
@@ -483,7 +486,7 @@ var process2 = {
   execPath: config2.execPath,
   execArgv: [],
   argv: config2.argv,
-  argv0: config2.argv[0] || "node",
+  argv0: config2.argv0,
   title: "node",
   env: config2.env,
   // Config stubs
@@ -873,7 +876,7 @@ function applyProcessConfig(nextConfig) {
   process2.ppid = nextConfig.ppid;
   process2.execPath = nextConfig.execPath;
   process2.argv = nextConfig.argv;
-  process2.argv0 = nextConfig.argv[0] || "node";
+  process2.argv0 = nextConfig.argv0;
   process2.env = nextConfig.env;
   process2.connected = nextConfig.env?.AGENTOS_NODE_IPC === "1";
   process2._cwd = nextConfig.cwd;

@@ -1,6 +1,6 @@
 use crate::fd_table::{
-    FdResult, FileDescription, ProcessFdTable, SharedFileDescription, FILETYPE_CHARACTER_DEVICE,
-    O_RDWR,
+    allocate_file_description_id, FdResult, FileDescription, ProcessFdTable, SharedFileDescription,
+    FILETYPE_CHARACTER_DEVICE, O_RDWR,
 };
 use crate::poll::{PollEvents, PollNotifier, POLLHUP, POLLIN, POLLOUT};
 use std::collections::{BTreeMap, VecDeque};
@@ -269,7 +269,6 @@ struct PtyManagerState {
     desc_to_pty: BTreeMap<u64, PtyRef>,
     waiters: BTreeMap<u64, PendingRead>,
     next_pty_id: u64,
-    next_desc_id: u64,
     next_waiter_id: u64,
 }
 
@@ -280,7 +279,6 @@ impl Default for PtyManagerState {
             desc_to_pty: BTreeMap::new(),
             waiters: BTreeMap::new(),
             next_pty_id: 0,
-            next_desc_id: 200_000,
             next_waiter_id: 1,
         }
     }
@@ -344,10 +342,8 @@ impl PtyManager {
         let pty_id = state.next_pty_id;
         state.next_pty_id += 1;
 
-        let master_id = state.next_desc_id;
-        state.next_desc_id += 1;
-        let slave_id = state.next_desc_id;
-        state.next_desc_id += 1;
+        let master_id = allocate_file_description_id();
+        let slave_id = allocate_file_description_id();
 
         let path = format!("/dev/pts/{pty_id}");
         state.ptys.insert(
