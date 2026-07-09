@@ -5,6 +5,10 @@ implementation, backed by the host_process broker. WASI cannot provide fork()
 semantics, so route Git's central child-process path through posix_spawn while
 leaving the rest of upstream Git's command machinery intact.
 
+POSIX spawn does not execute Git's fork-child close calls. Add explicit,
+deduplicated close actions after the descriptor mappings so children cannot
+retain unused pipe ends and suppress EOF.
+
 --- a/run-command.c
 +++ b/run-command.c
 @@ -18,6 +18,10 @@
@@ -46,7 +50,7 @@ leaving the rest of upstream Git's command machinery intact.
  
  	if (cmd->no_stdin || cmd->no_stdout || cmd->no_stderr) {
  		null_fd = xopen("/dev/null", O_RDWR | O_CLOEXEC);
-@@ -773,6 +781,79 @@
+@@ -773,6 +781,140 @@
  	}
  
  	childenv = prep_childenv(cmd->env.v);
@@ -98,6 +102,67 @@ leaving the rest of upstream Git's command machinery intact.
 +				goto wasi_spawn_failed_action;
 +		}
 +
++		/*
++		 * Unlike fork(), posix_spawn() does not run Git's child_close()
++		 * calls. Close every non-stdio pipe end and caller-supplied source
++		 * after the dup2 actions, otherwise a child can retain the last
++		 * writer and prevent its sibling from ever observing EOF.
++		 */
++		{
++			int close_fds[8];
++			size_t close_nr = 0;
++
++#define ADD_SPAWN_CLOSE(fd) do { \
++	int close_fd = (fd); \
++	int already_added = 0; \
++	for (size_t close_i = 0; close_i < close_nr; close_i++) \
++		if (close_fds[close_i] == close_fd) \
++			already_added = 1; \
++	if (close_fd > STDERR_FILENO && !already_added) \
++		close_fds[close_nr++] = close_fd; \
++} while (0)
++
++			if (need_in) {
++				ADD_SPAWN_CLOSE(fdin[0]);
++				ADD_SPAWN_CLOSE(fdin[1]);
++			} else {
++				ADD_SPAWN_CLOSE(cmd->in);
++			}
++			if (need_out) {
++				ADD_SPAWN_CLOSE(fdout[0]);
++				ADD_SPAWN_CLOSE(fdout[1]);
++			} else {
++				ADD_SPAWN_CLOSE(cmd->out);
++			}
++			if (need_err) {
++				ADD_SPAWN_CLOSE(fderr[0]);
++				ADD_SPAWN_CLOSE(fderr[1]);
++			} else {
++				ADD_SPAWN_CLOSE(cmd->err);
++			}
++			ADD_SPAWN_CLOSE(null_fd);
++#undef ADD_SPAWN_CLOSE
++
++			for (size_t close_i = 0; close_i < close_nr; close_i++) {
++				spawn_err = posix_spawn_file_actions_addclose(
++					&actions, close_fds[close_i]);
++				if (spawn_err)
++					goto wasi_spawn_failed_action;
++			}
++		}
++
++		/*
++		 * Match the fork path's close_fd_above_stderr contract. Helpers
++		 * that communicate exclusively through stdio must not inherit an
++		 * unrelated pipe end and keep a sibling from observing EOF.
++		 */
++		if (cmd->close_fd_above_stderr) {
++			spawn_err = posix_spawn_file_actions_addclosefrom_np(
++				&actions, STDERR_FILENO + 1);
++			if (spawn_err)
++				goto wasi_spawn_failed_action;
++		}
++
 +		spawn_err = posix_spawn(&cmd->pid, argv.v[1], &actions, NULL,
 +					(char *const *)argv.v + 1, childenv);
 +		if (spawn_err == ENOEXEC)
@@ -126,8 +191,7 @@ leaving the rest of upstream Git's command machinery intact.
  	atfork_prepare(&as);
  
  	/*
-@@ -904,8 +985,9 @@
- 	if (null_fd >= 0)
+@@ -905,6 +1047,7 @@
  		close(null_fd);
  	strvec_clear(&argv);
  	free(childenv);

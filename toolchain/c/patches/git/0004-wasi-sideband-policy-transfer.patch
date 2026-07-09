@@ -1,0 +1,102 @@
+Preserve resolved sideband safety policy in WASI helpers.
+
+Git applies URL-specific sideband.allowControlCharacters configuration in the
+transport process. WASI demultiplexes sideband traffic in a spawned multicall
+helper rather than a native thread, so pass the already-resolved numeric policy
+to that helper without exposing the remote URL (and possible credentials) in
+the child argv.
+
+--- a/sideband.c
++++ b/sideband.c
+@@ -106,6 +106,35 @@
+ 	urlmatch_config_release(&config);
+ }
+ 
++int sideband_get_allow_control_characters(void)
++{
++	const char *value;
++
++	if (allow_control_characters == ALLOW_CONTROL_SEQUENCES_UNSET) {
++		if (!repo_config_get_value(the_repository,
++					   "sideband.allowcontrolcharacters", &value))
++			sideband_allow_control_characters_config(
++				"sideband.allowcontrolcharacters", value);
++
++		if (allow_control_characters == ALLOW_CONTROL_SEQUENCES_UNSET)
++			allow_control_characters = ALLOW_DEFAULT_ANSI_SEQUENCES;
++	}
++
++	return allow_control_characters;
++}
++
++int sideband_set_allow_control_characters(int value)
++{
++	const int valid = ALLOW_ANSI_COLOR_SEQUENCES |
++		ALLOW_ANSI_CURSOR_MOVEMENTS | ALLOW_ANSI_ERASE |
++		ALLOW_ALL_CONTROL_CHARACTERS;
++
++	if (value < 0 || (value & ~valid))
++		return -1;
++	allow_control_characters = value;
++	return 0;
++}
++
+ /* Returns a color setting (GIT_COLOR_NEVER, etc). */
+ static enum git_colorbool use_sideband_colors(void)
+ {
+@@ -119,13 +148,7 @@
+ 	if (use_sideband_colors_cached != GIT_COLOR_UNKNOWN)
+ 		return use_sideband_colors_cached;
+ 
+-	if (allow_control_characters == ALLOW_CONTROL_SEQUENCES_UNSET) {
+-		if (!repo_config_get_value(the_repository, "sideband.allowcontrolcharacters", &value))
+-			sideband_allow_control_characters_config("sideband.allowcontrolcharacters", value);
+-
+-		if (allow_control_characters == ALLOW_CONTROL_SEQUENCES_UNSET)
+-			allow_control_characters = ALLOW_DEFAULT_ANSI_SEQUENCES;
+-	}
++	sideband_get_allow_control_characters();
+ 
+ 	if (!repo_config_get_string_tmp(the_repository, key, &value))
+ 		use_sideband_colors_cached = git_config_colorbool(key, value);
+--- a/sideband.h
++++ b/sideband.h
+@@ -44,4 +44,11 @@
+  */
+ int sideband_allow_control_characters_config(const char *var, const char *value);
+ 
++/*
++ * Serialize the resolved control-character policy when an implementation
++ * must move sideband demultiplexing into another process.
++ */
++int sideband_get_allow_control_characters(void);
++int sideband_set_allow_control_characters(int value);
++
+ #endif
+--- a/builtin/receive-pack.c
++++ b/builtin/receive-pack.c
+@@ -565,8 +565,14 @@
+ 			 const char *prefix UNUSED,
+ 			 struct repository *repo UNUSED)
+ {
+-	if (argc == 3 && !strcmp(argv[1], "demux"))
++	int allow_control_characters;
++
++	if (argc == 4 && !strcmp(argv[1], "demux")) {
++		if (strtol_i(argv[3], 10, &allow_control_characters) ||
++		    sideband_set_allow_control_characters(allow_control_characters))
++			return error("invalid sideband control-character policy");
+ 		return recv_sideband(argv[2], STDIN_FILENO, STDOUT_FILENO);
++	}
+ 
+ 	if (argc == 5 && !strcmp(argv[1], "mux")) {
+ 		use_sideband = atoi(argv[2]);
+@@ -578,7 +584,7 @@
+ 		return copy_to_sideband(STDIN_FILENO, STDOUT_FILENO, NULL);
+ 	}
+ 
+-	return error("usage: git sideband--helper demux <label> | "
++	return error("usage: git sideband--helper demux <label> <control-policy> | "
+ 		     "mux <packet-size> <keepalive-mode> <keepalive-seconds>");
+ }
+ 

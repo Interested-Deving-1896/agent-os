@@ -1,0 +1,213 @@
+Stream Git sidebands through a spawned multicall helper on WASI.
+
+Native Git runs recv_sideband() in an async worker while index-pack or
+pack-objects runs in parallel. The old WASI workaround ran recv_sideband()
+synchronously: fetch packs and push status reports were first written to
+objects/pack/tmp_sideband_* and only consumed after the network phase.
+Besides doubling storage for fetched packs, that changed full-duplex push
+semantics and could deadlock when a server needed its response drained while
+the client was still uploading.
+
+The AgentOS POSIX layer supports posix_spawn(), so preserve Git's native
+process topology with a hidden multicall applet. The applet performs the
+same recv_sideband() call as the native async worker. fetch-pack pipes its
+band-1 output directly into index-pack/unpack-objects; send-pack starts it
+before pack-objects and reads the remote status from its bounded pipe.
+Band-2 progress and band-3 errors continue to go directly to stderr. The
+pack failure path also drains and reports whatever remote status arrives,
+matching native Git.
+
+--- a/builtin.h
++++ b/builtin.h
+@@ -252,6 +252,7 @@
+ int cmd_revert(int argc, const char **argv, const char *prefix, struct repository *repo);
+ int cmd_rm(int argc, const char **argv, const char *prefix, struct repository *repo);
+ int cmd_send_pack(int argc, const char **argv, const char *prefix, struct repository *repo);
++int cmd_sideband__helper(int argc, const char **argv, const char *prefix, struct repository *repo);
+ int cmd_shortlog(int argc, const char **argv, const char *prefix, struct repository *repo);
+ int cmd_show(int argc, const char **argv, const char *prefix, struct repository *repo);
+ int cmd_show_branch(int argc, const char **argv, const char *prefix, struct repository *repo);
+--- a/git.c
++++ b/git.c
+@@ -649,6 +649,7 @@
+ 	{ "revert", cmd_revert, RUN_SETUP | NEED_WORK_TREE },
+ 	{ "rm", cmd_rm, RUN_SETUP },
+ 	{ "send-pack", cmd_send_pack, RUN_SETUP },
++	{ "sideband--helper", cmd_sideband__helper, NO_PARSEOPT },
+ 	{ "shortlog", cmd_shortlog, RUN_SETUP_GENTLY | USE_PAGER },
+ 	{ "show", cmd_show, RUN_SETUP },
+ 	{ "show-branch", cmd_show_branch, RUN_SETUP },
+--- a/fetch-pack.c
++++ b/fetch-pack.c
+@@ -892,6 +892,7 @@
+ 	return retval;
+ }
+ 
++#ifndef __wasi__
+ static int sideband_demux(int in UNUSED, int out, void *data)
+ {
+ 	int *xd = data;
+@@ -901,6 +902,7 @@
+ 	close(out);
+ 	return ret;
+ }
++#endif
+ 
+ static void create_promisor_file(const char *keep_name,
+ 				 struct ref **sought, int nr_sought)
+@@ -969,9 +971,13 @@
+ 	struct child_process cmd = CHILD_PROCESS_INIT;
+ 	int fsck_objects = 0;
+ 	int ret;
++#ifdef __wasi__
++	struct child_process demux_process = CHILD_PROCESS_INIT;
++#endif
+ 
+ 	memset(&demux, 0, sizeof(demux));
+ 	if (use_sideband) {
++#ifndef __wasi__
+ 		/* xd[] is talking with upload-pack; subprocess reads from
+ 		 * xd[0], spits out band#2 to stderr, and feeds us band#1
+ 		 * through demux->out.
+@@ -982,6 +988,28 @@
+ 		demux.isolate_sigpipe = 1;
+ 		if (start_async(&demux))
+ 			die(_("fetch-pack: unable to fork off sideband demultiplexer"));
++#else
++		/*
++		 * The WASI runtime cannot execute an in-process async function,
++		 * but it can spawn another Git multicall applet. Keep the native
++		 * streaming topology: the helper drains the remote concurrently
++		 * and pipes band#1 directly to index-pack/unpack-objects.
++		 */
++		strvec_pushl(&demux_process.args,
++			     "sideband--helper", "demux", "fetch-pack", NULL);
++		strvec_pushf(&demux_process.args, "%d",
++			     sideband_get_allow_control_characters());
++		demux_process.git_cmd = 1;
++		demux_process.clean_on_exit = 1;
++		demux_process.in = dup(xd[0]);
++		if (demux_process.in < 0)
++			die_errno(_("fetch-pack: unable to duplicate sideband input"));
++		demux_process.out = -1;
++		demux_process.close_fd_above_stderr = 1;
++		if (start_command(&demux_process))
++			die(_("fetch-pack: unable to spawn sideband demultiplexer"));
++		demux.out = demux_process.out;
++#endif
+ 	}
+ 	else
+ 		demux.out = xd[0];
+@@ -1098,8 +1126,13 @@
+ 			ret == 0;
+ 	else
+ 		die(_("%s failed"), cmd_name);
++#ifndef __wasi__
+ 	if (use_sideband && finish_async(&demux))
+ 		die(_("error in sideband demultiplexer"));
++#else
++	if (use_sideband && finish_command(&demux_process))
++		die(_("error in sideband demultiplexer"));
++#endif
+ 
+ 	sigchain_pop(SIGPIPE);
+ 
+--- a/send-pack.c
++++ b/send-pack.c
+@@ -281,6 +281,7 @@
+ 	return ret;
+ }
+ 
++#ifndef __wasi__
+ static int sideband_demux(int in UNUSED, int out, void *data)
+ {
+ 	int *fd = data, ret;
+@@ -290,6 +291,7 @@
+ 	close(out);
+ 	return ret;
+ }
++#endif
+ 
+ static int advertise_shallow_grafts_cb(const struct commit_graft *graft, void *cb)
+ {
+@@ -538,6 +540,9 @@
+ 	char *push_cert_nonce = NULL;
+ 	struct packet_reader reader;
+ 	int use_bitmaps;
++#ifdef __wasi__
++	struct child_process demux_process = CHILD_PROCESS_INIT;
++#endif
+ 
+ 	if (!remote_refs) {
+ 		fprintf(stderr, "No refs in common and none specified; doing nothing.\n"
+@@ -729,6 +734,7 @@
+ 
+ 	if (use_sideband && cmds_sent) {
+ 		memset(&demux, 0, sizeof(demux));
++#ifndef __wasi__
+ 		demux.proc = sideband_demux;
+ 		demux.data = fd;
+ 		demux.out = -1;
+@@ -736,6 +742,28 @@
+ 		if (start_async(&demux))
+ 			die("send-pack: unable to fork off sideband demultiplexer");
+ 		in = demux.out;
++#endif
++		/*
++		 * Spawn the hidden Git helper on WASI so the response is drained
++		 * while pack-objects is still writing the request, matching the
++		 * native async worker's full-duplex process topology.
++		 */
++#ifdef __wasi__
++		strvec_pushl(&demux_process.args,
++			     "sideband--helper", "demux", "send-pack", NULL);
++		strvec_pushf(&demux_process.args, "%d",
++			     sideband_get_allow_control_characters());
++		demux_process.git_cmd = 1;
++		demux_process.clean_on_exit = 1;
++		demux_process.in = dup(fd[0]);
++		if (demux_process.in < 0)
++			die_errno("send-pack: unable to duplicate sideband input");
++		demux_process.out = -1;
++		demux_process.close_fd_above_stderr = 1;
++		if (start_command(&demux_process))
++			die("send-pack: unable to spawn sideband demultiplexer");
++		in = demux_process.out;
++#endif
+ 	}
+ 
+ 	packet_reader_init(&reader, in, NULL, 0,
+@@ -759,8 +787,12 @@
+ 				receive_status(r, &reader, remote_refs);
+ 
+ 			if (use_sideband) {
+-				close(demux.out);
++				close(in);
++#ifndef __wasi__
+ 				finish_async(&demux);
++#else
++				finish_command(&demux_process);
++#endif
+ 			}
+ 			fd[1] = -1;
+ 
+@@ -782,11 +814,19 @@
+ 		packet_flush(out);
+ 
+ 	if (use_sideband && cmds_sent) {
++#ifndef __wasi__
+ 		close(demux.out);
+ 		if (finish_async(&demux)) {
+ 			error("error in sideband demultiplexer");
+ 			ret = -1;
+ 		}
++#else
++		close(in);
++		if (finish_command(&demux_process)) {
++			error("error in sideband demultiplexer");
++			ret = -1;
++		}
++#endif
+ 	}
+ 
+ 	if (ret < 0)

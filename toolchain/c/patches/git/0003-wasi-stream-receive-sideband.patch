@@ -1,0 +1,290 @@
+Stream receive-pack sideband muxers through a spawned helper on WASI.
+
+receive-pack uses the same in-process async facility for hook stderr,
+connectivity progress, and index-pack progress. On WASI, async startup falls
+back to unavailable fork(); most callers then lose progress and the unpack
+path incorrectly returns success without consuming the pack.
+
+Reuse the hidden sideband multicall helper as a streaming mux process. The
+helper reads bounded 128-byte chunks exactly like upstream copy_to_sideband(),
+including keepalives, while its stdin pipe provides backpressure. Native builds
+retain the existing async implementation. Treat mux startup or exit failure as
+an unpack failure instead of silently skipping the pack.
+
+--- a/builtin/receive-pack.c
++++ b/builtin/receive-pack.c
+@@ -560,35 +560,103 @@
+ 	return 0;
+ }
+ 
++int cmd_sideband__helper(int argc,
++			 const char **argv,
++			 const char *prefix UNUSED,
++			 struct repository *repo UNUSED)
++{
++	if (argc == 3 && !strcmp(argv[1], "demux"))
++		return recv_sideband(argv[2], STDIN_FILENO, STDOUT_FILENO);
++
++	if (argc == 5 && !strcmp(argv[1], "mux")) {
++		use_sideband = atoi(argv[2]);
++		use_keepalive = atoi(argv[3]);
++		keepalive_in_sec = atoi(argv[4]);
++		if (use_sideband <= 0 || use_keepalive < KEEPALIVE_NEVER ||
++		    use_keepalive > KEEPALIVE_ALWAYS)
++			return error("invalid sideband mux parameters");
++		return copy_to_sideband(STDIN_FILENO, STDOUT_FILENO, NULL);
++	}
++
++	return error("usage: git sideband--helper demux <label> | "
++		     "mux <packet-size> <keepalive-mode> <keepalive-seconds>");
++}
++
++struct sideband_worker {
++#ifdef __wasi__
++	struct child_process process;
++#else
++	struct async async;
++#endif
++};
++
++static int start_sideband_worker(struct sideband_worker *worker)
++{
++#ifdef __wasi__
++	int output = dup(STDOUT_FILENO);
++
++	if (output < 0)
++		return -1;
++	child_process_init(&worker->process);
++	strvec_pushl(&worker->process.args, "sideband--helper", "mux", NULL);
++	strvec_pushf(&worker->process.args, "%d", use_sideband);
++	strvec_pushf(&worker->process.args, "%d", use_keepalive);
++	strvec_pushf(&worker->process.args, "%d", keepalive_in_sec);
++	worker->process.git_cmd = 1;
++	worker->process.in = -1;
++	worker->process.out = output;
++	if (start_command(&worker->process))
++		return -1;
++	return worker->process.in;
++#else
++	memset(&worker->async, 0, sizeof(worker->async));
++	worker->async.proc = copy_to_sideband;
++	worker->async.in = -1;
++	if (start_async(&worker->async))
++		return -1;
++	return worker->async.in;
++#endif
++}
++
++static int finish_sideband_worker(struct sideband_worker *worker)
++{
++#ifdef __wasi__
++	return finish_command(&worker->process);
++#else
++	return finish_async(&worker->async);
++#endif
++}
++
+ /*
+  * Start an async thread which redirects hook stderr over the sideband.
+  * The original stderr fd is saved to `saved_stderr` and STDERR_FILENO is
+  * redirected to the async's input pipe.
+  */
+-static void prepare_sideband_async(struct async *sideband_async, int *saved_stderr, int *started)
++static void prepare_sideband_async(struct sideband_worker *sideband_async,
++				   int *saved_stderr, int *started)
+ {
++	int input;
++
+ 	*started = 0;
+ 
+ 	if (!use_sideband)
+ 		return;
+ 
+-	memset(sideband_async, 0, sizeof(*sideband_async));
+-	sideband_async->proc = copy_to_sideband;
+-	sideband_async->in = -1;
+-
+-	if (!start_async(sideband_async)) {
++	input = start_sideband_worker(sideband_async);
++	if (input >= 0) {
+ 		*started = 1;
+ 		*saved_stderr = dup(STDERR_FILENO);
+ 		if (*saved_stderr >= 0)
+-			dup2(sideband_async->in, STDERR_FILENO);
+-		close(sideband_async->in);
++			dup2(input, STDERR_FILENO);
++		close(input);
+ 	}
+ }
+ 
+ /*
+  * Restore the original stderr and wait for the async sideband thread to finish.
+  */
+-static void finish_sideband_async(struct async *sideband_async, int saved_stderr, int started)
++static void finish_sideband_async(struct sideband_worker *sideband_async,
++				  int saved_stderr, int started)
+ {
+ 	if (!use_sideband)
+ 		return;
+@@ -599,7 +667,7 @@
+ 	}
+ 
+ 	if (started)
+-		finish_async(sideband_async);
++		finish_sideband_worker(sideband_async);
+ }
+ 
+ static void hmac_hash(unsigned char *out,
+@@ -935,7 +1003,7 @@
+ 		.skip_broken = skip_broken,
+ 		.buf = STRBUF_INIT,
+ 	};
+-	struct async sideband_async;
++	struct sideband_worker sideband_async;
+ 	int sideband_async_started = 0;
+ 	int saved_stderr = -1;
+ 	int ret;
+@@ -983,7 +1051,7 @@
+ {
+ 	static const char hook_name[] = "update";
+ 	struct run_hooks_opt opt = RUN_HOOKS_OPT_INIT;
+-	struct async sideband_async;
++	struct sideband_worker sideband_async;
+ 	int sideband_async_started = 0;
+ 	int saved_stderr = -1;
+ 	int code;
+@@ -1152,7 +1220,7 @@
+ 				 const struct string_list *push_options)
+ {
+ 	struct child_process proc = CHILD_PROCESS_INIT;
+-	struct async muxer;
++	struct sideband_worker muxer;
+ 	struct command *cmd;
+ 	struct packet_reader reader;
+ 	struct strbuf cap = STRBUF_INIT;
+@@ -1160,6 +1228,7 @@
+ 	int hook_use_push_options = 0;
+ 	int version = 0;
+ 	int code;
++	int muxer_started = 0;
+ 	const char *hook_path = find_hook(the_repository, "proc-receive");
+ 
+ 	if (!hook_path) {
+@@ -1173,21 +1242,18 @@
+ 	proc.trace2_hook_name = "proc-receive";
+ 
+ 	if (use_sideband) {
+-		memset(&muxer, 0, sizeof(muxer));
+-		muxer.proc = copy_to_sideband;
+-		muxer.in = -1;
+-		code = start_async(&muxer);
+-		if (code)
+-			return code;
+-		proc.err = muxer.in;
++		proc.err = start_sideband_worker(&muxer);
++		if (proc.err < 0)
++			return -1;
++		muxer_started = 1;
+ 	} else {
+ 		proc.err = 0;
+ 	}
+ 
+ 	code = start_command(&proc);
+ 	if (code) {
+-		if (use_sideband)
+-			finish_async(&muxer);
++		if (muxer_started)
++			finish_sideband_worker(&muxer);
+ 		return code;
+ 	}
+ 
+@@ -1293,8 +1359,8 @@
+ cleanup:
+ 	close(proc.in);
+ 	close(proc.out);
+-	if (use_sideband)
+-		finish_async(&muxer);
++	if (muxer_started)
++		finish_sideband_worker(&muxer);
+ 	if (finish_command(&proc))
+ 		code = -1;
+ 	if (errmsg.len >0) {
+@@ -1678,7 +1744,7 @@
+ {
+ 	static const char hook_name[] = "post-update";
+ 	struct run_hooks_opt opt = RUN_HOOKS_OPT_INIT;
+-	struct async sideband_async;
++	struct sideband_worker sideband_async;
+ 	struct command *cmd;
+ 	int sideband_async_started = 0;
+ 	int saved_stderr = -1;
+@@ -2033,8 +2099,9 @@
+ 	struct check_connected_options opt = CHECK_CONNECTED_INIT;
+ 	struct command *cmd;
+ 	struct iterate_data data;
+-	struct async muxer;
++	struct sideband_worker muxer;
+ 	int err_fd = 0;
++	int muxer_started = 0;
+ 	int run_proc_receive = 0;
+ 
+ 	if (unpacker_error) {
+@@ -2045,11 +2112,11 @@
+ 
+ 	if (!skip_connectivity_check) {
+ 		if (use_sideband) {
+-			memset(&muxer, 0, sizeof(muxer));
+-			muxer.proc = copy_to_sideband;
+-			muxer.in = -1;
+-			if (!start_async(&muxer))
+-				err_fd = muxer.in;
++			err_fd = start_sideband_worker(&muxer);
++			if (err_fd >= 0)
++				muxer_started = 1;
++			else
++				err_fd = 0;
+ 			/* ...else, continue without relaying sideband */
+ 		}
+ 
+@@ -2063,8 +2130,8 @@
+ 		if (check_connected(iterate_receive_command_list, &data, &opt))
+ 			set_connectivity_errors(commands, si);
+ 
+-		if (use_sideband)
+-			finish_async(&muxer);
++		if (muxer_started)
++			finish_sideband_worker(&muxer);
+ 	}
+ 
+ 	reject_updates_to_hidden(commands);
+@@ -2433,22 +2500,22 @@
+ 
+ static const char *unpack_with_sideband(struct shallow_info *si)
+ {
+-	struct async muxer;
++	struct sideband_worker muxer;
+ 	const char *ret;
++	int err_fd;
+ 
+ 	if (!use_sideband)
+ 		return unpack(0, si);
+ 
+ 	use_keepalive = KEEPALIVE_AFTER_NUL;
+-	memset(&muxer, 0, sizeof(muxer));
+-	muxer.proc = copy_to_sideband;
+-	muxer.in = -1;
+-	if (start_async(&muxer))
+-		return NULL;
++	err_fd = start_sideband_worker(&muxer);
++	if (err_fd < 0)
++		return "sideband muxer failed";
+ 
+-	ret = unpack(muxer.in, si);
++	ret = unpack(err_fd, si);
+ 
+-	finish_async(&muxer);
++	if (finish_sideband_worker(&muxer) && !ret)
++		ret = "sideband muxer failed";
+ 	return ret;
+ }
+ 
