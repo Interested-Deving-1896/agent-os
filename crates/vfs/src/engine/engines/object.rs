@@ -139,7 +139,7 @@ impl<B: ObjectBackend> VirtualFileSystem for ObjectFs<B> {
             }
             result.push(Dentry {
                 name,
-                ino: 0,
+                ino: object_ino(&entry.name),
                 kind: if entry.is_prefix {
                     InodeType::Directory
                 } else {
@@ -200,13 +200,13 @@ impl<B: ObjectBackend> VirtualFileSystem for ObjectFs<B> {
     async fn stat(&self, path: &str) -> VfsResult<VirtualStat> {
         let key = self.key_for(path)?;
         if let Some(meta) = self.backend.head(&key).await? {
-            return Ok(object_stat(meta));
+            return Ok(object_stat(meta, &key));
         }
         let entries = self.backend.list(&self.dir_prefix_for(path)?).await?;
         if entries.is_empty() {
             return Err(VfsError::enoent(path));
         }
-        Ok(object_stat(self.dir_meta()))
+        Ok(object_stat(self.dir_meta(), &key))
     }
 
     async fn lstat(&self, path: &str) -> VfsResult<VirtualStat> {
@@ -337,7 +337,20 @@ impl<B: ObjectBackend> VirtualFileSystem for ObjectFs<B> {
     }
 }
 
-fn object_stat(meta: ObjectMeta) -> VirtualStat {
+fn object_ino(key: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in key.trim_end_matches('/').as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
+fn object_stat(meta: ObjectMeta, key: &str) -> VirtualStat {
     let type_bits = match meta.kind {
         InodeType::File => crate::engine::types::S_IFREG,
         InodeType::Directory => crate::engine::types::S_IFDIR,
@@ -353,7 +366,7 @@ fn object_stat(meta: ObjectMeta) -> VirtualStat {
         mtime: meta.mtime,
         ctime: meta.mtime,
         birthtime: meta.mtime,
-        ino: 0,
+        ino: object_ino(key),
         nlink: 1,
         uid: meta.uid,
         gid: meta.gid,

@@ -27,14 +27,7 @@ fn generated_invalid_path(seed: u32) -> String {
             path.push('/');
         }
         path.push(char::from(b'a' + ((seed + segment) % 26) as u8));
-        let invalid_byte = if seed.is_multiple_of(2) {
-            0
-        } else if seed.is_multiple_of(5) {
-            0x7f
-        } else {
-            1 + ((seed + segment) % 31) as u8
-        };
-        path.push(char::from(invalid_byte));
+        path.push('\0');
         path.push(char::from(b'a' + (((seed / 3) + segment) % 26) as u8));
     }
     path
@@ -179,7 +172,7 @@ fn symlink_loops_fail_closed() {
 }
 
 #[test]
-fn path_validation_rejects_nul_and_control_bytes_without_mutating_filesystem() {
+fn path_validation_rejects_nul_without_mutating_filesystem() {
     let mut baseline = MemoryFileSystem::new();
     baseline
         .write_file("/safe/file.txt", "safe contents")
@@ -194,7 +187,7 @@ fn path_validation_rejects_nul_and_control_bytes_without_mutating_filesystem() {
         .create_dir("/safe/empty")
         .expect("seed removable dir");
 
-    let invalid_paths = ["/bad\0path", "/bad\npath", "/bad\x7fpath"];
+    let invalid_paths = ["/bad\0path"];
 
     for invalid_path in invalid_paths {
         assert_invalid_path_keeps_snapshot(&baseline, invalid_path, |fs, path| fs.read_file(path));
@@ -260,13 +253,24 @@ fn path_validation_rejects_nul_and_control_bytes_without_mutating_filesystem() {
 fn validate_path_rejects_generated_invalid_inputs() {
     for seed in 0..1_000u32 {
         let invalid_path = generated_invalid_path(seed);
-        assert!(
-            invalid_path
-                .bytes()
-                .any(|byte| byte == 0 || byte.is_ascii_control()),
-            "generated path should contain at least one prohibited byte"
-        );
+        assert!(invalid_path.contains('\0'));
         assert_error_code(validate_path(&invalid_path), "EINVAL");
+    }
+}
+
+#[test]
+fn path_validation_and_storage_accept_non_nul_ascii_control_bytes() {
+    let mut filesystem = MemoryFileSystem::new();
+
+    for path in ["/line\nbreak", "/unit\x1fseparator", "/delete\x7fbyte"] {
+        validate_path(path).expect("Linux permits non-NUL control bytes in pathnames");
+        filesystem
+            .write_file(path, path.as_bytes())
+            .expect("store control-byte pathname");
+        assert_eq!(
+            filesystem.read_file(path).expect("read control-byte path"),
+            path.as_bytes()
+        );
     }
 }
 

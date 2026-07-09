@@ -1414,14 +1414,6 @@ pub fn validate_path(path: &str) -> VfsResult<()> {
     if path.as_bytes().contains(&0) {
         return Err(VfsError::invalid_input("path contains NUL byte"));
     }
-    if let Some(control) = path
-        .bytes()
-        .find(|byte| byte.is_ascii_control() && *byte != b'\0')
-    {
-        return Err(VfsError::invalid_input(format!(
-            "path contains control character byte 0x{control:02x}"
-        )));
-    }
     let normalized = normalize_path(path);
     if normalized.len() > MAX_PATH_LENGTH {
         return Err(VfsError::path_too_long(path));

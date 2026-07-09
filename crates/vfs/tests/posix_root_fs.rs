@@ -293,6 +293,16 @@ fn root_filesystem_uses_bundled_base_and_round_trips_snapshots() {
     assert!(os_release.is_symbolic_link);
     assert_eq!(os_release.uid, 0);
     assert_eq!(os_release.gid, 0);
+    let services = root
+        .read_file("/etc/services")
+        .expect("read bundled Linux services database");
+    assert!(services
+        .windows(b"smtp\t\t25/tcp\t\tmail".len())
+        .any(|window| window == b"smtp\t\t25/tcp\t\tmail"));
+    assert_eq!(
+        root.read_file("/etc/hosts").expect("read bundled hosts file"),
+        b"127.0.0.1 localhost localhost.localdomain\n::1 localhost localhost.localdomain ip6-localhost ip6-loopback\nfe00:: ip6-localnet\nff00:: ip6-mcastprefix\nff02::1 ip6-allnodes\nff02::2 ip6-allrouters\n127.0.1.1 secure-exec\n"
+    );
 
     root.mkdir("/workspace", true).expect("create workspace");
     root.write_file("/workspace/run.sh", b"echo hi".to_vec())

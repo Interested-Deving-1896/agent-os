@@ -182,6 +182,28 @@ async fn object_fs_maps_files_to_native_objects() {
     assert_eq!(fs.read_file("/dir/file.txt").await.unwrap(), b"hello");
     assert_eq!(fs.read_dir("/dir").await.unwrap(), vec!["file.txt"]);
     assert_eq!(fs.pread("/dir/file.txt", 1, 3).await.unwrap(), b"ell");
+
+    let file_entry = fs
+        .read_dir_with_types("/dir")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.name == "file.txt")
+        .unwrap();
+    let file_stat = fs.stat("/dir/file.txt").await.unwrap();
+    assert_ne!(file_entry.ino, 0);
+    assert_eq!(file_entry.ino, file_stat.ino);
+
+    let directory_entry = fs
+        .read_dir_with_types("/")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.name == "dir")
+        .unwrap();
+    let directory_stat = fs.stat("/dir").await.unwrap();
+    assert_ne!(directory_entry.ino, 0);
+    assert_eq!(directory_entry.ino, directory_stat.ino);
 }
 
 #[tokio::test]
