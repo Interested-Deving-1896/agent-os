@@ -527,6 +527,29 @@ ykAheWCsAteSEWVc0w==\n\
             }));
         }
 
+        fn wasm_signal_queue_is_bounded() {
+            let kernel_handle = create_kernel_process_handle_for_tests();
+            let mut process = ActiveProcess::new(
+                kernel_handle.pid(),
+                kernel_handle,
+                GuestRuntimeKind::WebAssembly,
+                ActiveExecution::Tool(ToolExecution::default()),
+            );
+            for _ in 0..MAX_PROCESS_EVENT_QUEUE {
+                process
+                    .queue_pending_wasm_signal(nix::libc::SIGUSR1)
+                    .expect("signal queue should accept entries up to its bound");
+            }
+            let error = process
+                .queue_pending_wasm_signal(nix::libc::SIGUSR1)
+                .expect_err("signal queue should reject overflow");
+            assert!(
+                error.to_string().contains("process event queue exceeded"),
+                "unexpected overflow error: {error}"
+            );
+            assert_eq!(process.pending_wasm_signals.len(), MAX_PROCESS_EVENT_QUEUE);
+        }
+
         fn descendant_transfer_overflow_preserves_global_queue() {
             let mut sidecar = create_test_sidecar();
             let (connection_id, session_id) =
@@ -1339,21 +1362,44 @@ ykAheWCsAteSEWVc0w==\n\
                 .join("../..")
                 .canonicalize()
                 .expect("canonicalize repo root");
-            let copied = repo_root.join("registry/software/coreutils/wasm");
+            let copied = repo_root.join("software/coreutils/wasm");
             if copied.exists() {
                 return copied;
             }
 
-            let fallback = repo_root.join("registry/native/target/wasm32-wasip1/release/commands");
+            let fallback = repo_root.join("toolchain/target/wasm32-wasip1/release/commands");
             if fallback.exists() {
                 return fallback;
             }
 
-            let vendored = repo_root.join("packages/core/commands");
+            let vendored = repo_root.join("packages/runtime-core/commands");
             if vendored.exists() {
                 let staged = temp_dir("agentos-native-sidecar-vendored-commands");
                 for command in ["bash", "cat", "mkdir", "printf", "sh"] {
                     let source = vendored.join(command);
+                    let target = staged.join(command);
+                    fs::copy(&source, &target).unwrap_or_else(|error| {
+                        panic!(
+                            "copy vendored command {} -> {}: {error}",
+                            source.display(),
+                            target.display()
+                        )
+                    });
+                    let mut permissions = fs::metadata(&target)
+                        .expect("stat staged vendored command")
+                        .permissions();
+                    permissions.set_mode(0o755);
+                    fs::set_permissions(&target, permissions)
+                        .expect("chmod staged vendored command");
+                }
+                return staged;
+            }
+
+            let legacy_vendored = repo_root.join("packages/core/commands");
+            if legacy_vendored.exists() {
+                let staged = temp_dir("agentos-native-sidecar-vendored-commands");
+                for command in ["bash", "cat", "mkdir", "printf", "sh"] {
+                    let source = legacy_vendored.join(command);
                     let target = staged.join(command);
                     fs::copy(&source, &target).unwrap_or_else(|error| {
                         panic!(
@@ -21217,6 +21263,7 @@ console.log(JSON.stringify({
             pending_process_events_are_bounded();
             process_event_receiver_overflow_preserves_queued_event();
             tool_execution_event_overflow_is_reported();
+            wasm_signal_queue_is_bounded();
             descendant_transfer_overflow_preserves_global_queue();
             exit_trailing_requeue_preserves_exit_when_queue_is_full();
             javascript_child_process_poll_reports_echild_when_child_disappears_after_drain();
@@ -21255,6 +21302,7 @@ console.log(JSON.stringify({
             pending_process_events_are_bounded();
             process_event_receiver_overflow_preserves_queued_event();
             tool_execution_event_overflow_is_reported();
+            wasm_signal_queue_is_bounded();
             descendant_transfer_overflow_preserves_global_queue();
             exit_trailing_requeue_preserves_exit_when_queue_is_full();
         }

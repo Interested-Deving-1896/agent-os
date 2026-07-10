@@ -37,7 +37,19 @@ core.[0-9]*
 # Secrets
 secrets/**/*
 
-# Registry build artifacts
+# Generated WASM toolchain and software artifacts. These are rebuilt for tests
+# and releases and must never be committed.
+packages/runtime-core/commands/
+toolchain/vendor/
+toolchain/c/build/
+toolchain/c/vendor/
+toolchain/c/libs/
+toolchain/c/sysroot/
+toolchain/c/.cache/
+toolchain/std-patches/wasi-libc-overrides/*.o
+software/*/bin/
+
+# Legacy registry build paths retained for old worktrees.
 registry/native/target/
 registry/native/vendor/
 registry/native/c/build/
@@ -47,6 +59,7 @@ registry/native/c/.cache/
 registry/native/c/sysroot/
 registry/software/coreutils/bin/
 registry/software/*/wasm/
+software/*/wasm/
 registry/software/*/agentos-package.meta.json
 registry/.last-publish-hash
 registry/software/*/.last-publish-hash

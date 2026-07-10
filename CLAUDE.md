@@ -74,26 +74,24 @@ the guest — over inventing a softer fallback that hides the failure.
   only when the caller explicitly supplied them.
 - Agent adapters must use real upstream SDKs. Do not replace SDK adapters with
   direct API-call stubs.
-- Native registry command binaries are generated artifacts. Do not commit
-  `registry/software/coreutils/bin/`; a fresh checkout intentionally has no
-  staged coreutils commands. Any VM, browser demo, or test that needs `sh` or
-  coreutils must build and stage the complete package from the repository root:
+- WASM command binaries and every toolchain build output are generated
+  artifacts. Never commit `packages/runtime-core/commands/`, `software/*/bin/`,
+  `toolchain/vendor/`, `toolchain/c/{build,vendor,libs,sysroot,.cache}/`, or
+  `toolchain/std-patches/wasi-libc-overrides/*.o`. A fresh checkout intentionally
+  contains source and patches only. Rebuild and stage the complete default tool
+  set from the repository root with:
 
   ```bash
   pnpm install --frozen-lockfile
-  just registry-native
-  pnpm --filter @agentos-software/coreutils build:runtime
+  just tools-rebuild
   ```
 
-  `just registry-native` compiles the patched Rust and C WASI sources into
-  `registry/native/target/wasm32-wasip1/release/commands/`; the pnpm command
-  then stages `bin/` and assembles `dist/package/`. `just registry-native-cmd
-  sh` builds only one development artifact and is not sufficient to assemble
-  the complete coreutils package. The ordinary `build` script may create an
-  empty placeholder for source-only repository checks; that placeholder is not
-  runnable and must never be treated as proof that coreutils was built.
-  Publishing coreutils must run the strict `build:runtime` lifecycle and fail
-  when the generated command set is absent or incomplete.
+  `just tools-rebuild` runs `just toolchain-build`, copies the canonical output
+  from `toolchain/target/wasm32-wasip1/release/commands/` into runtime staging,
+  and builds the `@agentos-software/*` packages. For focused development,
+  `just toolchain-cmd <command>` rebuilds one command, but it is not sufficient
+  for a release or complete package validation. Publish workflows must rebuild
+  and stage the complete command set and fail when it is absent or incomplete.
 
 ## Publishing
 

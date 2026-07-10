@@ -1,13 +1,13 @@
+import { guestEncodingBootstrapCode } from "./encoding.js";
+import { BROWSER_BUFFER_POLYFILL_CODE } from "./generated/buffer-polyfill.js";
+import { BROWSER_PATH_POLYFILL_CODE } from "./generated/path-polyfill.js";
+import { BROWSER_UTIL_POLYFILL_CODE } from "./generated/util-polyfill.js";
 import {
 	createInMemoryFileSystem,
 	InMemoryFileSystem,
 } from "./os-filesystem.js";
-import { guestEncodingBootstrapCode } from "./encoding.js";
-import { BROWSER_WASI_POLYFILL_CODE } from "./wasi-polyfill.js";
 import { PROCESS_SIGNAL_NUMBERS } from "./signals.js";
-import { BROWSER_BUFFER_POLYFILL_CODE } from "./generated/buffer-polyfill.js";
-import { BROWSER_PATH_POLYFILL_CODE } from "./generated/path-polyfill.js";
-import { BROWSER_UTIL_POLYFILL_CODE } from "./generated/util-polyfill.js";
+import { BROWSER_WASI_POLYFILL_CODE } from "./wasi-polyfill.js";
 
 export type StdioChannel = "stdout" | "stderr";
 export type TimingMitigation = "off" | "freeze";
@@ -295,7 +295,11 @@ export interface NodeRuntimeDriver {
 	/** End stdin for a running `streamingStdin` execution. */
 	endStdin?(executionId: string): void;
 	/** Write bytes to a PTY fd owned by the execution. */
-	writePty?(executionId: string, fd: number, data: string | Uint8Array): Promise<number>;
+	writePty?(
+		executionId: string,
+		fd: number,
+		data: string | Uint8Array,
+	): Promise<number>;
 	/** Read bytes from a PTY fd owned by the execution. */
 	readPty?(
 		executionId: string,
@@ -2957,9 +2961,15 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 			const waitBuffer = new SharedArrayBuffer(4);
 			const wait = new Int32Array(waitBuffer);
 			const errnoSuccess = 0;
+			const errnoAcces = 2;
 			const errnoBadf = 8;
 			const errnoChild = 10;
+			const errnoInval = 28;
+			const errnoIo = 29;
+			const errnoNoent = 44;
 			const errnoNosys = 52;
+			const errnoPerm = 63;
+			const errnoRofs = 69;
 			let nextSyntheticFd = 1000;
 			const syntheticFdEntries = new Map();
 			let activeFdOverrides = null;
@@ -2992,6 +3002,16 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 				if (stat && typeof stat.isDirectory === "function" && stat.isDirectory()) return 0o040755;
 				if (stat && typeof stat.isSymbolicLink === "function" && stat.isSymbolicLink()) return 0o120777;
 				return fallback >>> 0;
+			};
+			const hostFsErrno = (error) => {
+				switch (error && typeof error === "object" ? error.code : undefined) {
+					case "EACCES": return errnoAcces;
+					case "EPERM": return errnoPerm;
+					case "ENOENT": return errnoNoent;
+					case "EINVAL": return errnoInval;
+					case "EROFS": return errnoRofs;
+					default: return errnoIo;
+				}
 			};
 			const currentGuestCwd = () => {
 				const cwd = typeof activeChildCwd === "string" && activeChildCwd.startsWith("/")
@@ -3084,7 +3104,7 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 				try {
 					const childWasi = new WASI({
 						returnOnExit: true,
-						args: [child.commandPath, ...child.argv.slice(1)],
+						args: child.argv.length > 0 ? child.argv : [child.commandPath],
 						env: child.env,
 						preopens: { "/": child.cwd || "/" },
 					});
@@ -3097,9 +3117,9 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 					activeFdOverrides = child.overrides;
 					activeChildCwd = child.cwd || "/";
 					const exitCode = childWasi.start(childInstance);
-					exitedChildren.set(child.pid, exitCode << 8);
+					exitedChildren.set(child.pid, exitCode);
 				} catch {
-					exitedChildren.set(child.pid, 127 << 8);
+					exitedChildren.set(child.pid, 127);
 				} finally {
 					for (const handle of child.childOverrideHandles) closeSyntheticHandle(handle);
 					activeFdOverrides = previousActiveFdOverrides;
@@ -3264,15 +3284,14 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 								return 0;
 							}
 						},
-						// Matches node runner host_fs.chmod(fd, pathPtr, pathLen, mode):
-						// 0 on success, 1 on failure.
+						// Match node's host_fs chmod errno contract exactly.
 						chmod(_fd, pathPtr, pathLen, mode) {
 							try {
 								const guestPath = resolveGuestPath(readString(pathPtr, pathLen));
 								fs().chmodSync(guestPath, Number(mode) >>> 0);
-								return 0;
-							} catch {
-								return 1;
+								return errnoSuccess;
+							} catch (error) {
+								return hostFsErrno(error);
 							}
 						},
 						// The node runner exports 7 host_fs symbols; mirror the full
@@ -3316,23 +3335,37 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 								return (1n << 64n) - 1n;
 							}
 						},
-						// Browser fs() has no fd-based fchmod/ftruncate; provide the
-						// symbols (best-effort failure) so imports resolve. Rust guest
-						// binaries bypass wasi-libc stat/chmod/truncate, so these paths
-						// are unreached in practice.
-						fchmod(_fd, _mode) {
-							return 1;
+						fchmod(fd, mode) {
+							const handle = lookupSyntheticFd(fd >>> 0);
+							if (!handle || handle.kind !== "guest-file" || typeof handle.targetFd !== "number") {
+								return errnoBadf;
+							}
+							try {
+								fs().fchmodSync(handle.targetFd, Number(mode) >>> 0);
+								return errnoSuccess;
+							} catch (error) {
+								return hostFsErrno(error);
+							}
 						},
-						ftruncate(_fd, _length) {
-							return 1;
+						ftruncate(fd, length) {
+							const handle = lookupSyntheticFd(fd >>> 0);
+							if (!handle || handle.kind !== "guest-file" || typeof handle.targetFd !== "number") {
+								return errnoBadf;
+							}
+							try {
+								fs().ftruncateSync(handle.targetFd, Number(length));
+								return errnoSuccess;
+							} catch (error) {
+								return hostFsErrno(error);
+							}
 						},
 					},
 					host_process: {
-							proc_spawn(argvPtr, argvLen, envpPtr, envpLen, stdinFd, stdoutFd, stderrFd, cwdPtr, cwdLen, retPid) {
+							proc_spawn(execPathPtr, execPathLen, argvPtr, argvLen, envpPtr, envpLen, stdinFd, stdoutFd, stderrFd, cwdPtr, cwdLen, retPid) {
 								try {
+									const commandPath = readString(execPathPtr, execPathLen);
+									if (!commandPath) return errnoNosys;
 									const argv = decodeNullSeparated(readBytes(argvPtr, argvLen));
-									if (argv.length === 0) return errnoNosys;
-									const commandPath = argv[0];
 									const commandName = commandPath.split("/").filter(Boolean).at(-1) || commandPath;
 								const module = commandModules.get(commandName);
 									if (!module) return errnoNosys;
@@ -3374,22 +3407,24 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 								return errnoNosys;
 							}
 						},
-							proc_waitpid(pid, _options, retStatus, retPid) {
+							proc_waitpid(pid, _options, retExitCode, retSignal, retPid) {
 								const requested = pid >>> 0;
 								runReadyDeferredChildren(requested === 0xffffffff ? undefined : requested);
 							const childPid = requested === 0xffffffff
 								? exitedChildren.keys().next().value
 								: requested;
 							if (!childPid || !exitedChildren.has(childPid)) {
-									if ((_options >>> 0) !== 0) {
-										writeU32(retStatus, 0);
-										writeU32(retPid, 0);
+								if ((_options >>> 0) !== 0) {
+									writeU32(retExitCode, 0);
+									writeU32(retSignal, 0);
+									writeU32(retPid, 0);
 										return errnoSuccess;
 									}
 									writeU32(retPid, 0);
 									return errnoChild;
 								}
-							writeU32(retStatus, exitedChildren.get(childPid) || 0);
+							writeU32(retExitCode, exitedChildren.get(childPid) || 0);
+							writeU32(retSignal, 0);
 							writeU32(retPid, childPid);
 							exitedChildren.delete(childPid);
 							return errnoSuccess;
@@ -3413,6 +3448,15 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 							replaceSyntheticFd(newFd >>> 0, cloned);
 							return errnoSuccess;
 						},
+						proc_closefrom(lowFd) {
+							const minimumFd = lowFd >>> 0;
+							for (const [fd, handle] of Array.from(syntheticFdEntries.entries())) {
+								if (fd < minimumFd) continue;
+								closeSyntheticHandle(handle);
+								syntheticFdEntries.delete(fd);
+							}
+							return errnoSuccess;
+						},
 						fd_pipe(retReadFd, retWriteFd) {
 							const pipe = {
 								chunks: [],
@@ -3431,7 +3475,11 @@ export const POLYFILL_CODE_MAP: Record<string, string> = {
 						proc_getppid(retPid) { return writeU32(retPid, 0); },
 						proc_kill() { return errnoNosys; },
 						sleep_ms(milliseconds) {
-							Atomics.wait(wait, 0, 0, milliseconds >>> 0);
+							const deadline = Date.now() + (milliseconds >>> 0);
+							while (Date.now() < deadline) {
+								// Keep guest sleeps interruptible by V8 termination during kill/dispose.
+								Atomics.wait(wait, 0, 0, Math.max(1, Math.min(10, deadline - Date.now())));
+							}
 							return errnoSuccess;
 						},
 						pty_open() { return errnoNosys; },

@@ -2672,6 +2672,8 @@ fn validate_requirement(
 #[derive(Debug, Deserialize, Default)]
 pub struct JavascriptChildProcessSpawnOptions {
     #[serde(default)]
+    pub argv0: Option<String>,
+    #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,

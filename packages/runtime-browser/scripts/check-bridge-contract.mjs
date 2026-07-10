@@ -179,6 +179,7 @@ const browserUnsupportedContractGlobals = new Set([
 	"_networkHttpServerRespondRaw",
 	"_networkHttpServerWaitRaw",
 	"_processKill",
+	"_processTakeSignal",
 	"_ptySetRawMode",
 	"_pythonRpc",
 	"_pythonStdinRead",

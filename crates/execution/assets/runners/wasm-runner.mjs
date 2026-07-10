@@ -21,7 +21,10 @@ const WASI_ERRNO_AGAIN = 6;
 const WASI_ERRNO_BADF = 8;
 const WASI_ERRNO_CHILD = 10;
 const WASI_ERRNO_INVAL = 28;
+const WASI_ERRNO_IO = 29;
+const WASI_ERRNO_MFILE = 33;
 const WASI_ERRNO_NOENT = 44;
+const WASI_ERRNO_PERM = 63;
 const WASI_ERRNO_PIPE = 64;
 const WASI_ERRNO_ROFS = 69;
 const WASI_ERRNO_SPIPE = 70;
@@ -1354,14 +1357,17 @@ function mapSyntheticFsError(error) {
     case 'EBADF':
       return WASI_ERRNO_BADF;
     case 'EACCES':
-    case 'EPERM':
       return WASI_ERRNO_ACCES;
+    case 'EPERM':
+      return WASI_ERRNO_PERM;
+    case 'ENOENT':
+      return WASI_ERRNO_NOENT;
     case 'EINVAL':
       return WASI_ERRNO_INVAL;
     case 'EROFS':
       return WASI_ERRNO_ROFS;
     default:
-      return WASI_ERRNO_FAULT;
+      return WASI_ERRNO_IO;
   }
 }
 
@@ -2149,10 +2155,11 @@ function routeChunkToDelegateFd(fd, bytes) {
 }
 
 function finalizeChildExit(record, exitCode, signal) {
-  const status =
-    signal == null
-      ? (Number(exitCode ?? 1) & 0xff)
-      : 128 + (signalNumberFromName(signal) & 0x7f);
+  const signalNumber = signal == null ? 0 : signalNumberFromName(signal) & 0x7f;
+  const rawExitCode = signalNumber === 0 ? Number(exitCode ?? 1) & 0xff : 0;
+  const status = signalNumber === 0 ? rawExitCode : 128 + signalNumber;
+  record.exitCode = rawExitCode;
+  record.exitSignal = signalNumber;
   record.exitStatus = status;
   for (const fd of record.delegateRetainedFds ?? []) {
     if (releaseDelegateFd(fd) && typeof delegateManagedFdClose === 'function') {
@@ -2312,6 +2319,8 @@ function createSyntheticChildRecord(result, stdinTarget, stdoutTarget, stderrTar
     stdoutPipe: null,
     stderrPipe: null,
     delegateRetainedFds: [],
+    exitCode: null,
+    exitSignal: null,
     exitStatus: null,
     pendingEvents,
     synthetic: true,
@@ -2652,6 +2661,8 @@ function readSyncRpcLine() {
   }
 }
 
+const pendingWasmSignals = [];
+
 function callSyncRpc(method, args = []) {
   if (
     globalThis.__agentOSSyncRpc &&
@@ -2703,6 +2714,15 @@ const HOST_NET_TIMEOUT_SENTINEL = '__agentos_net_timeout__';
 
 function getHostNetSocket(fd) {
   return hostNetSockets.get(Number(fd) >>> 0) ?? null;
+}
+
+function allocateHostNetSocketFd() {
+  for (let fd = HOST_NET_SOCKET_FD_MIN; fd <= HOST_NET_SOCKET_FD_MAX; fd += 1) {
+    if (!hostNetSockets.has(fd)) {
+      return fd;
+    }
+  }
+  return null;
 }
 
 function dequeueHostNetBytes(socket, maxBytes) {
@@ -2795,13 +2815,19 @@ function parseHostNetAddress(raw) {
   };
 }
 
+function parseHostNetUnixAddress(raw) {
+  const value = String(raw ?? '');
+  return value.startsWith('unix:') ? value.slice(5) : null;
+}
+
 function parseHostNetListenAddress(raw) {
   const value = String(raw ?? '').trim();
   if (!value) {
     throw new Error('host_net listen address is required');
   }
-  if (value.startsWith('/')) {
-    return { path: value };
+  const unixPath = parseHostNetUnixAddress(value);
+  if (unixPath != null) {
+    return { path: unixPath };
   }
   const address = parseHostNetAddress(value);
   return { host: address.host, port: address.port };
@@ -2969,7 +2995,8 @@ function writeGuestBytes(ptr, maxLen, bytes, actualLenPtr) {
 // Perform a single NON-BLOCKING accept on a listening host_net socket. On success it
 // registers the accepted connection as a new host_net socket and returns
 // { acceptedFd, address } (address is a Buffer: "host:port" for TCP, the peer path for
-// AF_UNIX). Returns null when no connection is currently pending. Used by both net_poll
+// AF_UNIX), or { error } when accepting the pending connection failed. Returns null when
+// no connection is currently pending. Used by both net_poll
 // (to report accurate listener readiness) and net_accept (non-blocking semantics) so the
 // server never blocks inside accept() and starves already-connected clients.
 function tryHostNetAcceptOnce(socket) {
@@ -2984,7 +3011,11 @@ function tryHostNetAcceptOnce(socket) {
     return null;
   }
 
-  const acceptedFd = nextHostNetSocketFd++;
+  const acceptedFd = allocateHostNetSocketFd();
+  if (acceptedFd == null) {
+    callSyncRpc('net.destroy', [result.socketId]);
+    return { error: WASI_ERRNO_MFILE };
+  }
   hostNetSockets.set(acceptedFd, {
     domain: socket.domain,
     sockType: socket.sockType,
@@ -3010,7 +3041,7 @@ function tryHostNetAcceptOnce(socket) {
       port: result.info.remotePort,
     }), 'utf8');
   } else {
-    address = Buffer.from(String(result.info?.remotePath ?? ''), 'utf8');
+    address = Buffer.from(`unix:${String(result.info?.remotePath ?? '')}`, 'utf8');
   }
   return { acceptedFd, address };
 }
@@ -3040,6 +3071,7 @@ const hostNetImport = {
         process.env.AGENTOS_SANDBOX_ROOT.length > 0);
     try {
       while (true) {
+        dispatchPendingWasmSignals();
         const view = new DataView(instanceMemory.buffer);
         let ready = 0;
         // fds the kernel owns (PTY/pipe stdio in sidecar-managed mode): their readiness
@@ -3124,8 +3156,11 @@ const hostNetImport = {
           let response = null;
           try {
             response = callSyncRpc('__kernel_poll', [kernelTargets, sliceMs]);
-          } catch {
-            response = null;
+          } catch (error) {
+            traceHostProcess('kernel-poll-error', {
+              message: error instanceof Error ? error.message : String(error),
+            });
+            return WASI_ERRNO_FAULT;
           }
           const responseEntries = Array.isArray(response?.fds) ? response.fds : [];
           for (const entry of kernelEntries) {
@@ -3144,6 +3179,7 @@ const hostNetImport = {
         }
 
         if (ready > 0 || t === 0 || (deadline != null && Date.now() >= deadline)) {
+          dispatchPendingWasmSignals();
           new DataView(instanceMemory.buffer).setUint32(Number(retReadyPtr) >>> 0, ready >>> 0, true);
           return 0;
         }
@@ -3173,7 +3209,10 @@ const hostNetImport = {
       const numericType = Number(sockType) >>> 0;
       const numericProtocol = Number(protocol) >>> 0;
 
-      const fd = nextHostNetSocketFd++;
+      const fd = allocateHostNetSocketFd();
+      if (fd == null) {
+        return WASI_ERRNO_MFILE;
+      }
       hostNetSockets.set(fd, {
         domain: numericDomain,
         sockType: numericType,
@@ -3217,20 +3256,19 @@ const hostNetImport = {
       const nulAt = rawAddr.indexOf(String.fromCharCode(0));
       if (nulAt >= 0) rawAddr = rawAddr.slice(0, nulAt);
       rawAddr = rawAddr.trim();
-      // AF_UNIX path connect (e.g. X11 /tmp/.X11-unix/X0): the C library passes the
-      // raw sun_path, the same '/'-prefixed string net_bind/net_listen receive. Route it
-      // to the sidecar's path-based net.connect, which dials the host-backed unix socket
-      // the listener bound under the VM sandbox root, so two guests in one VM can talk.
-      if (rawAddr.startsWith('/')) {
+      // AF_UNIX addresses use an explicit wire prefix so relative paths and paths containing ':'
+      // cannot be mistaken for TCP host:port strings.
+      const unixPath = parseHostNetUnixAddress(rawAddr);
+      if (unixPath != null) {
         let result;
         try {
-          result = callSyncRpc('net.connect', [{ path: rawAddr }]);
+          result = callSyncRpc('net.connect', [{ path: unixPath }]);
         } catch (e) {
-          try { process.stderr.write('[host_net] connect ' + rawAddr + ' failed: ' + (e && e.message ? e.message : String(e)) + '\n'); } catch (_) {}
+          try { process.stderr.write('[host_net] connect ' + unixPath + ' failed: ' + (e && e.message ? e.message : String(e)) + '\n'); } catch (_) {}
           return WASI_ERRNO_FAULT;
         }
         if (!result || typeof result.socketId !== 'string') {
-          try { process.stderr.write('[host_net] ' + rawAddr + ' returned no socketId\n'); } catch (_) {}
+          try { process.stderr.write('[host_net] ' + unixPath + ' returned no socketId\n'); } catch (_) {}
           return WASI_ERRNO_FAULT;
         }
         socket.socketId = result.socketId;
@@ -3423,6 +3461,9 @@ const hostNetImport = {
         if (!accepted) {
           pumpSpawnedChildren(10);
         }
+      }
+      if (accepted.error != null) {
+        return accepted.error;
       }
       if (writeGuestUint32(retFdPtr, accepted.acceptedFd) !== WASI_ERRNO_SUCCESS) {
         return WASI_ERRNO_FAULT;
@@ -3720,6 +3761,8 @@ const hostNetImport = {
 
 const hostProcessImport = {
         proc_spawn(
+          execPathPtr,
+          execPathLen,
           argvPtr,
           argvLen,
           envpPtr,
@@ -3734,13 +3777,28 @@ const hostProcessImport = {
           if (permissionTier !== 'full') {
             return WASI_ERRNO_FAULT;
           }
+          traceHostProcess('proc-spawn-call', {
+            execPathPtr: Number(execPathPtr) >>> 0,
+            execPathLen: Number(execPathLen) >>> 0,
+            argvPtr: Number(argvPtr) >>> 0,
+            argvLen: Number(argvLen) >>> 0,
+            envpPtr: Number(envpPtr) >>> 0,
+            envpLen: Number(envpLen) >>> 0,
+            stdinFd: Number(stdinFd) >>> 0,
+            stdoutFd: Number(stdoutFd) >>> 0,
+            stderrFd: Number(stderrFd) >>> 0,
+            cwdPtr: Number(cwdPtr) >>> 0,
+            cwdLen: Number(cwdLen) >>> 0,
+            retPidPtr: Number(retPidPtr) >>> 0,
+          });
           try {
-            const argv = decodeNullSeparatedStrings(readGuestBytes(argvPtr, argvLen));
-            if (argv.length === 0) {
+            const command = readGuestString(execPathPtr, execPathLen);
+            if (command.length === 0) {
               return WASI_ERRNO_FAULT;
             }
-
-            const [command, ...args] = argv;
+            const argv = decodeNullSeparatedStrings(readGuestBytes(argvPtr, argvLen));
+            const argv0 = argv[0] ?? command;
+            const args = argv.slice(1);
             const env = parseSerializedEnv(readGuestBytes(envpPtr, envpLen));
             const cwd =
               Number(cwdLen) > 0 ? readGuestString(cwdPtr, cwdLen) : undefined;
@@ -3768,6 +3826,7 @@ const hostProcessImport = {
             }
             traceHostProcess('proc-spawn-begin', {
               command,
+              argv0,
               args,
               cwd: cwd ?? null,
               stdinFd: Number(stdinFd) >>> 0,
@@ -3797,6 +3856,7 @@ const hostProcessImport = {
                 command,
                 args,
                 options: {
+                  argv0,
                   cwd,
                   env,
                   internalBootstrapEnv: {},
@@ -3854,6 +3914,8 @@ const hostProcessImport = {
               stdinReadyAtMs: Date.now() + 100,
               delegateRetainedFds,
               retainedSpawnOutputHandles,
+              exitCode: null,
+              exitSignal: null,
               exitStatus: null,
       };
             spawnedChildren.set(pid, record);
@@ -3862,6 +3924,7 @@ const hostProcessImport = {
               command,
               childId: result.childId,
               pid,
+              resolvedArgs: result.args ?? null,
             });
             if (stdinRedirectBytes != null) {
               if (stdinRedirectBytes.length > 0) {
@@ -3882,7 +3945,7 @@ const hostProcessImport = {
             return WASI_ERRNO_FAULT;
           }
         },
-        proc_waitpid(pid, options, retStatusPtr, retPidPtr) {
+        proc_waitpid(pid, options, retExitCodePtr, retSignalPtr, retPidPtr) {
           const requestedPid = Number(pid) >>> 0;
           if (permissionTier !== 'full') {
             return requestedPid === 0xffffffff ? WASI_ERRNO_CHILD : WASI_ERRNO_SRCH;
@@ -3903,7 +3966,10 @@ const hostProcessImport = {
               pid: record.pid,
             });
             if (typeof record.exitStatus === 'number') {
-              if (writeGuestUint32(retStatusPtr, record.exitStatus) !== WASI_ERRNO_SUCCESS) {
+              if (writeGuestUint32(retExitCodePtr, record.exitCode ?? 0) !== WASI_ERRNO_SUCCESS) {
+                return WASI_ERRNO_FAULT;
+              }
+              if (writeGuestUint32(retSignalPtr, record.exitSignal ?? 0) !== WASI_ERRNO_SUCCESS) {
                 return WASI_ERRNO_FAULT;
               }
               const writePidResult = writeGuestUint32(retPidPtr, record.pid);
@@ -3956,7 +4022,10 @@ const hostProcessImport = {
 
               if (event.type === 'exit') {
                 processChildEvent(record, event);
-                if (writeGuestUint32(retStatusPtr, record.exitStatus ?? 1) !== WASI_ERRNO_SUCCESS) {
+                if (writeGuestUint32(retExitCodePtr, record.exitCode ?? 0) !== WASI_ERRNO_SUCCESS) {
+                  return WASI_ERRNO_FAULT;
+                }
+                if (writeGuestUint32(retSignalPtr, record.exitSignal ?? 0) !== WASI_ERRNO_SUCCESS) {
                   return WASI_ERRNO_FAULT;
                 }
                 const writePidResult = writeGuestUint32(retPidPtr, record.pid);
@@ -4153,9 +4222,42 @@ const hostProcessImport = {
             return WASI_ERRNO_FAULT;
           }
         },
+        proc_closefrom(lowFd) {
+          const minimumFd = Number(lowFd) >>> 0;
+          const openVirtualFds = new Set([
+            ...syntheticFdEntries.keys(),
+            ...passthroughHandles.keys(),
+            ...hostNetSockets.keys(),
+            ...delegateManagedFdRefCounts.keys(),
+          ]);
+          let firstError = WASI_ERRNO_SUCCESS;
+          for (const fd of [...openVirtualFds].sort((left, right) => left - right)) {
+            if (fd < minimumFd) {
+              continue;
+            }
+            const result = wasiImport.fd_close(fd);
+            if (
+              result !== WASI_ERRNO_SUCCESS &&
+              result !== WASI_ERRNO_BADF &&
+              firstError === WASI_ERRNO_SUCCESS
+            ) {
+              firstError = result;
+            }
+          }
+          return firstError;
+        },
         sleep_ms(milliseconds) {
           try {
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(milliseconds) >>> 0);
+            const waitArray = new Int32Array(new SharedArrayBuffer(4));
+            const deadline = Date.now() + (Number(milliseconds) >>> 0);
+            while (Date.now() < deadline) {
+              // Keep guest sleeps interruptible by V8 termination during SIGTERM,
+              // SIGKILL, and VM disposal. Also drain handled Wasm signals at
+              // syscall boundaries so cooperative handlers run during sleeps.
+              dispatchPendingWasmSignals();
+              Atomics.wait(waitArray, 0, 0, Math.max(1, Math.min(10, deadline - Date.now())));
+            }
+            dispatchPendingWasmSignals();
             return WASI_ERRNO_SUCCESS;
           } catch {
             return WASI_ERRNO_FAULT;
@@ -4174,11 +4276,12 @@ const hostProcessImport = {
               mask: decodeSignalMask(maskLo, maskHi),
               flags: Number(flags) >>> 0,
             };
-            emitControlMessage({
-              type: 'signal_state',
-              signal: Number(signal) >>> 0,
-              registration,
-            });
+            callSyncRpc('process.signal_state', [
+              Number(signal) >>> 0,
+              registration.action,
+              JSON.stringify(registration.mask),
+              registration.flags,
+            ]);
             return WASI_ERRNO_SUCCESS;
           } catch {
             return WASI_ERRNO_FAULT;
@@ -4418,14 +4521,14 @@ const hostFsImport = {
     try {
       const target = resolvePathOpenGuestPath(fd, pathPtr, pathLen);
       if (typeof target !== 'string') {
-        return 1;
+        return WASI_ERRNO_NOENT;
       }
       const mapping = resolveHostFsMapping(target);
       if (!mapping || typeof mapping.hostPath !== 'string') {
-        return 1;
+        return WASI_ERRNO_NOENT;
       }
       if (mapping.readOnly) {
-        return 1;
+        return WASI_ERRNO_ROFS;
       }
       traceHostProcess('host-fs-chmod', {
         target,
@@ -4434,9 +4537,11 @@ const hostFsImport = {
       });
       chmodMappedGuestPath(target, mapping.hostPath, Number(mode) >>> 0);
       return 0;
-    } catch {
-      traceHostProcess('host-fs-chmod-fault', {});
-      return 1;
+    } catch (error) {
+      traceHostProcess('host-fs-chmod-fault', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return mapSyntheticFsError(error);
     }
   },
   fchmod(fd, mode) {
@@ -4444,12 +4549,15 @@ const hostFsImport = {
       const descriptor = Number(fd) >>> 0;
       const handle = lookupFdHandle(descriptor);
       if (handle?.readOnly === true) {
-        return 1;
+        return WASI_ERRNO_ROFS;
       }
       if (typeof handle?.guestPath === 'string') {
         const mapping = resolveHostFsMapping(handle.guestPath);
-        if (!mapping || typeof mapping.hostPath !== 'string' || mapping.readOnly) {
-          return 1;
+        if (!mapping || typeof mapping.hostPath !== 'string') {
+          return WASI_ERRNO_NOENT;
+        }
+        if (mapping.readOnly) {
+          return WASI_ERRNO_ROFS;
         }
         chmodMappedGuestPath(handle.guestPath, mapping.hostPath, Number(mode) >>> 0);
         return 0;
@@ -4458,9 +4566,11 @@ const hostFsImport = {
         typeof handle?.targetFd === 'number' ? Number(handle.targetFd) >>> 0 : descriptor;
       fsModule.fchmodSync(targetFd, Number(mode) >>> 0);
       return 0;
-    } catch {
-      traceHostProcess('host-fs-fchmod-fault', {});
-      return 1;
+    } catch (error) {
+      traceHostProcess('host-fs-fchmod-fault', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return mapSyntheticFsError(error);
     }
   },
   ftruncate(fd, length) {
@@ -5595,11 +5705,17 @@ wasiImport.fd_write = (fd, iovs, iovsLen, nwrittenPtr) => {
 };
 
 wasiImport.fd_close = (fd) => {
+  const numericFd = Number(fd) >>> 0;
   traceHostProcess('fd-close-begin', {
-    fd: Number(fd) >>> 0,
-    syntheticKind: syntheticFdEntries.get(Number(fd) >>> 0)?.kind ?? null,
-    passthroughKind: passthroughHandles.get(Number(fd) >>> 0)?.kind ?? null,
+    fd: numericFd,
+    syntheticKind: syntheticFdEntries.get(numericFd)?.kind ?? null,
+    passthroughKind: passthroughHandles.get(numericFd)?.kind ?? null,
   });
+  if (hostNetSockets.has(numericFd)) {
+    return __agentOSWasiMeasurePhase('fd_close', 'host_socket_close', () =>
+      hostNetImport.net_close(numericFd)
+    );
+  }
   if (__agentOSWasiMeasurePhase('fd_close', 'synthetic_close', () => closeSyntheticFd(fd))) {
     traceHostProcess('fd-close-synthetic', { fd: Number(fd) >>> 0 });
     return WASI_ERRNO_SUCCESS;
@@ -5728,7 +5844,9 @@ wasiImport.poll_oneoff = (inPtr, outPtr, nsubscriptions, neventsPtr) => {
     });
   }
 
-  if (!hasSyntheticSubscription && !hasRemappedPassthroughSubscription) {
+  const hasClockSubscription = subscriptions.some((subscription) => subscription.kind === 'clock');
+
+  if (!hasSyntheticSubscription && !hasRemappedPassthroughSubscription && !hasClockSubscription) {
     return delegateManagedPollOneoff
       ? delegateManagedPollOneoff(inPtr, outPtr, nsubscriptions, neventsPtr)
       : WASI_ERRNO_BADF;
@@ -5775,8 +5893,17 @@ wasiImport.poll_oneoff = (inPtr, outPtr, nsubscriptions, neventsPtr) => {
         pollTargets,
         Math.max(0, Number(waitMs) >>> 0),
       ]);
-    } catch {
-      return [];
+    } catch (error) {
+      traceHostProcess('kernel-poll-error', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return subscriptions.map((subscription) => ({
+        userdata: subscription.userdata,
+        error: WASI_ERRNO_FAULT,
+        type: subscription.kind === 'fd_read' ? 1 : 2,
+        nbytes: 0,
+        flags: 0,
+      }));
     }
 
     const responseEntries = Array.isArray(response?.fds) ? response.fds : [];
@@ -5812,6 +5939,7 @@ wasiImport.poll_oneoff = (inPtr, outPtr, nsubscriptions, neventsPtr) => {
   }
 
   while (readyEvents.length === 0) {
+    dispatchPendingWasmSignals();
     for (const subscription of subscriptions) {
       if (subscription.error != null) {
         readyEvents.push({
@@ -5895,7 +6023,7 @@ wasiImport.poll_oneoff = (inPtr, outPtr, nsubscriptions, neventsPtr) => {
     );
   }
 
-  if (readyEvents.length === 0 && subscriptions.some((subscription) => subscription.kind === 'clock')) {
+    if (readyEvents.length === 0 && hasClockSubscription) {
     const clockSubscription = subscriptions.find((subscription) => subscription.kind === 'clock');
     readyEvents.push({
       userdata: clockSubscription.userdata,
@@ -6036,6 +6164,27 @@ function dispatchWasmSignal(signal) {
   }
 }
 
+function dispatchPendingWasmSignals() {
+  while (pendingWasmSignals.length > 0) {
+    dispatchWasmSignal(pendingWasmSignals.shift());
+  }
+  while (true) {
+    let signal;
+    try {
+      signal = callSyncRpc('process.take_signal', []);
+    } catch (error) {
+      if (error?.code === 'ERR_AGENTOS_WASM_SYNC_RPC_UNAVAILABLE') {
+        return;
+      }
+      throw error;
+    }
+    if (typeof signal !== 'number') {
+      return;
+    }
+    dispatchWasmSignal(signal);
+  }
+}
+
 Object.defineProperty(globalThis, '__secureExecWasmSignalDispatch', {
   configurable: true,
   writable: true,
@@ -6044,7 +6193,9 @@ Object.defineProperty(globalThis, '__secureExecWasmSignalDispatch', {
       typeof payload?.number === 'number'
         ? payload.number
         : signalNumberFromName(payload?.signal);
-    dispatchWasmSignal(signal);
+    if (signal > 0) {
+      pendingWasmSignals.push(signal);
+    }
   },
 });
 

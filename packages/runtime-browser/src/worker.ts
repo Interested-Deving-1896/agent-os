@@ -1,13 +1,13 @@
-import { hmac as nobleHmac } from "@noble/hashes/hmac.js";
 import {
 	cbc as nobleAesCbc,
 	ctr as nobleAesCtr,
 	gcm as nobleAesGcm,
 } from "@noble/ciphers/aes.js";
+import { hmac as nobleHmac } from "@noble/hashes/hmac.js";
 import { md5, sha1 } from "@noble/hashes/legacy.js";
 import { pbkdf2 as noblePbkdf2 } from "@noble/hashes/pbkdf2.js";
-import { sha224, sha256, sha384, sha512 } from "@noble/hashes/sha2.js";
 import { scrypt as nobleScrypt } from "@noble/hashes/scrypt.js";
+import { sha224, sha256, sha384, sha512 } from "@noble/hashes/sha2.js";
 import { transform } from "sucrase";
 import type {
 	BrowserChildProcessPollEvent,
@@ -16,11 +16,6 @@ import type {
 import { createBrowserNetworkAdapter } from "./driver.js";
 import { base64ToBytes, toUint8Array } from "./encoding.js";
 import { posixErrno } from "./errno.js";
-import {
-	PROCESS_SIGNAL_NUMBERS,
-	defaultSignalExitCode,
-	signalNumberForEvent,
-} from "./signals.js";
 import type {
 	ExecResult,
 	NetworkAdapter,
@@ -40,6 +35,11 @@ import {
 	POLYFILL_CODE_MAP,
 	transformDynamicImport,
 } from "./runtime.js";
+import {
+	defaultSignalExitCode,
+	PROCESS_SIGNAL_NUMBERS,
+	signalNumberForEvent,
+} from "./signals.js";
 import {
 	assertBrowserSyncBridgeSupport,
 	type BrowserSyncBridgeErrorPayload,
@@ -94,8 +94,9 @@ const MAX_STDIO_MESSAGE_CHARS = 8192;
 
 function eventForSignalNumber(signal: number): string {
 	return (
-		Object.entries(PROCESS_SIGNAL_NUMBERS).find(([, value]) => value === signal)?.[0] ??
-		`SIG${signal}`
+		Object.entries(PROCESS_SIGNAL_NUMBERS).find(
+			([, value]) => value === signal,
+		)?.[0] ?? `SIG${signal}`
 	);
 }
 
@@ -1626,6 +1627,12 @@ function createFsModule(syncBridge: ReturnType<typeof createSyncBridgeClient>) {
 		fstatSync(fd: number) {
 			return statSync(requireOpenFd(fd, "fstat").path);
 		},
+		fchmodSync(fd: number, mode: number) {
+			syncBridge.requestVoid("fs.chmod", [
+				requireOpenFd(fd, "fchmod").path,
+				Number(mode) || 0,
+			]);
+		},
 		ftruncateSync(fd: number, length = 0) {
 			syncBridge.requestVoid("fs.truncate", [
 				requireOpenFd(fd, "ftruncate").path,
@@ -2711,7 +2718,11 @@ function createBrowserProcess(): Record<string, unknown> {
 			slaveFd = pair.slaveFd;
 			path = typeof pair.path === "string" ? pair.path : undefined;
 			ptySyncBridge().requestVoid("pty.resize", [
-				{ fd: slaveFd as number, cols: Math.max(1, columns), rows: Math.max(1, rows) },
+				{
+					fd: slaveFd as number,
+					cols: Math.max(1, columns),
+					rows: Math.max(1, rows),
+				},
 			]);
 			if (activeExecutionId && activeProcessRequestId !== null) {
 				postPtyOpened(activeExecutionId, activeProcessRequestId, {
@@ -3265,7 +3276,9 @@ function createBrowserProcess(): Record<string, unknown> {
 		},
 		kill(pid: number, signal: string | number = "SIGTERM") {
 			if (pid !== processBridge.pid) {
-				throw new Error(`process.kill only supports the current browser process pid (${processBridge.pid})`);
+				throw new Error(
+					`process.kill only supports the current browser process pid (${processBridge.pid})`,
+				);
 			}
 			const event =
 				typeof signal === "number"

@@ -5,4 +5,4 @@
 - `just shell` always uses the in-repo AgentOS sidecar it just built, even if the host environment exports `AGENTOS_SIDECAR_BIN`. To deliberately test another binary, invoke the shell CLI directly with that override.
 - `just shell --actor` additionally builds and pins the in-repo actor plugin. Actor development requires the Rivet repo at `../r6` (override with `AGENTOS_R6_ROOT`); the recipe installs the filtered `rivetkit` dependency graph there when its `tsx` loader is missing.
 - Do not implement or route through a custom/synthetic shell, prompt, line editor, or command parser; interactive shell mode must launch native Bash through the terminal/PTY path so behavior matches `docker run -it bash`.
-- Keep `agentos-shell` loading every command-providing package from the in-repo `registry/software/`; when that registry changes, update the imports, package dependencies, and smoke coverage here.
+- Keep `agentos-shell` loading every command-providing package from the in-repo `software/`; when that registry changes, update the imports, package dependencies, and smoke coverage here.

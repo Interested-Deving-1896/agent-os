@@ -37,7 +37,7 @@ const SIDECAR_BINARY =
 	process.env.AGENTOS_SIDECAR_BIN ??
 	resolve(REPO_ROOT, "target/debug/agentos-sidecar");
 const REGISTRY_SH_CANDIDATES = [
-	"registry/native/target/wasm32-wasip1/release/commands/sh",
+	"toolchain/target/wasm32-wasip1/release/commands/sh",
 ].map((candidate) => resolve(REPO_ROOT, candidate));
 const REGISTRY_SH = REGISTRY_SH_CANDIDATES.find((candidate) =>
 	existsSync(candidate),

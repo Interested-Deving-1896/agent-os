@@ -408,7 +408,7 @@ function FooterCta() {
 			</p>
 			<div className="flex flex-wrap items-center justify-center gap-3">
 				<a
-					href="https://github.com/rivet-dev/agentos/blob/main/registry/CONTRIBUTING.md"
+					href="https://github.com/rivet-dev/agentos/blob/main/software/CONTRIBUTING.md"
 					target="_blank"
 					rel="noopener noreferrer"
 					className="selection-dark inline-flex items-center gap-2 rounded-lg bg-ink px-5 py-2.5 text-sm font-medium text-cream no-underline transition-colors hover:bg-ink/85"

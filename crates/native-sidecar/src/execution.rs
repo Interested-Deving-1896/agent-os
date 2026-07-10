@@ -41,10 +41,10 @@ use crate::state::{
     JavascriptTlsDataValue, JavascriptTlsMaterial, JavascriptUdpFamily, JavascriptUdpSocketEvent,
     JavascriptUnixListenerEvent, KernelSocketReadinessEvent, KernelSocketReadinessRegistry,
     KernelSocketReadinessTarget, LoopbackTlsPendingWriteHandle, LoopbackTlsPendingWriteState,
-    NetworkResourceCounts, PendingTcpSocket, PendingUnixSocket, ProcNetEntry, ProcessEventEnvelope,
-    PythonHostSocket, ResolvedChildProcessExecution, ResolvedTcpConnectAddr, SharedBridge,
-    SharedSidecarRequestClient, SidecarKernel, SocketQueryKind, ToolExecution, VmDnsConfig,
-    VmListenPolicy, VmState, DEFAULT_JAVASCRIPT_NET_BACKLOG, EXECUTION_DRIVER_NAME,
+    NetworkResourceCounts, PendingKernelStdin, PendingTcpSocket, PendingUnixSocket, ProcNetEntry,
+    ProcessEventEnvelope, PythonHostSocket, ResolvedChildProcessExecution, ResolvedTcpConnectAddr,
+    SharedBridge, SharedSidecarRequestClient, SidecarKernel, SocketQueryKind, ToolExecution,
+    VmDnsConfig, VmListenPolicy, VmState, DEFAULT_JAVASCRIPT_NET_BACKLOG, EXECUTION_DRIVER_NAME,
     EXECUTION_SANDBOX_ROOT_ENV, JAVASCRIPT_COMMAND, LOOPBACK_EXEMPT_PORTS_ENV,
     MAPPED_HOST_FD_START, PYTHON_COMMAND, TOOL_DRIVER_NAME,
     VM_LISTEN_ALLOW_PRIVILEGED_METADATA_KEY, WASM_COMMAND, WASM_STDIO_SYNC_RPC_ENV,
@@ -471,6 +471,7 @@ impl ActiveProcess {
             kernel_pid,
             kernel_handle,
             kernel_stdin_writer_fd: None,
+            pending_kernel_stdin: PendingKernelStdin::default(),
             tty_master_fd: None,
             runtime,
             detached: false,
@@ -483,6 +484,7 @@ impl ActiveProcess {
             next_mapped_host_fd: MAPPED_HOST_FD_START,
             pending_execution_events: VecDeque::new(),
             pending_self_signal_exit: None,
+            pending_wasm_signals: VecDeque::new(),
             child_processes: BTreeMap::new(),
             next_child_process_id: 0,
             http_servers: BTreeMap::new(),
@@ -525,6 +527,14 @@ impl ActiveProcess {
             return Err(process_event_queue_overflow_error());
         }
         self.pending_execution_events.push_back(event);
+        Ok(())
+    }
+
+    pub(crate) fn queue_pending_wasm_signal(&mut self, signal: i32) -> Result<(), SidecarError> {
+        if self.pending_wasm_signals.len() >= MAX_PROCESS_EVENT_QUEUE {
+            return Err(process_event_queue_overflow_error());
+        }
+        self.pending_wasm_signals.push_back(signal);
         Ok(())
     }
 
@@ -759,6 +769,10 @@ fn closed_python_event_channel(message: &str) -> bool {
 
 fn closed_wasm_event_channel(message: &str) -> bool {
     message == WasmExecutionError::EventChannelClosed.to_string()
+}
+
+fn is_expected_v8_termination_diagnostic(chunk: &[u8]) -> bool {
+    chunk == b"Error: Execution terminated\n"
 }
 
 fn missing_vm_error(vm_id: &str) -> SidecarError {
@@ -4542,6 +4556,8 @@ where
         let (connection_id, session_id, vm_id) = self.vm_scope_for(&request.ownership)?;
         self.require_owned_vm(&connection_id, &session_id, &vm_id)?;
 
+        self.drain_root_signal_state_events(&vm_id, &payload.process_id)?;
+
         let handlers = self
             .vms
             .get(&vm_id)
@@ -4553,6 +4569,77 @@ where
             response: signal_state_response(request, payload.process_id, handlers),
             events: Vec::new(),
         })
+    }
+
+    fn drain_root_signal_state_events(
+        &mut self,
+        vm_id: &str,
+        process_id: &str,
+    ) -> Result<(), SidecarError> {
+        let mut deferred = VecDeque::new();
+
+        loop {
+            let event = {
+                let Some(vm) = self.vms.get_mut(vm_id) else {
+                    break;
+                };
+                let Some(process) = vm.active_processes.get_mut(process_id) else {
+                    break;
+                };
+                if let Some(event) = process.pending_execution_events.pop_front() {
+                    Some(event)
+                } else {
+                    match process.execution.poll_event_blocking(Duration::ZERO) {
+                        Ok(event) => event,
+                        Err(SidecarError::Execution(message))
+                            if (process.runtime == GuestRuntimeKind::JavaScript
+                                && closed_javascript_event_channel(&message))
+                                || (process.runtime == GuestRuntimeKind::Python
+                                    && closed_python_event_channel(&message))
+                                || (process.runtime == GuestRuntimeKind::WebAssembly
+                                    && closed_wasm_event_channel(&message)) =>
+                        {
+                            None
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
+
+            let Some(event) = event else {
+                break;
+            };
+
+            match event {
+                ActiveExecutionEvent::SignalState {
+                    signal,
+                    registration,
+                } => {
+                    if let Some(vm) = self.vms.get_mut(vm_id) {
+                        apply_process_signal_state_update(
+                            &mut vm.signal_states,
+                            process_id,
+                            signal,
+                            registration,
+                        );
+                    }
+                }
+                other => deferred.push_back(other),
+            }
+        }
+
+        if let Some(vm) = self.vms.get_mut(vm_id) {
+            if let Some(process) = vm.active_processes.get_mut(process_id) {
+                for event in deferred.into_iter().rev() {
+                    if process.pending_execution_events.len() >= MAX_PROCESS_EVENT_QUEUE {
+                        return Err(process_event_queue_overflow_error());
+                    }
+                    process.pending_execution_events.push_front(event);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) async fn get_zombie_timer_count(
@@ -4646,7 +4733,7 @@ where
                 KillBehavior::SharedV8DispatchOrTerminate
             }
             ActiveExecution::Wasm(execution) if execution.uses_shared_v8_runtime() => {
-                KillBehavior::SharedV8Terminate
+                KillBehavior::SharedV8DispatchOrTerminate
             }
             ActiveExecution::Python(execution) if execution.uses_shared_v8_runtime() => {
                 KillBehavior::SharedV8Terminate
@@ -4699,8 +4786,37 @@ where
                 }
             }
             KillBehavior::SharedV8DispatchOrTerminate => {
-                if signal != 0 && !dispatch_v8_process_signal(process, signal)? {
-                    process.execution.terminate()?;
+                if signal != 0 {
+                    let is_shared_wasm = matches!(
+                        &process.execution,
+                        ActiveExecution::Wasm(execution) if execution.uses_shared_v8_runtime()
+                    );
+                    if is_shared_wasm {
+                        let action = vm
+                            .signal_states
+                            .get(process_id)
+                            .and_then(|handlers| handlers.get(&(signal as u32)))
+                            .map(|registration| &registration.action);
+                        match action {
+                            Some(SignalDispositionAction::Ignore) => {}
+                            Some(SignalDispositionAction::User) => {
+                                process.queue_pending_wasm_signal(signal)?;
+                            }
+                            Some(SignalDispositionAction::Default) | None => {
+                                if !matches!(
+                                    canonical_signal_name(signal),
+                                    Some("SIGWINCH" | "SIGCHLD" | "SIGURG")
+                                ) {
+                                    process.execution.terminate()?;
+                                    process.queue_pending_execution_event(
+                                        ActiveExecutionEvent::Exited(128 + signal),
+                                    )?;
+                                }
+                            }
+                        }
+                    } else if !dispatch_v8_process_signal(process, signal)? {
+                        process.execution.terminate()?;
+                    }
                 }
             }
             KillBehavior::Noop => {}
@@ -5895,6 +6011,7 @@ where
                     command,
                     args: request.args.clone(),
                     options: JavascriptChildProcessSpawnOptions {
+                        argv0: None,
                         cwd,
                         env: request.env.clone(),
                         input: None,
@@ -6677,6 +6794,12 @@ where
             &parent_host_cwd,
             &mut request,
         )?;
+        if let (Some(argv0), Some(current_argv0)) = (
+            request.options.argv0.as_ref(),
+            resolved.process_args.first_mut(),
+        ) {
+            current_argv0.clone_from(argv0);
+        }
         {
             let vm = self
                 .vms
@@ -6686,6 +6809,23 @@ where
         }
         let resolved = resolved;
         record_execute_phase("child_process_resolve_execution", phase_start.elapsed());
+        let parent_sync_roots = {
+            let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
+            let parent = vm
+                .active_processes
+                .get(process_id)
+                .ok_or_else(|| missing_process_error(vm_id, process_id))?;
+            (parent.host_write_dirty_recursive()
+                || !parent.clean_host_writes_are_observable_recursive())
+            .then(|| (parent.host_cwd.clone(), parent.guest_cwd.clone()))
+        };
+        if let Some((host_cwd, guest_cwd)) = parent_sync_roots {
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            sync_process_host_roots_to_kernel(vm, &host_cwd, &guest_cwd)?;
+        }
         let (parent_kernel_pid, child_process_id) = {
             let vm = self
                 .vms
@@ -7188,6 +7328,12 @@ where
             &parent_host_cwd,
             &mut request,
         )?;
+        if let (Some(argv0), Some(current_argv0)) = (
+            request.options.argv0.as_ref(),
+            resolved.process_args.first_mut(),
+        ) {
+            current_argv0.clone_from(argv0);
+        }
         {
             let vm = self
                 .vms
@@ -7197,6 +7343,29 @@ where
         }
         let resolved = resolved;
         record_execute_phase("child_process_resolve_execution", phase_start.elapsed());
+        let parent_sync_roots = {
+            let vm = self.vms.get(vm_id).ok_or_else(|| missing_vm_error(vm_id))?;
+            let root = vm
+                .active_processes
+                .get(process_id)
+                .ok_or_else(|| missing_process_error(vm_id, process_id))?;
+            let parent =
+                Self::active_process_by_path(root, current_process_path).ok_or_else(|| {
+                    SidecarError::InvalidState(format!(
+                        "unknown child process path {current_process_label} during nested spawn"
+                    ))
+                })?;
+            (parent.host_write_dirty_recursive()
+                || !parent.clean_host_writes_are_observable_recursive())
+            .then(|| (parent.host_cwd.clone(), parent.guest_cwd.clone()))
+        };
+        if let Some((host_cwd, guest_cwd)) = parent_sync_roots {
+            let vm = self
+                .vms
+                .get_mut(vm_id)
+                .ok_or_else(|| missing_vm_error(vm_id))?;
+            sync_process_host_roots_to_kernel(vm, &host_cwd, &guest_cwd)?;
+        }
 
         let sidecar_requests = self.sidecar_requests.clone();
         let vm = self
@@ -7837,6 +8006,11 @@ where
         {
             return Ok(false);
         }
+        // Top off the child's stdin pipe from any host-side backlog before
+        // probing readiness: the child draining the pipe is exactly what frees
+        // capacity for the next queued stdin bytes (and, once the backlog is
+        // empty, executes a deferred stdin close so EOF arrives in order).
+        flush_pending_kernel_stdin(kernel, child)?;
         let now = Instant::now();
         let requested_timeout_ms = match request.method.as_str() {
             "__kernel_stdin_read" => parse_kernel_stdin_read_args(request)?.1,
@@ -8085,6 +8259,26 @@ where
                     }));
                 }
                 ActiveExecutionEvent::Stderr(chunk) => {
+                    let suppress_termination_diagnostic = {
+                        let Some(vm) = self.vms.get_mut(vm_id) else {
+                            return Ok(Value::Null);
+                        };
+                        let Some(parent) = Self::descendant_parent_process_mut(
+                            vm,
+                            process_id,
+                            current_process_path,
+                        ) else {
+                            return Ok(Value::Null);
+                        };
+                        let Some(child) = parent.child_processes.get(child_process_id) else {
+                            return Ok(Value::Null);
+                        };
+                        child.pending_self_signal_exit.is_some()
+                            && is_expected_v8_termination_diagnostic(&chunk)
+                    };
+                    if suppress_termination_diagnostic {
+                        continue;
+                    }
                     return Ok(json!({
                         "type": "stderr",
                         "data": javascript_sync_rpc_bytes_value(&chunk),
@@ -8137,7 +8331,7 @@ where
                     let Some(vm) = self.vms.get_mut(vm_id) else {
                         return Ok(Value::Null);
                     };
-                    let signal_name = {
+                    let termination_signal = {
                         let Some(parent) = Self::descendant_parent_process_mut(
                             vm,
                             process_id,
@@ -8148,14 +8342,14 @@ where
                         let Some(child) = parent.child_processes.get_mut(child_process_id) else {
                             return Ok(Value::Null);
                         };
-                        child.pending_self_signal_exit.take().and_then(|signal| {
-                            if exit_code == 128 + signal {
-                                canonical_signal_name(signal).map(str::to_owned)
-                            } else {
-                                None
-                            }
-                        })
+                        child.pending_self_signal_exit.take()
                     };
+                    let signal_name = termination_signal
+                        .and_then(canonical_signal_name)
+                        .map(str::to_owned);
+                    let process_exit_code = termination_signal
+                        .map(|signal| 128 + signal)
+                        .unwrap_or(exit_code);
                     let (parent_runtime_pid, parent_v8_signal_session, should_signal_parent) = {
                         let Some(parent) =
                             Self::descendant_parent_process(vm, process_id, current_process_path)
@@ -8195,7 +8389,7 @@ where
                     release_inherited_child_raw_mode(&mut vm.kernel, &child)?;
                     let kernel_readiness = Arc::clone(&vm.kernel_socket_readiness);
                     terminate_child_process_tree(&mut vm.kernel, &mut child, &kernel_readiness);
-                    child.kernel_handle.finish(exit_code);
+                    child.kernel_handle.finish(process_exit_code);
                     let _ = vm.kernel.wait_and_reap(child.kernel_pid);
                     vm.signal_states.remove(child_process_id);
                     for (detached_process_id, detached_child) in detached_children {
@@ -8213,7 +8407,10 @@ where
                     }
                     let mut payload = Map::new();
                     payload.insert(String::from("type"), Value::String(String::from("exit")));
-                    payload.insert(String::from("exitCode"), Value::from(exit_code));
+                    payload.insert(
+                        String::from("exitCode"),
+                        termination_signal.map_or_else(|| Value::from(exit_code), |_| Value::Null),
+                    );
                     if let Some(signal_name) = signal_name {
                         payload.insert(String::from("signal"), Value::String(signal_name));
                     }
@@ -8620,6 +8817,11 @@ where
         let Some(vm) = self.vms.get_mut(vm_id) else {
             return Ok(());
         };
+        let registration = vm
+            .signal_states
+            .get(child_process_id)
+            .and_then(|handlers| handlers.get(&(signal as u32)))
+            .map(|registration| registration.action.clone());
         let Some(root) = vm.active_processes.get_mut(process_id) else {
             return Ok(());
         };
@@ -8630,7 +8832,7 @@ where
         let Some(child) = parent.child_processes.get_mut(child_process_id) else {
             return Ok(());
         };
-        terminate_tracked_child_process_for_signal(&mut vm.kernel, child, signal)?;
+        signal_tracked_child_process(&mut vm.kernel, child, signal, registration.as_ref())?;
         let child_process_label = if current_process_path.is_empty() {
             child_process_id.to_owned()
         } else {
@@ -8804,9 +9006,10 @@ where
                         "ESRCH: unknown process pid {target_pid}"
                     )));
                 };
-                if let Some(session) = target.execution.javascript_v8_session_handle().filter(
-                    |_| matches!(&target.execution, ActiveExecution::Javascript(execution) if execution.uses_shared_v8_runtime())
-                        || matches!(&target.execution, ActiveExecution::Wasm(execution) if execution.uses_shared_v8_runtime()),
+                if matches!(&target.execution, ActiveExecution::Wasm(execution) if execution.uses_shared_v8_runtime()) {
+                    target.queue_pending_wasm_signal(signal)?;
+                } else if let Some(session) = target.execution.javascript_v8_session_handle().filter(
+                    |_| matches!(&target.execution, ActiveExecution::Javascript(execution) if execution.uses_shared_v8_runtime()),
                 ) {
                     dispatch_v8_session_signal_async(session, signal);
                 } else if !dispatch_v8_process_signal(target, signal)? {
@@ -8959,6 +9162,11 @@ where
         let Some(vm) = self.vms.get_mut(vm_id) else {
             return Ok(());
         };
+        let registration = vm
+            .signal_states
+            .get(child_process_id)
+            .and_then(|handlers| handlers.get(&(signal as u32)))
+            .map(|registration| registration.action.clone());
         let process = vm
             .active_processes
             .get_mut(process_id)
@@ -8972,7 +9180,7 @@ where
                     "unknown child process {child_process_id} during kill"
                 ))
             })?;
-        terminate_tracked_child_process_for_signal(&mut vm.kernel, child, signal)?;
+        signal_tracked_child_process(&mut vm.kernel, child, signal, registration.as_ref())?;
         emit_security_audit_event(
             &self.bridge,
             vm_id,
@@ -9034,6 +9242,12 @@ where
                 let Some(vm) = self.vms.get_mut(vm_id) else {
                     return Ok(());
                 };
+                let signal_key = path.last().map(String::as_str).unwrap_or(&process_id);
+                let registration = vm
+                    .signal_states
+                    .get(signal_key)
+                    .and_then(|handlers| handlers.get(&(signal as u32)))
+                    .map(|registration| registration.action.clone());
                 let Some(root) = vm.active_processes.get_mut(&process_id) else {
                     return Ok(());
                 };
@@ -9042,7 +9256,12 @@ where
                         "ESRCH: no such process {target_kernel_pid}"
                     )));
                 };
-                terminate_tracked_child_process_for_signal(&mut vm.kernel, target, signal)?;
+                signal_tracked_child_process(
+                    &mut vm.kernel,
+                    target,
+                    signal,
+                    registration.as_ref(),
+                )?;
                 emit_security_audit_event(
                     &self.bridge,
                     vm_id,
@@ -9132,37 +9351,38 @@ where
     }
 }
 
-/// Applies a kill signal to a tracked child execution. Shared-runtime
-/// executions for lethal signals are terminated directly with a synthetic
-/// signal exit so child polls observe a prompt close; everything else routes
-/// through the kernel process table.
-fn terminate_tracked_child_process_for_signal(
+/// Applies a signal to a tracked child using the same default/ignore/user
+/// disposition rules as Linux. Default-terminating signals preserve their
+/// signal identity separately from the shell-style backend exit code.
+fn signal_tracked_child_process(
     kernel: &mut SidecarKernel,
     child: &mut ActiveProcess,
     signal: i32,
+    registration: Option<&SignalDispositionAction>,
 ) -> Result<(), SidecarError> {
-    let should_terminate_shared_runtime = child.execution.uses_shared_v8_runtime()
-        && signal != 0
-        && !matches!(
-            signal,
-            libc::SIGHUP
-                | libc::SIGINT
-                | libc::SIGTERM
-                | libc::SIGCHLD
-                | libc::SIGWINCH
-                | libc::SIGSTOP
-                | libc::SIGCONT
-        );
-    if should_terminate_shared_runtime {
-        child.execution.terminate()?;
-        child.pending_self_signal_exit = Some(signal);
-        child.queue_pending_execution_event(ActiveExecutionEvent::Exited(128 + signal))?;
-    } else {
-        kernel
+    if signal == 0 || matches!(signal, libc::SIGSTOP | libc::SIGCONT) {
+        return kernel
             .kill_process(EXECUTION_DRIVER_NAME, child.kernel_pid, signal)
-            .map_err(kernel_error)?;
+            .map_err(kernel_error);
     }
-    Ok(())
+
+    match registration {
+        Some(SignalDispositionAction::Ignore) => Ok(()),
+        Some(SignalDispositionAction::User) => kernel
+            .kill_process(EXECUTION_DRIVER_NAME, child.kernel_pid, signal)
+            .map_err(kernel_error),
+        Some(SignalDispositionAction::Default) | None
+            if matches!(
+                canonical_signal_name(signal),
+                Some("SIGWINCH" | "SIGCHLD" | "SIGURG")
+            ) =>
+        {
+            Ok(())
+        }
+        Some(SignalDispositionAction::Default) | None => {
+            apply_active_process_default_signal(kernel, child, signal)
+        }
+    }
 }
 
 fn sidecar_error_is_esrch(error: &SidecarError) -> bool {
@@ -9186,15 +9406,23 @@ fn apply_active_process_default_signal(
 
     if process.execution.uses_shared_v8_runtime() {
         process.execution.terminate()?;
-        if signal != 0 && matches!(process.execution, ActiveExecution::Wasm(_)) {
-            process.queue_pending_execution_event(ActiveExecutionEvent::Exited(128 + signal))?;
+        if signal != 0 {
+            process.pending_self_signal_exit = Some(signal);
+            if matches!(process.execution, ActiveExecution::Wasm(_)) {
+                process
+                    .queue_pending_execution_event(ActiveExecutionEvent::Exited(128 + signal))?;
+            }
         }
         return Ok(());
     }
 
     kernel
         .kill_process(EXECUTION_DRIVER_NAME, process.kernel_pid, signal)
-        .map_err(kernel_error)
+        .map_err(kernel_error)?;
+    if signal != 0 {
+        process.pending_self_signal_exit = Some(signal);
+    }
+    Ok(())
 }
 
 fn map_wasm_signal_registration(
@@ -9885,8 +10113,7 @@ pub(crate) fn sync_active_process_host_writes_to_kernel(
     vm: &mut VmState,
 ) -> Result<(), SidecarError> {
     if vm.root_filesystem_mode != RootFilesystemMode::ReadOnly {
-        let shadow_root = vm.cwd.clone();
-        sync_host_directory_tree_to_kernel(vm, &shadow_root, "/")?;
+        sync_vm_shadow_root_to_kernel(vm)?;
     }
 
     let normalized_vm_root = normalize_host_path(&vm.cwd);
@@ -9896,6 +10123,88 @@ pub(crate) fn sync_active_process_host_writes_to_kernel(
     }
 
     Ok(())
+}
+
+/// Syncs the VM shadow root into the kernel VFS and reconciles deletions.
+///
+/// The walk itself is additive (it copies shadow entries into the kernel), so
+/// on its own it can never express a guest deletion performed directly on the
+/// shadow tree — a removed file would be resurrected forever. To get real
+/// Linux semantics the walk records every guest path it sees and diffs that
+/// set against the previous walk's inventory: paths that were present in the
+/// shadow before and are gone now are removed from the kernel VFS as well.
+///
+/// Deletion propagation is scoped to the guest-writable shadow region: it only
+/// runs for the VM shadow root walk (never for external host roots), re-checks
+/// the protected/mount skip list, never touches the POSIX bootstrap skeleton,
+/// and removes directories non-recursively so a kernel directory that still
+/// has kernel-only content (for example a mount point or a path that was never
+/// materialized into the shadow) is left in place with a warning.
+fn sync_vm_shadow_root_to_kernel(vm: &mut VmState) -> Result<(), SidecarError> {
+    let shadow_root = normalize_host_path(&vm.cwd);
+    if host_sync_root_is_filesystem_root(&shadow_root) {
+        tracing::warn!("skipping host shadow sync rooted at the host filesystem root");
+        return Ok(());
+    }
+    let mut synced_file_times = BTreeMap::new();
+    let mut inventory = BTreeSet::new();
+    sync_host_directory_tree_to_kernel_inner(
+        vm,
+        &shadow_root,
+        &shadow_root,
+        "/",
+        &mut synced_file_times,
+        Some(&mut inventory),
+    )?;
+    propagate_shadow_deletions_to_kernel(vm, &inventory);
+    vm.shadow_sync_inventory = inventory;
+    Ok(())
+}
+
+/// Removes kernel paths whose shadow copy disappeared since the last walk.
+///
+/// Best-effort by design: a failure to reconcile one stale path must not
+/// poison the guest filesystem operation that triggered the sync, so failures
+/// are surfaced as host-visible warnings instead of errors. Children sort
+/// after their parents in the `BTreeSet`, so the reverse iteration removes
+/// leaves before the directories that contain them.
+fn propagate_shadow_deletions_to_kernel(vm: &mut VmState, current: &BTreeSet<String>) {
+    if vm.shadow_sync_inventory.is_empty() {
+        return;
+    }
+    let stale: Vec<String> = vm
+        .shadow_sync_inventory
+        .iter()
+        .rev()
+        .filter(|path| !current.contains(*path))
+        .cloned()
+        .collect();
+    for path in stale {
+        if path == "/" || should_skip_shadow_sync_path(vm, &path) || is_shadow_bootstrap_dir(&path)
+        {
+            continue;
+        }
+        let stat = match vm.kernel.lstat(&path) {
+            Ok(stat) => stat,
+            // Already gone (for example removed through the kernel-direct
+            // guest fs path, which mirrors deletions into the shadow itself).
+            Err(_) => continue,
+        };
+        let result = if stat.is_directory && !stat.is_symbolic_link {
+            vm.kernel.remove_dir(&path)
+        } else {
+            vm.kernel.remove_file(&path)
+        };
+        if let Err(error) = result {
+            if error.code() != "ENOENT" {
+                tracing::warn!(
+                    path = %path,
+                    error = %error,
+                    "failed to propagate guest shadow deletion into the kernel VFS"
+                );
+            }
+        }
+    }
 }
 
 fn collect_active_process_host_sync_roots(
@@ -9935,16 +10244,23 @@ fn sync_process_host_writes_to_kernel(
     vm: &mut VmState,
     process: &ActiveProcess,
 ) -> Result<(), SidecarError> {
+    sync_process_host_roots_to_kernel(vm, &process.host_cwd, &process.guest_cwd)
+}
+
+fn sync_process_host_roots_to_kernel(
+    vm: &mut VmState,
+    process_host_cwd: &Path,
+    process_guest_cwd: &str,
+) -> Result<(), SidecarError> {
     if vm.root_filesystem_mode != RootFilesystemMode::ReadOnly {
-        let shadow_root = vm.cwd.clone();
-        sync_host_directory_tree_to_kernel(vm, &shadow_root, "/")?;
+        sync_vm_shadow_root_to_kernel(vm)?;
     }
 
     if !path_is_within_root(
-        &normalize_host_path(&process.host_cwd),
+        &normalize_host_path(process_host_cwd),
         &normalize_host_path(&vm.cwd),
     ) {
-        sync_host_directory_tree_to_kernel(vm, &process.host_cwd, &process.guest_cwd)?;
+        sync_host_directory_tree_to_kernel(vm, process_host_cwd, process_guest_cwd)?;
     }
 
     Ok(())
@@ -9976,6 +10292,7 @@ fn sync_host_directory_tree_to_kernel(
         &normalized_host_root,
         &normalized_guest_root,
         &mut synced_file_times,
+        None,
     )
 }
 
@@ -9985,6 +10302,7 @@ fn sync_host_directory_tree_to_kernel_inner(
     current_host_dir: &Path,
     guest_root: &str,
     synced_file_times: &mut BTreeMap<(u64, u64), (u64, u64)>,
+    mut inventory: Option<&mut BTreeSet<String>>,
 ) -> Result<(), SidecarError> {
     let entries = match fs::read_dir(current_host_dir) {
         Ok(entries) => entries,
@@ -10046,6 +10364,15 @@ fn sync_host_directory_tree_to_kernel_inner(
             continue;
         }
 
+        // Record every shadow entry we can represent in the kernel (dirs,
+        // files, symlinks) so the deletion reconcile can tell "was in the
+        // shadow, now gone" apart from "never came from the shadow".
+        if let Some(inventory) = inventory.as_deref_mut() {
+            if file_type.is_dir() || file_type.is_file() || file_type.is_symlink() {
+                inventory.insert(guest_path.clone());
+            }
+        }
+
         if file_type.is_dir() {
             let metadata = entry.metadata().map_err(|error| {
                 SidecarError::Io(format!(
@@ -10081,6 +10408,7 @@ fn sync_host_directory_tree_to_kernel_inner(
                 &host_path,
                 guest_root,
                 synced_file_times,
+                inventory.as_deref_mut(),
             )?;
             continue;
         }
@@ -11645,9 +11973,10 @@ mod runtime_guest_path_mapping_tests {
 #[cfg(test)]
 mod kernel_poll_sync_rpc_tests {
     use super::{
-        service_javascript_kernel_poll_sync_rpc, ActiveExecution, ActiveProcess,
-        JavascriptSyncRpcRequest, KernelPollFdResponse, SidecarKernel, ToolExecution,
-        EXECUTION_DRIVER_NAME, JAVASCRIPT_COMMAND,
+        close_kernel_process_stdin, service_javascript_kernel_poll_sync_rpc,
+        service_javascript_kernel_stdin_sync_rpc, write_kernel_process_stdin, ActiveExecution,
+        ActiveProcess, JavascriptSyncRpcRequest, KernelPollFdResponse, SidecarKernel,
+        ToolExecution, EXECUTION_DRIVER_NAME, JAVASCRIPT_COMMAND,
     };
     use agentos_kernel::command_registry::CommandDriver;
     use agentos_kernel::kernel::{KernelVmConfig, SpawnOptions};
@@ -11655,6 +11984,7 @@ mod kernel_poll_sync_rpc_tests {
     use agentos_kernel::permissions::Permissions;
     use agentos_kernel::poll::{POLLHUP, POLLIN};
     use agentos_kernel::vfs::MemoryFileSystem;
+    use base64::Engine as _;
     use serde_json::{json, Value};
     use std::collections::HashMap;
     #[test]
@@ -11691,7 +12021,7 @@ mod kernel_poll_sync_rpc_tests {
             .fd_close(EXECUTION_DRIVER_NAME, pid, stdin_read_fd)
             .expect("close original stdin read fd");
 
-        let process = ActiveProcess::new(
+        let mut process = ActiveProcess::new(
             pid,
             kernel_handle,
             super::GuestRuntimeKind::JavaScript,
@@ -11707,7 +12037,7 @@ mod kernel_poll_sync_rpc_tests {
 
         let response = service_javascript_kernel_poll_sync_rpc(
             &mut kernel,
-            &process,
+            &mut process,
             &JavascriptSyncRpcRequest {
                 id: 1,
                 method: String::from("__kernel_poll"),
@@ -11744,6 +12074,106 @@ mod kernel_poll_sync_rpc_tests {
 
         process.kernel_handle.finish(0);
         kernel.waitpid(pid).expect("wait javascript kernel process");
+    }
+
+    #[test]
+    fn top_level_kernel_stdin_redrives_backlog_and_deferred_eof() {
+        let mut config = KernelVmConfig::new("vm-top-level-stdin-backlog");
+        config.permissions = Permissions::allow_all();
+        let mut kernel = SidecarKernel::new(MountTable::new(MemoryFileSystem::new()), config);
+        kernel
+            .register_driver(CommandDriver::new(
+                EXECUTION_DRIVER_NAME,
+                [JAVASCRIPT_COMMAND],
+            ))
+            .expect("register execution driver");
+        let kernel_handle = kernel
+            .spawn_process(
+                JAVASCRIPT_COMMAND,
+                Vec::new(),
+                SpawnOptions {
+                    requester_driver: Some(String::from(EXECUTION_DRIVER_NAME)),
+                    ..SpawnOptions::default()
+                },
+            )
+            .expect("spawn kernel process");
+        let pid = kernel_handle.pid();
+        let (read_fd, writer_fd) = kernel
+            .open_pipe(EXECUTION_DRIVER_NAME, pid)
+            .expect("open stdin pipe");
+        kernel
+            .fd_dup2(EXECUTION_DRIVER_NAME, pid, read_fd, 0)
+            .expect("dup stdin read end onto fd 0");
+        kernel
+            .fd_close(EXECUTION_DRIVER_NAME, pid, read_fd)
+            .expect("close original stdin read fd");
+        kernel
+            .fd_fcntl(
+                EXECUTION_DRIVER_NAME,
+                pid,
+                writer_fd,
+                agentos_kernel::fd_table::F_SETFL,
+                agentos_kernel::fd_table::O_NONBLOCK,
+            )
+            .expect("make stdin writer nonblocking");
+
+        let mut process = ActiveProcess::new(
+            pid,
+            kernel_handle,
+            super::GuestRuntimeKind::WebAssembly,
+            ActiveExecution::Tool(ToolExecution::default()),
+        )
+        .with_kernel_stdin_writer_fd(writer_fd);
+        let payload = (0..(65_536 + 8192))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+
+        write_kernel_process_stdin(&mut kernel, &mut process, &payload)
+            .expect("queue stdin larger than the pipe");
+        assert!(process.pending_kernel_stdin.total > 0);
+        close_kernel_process_stdin(&mut kernel, &mut process).expect("defer stdin close");
+
+        let mut received = Vec::new();
+        for id in 1..=2 {
+            let response = service_javascript_kernel_stdin_sync_rpc(
+                &mut kernel,
+                &mut process,
+                &JavascriptSyncRpcRequest {
+                    id,
+                    method: String::from("__kernel_stdin_read"),
+                    raw_bytes_args: HashMap::new(),
+                    args: vec![json!(65_536), json!(0)],
+                },
+            )
+            .expect("read queued stdin");
+            let encoded = response["dataBase64"]
+                .as_str()
+                .expect("stdin response should contain data");
+            received.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .expect("decode stdin response"),
+            );
+        }
+        assert_eq!(received, payload);
+        assert_eq!(process.pending_kernel_stdin.total, 0);
+        assert!(process.kernel_stdin_writer_fd.is_none());
+
+        let eof = service_javascript_kernel_stdin_sync_rpc(
+            &mut kernel,
+            &mut process,
+            &JavascriptSyncRpcRequest {
+                id: 3,
+                method: String::from("__kernel_stdin_read"),
+                raw_bytes_args: HashMap::new(),
+                args: vec![json!(1), json!(0)],
+            },
+        )
+        .expect("observe stdin eof");
+        assert_eq!(eof, json!({ "done": true }));
+
+        process.kernel_handle.finish(0);
+        kernel.waitpid(pid).expect("wait kernel process");
     }
 }
 
@@ -17026,6 +17456,10 @@ where
                 "action": "default",
             }))
         }
+        "process.take_signal" => {
+            let signal = process.pending_wasm_signals.pop_front();
+            Ok(signal.map(Value::from).unwrap_or(Value::Null).into())
+        }
         "process.umask" => {
             let new_mask = javascript_sync_rpc_arg_u32_optional(&request.args, 0, "process umask")?;
             kernel
@@ -19341,13 +19775,19 @@ fn service_javascript_kernel_stdin_sync_rpc(
     process: &mut ActiveProcess,
     request: &JavascriptSyncRpcRequest,
 ) -> Result<Value, SidecarError> {
+    // A previous guest read may have freed pipe capacity. Re-drive the host
+    // backlog before and after this read so a top-level process drains queued
+    // stdin and observes a deferred EOF exactly like the child-process path.
+    flush_pending_kernel_stdin(kernel, process)?;
     let (max_bytes, timeout_ms) = parse_kernel_stdin_read_args(request)?;
-    kernel_stdin_read_response(
+    let response = kernel_stdin_read_response(
         kernel,
         process.kernel_pid,
         max_bytes,
         Duration::from_millis(timeout_ms),
-    )
+    );
+    flush_pending_kernel_stdin(kernel, process)?;
+    response
 }
 
 /// Parse `__kernel_stdin_read` args: (max bytes, requested timeout ms).
@@ -19587,11 +20027,14 @@ fn service_javascript_kernel_stdio_write_sync_rpc(
 
 fn service_javascript_kernel_poll_sync_rpc(
     kernel: &mut SidecarKernel,
-    process: &ActiveProcess,
+    process: &mut ActiveProcess,
     request: &JavascriptSyncRpcRequest,
 ) -> Result<Value, SidecarError> {
+    flush_pending_kernel_stdin(kernel, process)?;
     let (fd_requests, timeout_ms) = parse_kernel_poll_args(request)?;
-    kernel_poll_response(kernel, process.kernel_pid, &fd_requests, timeout_ms)
+    let response = kernel_poll_response(kernel, process.kernel_pid, &fd_requests, timeout_ms);
+    flush_pending_kernel_stdin(kernel, process)?;
+    response
 }
 
 /// Parse `__kernel_poll` args: (fd list, requested timeout ms).
@@ -19662,6 +20105,36 @@ fn install_kernel_stdin_pipe(kernel: &mut SidecarKernel, pid: u32) -> Result<u32
     kernel
         .fd_close(EXECUTION_DRIVER_NAME, pid, read_fd)
         .map_err(kernel_error)?;
+    // The write end is host-side plumbing that lives in the guest process's
+    // own fd table. Mark it close-on-exec so descendants spawned by this
+    // process (which fork the fd table) do not inherit a write handle to
+    // their own stdin pipe; an inherited writer would keep the pipe's writer
+    // refcount above zero forever and a descendant blocked reading inherited
+    // stdin would never observe EOF (this hung git's smart-HTTP helper chain:
+    // git -> git remote-https -> git-remote-https).
+    kernel
+        .fd_fcntl(
+            EXECUTION_DRIVER_NAME,
+            pid,
+            write_fd,
+            agentos_kernel::fd_table::F_SETFD,
+            agentos_kernel::fd_table::FD_CLOEXEC,
+        )
+        .map_err(kernel_error)?;
+    // Non-blocking writes only: the sidecar dispatch thread feeds this pipe
+    // from `write_kernel_process_stdin` / `flush_pending_kernel_stdin`, and a
+    // blocking pipe write would deadlock — the child's pipe reads are parked
+    // sync RPCs serviced by this same thread. A full pipe surfaces EAGAIN and
+    // the remainder is queued in `ActiveProcess::pending_kernel_stdin`.
+    kernel
+        .fd_fcntl(
+            EXECUTION_DRIVER_NAME,
+            pid,
+            write_fd,
+            agentos_kernel::fd_table::F_SETFL,
+            agentos_kernel::fd_table::O_NONBLOCK,
+        )
+        .map_err(kernel_error)?;
     Ok(write_fd)
 }
 
@@ -19686,6 +20159,13 @@ fn javascript_child_process_stdin_mode(request: &JavascriptChildProcessSpawnRequ
         .unwrap_or("pipe")
 }
 
+/// Host-side cap on stdin bytes queued for a child's kernel pipe. Matches the
+/// kernel's default per-write bound (`resource.max_fd_write_bytes`); a parent
+/// cannot park more than this behind a slow child before getting a typed
+/// error.
+const MAX_PENDING_KERNEL_STDIN_BYTES: usize =
+    agentos_kernel::resource_accounting::DEFAULT_MAX_FD_WRITE_BYTES;
+
 pub(crate) fn write_kernel_process_stdin(
     kernel: &mut SidecarKernel,
     process: &mut ActiveProcess,
@@ -19701,17 +20181,115 @@ pub(crate) fn write_kernel_process_stdin(
     let Some(writer_fd) = process.kernel_stdin_writer_fd else {
         return Ok(());
     };
-    kernel
-        .fd_write(EXECUTION_DRIVER_NAME, process.kernel_pid, writer_fd, chunk)
-        .map_err(kernel_error)?;
-    // For a TTY process the master write above drives line-discipline echo into
-    // the master output buffer. Drain it now and surface it as the single
-    // ordered Stdout stream so typed-character echo reaches the host even while
-    // the guest is blocked in read() and not producing output of its own.
-    if let Some(echo) = drain_tty_master_output(kernel, process)? {
-        process.queue_pending_execution_event(ActiveExecutionEvent::Stdout(echo))?;
+    if process.tty_master_fd.is_some() {
+        kernel
+            .fd_write(EXECUTION_DRIVER_NAME, process.kernel_pid, writer_fd, chunk)
+            .map_err(kernel_error)?;
+        // For a TTY process the master write above drives line-discipline echo
+        // into the master output buffer. Drain it now and surface it as the
+        // single ordered Stdout stream so typed-character echo reaches the
+        // host even while the guest is blocked in read() and not producing
+        // output of its own.
+        if let Some(echo) = drain_tty_master_output(kernel, process)? {
+            process.queue_pending_execution_event(ActiveExecutionEvent::Stdout(echo))?;
+        }
+        forward_tty_slave_input_to_javascript(kernel, process)?;
+        return Ok(());
     }
-    forward_tty_slave_input_to_javascript(kernel, process)?;
+    // Pipe-backed stdin. The kernel pipe caps at MAX_PIPE_BUFFER_BYTES and
+    // fd_write reports POSIX partial writes, so anything the pipe cannot take
+    // right now is queued and flushed as the child drains (see
+    // `flush_pending_kernel_stdin`). Silently dropping the remainder is how
+    // multi-buffer stdin payloads (e.g. git's spooled pack piped into
+    // `index-pack --stdin`) used to truncate at 64 KiB.
+    let pending_total = process.pending_kernel_stdin.total;
+    if pending_total.saturating_add(chunk.len()) > MAX_PENDING_KERNEL_STDIN_BYTES {
+        return Err(SidecarError::InvalidState(format!(
+            "child process stdin backlog limit exceeded: {pending_total} pending + {} new bytes \
+             > {MAX_PENDING_KERNEL_STDIN_BYTES} (MAX_PENDING_KERNEL_STDIN_BYTES); the child is \
+             not draining stdin — write smaller chunks after the child consumes them, or raise \
+             this bound together with the kernel resource.max_fd_write_bytes limit",
+            chunk.len(),
+        )));
+    }
+    process.pending_kernel_stdin.push(chunk);
+    flush_pending_kernel_stdin(kernel, process)
+}
+
+/// Write as much queued stdin as the child's kernel pipe can take right now.
+/// Called on every stdin write and from the child kernel-wait servicing path
+/// (each parked `__kernel_stdin_read` / `__kernel_poll` re-check), so the
+/// backlog drains in lockstep with the child's reads. Executes the deferred
+/// stdin close once the backlog is empty.
+pub(crate) fn flush_pending_kernel_stdin(
+    kernel: &mut SidecarKernel,
+    process: &mut ActiveProcess,
+) -> Result<(), SidecarError> {
+    if process.tty_master_fd.is_some() {
+        return Ok(());
+    }
+    let Some(writer_fd) = process.kernel_stdin_writer_fd else {
+        process.pending_kernel_stdin.clear();
+        process.pending_kernel_stdin.close_requested = false;
+        return Ok(());
+    };
+    while let Some(front) = process.pending_kernel_stdin.chunks.pop_front() {
+        let offset = process.pending_kernel_stdin.front_offset;
+        let slice = &front[offset..];
+        match kernel.fd_write(EXECUTION_DRIVER_NAME, process.kernel_pid, writer_fd, slice) {
+            Ok(written) if written >= slice.len() => {
+                process.pending_kernel_stdin.total = process
+                    .pending_kernel_stdin
+                    .total
+                    .saturating_sub(slice.len());
+                process.pending_kernel_stdin.front_offset = 0;
+            }
+            Ok(written) => {
+                // Pipe is full mid-chunk; keep the remainder queued.
+                process.pending_kernel_stdin.total =
+                    process.pending_kernel_stdin.total.saturating_sub(written);
+                process.pending_kernel_stdin.front_offset = offset + written;
+                process.pending_kernel_stdin.chunks.push_front(front);
+                break;
+            }
+            Err(error) if error.code() == "EAGAIN" => {
+                process.pending_kernel_stdin.chunks.push_front(front);
+                break;
+            }
+            Err(error) if error.code() == "EPIPE" => {
+                // Reader side is gone (child exited or closed stdin). Release
+                // the writer, but preserve Linux write(2) behavior by returning
+                // EPIPE to the caller instead of reporting that discarded
+                // backlog bytes were accepted.
+                process.pending_kernel_stdin.clear();
+                process.pending_kernel_stdin.close_requested = false;
+                process.kernel_stdin_writer_fd = None;
+                if let Err(close_error) =
+                    kernel.fd_close(EXECUTION_DRIVER_NAME, process.kernel_pid, writer_fd)
+                {
+                    tracing::warn!(
+                        process_id = process.kernel_pid,
+                        fd = writer_fd,
+                        error = %close_error,
+                        "failed to close child stdin after EPIPE"
+                    );
+                }
+                return Err(kernel_error(error));
+            }
+            Err(error) => {
+                process.pending_kernel_stdin.chunks.push_front(front);
+                return Err(kernel_error(error));
+            }
+        }
+    }
+    if process.pending_kernel_stdin.is_empty() && process.pending_kernel_stdin.close_requested {
+        process.pending_kernel_stdin.close_requested = false;
+        if let Some(writer_fd) = process.kernel_stdin_writer_fd.take() {
+            kernel
+                .fd_close(EXECUTION_DRIVER_NAME, process.kernel_pid, writer_fd)
+                .map_err(kernel_error)?;
+        }
+    }
     Ok(())
 }
 
@@ -19758,6 +20336,13 @@ pub(crate) fn close_kernel_process_stdin(
     kernel: &mut SidecarKernel,
     process: &mut ActiveProcess,
 ) -> Result<(), SidecarError> {
+    if !process.pending_kernel_stdin.is_empty() && process.kernel_stdin_writer_fd.is_some() {
+        // Queued stdin has not reached the pipe yet; closing now would hand
+        // the child a premature EOF. `flush_pending_kernel_stdin` performs the
+        // close once the backlog drains.
+        process.pending_kernel_stdin.close_requested = true;
+        return Ok(());
+    }
     let Some(writer_fd) = process.kernel_stdin_writer_fd.take() else {
         return Ok(());
     };
@@ -24418,6 +25003,13 @@ fn dispatch_v8_process_signal(process: &ActiveProcess, signal: i32) -> Result<bo
     let Some(signal_name) = signal_name_for_stream_event(signal) else {
         return Ok(false);
     };
+    if matches!(&process.execution, ActiveExecution::Wasm(execution) if execution.uses_shared_v8_runtime())
+    {
+        if let Some(session) = process.execution.javascript_v8_session_handle() {
+            dispatch_v8_session_signal_async(session, signal);
+            return Ok(true);
+        }
+    }
     process.execution.send_javascript_stream_event(
         "signal",
         json!({

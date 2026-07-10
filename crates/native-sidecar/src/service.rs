@@ -145,6 +145,8 @@ pub use crate::state::{NativeSidecarConfig, SidecarError};
 #[derive(Debug, Default, Deserialize)]
 struct LegacyJavascriptChildProcessSpawnOptions {
     #[serde(default)]
+    argv0: Option<String>,
+    #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
@@ -209,6 +211,7 @@ pub(crate) fn parse_javascript_child_process_spawn_request(
             command,
             args: parsed_args,
             options: JavascriptChildProcessSpawnOptions {
+                argv0: parsed_options.argv0,
                 cwd: parsed_options.cwd,
                 env: parsed_options.env,
                 internal_bootstrap_env: sanitize_javascript_child_process_internal_bootstrap_env(
