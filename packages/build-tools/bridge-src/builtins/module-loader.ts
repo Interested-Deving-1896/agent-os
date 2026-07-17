@@ -152,7 +152,12 @@ var Module = class _Module {
     return _requireFrom(request, this.path);
   }
   _compile(content, filename) {
-    const contentWithSourceUrl = String(content) + "\n//# sourceURL=" + String(filename);
+    let source = String(content);
+    if (source.startsWith("#!")) {
+      const newline = source.indexOf("\n");
+      source = newline === -1 ? "" : "\n" + source.slice(newline + 1);
+    }
+    const contentWithSourceUrl = source + "\n//# sourceURL=" + String(filename);
     const wrapper = new Function(
       "exports",
       "require",
