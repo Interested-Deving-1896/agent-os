@@ -1,8 +1,8 @@
 {
-  "name": "rivetkit-fixture-pass",
+  "name": "project-matrix-jsdom-pass",
   "private": true,
   "type": "module",
   "dependencies": {
-    "rivetkit": "2.3.4"
+    "jsdom": "29.1.1"
   }
 }
