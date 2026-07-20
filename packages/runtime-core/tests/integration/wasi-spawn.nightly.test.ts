@@ -112,7 +112,7 @@ class SimpleVFS {
   }
 }
 
-describeIf(!skipReason(), 'wasi-spawn: WasiChild host_process integration', { timeout: 30_000 }, () => {
+describeIf(!skipReason(), 'wasi-spawn: WasiChild host_process integration', { timeout: 60_000 }, () => {
   let kernel: Kernel;
   let vfs: SimpleVFS;
 

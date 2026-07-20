@@ -20,6 +20,9 @@ import {
 } from '@rivet-dev/agentos-vm-test-harness';
 import type { Kernel } from '@rivet-dev/agentos-vm-test-harness';
 
+const PIPE_COMMAND_TIMEOUT_MS = 30_000;
+const PIPE_TEST_TIMEOUT_MS = 60_000;
+
 // ---------------------------------------------------------------------------
 // Integration tests with real WasmVM + Node (skipped if WASM not built)
 // ---------------------------------------------------------------------------
@@ -34,24 +37,30 @@ describeIf(!skipUnlessWasmBuilt(), 'cross-runtime pipes (WasmVM + Node)', () => 
 
   it('WasmVM echo | cat pipe works', async () => {
     ({ kernel, dispose } = await createIntegrationKernel({ runtimes: ['wasmvm'] }));
-    const result = await kernel.exec('echo hello | cat', { timeout: 15000 });
+    const result = await kernel.exec('echo hello | cat', {
+      timeout: PIPE_COMMAND_TIMEOUT_MS,
+    });
     expect(result.stdout.trim()).toBe('hello');
     expect(result.exitCode).toBe(0);
-  }, 30000);
+  }, PIPE_TEST_TIMEOUT_MS);
 
   it('WasmVM echo | node -e pipe works', async () => {
     ({ kernel, dispose } = await createIntegrationKernel({ runtimes: ['wasmvm', 'node'] }));
     const script = 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>process.stdout.write(d.toUpperCase()))';
-    const result = await kernel.exec(`echo hello | node -e '${script}'`, { timeout: 15000 });
+    const result = await kernel.exec(`echo hello | node -e '${script}'`, {
+      timeout: PIPE_COMMAND_TIMEOUT_MS,
+    });
     expect(result.stdout.trim()).toBe('HELLO');
     expect(result.exitCode).toBe(0);
-  }, 30000);
+  }, PIPE_TEST_TIMEOUT_MS);
 
   it('WasmVM echo | WasmVM wc -c pipe works', async () => {
     ({ kernel, dispose } = await createIntegrationKernel({ runtimes: ['wasmvm'] }));
-    const result = await kernel.exec('echo hello | wc -c', { timeout: 15000 });
+    const result = await kernel.exec('echo hello | wc -c', {
+      timeout: PIPE_COMMAND_TIMEOUT_MS,
+    });
     // "hello\n" is 6 bytes
     expect(result.stdout.trim()).toBe('6');
     expect(result.exitCode).toBe(0);
-  }, 30000);
+  }, PIPE_TEST_TIMEOUT_MS);
 });

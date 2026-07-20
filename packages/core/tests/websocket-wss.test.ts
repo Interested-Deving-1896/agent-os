@@ -1,10 +1,10 @@
 import { createServer } from "node:https";
-import { resolve } from "node:path";
-import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 import type { AddressInfo } from "node:net";
+import { resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { WebSocketServer } from "ws";
 import { AgentOs } from "../src/index.js";
+import { moduleAccessMounts } from "./helpers/node-modules-mount.js";
 
 const MODULE_ACCESS_CWD = resolve(import.meta.dirname, "..");
 
@@ -59,7 +59,7 @@ ykAheWCsAteSEWVc0w==
 -----END CERTIFICATE-----
 `;
 
-const GUEST_SCRIPT = String.raw`
+const GUEST_SCRIPT = `
 import WebSocket from "ws";
 
 const wsUrl = process.env.WS_URL;
@@ -155,10 +155,7 @@ describe("guest websocket over wss", () => {
 						rules: [
 							{
 								mode: "allow",
-								patterns: [
-									`dns://localhost`,
-									`tcp://localhost:${port}`,
-								],
+								patterns: [`tcp://127.0.0.1:${port}`],
 							},
 						],
 					},
@@ -171,24 +168,30 @@ describe("guest websocket over wss", () => {
 
 			const { pid } = vm.spawn("node", ["/tmp/websocket-wss-test.mjs"], {
 				env: {
-					WS_URL: `wss://localhost:${port}`,
+					WS_URL: `wss://127.0.0.1:${port}`,
 				},
-				onStdout: (data: Uint8Array) => {
-					stdout += new TextDecoder().decode(data);
-				},
-				onStderr: (data: Uint8Array) => {
-					stderr += new TextDecoder().decode(data);
-				},
+			});
+			const unsubscribeOutput = vm.onProcessOutput(pid, (event) => {
+				const decoded = new TextDecoder().decode(event.data);
+				if (event.stream === "stdout") {
+					stdout += decoded;
+				} else {
+					stderr += decoded;
+				}
 			});
 
 			const exitCode = await vm.waitProcess(pid);
+			unsubscribeOutput();
 			expect(exitCode, `stdout:\n${stdout}\nstderr:\n${stderr}`).toBe(0);
 
 			const replyLine = stdout
 				.split("\n")
 				.find((line) => line.startsWith("WS_REPLY:"));
 			expect(replyLine, `stdout:\n${stdout}\nstderr:\n${stderr}`).toBeTruthy();
-			expect(JSON.parse(replyLine!.slice("WS_REPLY:".length))).toEqual({
+			if (replyLine === undefined) {
+				throw new Error("guest did not emit a WebSocket reply");
+			}
+			expect(JSON.parse(replyLine.slice("WS_REPLY:".length))).toEqual({
 				ok: true,
 				payload: JSON.stringify({ kind: "ping" }),
 			});
