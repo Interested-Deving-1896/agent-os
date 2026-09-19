@@ -10646,16 +10646,23 @@ console.log(JSON.stringify({ status: "ok", summary }));
                     "{capability} should be allowed by default"
                 );
             }
-            // The network is denied apart from the default egress hosts.
-            assert_eq!(
-                agentos_native_sidecar_core::permissions::evaluate_permissions_policy(
-                    &permissions,
-                    "network",
-                    "network.http",
-                    Some("tcp://example.com:443"),
-                ),
-                agentos_vm_config::PermissionMode::Deny
-            );
+            // Every external host, including model providers, is denied.
+            for (capability, resource) in [
+                ("network.http", "tcp://example.com:443"),
+                ("network.dns", "dns://api.anthropic.com"),
+                ("network.http", "tcp://api.anthropic.com:443"),
+            ] {
+                assert_eq!(
+                    agentos_native_sidecar_core::permissions::evaluate_permissions_policy(
+                        &permissions,
+                        "network",
+                        capability,
+                        Some(resource),
+                    ),
+                    agentos_vm_config::PermissionMode::Deny,
+                    "{resource} should be denied by default"
+                );
+            }
         }
         fn configure_vm_rollback_restore_failure_falls_back_to_static_deny_all() {
             let mut sidecar = create_test_sidecar();

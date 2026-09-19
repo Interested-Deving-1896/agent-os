@@ -866,9 +866,9 @@ export interface AgentOsOptions {
 	bindings?: Bindings[];
 	/**
 	 * Permission policy for the kernel. By default the guest behaves like a
-	 * sandboxed machine: its virtual filesystem, processes, and environment are
-	 * allowed, and the network is denied apart from the default model-provider
-	 * hosts. Your policy is merged over that default, so an omitted scope keeps it.
+	 * sandboxed machine: its virtual filesystem, processes, environment, listeners,
+	 * and loopback networking work, while external network access is denied. Your
+	 * policy is merged over that default, so an omitted scope keeps it.
 	 */
 	permissions?: Permissions;
 	/**

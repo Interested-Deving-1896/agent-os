@@ -84,7 +84,7 @@ describe("one-shot calls", () => {
 		expect(local).toMatchObject({ outcome: "succeeded", value: true });
 
 		const external = await evaluate(
-			`fetch("https://example.com").then(() => true)`,
+			`fetch("https://api.anthropic.com").then(() => true)`,
 			bare,
 		);
 		expect(external.outcome).toBe("failed");

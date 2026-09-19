@@ -54,19 +54,10 @@ pub fn allow_all_policy() -> vm_config::PermissionsPolicy {
     }
 }
 
-/// Hosts the default policy lets guests reach, so agents can call their model
-/// providers without an explicit network grant.
-pub const DEFAULT_EGRESS_HOSTS: &[&str] = &[
-    "api.anthropic.com",
-    "api.openai.com",
-    "generativelanguage.googleapis.com",
-    "openrouter.ai",
-];
-
 /// The policy for every scope a client leaves out. The guest behaves like a
 /// sandboxed machine: its virtual filesystem, processes, environment, bindings,
 /// listeners, and loopback networking work. External network access is denied
-/// apart from `DEFAULT_EGRESS_HOSTS`.
+/// until the client grants it explicitly.
 /// The host filesystem is reachable only through mounts the client configures.
 pub fn default_permissions_policy() -> vm_config::PermissionsPolicy {
     let allow = || {
@@ -96,17 +87,6 @@ pub fn default_permissions_policy() -> vm_config::PermissionsPolicy {
                             String::from("tcp://::1:*"),
                             String::from("unix:**"),
                         ],
-                    },
-                    vm_config::PatternPermissionRule {
-                        mode: vm_config::PermissionMode::Allow,
-                        operations: vec![String::from("*")],
-                        // A network resource is `dns://<host>` for resolution and
-                        // `tcp://<host>:<port>` for the connection, so each host
-                        // needs both.
-                        patterns: DEFAULT_EGRESS_HOSTS
-                            .iter()
-                            .flat_map(|host| [format!("dns://{host}"), format!("tcp://{host}:*")])
-                            .collect(),
                     },
                 ],
             },
@@ -541,13 +521,13 @@ mod tests {
             "network.http",
             "tcp://127.0.0.1:3000"
         ));
-        assert!(allowed(
+        assert!(!allowed(
             &policy,
             "network",
             "network.dns",
             "dns://api.anthropic.com"
         ));
-        assert!(allowed(
+        assert!(!allowed(
             &policy,
             "network",
             "network.http",
