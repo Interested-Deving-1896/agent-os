@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  Secure Node.js execution without a sandbox.<br/>Run untrusted JavaScript and TypeScript in an isolated VM with real Node.js APIs, npm packages, and a virtual filesystem.<br/>Powered by <a href="https://rivet.dev/agentos">agentOS</a>.
+  Secure Node.js execution without a sandbox.<br/>Run untrusted JavaScript and TypeScript in an isolated VM with real Node.js APIs, npm packages, and a virtual filesystem.
 </p>
 
 <p align="center">
