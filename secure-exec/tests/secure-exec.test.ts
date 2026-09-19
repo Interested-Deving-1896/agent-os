@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer as createHostServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentOs } from "@rivet-dev/agentos-core";
@@ -27,14 +28,22 @@ const bare = { defaultSoftware: false } as const;
 afterAll(shutdown);
 
 const listen = `(async () => {
-	const { createServer } = await import("node:net");
-	const server = createServer();
+	const { createConnection, createServer } = await import("node:net");
+	const server = createServer((socket) => socket.end("local"));
 	await new Promise((resolve, reject) => {
 		server.once("error", reject);
 		server.listen(0, "127.0.0.1", resolve);
 	});
-	server.close();
-	return true;
+	const address = server.address();
+	const body = await new Promise((resolve, reject) => {
+		const chunks = [];
+		const socket = createConnection({ host: "127.0.0.1", port: address.port });
+		socket.on("data", (chunk) => chunks.push(chunk));
+		socket.on("end", () => resolve(Buffer.concat(chunks).toString()));
+		socket.on("error", reject);
+	});
+	await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+	return body;
 })()`;
 
 describe("one-shot calls", () => {
@@ -81,7 +90,7 @@ describe("one-shot calls", () => {
 
 	test("allow VM-local listeners while denying external network by default", async () => {
 		const local = await evaluate(listen, bare);
-		expect(local).toMatchObject({ outcome: "succeeded", value: true });
+		expect(local).toMatchObject({ outcome: "succeeded", value: "local" });
 
 		const external = await evaluate(
 			`fetch("https://api.anthropic.com").then(() => true)`,
@@ -95,7 +104,7 @@ describe("one-shot calls", () => {
 			permissions: { network: "allow" },
 			...bare,
 		});
-		expect(allowed).toMatchObject({ outcome: "succeeded", value: true });
+		expect(allowed).toMatchObject({ outcome: "succeeded", value: "local" });
 	});
 
 	test("start the requested program while denying guest subprocesses", async () => {
@@ -176,7 +185,7 @@ describe("createVm", () => {
 		const vm = await createVm(bare);
 		try {
 			const local = await vm.javascript.evaluate(listen);
-			expect(local).toMatchObject({ outcome: "succeeded", value: true });
+			expect(local).toMatchObject({ outcome: "succeeded", value: "local" });
 		} finally {
 			await vm.dispose();
 		}
@@ -197,16 +206,29 @@ describe("createVm", () => {
 		}
 	});
 
-	test("runs a spawned server that the host can call", async () => {
-		const vm = await createVm(bare);
+	test("keeps guest listeners off the host network", async () => {
+		const hostServer = createHostServer((_request, response) =>
+			response.end("host"),
+		);
+		await new Promise<void>((resolve, reject) => {
+			hostServer.once("error", reject);
+			hostServer.listen(0, "127.0.0.1", resolve);
+		});
+		const address = hostServer.address();
+		if (!address || typeof address === "string") {
+			throw new Error("expected a TCP host listener");
+		}
+
+		let vm: Awaited<ReturnType<typeof createVm>> | undefined;
 		try {
+			vm = await createVm(bare);
 			const ready = Promise.withResolvers<void>();
 			const decoder = new TextDecoder();
 			const server = await vm.javascript.spawn(
 				`
 				import { createServer } from "node:http";
-				createServer((request, response) => response.end("hello"))
-					.listen(3000, () => console.log("listening"));
+				createServer((_request, response) => response.end("guest"))
+					.listen(${address.port}, "127.0.0.1", () => console.log("listening"));
 				`,
 				{
 					onStdout: (chunk) => {
@@ -215,12 +237,21 @@ describe("createVm", () => {
 				},
 			);
 			await ready.promise;
-			const response = await vm.network.httpRequest({ port: 3000, path: "/" });
-			const body = new TextDecoder().decode(response.body);
-			expect(body).toBe("hello");
+
+			const [hostBody, guestResponse] = await Promise.all([
+				fetch(`http://127.0.0.1:${address.port}`).then((response) =>
+					response.text(),
+				),
+				vm.network.httpRequest({ port: address.port, path: "/" }),
+			]);
+			expect(hostBody).toBe("host");
+			expect(new TextDecoder().decode(guestResponse.body)).toBe("guest");
 			await vm.process.kill(server.pid);
 		} finally {
-			await vm.dispose();
+			await vm?.dispose();
+			await new Promise<void>((resolve, reject) => {
+				hostServer.close((error) => (error ? reject(error) : resolve()));
+			});
 		}
 	});
 });
