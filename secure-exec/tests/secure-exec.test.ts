@@ -98,6 +98,31 @@ describe("one-shot calls", () => {
 		expect(allowed).toMatchObject({ outcome: "succeeded", value: true });
 	});
 
+	test("start the requested program while denying guest subprocesses", async () => {
+		const result = await evaluate<{
+			code: string | null;
+			status: number | null;
+		}>(
+			`(async () => {
+				const { spawnSync } = await import("node:child_process");
+				const child = spawnSync("node", ["-e", "process.exit(0)"]);
+				return {
+					code: child.error?.code ?? null,
+					status: child.status,
+				};
+			})()`,
+			{
+				permissions: { childProcess: "deny" },
+				...bare,
+			},
+		);
+
+		expect(result).toMatchObject({
+			outcome: "succeeded",
+			value: { code: "EACCES", status: 1 },
+		});
+	});
+
 	test("run and type-check TypeScript", async () => {
 		const value = await evaluateTypeScript<number>("(40 as number) + 2", bare);
 		expect(value).toMatchObject({ outcome: "succeeded", value: 42 });

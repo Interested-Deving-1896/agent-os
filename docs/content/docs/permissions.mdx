@@ -101,7 +101,7 @@ Bindings registered with the runtime are gated by the `binding` scope, matched b
 
 <CodeSnippet file="examples/permissions/server.ts" region="allow-one-binding" />
 
-The `childProcess`, `process`, and `env` scopes work the same way: `childProcess` patterns match the command (`operations: ["spawn"]`), `env` patterns match the variable name (`operations: ["read", "write"]`), and `process` is matched by pattern with `operations: ["*"]`.
+The `childProcess`, `process`, and `env` scopes work the same way: `childProcess` patterns match the command (`operations: ["spawn"]`), `env` patterns match the variable name (`operations: ["read", "write"]`), and `process` is matched by pattern with `operations: ["*"]`. Setting `childProcess: "deny"` blocks subprocesses created by guest code; it does not block the trusted runtime from starting the VM's requested root program.
 
 ## Combine policies and see denials
 

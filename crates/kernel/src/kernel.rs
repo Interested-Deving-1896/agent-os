@@ -212,6 +212,12 @@ pub struct VirtualProcessOptions {
     pub cwd: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildProcessPermissionCheck {
+    Enforce,
+    TrustedRootProcess,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecOptions {
     pub requester_driver: Option<String>,
@@ -2803,6 +2809,27 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         self.spawn_process_with_process_group(command, args, options, None)
     }
 
+    /// Starts the root process requested by the trusted client/runtime.
+    ///
+    /// `child_process` governs processes created by guest code, not the root
+    /// process required to run that code. Callers must never use this for a
+    /// guest-originated fork, spawn, or exec request.
+    pub fn spawn_trusted_root_process(
+        &mut self,
+        command: &str,
+        args: Vec<String>,
+        options: SpawnOptions,
+    ) -> KernelResult<KernelProcessHandle> {
+        self.spawn_process_with_process_group_and_cloexec(
+            command,
+            args,
+            options,
+            None,
+            false,
+            ChildProcessPermissionCheck::TrustedRootProcess,
+        )
+    }
+
     pub fn spawn_process_with_process_group(
         &mut self,
         command: &str,
@@ -2816,6 +2843,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             options,
             requested_pgid,
             false,
+            ChildProcessPermissionCheck::Enforce,
         )
     }
 
@@ -2838,6 +2866,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             options,
             requested_pgid,
             true,
+            ChildProcessPermissionCheck::Enforce,
         )
     }
 
@@ -2848,6 +2877,7 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         options: SpawnOptions,
         requested_pgid: Option<u32>,
         preserve_cloexec: bool,
+        permission_check: ChildProcessPermissionCheck,
     ) -> KernelResult<KernelProcessHandle> {
         self.assert_not_terminated()?;
         if let (Some(requester), Some(parent_pid)) =
@@ -2878,14 +2908,16 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             .map(|context| context.env.clone())
             .unwrap_or_else(|| self.env.clone());
         env.extend(options.env.clone());
-        check_command_execution(
-            &self.vm_id,
-            &self.permissions,
-            &resolved.command,
-            &resolved.args,
-            Some(&cwd),
-            &env,
-        )?;
+        if permission_check == ChildProcessPermissionCheck::Enforce {
+            check_command_execution(
+                &self.vm_id,
+                &self.permissions,
+                &resolved.command,
+                &resolved.args,
+                Some(&cwd),
+                &env,
+            )?;
+        }
 
         let inherited_fds = {
             let tables = lock_or_recover(&self.fd_tables);
@@ -3097,6 +3129,28 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         )
     }
 
+    /// Creates a virtual root process requested by the trusted client/runtime.
+    /// Guest-originated binding commands must use [`Self::create_virtual_process`]
+    /// or [`Self::create_virtual_process_with_process_group`] instead.
+    pub fn create_trusted_root_virtual_process(
+        &mut self,
+        requester_driver: &str,
+        driver: &str,
+        command: &str,
+        args: Vec<String>,
+        options: VirtualProcessOptions,
+    ) -> KernelResult<KernelProcessHandle> {
+        self.create_virtual_process_with_process_group_and_permission_check(
+            requester_driver,
+            driver,
+            command,
+            args,
+            options,
+            None,
+            ChildProcessPermissionCheck::TrustedRootProcess,
+        )
+    }
+
     pub fn create_virtual_process_with_process_group(
         &mut self,
         requester_driver: &str,
@@ -3105,6 +3159,28 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
         args: Vec<String>,
         options: VirtualProcessOptions,
         requested_pgid: Option<u32>,
+    ) -> KernelResult<KernelProcessHandle> {
+        self.create_virtual_process_with_process_group_and_permission_check(
+            requester_driver,
+            driver,
+            command,
+            args,
+            options,
+            requested_pgid,
+            ChildProcessPermissionCheck::Enforce,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_virtual_process_with_process_group_and_permission_check(
+        &mut self,
+        requester_driver: &str,
+        driver: &str,
+        command: &str,
+        args: Vec<String>,
+        options: VirtualProcessOptions,
+        requested_pgid: Option<u32>,
+        permission_check: ChildProcessPermissionCheck,
     ) -> KernelResult<KernelProcessHandle> {
         self.assert_not_terminated()?;
         if let Some(parent_pid) = options.parent_pid {
@@ -3130,14 +3206,16 @@ impl<F: VirtualFileSystem + 'static> KernelVm<F> {
             .map(|context| context.env.clone())
             .unwrap_or_else(|| self.env.clone());
         env.extend(options.env.clone());
-        check_command_execution(
-            &self.vm_id,
-            &self.permissions,
-            command,
-            &args,
-            Some(&cwd),
-            &env,
-        )?;
+        if permission_check == ChildProcessPermissionCheck::Enforce {
+            check_command_execution(
+                &self.vm_id,
+                &self.permissions,
+                command,
+                &args,
+                Some(&cwd),
+                &env,
+            )?;
+        }
 
         let inherited_fds = {
             let tables = lock_or_recover(&self.fd_tables);

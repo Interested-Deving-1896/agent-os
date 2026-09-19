@@ -4840,7 +4840,7 @@ where
             let guest_env = vm.guest_env.clone();
             let kernel_handle = vm
                 .kernel
-                .create_virtual_process(
+                .create_trusted_root_virtual_process(
                     EXECUTION_DRIVER_NAME,
                     BINDING_DRIVER_NAME,
                     command,
@@ -4960,7 +4960,7 @@ where
     let phase_start = Instant::now();
     let kernel_handle = vm
         .kernel
-        .spawn_process(
+        .spawn_trusted_root_process(
             &resolved.command,
             argv,
             SpawnOptions {
