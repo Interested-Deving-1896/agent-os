@@ -44,6 +44,19 @@ trusted input; a guest bypassing an applied policy is in scope, while a client
 choosing dangerous credentials, endpoints, mounts, or allowlists is not a
 runtime escape.
 
+The default security posture must behave like a Docker container with no host
+mounts and no published ports: software inside the VM can use its virtual
+filesystem, inspect its virtual process environment, spawn guest subprocesses,
+bind and listen on guest sockets, and communicate over guest loopback. None of
+those operations may expose a host resource by themselves. Host files enter
+only through explicit mounts or copied files; host environment values enter
+only through explicit configuration; guest listeners are not bound or
+published on the host; and external network/DNS access requires an explicit
+grant. A default network denial must block traffic that crosses the VM boundary,
+not local bind, listen, or loopback traffic inside the VM. Trusted runtime
+bootstrap, including launching the guest's Node interpreter, must not be
+mistaken for a guest subprocess and blocked by guest `childProcess` policy.
+
 Every limit, timeout, queue, buffer, and per-entity collection must be bounded
 by default, warn near threshold, and fail with a typed error that names the
 limit and how to raise it. Host-visible warnings/errors must reach stderr/log
@@ -220,6 +233,8 @@ custom host-syscall imports. Treat that target as **native POSIX**;
 
 - `scripts/publish` is the source of truth for npm/crates discovery, version
   rewriting, npm publish, crates publish, release assets, and R2 upload.
+- Until explicitly changed, release the current version line with patch bumps
+  only; do not advance the minor version.
 - Publishable npm packages and Rust crates are agentOS-owned. agentOS language
   execution is exposed through `@rivet-dev/agentos`; do not publish separate
   language packages, compatibility artifacts, or language subpaths. The one
