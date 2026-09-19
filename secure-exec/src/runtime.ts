@@ -46,13 +46,7 @@ export interface Vm extends AsyncDisposable {
 }
 
 export async function createVm(options: VmOptions = {}): Promise<Vm> {
-	const vm = await AgentOs.create({
-		...options,
-		// agentOS lets guests reach model-provider hosts by default, for agents.
-		// Code run here has no use for that, so deny the whole network unless the
-		// caller grants it. Every other scope keeps the agentOS default.
-		permissions: { network: "deny", ...options.permissions },
-	});
+	const vm = await AgentOs.create(options);
 	const { npm, ...javascript } = vm.javascript;
 	const dispose = () => vm.dispose();
 	return {

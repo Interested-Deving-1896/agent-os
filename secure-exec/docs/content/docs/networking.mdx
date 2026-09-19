@@ -7,8 +7,10 @@ skill: true
 Guest `fetch`, `node:http`, `node:net`, and DNS all run through a virtual
 network stack inside the VM. No guest code ever holds a real host socket.
 
-- The network is **denied by default**. Grant it, or specific hosts, with
-  [permissions](/secure-exec/docs/permissions).
+- Guest listeners and loopback connections work by default, but are never
+  published as host ports.
+- External network access is **denied by default**. Grant it, or specific hosts,
+  with [permissions](/secure-exec/docs/permissions).
 - Read or cancel response bodies you request. See
   [limitations](/secure-exec/docs/limitations).
 - To call a server running in the guest, use `vm.network.httpRequest`. See

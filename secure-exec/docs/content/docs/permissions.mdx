@@ -1,6 +1,6 @@
 ---
 title: "Permissions"
-description: "Control what untrusted code can reach in Secure Exec: the network is denied by default and everything else is virtualized."
+description: "Control what untrusted code can reach in Secure Exec: external network access is denied by default and everything else is virtualized."
 skill: true
 ---
 
@@ -9,9 +9,10 @@ Permissions are a VM option. Pass `permissions` on a call, or on
 
 ## The default
 
-The guest's filesystem, processes, and environment are fully virtualized, so
-they are allowed. The network is the one capability that reaches outside the
-VM, so it is denied.
+The guest's filesystem, processes, environment, and network stack are fully
+virtualized. Guest code can bind listeners and communicate over loopback inside
+the VM. External DNS and network connections cross the VM boundary, so they are
+denied.
 
 <CodeSnippet file="secure-exec/examples/permissions/src/index.ts" region="default" />
 

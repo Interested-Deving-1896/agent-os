@@ -79,9 +79,15 @@ describe("one-shot calls", () => {
 		expect(timedOut.outcome).toBe("timed_out");
 	});
 
-	test("deny the network by default and merge a partial policy", async () => {
-		const denied = await evaluate(listen, bare);
-		expect(denied.outcome).toBe("failed");
+	test("allow VM-local listeners while denying external network by default", async () => {
+		const local = await evaluate(listen, bare);
+		expect(local).toMatchObject({ outcome: "succeeded", value: true });
+
+		const external = await evaluate(
+			`fetch("https://example.com").then(() => true)`,
+			bare,
+		);
+		expect(external.outcome).toBe("failed");
 
 		// Granting only the network must leave process spawning allowed, or the
 		// guest could not run at all.
@@ -144,8 +150,8 @@ describe("createVm", () => {
 	test("returns an agentOS VM with the secure permission defaults", async () => {
 		const vm = await createVm(bare);
 		try {
-			const denied = await vm.javascript.evaluate(listen);
-			expect(denied.outcome).toBe("failed");
+			const local = await vm.javascript.evaluate(listen);
+			expect(local).toMatchObject({ outcome: "succeeded", value: true });
 		} finally {
 			await vm.dispose();
 		}
@@ -167,7 +173,7 @@ describe("createVm", () => {
 	});
 
 	test("runs a spawned server that the host can call", async () => {
-		const vm = await createVm({ permissions: { network: "allow" }, ...bare });
+		const vm = await createVm(bare);
 		try {
 			const ready = Promise.withResolvers<void>();
 			const decoder = new TextDecoder();

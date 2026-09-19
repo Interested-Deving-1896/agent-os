@@ -46,8 +46,8 @@ other than `succeeded` carries an `error`, and guest stack traces arrive on
 ## Configure the VM
 
 VM options go on the call: `permissions`, `limits`, `mounts`, and the rest of
-the agentOS VM options. The network is denied unless you allow it, and a policy
-is merged over the defaults.
+the agentOS VM options. External network access is denied unless you allow it,
+and a policy is merged over the defaults.
 
 ```ts
 await evaluate(

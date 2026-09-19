@@ -1,9 +1,9 @@
 // docs:start spawn
 import { createVm } from "secure-exec";
 
-// The server is user-authored code, so it runs in a VM. The guest may listen on
-// its virtual network only when the network is allowed.
-const vm = await createVm({ permissions: { network: "allow" } });
+// The server is user-authored code, so it runs in a VM. Guest listeners stay on
+// the VM's virtual network and do not need external network access.
+const vm = await createVm();
 
 // `spawn` returns as soon as the process starts, instead of waiting for the
 // code to finish. The server prints a line once it is listening, so the host

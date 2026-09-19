@@ -19,7 +19,7 @@ before anything happens.
 | | Default |
 |---|---|
 | Filesystem | A virtual filesystem. The host's is reachable only through [mounts](/secure-exec/docs/filesystem) you configure |
-| Network | Denied. Grant it, or specific hosts, with [permissions](/secure-exec/docs/permissions) |
+| Network | VM-local listeners and loopback work; external access requires [permission](/secure-exec/docs/permissions) |
 | Processes and environment | Virtual. Guest code can spawn processes and read its own environment, never yours |
 | Resources | Bounded. See [resource limits](/secure-exec/docs/resource-limits) |
 | State | None. Each one-shot call gets a fresh VM |
