@@ -1091,67 +1091,6 @@ impl ActiveUdpSocket {
         })
     }
 
-    /// Create a native-backed UDP capability without an adapter-owned task or
-    /// descriptor registry. The socket is bound lazily by the same `bind`,
-    /// `send_to`, and `poll` operations used by every native UDP consumer.
-    pub(in crate::execution) fn new_native(
-        family: JavascriptUdpFamily,
-        resources: Arc<ResourceLedger>,
-        runtime_context: agentos_runtime::RuntimeContext,
-        reactor_limits: ReactorIoLimits,
-    ) -> Result<Self, SidecarError> {
-        let bind_addr = match family {
-            JavascriptUdpFamily::Ipv4 => "127.0.0.1:0",
-            JavascriptUdpFamily::Ipv6 => "[::1]:0",
-        };
-        let socket = UdpSocket::bind(bind_addr).map_err(sidecar_net_error)?;
-        let local_addr = socket.local_addr().map_err(sidecar_net_error)?;
-        let fairness_identity = Arc::new(OnceLock::new());
-        let fairness_identity_committed = Arc::new(tokio::sync::Notify::new());
-        let fairness_retirement =
-            SocketFairnessRetirement::new(Arc::clone(&fairness_identity), runtime_context.clone());
-        let read_event_notify = Arc::new(tokio::sync::Notify::new());
-        let event_pusher = SocketReadinessSubscribers::new(&resources);
-        let native_read_wake_pending = Arc::new(AtomicBool::new(false));
-        let native_commands = spawn_native_udp_owner(
-            &runtime_context,
-            socket,
-            NativeUdpOwnerRegistration {
-                family,
-                resources: Arc::clone(&resources),
-                limits: reactor_limits,
-                fairness_identity: Arc::clone(&fairness_identity),
-                fairness_identity_committed: Arc::clone(&fairness_identity_committed),
-                event_pusher: Arc::clone(&event_pusher),
-                read_event_notify: Arc::clone(&read_event_notify),
-                wake_pending: Arc::clone(&native_read_wake_pending),
-            },
-        )?;
-        Ok(Self {
-            family,
-            native_commands: Some(native_commands),
-            kernel_socket_id: None,
-            guest_local_addr: Some(local_addr),
-            native_local_addr: Some(local_addr),
-            kernel_connected_remote_addr: None,
-            recv_buffer_size: 0,
-            send_buffer_size: 0,
-            description_handles: Arc::new(()),
-            kernel_transfer_guard: None,
-            resources,
-            runtime_context,
-            reactor_limits,
-            fairness_identity,
-            fairness_identity_committed,
-            fairness_retirement,
-            description_lease: Arc::new(SocketDescriptionLease::default()),
-            read_event_notify,
-            event_pusher: Arc::clone(&event_pusher),
-            readiness_registration: SocketReadinessRegistration::new(event_pusher, None, None),
-            native_read_wake_pending,
-        })
-    }
-
     pub(in crate::execution) fn clone_for_fd_transfer(&self) -> Result<Self, SidecarError> {
         Ok(Self {
             family: self.family,

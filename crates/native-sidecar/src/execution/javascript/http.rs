@@ -23,16 +23,6 @@ fn http_loopback_request_timeout() -> Duration {
 /// guest net path always polls with wait == 0. Keep deadlines bounded and do
 /// not add wait > 0 callers on paths that service concurrent VM traffic.
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(in crate::execution) struct JavascriptHttpListenRequest {
-    pub(in crate::execution) server_id: u64,
-    #[serde(default)]
-    pub(in crate::execution) port: Option<u16>,
-    #[serde(default)]
-    pub(in crate::execution) hostname: Option<String>,
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(in crate::execution) struct JavascriptHttpRequestOptions {

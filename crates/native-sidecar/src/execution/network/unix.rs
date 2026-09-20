@@ -77,7 +77,6 @@ pub(in crate::execution) fn register_guest_unix_binding(
     host_address_key: &str,
     address: GuestUnixAddress,
     guest_device_inode: Option<(u64, u64)>,
-    host_path: Option<PathBuf>,
 ) -> Result<(), SidecarError> {
     let mut registry = registry
         .lock()
@@ -87,17 +86,25 @@ pub(in crate::execution) fn register_guest_unix_binding(
             "duplicate Unix binding id {binding_id}"
         )));
     }
+    if registry
+        .values()
+        .any(|entry| entry.active_bindings > 0 && entry.host_address_key == host_address_key)
+    {
+        return Err(sidecar_net_error(std::io::Error::from_raw_os_error(
+            libc::EADDRINUSE,
+        )));
+    }
     registry.insert(
         binding_id.to_owned(),
         GuestUnixAddressRegistryEntry {
             host_address_key: host_address_key.to_owned(),
             address,
             guest_device_inode,
-            host_path,
             generation: NEXT_GUEST_UNIX_BINDING_GENERATION.fetch_add(1, Ordering::Relaxed),
             active_bindings: 1,
             queued_by_target: BTreeMap::new(),
             pending_connections: VecDeque::new(),
+            listener_route: None,
         },
     );
     Ok(())
@@ -106,21 +113,42 @@ pub(in crate::execution) fn register_guest_unix_binding(
 pub(in crate::execution) fn guest_unix_path_target(
     context: &JavascriptSocketPathContext,
     guest_device_inode: (u64, u64),
-) -> Result<Option<(PathBuf, String, GuestUnixAddress)>, SidecarError> {
+) -> Result<Option<(String, GuestUnixAddress)>, SidecarError> {
     let registry = context
         .unix_bound_addresses
         .lock()
         .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
     Ok(registry.iter().find_map(|(binding_id, entry)| {
-        (entry.active_bindings > 0 && entry.guest_device_inode == Some(guest_device_inode)).then(
-            || {
-                entry
-                    .host_path
-                    .clone()
-                    .map(|path| (path, binding_id.clone(), entry.address.clone()))
-            },
-        )?
+        (entry.active_bindings > 0 && entry.guest_device_inode == Some(guest_device_inode))
+            .then(|| (binding_id.clone(), entry.address.clone()))
     }))
+}
+
+fn guest_unix_listener_route(
+    registry: &GuestUnixAddressRegistry,
+    binding_id: &str,
+) -> Result<GuestUnixListenerRoute, SidecarError> {
+    registry
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?
+        .get(binding_id)
+        .and_then(|entry| entry.listener_route.clone())
+        .ok_or_else(|| sidecar_net_error(std::io::Error::from_raw_os_error(libc::ECONNREFUSED)))
+}
+
+fn activate_guest_unix_listener(
+    registry: &GuestUnixAddressRegistry,
+    binding_id: &str,
+    route: GuestUnixListenerRoute,
+) -> Result<(), SidecarError> {
+    let mut registry = registry
+        .lock()
+        .map_err(|_| SidecarError::InvalidState(String::from("Unix address registry poisoned")))?;
+    let entry = registry
+        .get_mut(binding_id)
+        .ok_or_else(|| SidecarError::InvalidState(format!("missing Unix binding {binding_id}")))?;
+    entry.listener_route = Some(route);
+    Ok(())
 }
 
 fn guest_unix_address_for_host_key(
@@ -397,6 +425,7 @@ pub(in crate::execution) fn release_guest_unix_binding(
         return Ok(());
     };
     entry.active_bindings = entry.active_bindings.saturating_sub(1);
+    entry.listener_route = None;
     if entry.active_bindings == 0 && entry.queued_by_target.is_empty() {
         registry.remove(binding_id);
     }
@@ -838,45 +867,24 @@ impl ActiveUnixSocket {
 
     pub(in crate::execution) fn bind_path(
         &mut self,
-        host_path: &Path,
+        _host_path: &Path,
         guest_path: &str,
         binding_id: &str,
     ) -> Result<(), SidecarError> {
-        if let Some(parent) = host_path.parent() {
-            fs::create_dir_all(parent).map_err(sidecar_net_error)?;
-        }
-        let stream = self
-            .stream
-            .lock()
-            .map_err(|_| SidecarError::InvalidState(String::from("Unix socket lock poisoned")))?;
-        let address = UnixAddr::new(host_path)
-            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
-        bind_socket(stream.as_raw_fd(), &address)
-            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
-        drop(stream);
         self.local_path = Some(guest_path.to_owned());
         self.local_abstract_path_hex = None;
         self.local_registry_binding_id = Some(binding_id.to_owned());
-        self.private_host_path = Some(host_path.to_path_buf());
+        self.private_host_path = None;
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
     pub(in crate::execution) fn bind_abstract(
         &mut self,
-        host_name: &[u8],
+        _host_name: &[u8],
         guest_name: &[u8],
         binding_id: &str,
     ) -> Result<(), SidecarError> {
-        let stream = self
-            .stream
-            .lock()
-            .map_err(|_| SidecarError::InvalidState(String::from("Unix socket lock poisoned")))?;
-        let address = UnixAddr::new_abstract(host_name)
-            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
-        bind_socket(stream.as_raw_fd(), &address)
-            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
-        drop(stream);
         self.local_path = Some(abstract_unix_node_path(guest_name));
         self.local_abstract_path_hex = Some(abstract_unix_name_hex(guest_name));
         self.local_registry_binding_id = Some(binding_id.to_owned());
@@ -980,87 +988,38 @@ impl ActiveUnixSocket {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(in crate::execution) enum NativeUnixConnectTarget {
-    Path(PathBuf),
-    Abstract(Vec<u8>),
-}
-
-async fn connect_native_unix_socket(
-    socket: Option<Socket>,
-    target: &NativeUnixConnectTarget,
-) -> Result<UnixStream, SidecarError> {
-    let socket = socket
-        .map(Ok)
-        .unwrap_or_else(|| Socket::new(Domain::UNIX, Type::STREAM, None))
-        .map_err(sidecar_net_error)?;
-    socket.set_nonblocking(true).map_err(sidecar_net_error)?;
-    let connect_result = match target {
-        NativeUnixConnectTarget::Path(path) => socket
-            .connect(&SockAddr::unix(path).map_err(sidecar_net_error)?)
-            .map_err(sidecar_net_error),
-        #[cfg(target_os = "linux")]
-        NativeUnixConnectTarget::Abstract(name) => {
-            let address = UnixAddr::new_abstract(name).map_err(|error| {
-                sidecar_net_error(std::io::Error::from_raw_os_error(error as i32))
-            })?;
-            connect_socket(socket.as_raw_fd(), &address)
-                .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))
-        }
-        #[cfg(not(target_os = "linux"))]
-        NativeUnixConnectTarget::Abstract(_) => return Err(abstract_unix_unsupported()),
-    };
-    if let Err(error) = connect_result {
-        let message = error.to_string();
-        let code = guest_errno_code(&message);
-        if !matches!(code, Some("EINPROGRESS" | "EALREADY" | "EAGAIN")) {
-            return Err(error);
-        }
-    }
-    let stream: UnixStream = socket.into();
-    stream.set_nonblocking(true).map_err(sidecar_net_error)?;
-    let stream = tokio::net::UnixStream::from_std(stream).map_err(sidecar_net_error)?;
-    stream.writable().await.map_err(sidecar_net_error)?;
-    if let Some(error) = stream.take_error().map_err(sidecar_net_error)? {
-        return Err(sidecar_net_error(error));
-    }
-    stream.peer_addr().map_err(sidecar_net_error)?;
-    stream.into_std().map_err(sidecar_net_error)
-}
-
 #[allow(clippy::too_many_arguments)]
-pub(in crate::execution) fn defer_native_unix_connect(
+pub(in crate::execution) fn defer_vm_local_unix_connect(
     process: &mut ActiveProcess,
     request_id: u64,
     pending_capability: PendingCapability,
-    target: NativeUnixConnectTarget,
     remote_address: GuestUnixAddress,
     unix_bound_addresses: GuestUnixAddressRegistry,
     target_binding_id: String,
     bound_listener: Option<(String, ActiveUnixListener)>,
 ) -> Result<JavascriptSyncRpcServiceResponse, SidecarError> {
+    if process
+        .pending_javascript_net_connects
+        .contains_key(&request_id)
+    {
+        return Err(SidecarError::InvalidState(format!(
+            "ERR_AGENTOS_SOCKET_CONNECT_STATE: request {request_id} already has a pending connect"
+        )));
+    }
+
+    let route = guest_unix_listener_route(&unix_bound_addresses, &target_binding_id)?;
+    let accepted_capability = reserve_capability(&route.capabilities, CapabilityKind::UnixSocket)?;
+    let (client_stream, server_stream) = UnixStream::pair().map_err(sidecar_net_error)?;
+    client_stream
+        .set_nonblocking(true)
+        .map_err(sidecar_net_error)?;
+    server_stream
+        .set_nonblocking(true)
+        .map_err(sidecar_net_error)?;
+
     let socket_id = process.allocate_unix_socket_id();
-    let runtime = process.runtime_context.clone();
-    let task_runtime = runtime.clone();
     let resources = Arc::clone(process.runtime_context.resources());
     let limits = reactor_io_limits(&process.limits);
-    let bound_socket_result = bound_listener.as_ref().map(|(_, listener)| {
-        listener
-            .bound_socket
-            .as_ref()
-            .ok_or_else(|| sidecar_net_error(std::io::Error::from_raw_os_error(libc::EINVAL)))?
-            .try_clone()
-            .map_err(sidecar_net_error)
-    });
-    let bound_socket = match bound_socket_result.transpose() {
-        Ok(socket) => socket,
-        Err(error) => {
-            if let Some((listener_id, listener)) = bound_listener {
-                process.unix_listeners.insert(listener_id, listener);
-            }
-            return Err(error);
-        }
-    };
     let local_address = bound_listener
         .as_ref()
         .map(|(_, listener)| GuestUnixAddress {
@@ -1070,99 +1029,81 @@ pub(in crate::execution) fn defer_native_unix_connect(
     let local_registry_binding_id = bound_listener
         .as_ref()
         .map(|(_, listener)| listener.registry_binding_id.clone());
-    let private_host_path = bound_listener
-        .as_ref()
-        .and_then(|(_, listener)| listener.private_host_path.clone());
-    let connected = Arc::new(Mutex::new(PendingJavascriptNetConnectState {
-        connected: None,
-        bound_unix_listener: bound_listener,
-    }));
-    let task_connected = Arc::clone(&connected);
-    if process
-        .pending_javascript_net_connects
-        .contains_key(&request_id)
-    {
-        restore_pending_bound_unix_connect(process, &connected)?;
-        return Err(SidecarError::InvalidState(format!(
-            "ERR_AGENTOS_SOCKET_CONNECT_STATE: request {request_id} already has a pending connect"
-        )));
-    }
-    let connect_metadata = match PendingGuestUnixConnectMetadata::register(
+    let mut connect_metadata = PendingGuestUnixConnectMetadata::register(
         Arc::clone(&unix_bound_addresses),
         local_registry_binding_id.clone(),
         target_binding_id.clone(),
-    ) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            restore_pending_bound_unix_connect(process, &connected)?;
-            return Err(error);
-        }
-    };
+    )?;
+    let connection_state =
+        accept_guest_unix_connection(&unix_bound_addresses, &connect_metadata.target_binding_id)?;
+    debug_assert!(Arc::ptr_eq(
+        &connection_state,
+        &connect_metadata.connection_state
+    ));
+
+    let mut client_socket = ActiveUnixSocket::from_stream_with_metadata(
+        client_stream,
+        None,
+        local_address.as_ref().map(|address| address.path.clone()),
+        Some(remote_address.path.clone()),
+        local_address
+            .as_ref()
+            .and_then(|address| address.abstract_path_hex.clone()),
+        remote_address.abstract_path_hex.clone(),
+        local_registry_binding_id,
+        None,
+        resources,
+        process.runtime_context.clone(),
+        limits,
+    )?;
+    client_socket.remote_registry_binding_id = Some(target_binding_id);
+
+    route
+        .sender
+        .try_send(JavascriptUnixListenerEvent::Connection {
+            socket: PendingUnixSocket {
+                stream: server_stream,
+                local_path: Some(remote_address.path.clone()),
+                remote_path: local_address.as_ref().map(|address| address.path.clone()),
+                local_abstract_path_hex: remote_address.abstract_path_hex.clone(),
+                remote_abstract_path_hex: local_address
+                    .as_ref()
+                    .and_then(|address| address.abstract_path_hex.clone()),
+                connection_guard: PendingUnixConnectionGuard {
+                    state: Some(connection_state),
+                },
+            },
+            capability: accepted_capability,
+        })
+        .map_err(|error| {
+            SidecarError::Execution(format!("ECONNREFUSED: Unix listener backlog full: {error}"))
+        })?;
+    if let Some(source_binding_id) = connect_metadata.source_binding_id.as_deref() {
+        rollback_guest_unix_peer(
+            &unix_bound_addresses,
+            source_binding_id,
+            &connect_metadata.target_binding_id,
+        )?;
+        connect_metadata.source_binding_id = None;
+    }
+    client_socket.connection_state = Some(connect_metadata.commit());
+    push_listener_event(&route.event_pusher);
+
+    let connected = Arc::new(Mutex::new(PendingJavascriptNetConnectState {
+        connected: Some(PendingJavascriptNetConnect::Unix {
+            socket_id,
+            socket: Box::new(client_socket),
+            pending_capability,
+            remote_path: remote_address.path,
+            remote_abstract_path_hex: remote_address.abstract_path_hex,
+        }),
+        bound_unix_listener: bound_listener,
+    }));
     process
         .pending_javascript_net_connects
-        .insert(request_id, Arc::clone(&connected));
+        .insert(request_id, connected);
     let (respond_to, receiver) = tokio::sync::oneshot::channel();
-    let spawn = runtime.spawn(agentos_runtime::TaskClass::Socket, async move {
-        let result = match tokio::time::timeout(
-            limits.operation_deadline,
-            connect_native_unix_socket(bound_socket, &target),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => {
-                let built = ActiveUnixSocket::from_stream_with_metadata(
-                    stream,
-                    None,
-                    local_address.as_ref().map(|address| address.path.clone()),
-                    Some(remote_address.path.clone()),
-                    local_address
-                        .as_ref()
-                        .and_then(|address| address.abstract_path_hex.clone()),
-                    remote_address.abstract_path_hex.clone(),
-                    local_registry_binding_id.clone(),
-                    private_host_path,
-                    resources,
-                    task_runtime,
-                    limits,
-                );
-                match built {
-                    Ok(mut socket) => {
-                        socket.connection_state = Some(connect_metadata.commit());
-                        socket.remote_registry_binding_id = Some(target_binding_id);
-                        task_connected
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .connected = Some(PendingJavascriptNetConnect::Unix {
-                            socket_id,
-                            socket: Box::new(socket),
-                            pending_capability,
-                            remote_path: remote_address.path,
-                            remote_abstract_path_hex: remote_address.abstract_path_hex,
-                        });
-                        Ok(Value::Null)
-                    }
-                    Err(error) => Err(deferred_connect_error(error)),
-                }
-            }
-            Ok(Err(error)) => Err(deferred_connect_error(error)),
-            Err(_) => Err(crate::state::DeferredRpcError {
-                code: String::from("ETIMEDOUT"),
-                message: format!(
-                    "Unix connect exceeded {}ms; raise limits.reactor.operationDeadlineMs",
-                    limits.operation_deadline.as_millis()
-                ),
-            }),
-        };
-        if respond_to.send(result).is_err() {
-            eprintln!("ERR_AGENTOS_SOCKET_COMPLETION_DROPPED: Unix connect caller stopped waiting");
-        }
-    });
-    if let Err(error) = spawn {
-        if let Some(pending) = process.pending_javascript_net_connects.remove(&request_id) {
-            restore_pending_bound_unix_connect(process, &pending)?;
-        }
-        return Err(SidecarError::from(error));
-    }
+    let _ = respond_to.send(Ok(Value::Null));
     Ok(JavascriptSyncRpcServiceResponse::Deferred {
         receiver,
         timeout: None,
@@ -1173,91 +1114,76 @@ pub(in crate::execution) fn defer_native_unix_connect(
 // ActiveUnixListener moved to crate::state
 
 impl ActiveUnixListener {
-    #[allow(clippy::too_many_arguments)]
-    fn from_bound_socket(
-        socket: Socket,
+    fn from_virtual(
         guest_path: String,
         abstract_path_hex: Option<String>,
         registry_binding_id: String,
-        private_host_path: Option<PathBuf>,
         guest_node_path: Option<String>,
         runtime_context: agentos_runtime::RuntimeContext,
         backlog: Option<u32>,
+        acceptor_started: bool,
+        reactor_limits: ReactorIoLimits,
     ) -> Self {
         let event_pusher = SocketReadinessSubscribers::new(runtime_context.resources());
-        let (sender, events) = async_completion_channel(runtime_context, 1);
-        drop(sender);
+        let capacity = listener_accept_capacity(backlog, reactor_limits);
+        let (sender, events) = async_completion_channel(runtime_context, capacity);
         let (close_sender, close_completion) = tokio::sync::oneshot::channel();
         drop(close_sender);
         Self {
-            listener: None,
-            bound_socket: Some(socket),
             events: Arc::new(Mutex::new(events)),
             event_pusher: Arc::clone(&event_pusher),
             readiness_registration: SocketReadinessRegistration::new(event_pusher, None, None),
             close_notify: Arc::new(tokio::sync::Notify::new()),
             close_completion: Arc::new(Mutex::new(Some(close_completion))),
-            acceptor_started: false,
+            acceptor_started,
             path: guest_path,
             abstract_path_hex,
             registry_binding_id,
-            private_host_path,
             guest_node_path,
             backlog: usize::try_from(backlog.unwrap_or(DEFAULT_JAVASCRIPT_NET_BACKLOG))
                 .expect("default backlog fits within usize"),
             active_connection_ids: Arc::new(Mutex::new(BTreeSet::new())),
             description_handles: Arc::new(()),
             description_lease: Arc::new(SocketDescriptionLease::default()),
+            virtual_sender: Some(sender),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(in crate::execution) fn bind_unlistened(
-        host_path: &Path,
+        _host_path: &Path,
         guest_path: &str,
         registry_binding_id: String,
         runtime_context: agentos_runtime::RuntimeContext,
     ) -> Result<Self, SidecarError> {
-        if let Some(parent) = host_path.parent() {
-            fs::create_dir_all(parent).map_err(sidecar_net_error)?;
-        }
-        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).map_err(sidecar_net_error)?;
-        socket
-            .bind(&SockAddr::unix(host_path).map_err(sidecar_net_error)?)
-            .map_err(sidecar_net_error)?;
-        Ok(Self::from_bound_socket(
-            socket,
+        Ok(Self::from_virtual(
             guest_path.to_owned(),
             None,
             registry_binding_id,
-            Some(host_path.to_path_buf()),
             Some(guest_path.to_owned()),
             runtime_context,
             None,
+            false,
+            reactor_io_limits(&crate::limits::VmLimits::default()),
         ))
     }
 
     #[cfg(target_os = "linux")]
     pub(in crate::execution) fn bind_abstract_unlistened(
-        host_name: &[u8],
+        _host_name: &[u8],
         guest_name: &[u8],
         registry_binding_id: String,
         runtime_context: agentos_runtime::RuntimeContext,
     ) -> Result<Self, SidecarError> {
-        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).map_err(sidecar_net_error)?;
-        let address = UnixAddr::new_abstract(host_name)
-            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
-        bind_socket(socket.as_raw_fd(), &address)
-            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
-        Ok(Self::from_bound_socket(
-            socket,
+        Ok(Self::from_virtual(
             abstract_unix_node_path(guest_name),
             Some(abstract_unix_name_hex(guest_name)),
             registry_binding_id,
             None,
-            None,
             runtime_context,
             None,
+            false,
+            reactor_io_limits(&crate::limits::VmLimits::default()),
         ))
     }
 
@@ -1280,43 +1206,33 @@ impl ActiveUnixListener {
         runtime_context: agentos_runtime::RuntimeContext,
         reactor_limits: ReactorIoLimits,
     ) -> Result<Self, SidecarError> {
-        let socket = self
-            .bound_socket
-            .take()
-            .ok_or_else(|| sidecar_net_error(std::io::Error::from_raw_os_error(libc::EINVAL)))?;
-        let backlog_value = backlog.unwrap_or(DEFAULT_JAVASCRIPT_NET_BACKLOG);
-        socket
-            .listen(i32::try_from(backlog_value).unwrap_or(i32::MAX))
-            .map_err(sidecar_net_error)?;
-        socket.set_nonblocking(true).map_err(sidecar_net_error)?;
-        let private_host_path = self.private_host_path.take();
-        let guest_node_path = self.guest_node_path.take();
-        let event_pusher = Arc::clone(&self.event_pusher);
-        let description_handles = Arc::clone(&self.description_handles);
-        let mut listened = Self::from_listener(
-            socket.into(),
-            self.path.clone(),
-            self.abstract_path_hex.clone(),
-            self.registry_binding_id.clone(),
-            private_host_path,
-            guest_node_path,
-            context,
-            backlog,
-            capabilities,
-            runtime_context,
-            reactor_limits,
+        if self.acceptor_started {
+            return Err(sidecar_net_error(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
+        }
+        self.acceptor_started = true;
+        self.backlog = usize::try_from(backlog.unwrap_or(DEFAULT_JAVASCRIPT_NET_BACKLOG))
+            .expect("default backlog fits within usize");
+        let capacity = listener_accept_capacity(backlog, reactor_limits);
+        let (sender, events) = async_completion_channel(runtime_context, capacity);
+        self.events = Arc::new(Mutex::new(events));
+        self.virtual_sender = Some(sender.clone());
+        activate_guest_unix_listener(
+            &context.unix_bound_addresses,
+            &self.registry_binding_id,
+            GuestUnixListenerRoute {
+                sender,
+                event_pusher: Arc::clone(&self.event_pusher),
+                capabilities,
+            },
         )?;
-        listened.readiness_registration =
-            SocketReadinessRegistration::new(Arc::clone(&event_pusher), None, None);
-        listened.event_pusher = event_pusher;
-        listened.description_handles = description_handles;
-        listened.description_lease = Arc::clone(&self.description_lease);
-        Ok(listened)
+        Ok(self)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(in crate::execution) fn bind(
-        host_path: &Path,
+        _host_path: &Path,
         guest_path: &str,
         registry_binding_id: String,
         context: JavascriptSocketPathContext,
@@ -1325,30 +1241,32 @@ impl ActiveUnixListener {
         runtime_context: agentos_runtime::RuntimeContext,
         reactor_limits: ReactorIoLimits,
     ) -> Result<Self, SidecarError> {
-        if let Some(parent) = host_path.parent() {
-            fs::create_dir_all(parent).map_err(sidecar_net_error)?;
-        }
-        let listener = UnixListener::bind(host_path).map_err(sidecar_net_error)?;
-        listener.set_nonblocking(true).map_err(sidecar_net_error)?;
-        Self::from_listener(
-            listener,
+        let listener = Self::from_virtual(
             guest_path.to_owned(),
             None,
             registry_binding_id,
-            Some(host_path.to_path_buf()),
             Some(guest_path.to_owned()),
-            context,
-            backlog,
-            capabilities,
             runtime_context,
+            backlog,
+            true,
             reactor_limits,
-        )
+        );
+        activate_guest_unix_listener(
+            &context.unix_bound_addresses,
+            &listener.registry_binding_id,
+            GuestUnixListenerRoute {
+                sender: listener.virtual_sender.clone().expect("virtual sender"),
+                event_pusher: Arc::clone(&listener.event_pusher),
+                capabilities,
+            },
+        )?;
+        Ok(listener)
     }
 
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::execution) fn bind_abstract(
-        host_name: &[u8],
+        _host_name: &[u8],
         guest_name: &[u8],
         registry_binding_id: String,
         context: JavascriptSocketPathContext,
@@ -1357,31 +1275,26 @@ impl ActiveUnixListener {
         runtime_context: agentos_runtime::RuntimeContext,
         reactor_limits: ReactorIoLimits,
     ) -> Result<Self, SidecarError> {
-        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).map_err(sidecar_net_error)?;
-        let address = UnixAddr::new_abstract(host_name)
-            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
-        bind_socket(socket.as_raw_fd(), &address)
-            .map_err(|error| sidecar_net_error(std::io::Error::from_raw_os_error(error as i32)))?;
-        socket
-            .listen(
-                i32::try_from(backlog.unwrap_or(DEFAULT_JAVASCRIPT_NET_BACKLOG))
-                    .unwrap_or(i32::MAX),
-            )
-            .map_err(sidecar_net_error)?;
-        socket.set_nonblocking(true).map_err(sidecar_net_error)?;
-        Self::from_listener(
-            socket.into(),
+        let listener = Self::from_virtual(
             abstract_unix_node_path(guest_name),
             Some(abstract_unix_name_hex(guest_name)),
             registry_binding_id,
             None,
-            None,
-            context,
-            backlog,
-            capabilities,
             runtime_context,
+            backlog,
+            true,
             reactor_limits,
-        )
+        );
+        activate_guest_unix_listener(
+            &context.unix_bound_addresses,
+            &listener.registry_binding_id,
+            GuestUnixListenerRoute {
+                sender: listener.virtual_sender.clone().expect("virtual sender"),
+                event_pusher: Arc::clone(&listener.event_pusher),
+                capabilities,
+            },
+        )?;
+        Ok(listener)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1399,74 +1312,8 @@ impl ActiveUnixListener {
         Err(abstract_unix_unsupported())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn from_listener(
-        listener: UnixListener,
-        guest_path: String,
-        abstract_path_hex: Option<String>,
-        registry_binding_id: String,
-        private_host_path: Option<PathBuf>,
-        guest_node_path: Option<String>,
-        context: JavascriptSocketPathContext,
-        backlog: Option<u32>,
-        capabilities: CapabilityRegistry,
-        runtime_context: agentos_runtime::RuntimeContext,
-        reactor_limits: ReactorIoLimits,
-    ) -> Result<Self, SidecarError> {
-        let accept_capacity = listener_accept_capacity(backlog, reactor_limits);
-        let event_pusher = SocketReadinessSubscribers::new(capabilities.resources().as_ref());
-        let close_notify = Arc::new(tokio::sync::Notify::new());
-        let (close_complete, close_completion) = tokio::sync::oneshot::channel();
-        let events = spawn_unix_listener_acceptor(
-            runtime_context,
-            listener.try_clone().map_err(sidecar_net_error)?,
-            guest_path.clone(),
-            abstract_path_hex.clone(),
-            context.unix_bound_addresses,
-            registry_binding_id.clone(),
-            Arc::clone(&event_pusher),
-            Arc::clone(&close_notify),
-            close_complete,
-            accept_capacity,
-            capabilities,
-            reactor_limits,
-        )?;
-        Ok(Self {
-            listener: Some(listener),
-            bound_socket: None,
-            events: Arc::new(Mutex::new(events)),
-            event_pusher: Arc::clone(&event_pusher),
-            readiness_registration: SocketReadinessRegistration::new(event_pusher, None, None),
-            close_notify,
-            close_completion: Arc::new(Mutex::new(Some(close_completion))),
-            acceptor_started: true,
-            path: guest_path.to_owned(),
-            abstract_path_hex,
-            registry_binding_id,
-            private_host_path,
-            guest_node_path,
-            backlog: usize::try_from(backlog.unwrap_or(DEFAULT_JAVASCRIPT_NET_BACKLOG))
-                .expect("default backlog fits within usize"),
-            active_connection_ids: Arc::new(Mutex::new(BTreeSet::new())),
-            description_handles: Arc::new(()),
-            description_lease: Arc::new(SocketDescriptionLease::default()),
-        })
-    }
-
     pub(in crate::execution) fn clone_for_fd_transfer(&self) -> Result<Self, SidecarError> {
         Ok(Self {
-            listener: self
-                .listener
-                .as_ref()
-                .map(UnixListener::try_clone)
-                .transpose()
-                .map_err(sidecar_net_error)?,
-            bound_socket: self
-                .bound_socket
-                .as_ref()
-                .map(Socket::try_clone)
-                .transpose()
-                .map_err(sidecar_net_error)?,
             events: Arc::clone(&self.events),
             event_pusher: Arc::clone(&self.event_pusher),
             readiness_registration: SocketReadinessRegistration::new(
@@ -1480,12 +1327,12 @@ impl ActiveUnixListener {
             path: self.path.clone(),
             abstract_path_hex: self.abstract_path_hex.clone(),
             registry_binding_id: self.registry_binding_id.clone(),
-            private_host_path: self.private_host_path.clone(),
             guest_node_path: self.guest_node_path.clone(),
             backlog: self.backlog,
             active_connection_ids: Arc::clone(&self.active_connection_ids),
             description_handles: Arc::clone(&self.description_handles),
             description_lease: Arc::clone(&self.description_lease),
+            virtual_sender: self.virtual_sender.clone(),
         })
     }
 
@@ -1540,7 +1387,7 @@ impl ActiveUnixListener {
         self,
     ) -> Pin<Box<dyn Future<Output = Result<(), tokio::sync::oneshot::error::RecvError>> + Send>>
     {
-        if !self.acceptor_started {
+        if !self.acceptor_started || self.virtual_sender.is_some() {
             return Box::pin(async { Ok(()) });
         }
         // `notify_one` retains a permit if the acceptor is between select
@@ -1637,17 +1484,6 @@ impl Drop for ActiveUnixSocket {
     }
 }
 
-impl Drop for ActiveUnixListener {
-    fn drop(&mut self) {
-        if !self.is_final_description_handle() {
-            return;
-        }
-        if let Some(path) = self.private_host_path.as_deref() {
-            cleanup_private_unix_socket_path(path);
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod guest_unix_metadata_tests {
@@ -1666,7 +1502,6 @@ mod guest_unix_metadata_tests {
                 path: format!("\0{binding_id}"),
                 abstract_path_hex: Some(String::from("61")),
             },
-            None,
             None,
         )
         .expect("register Unix address");
@@ -1919,158 +1754,6 @@ fn spawn_unix_plain_socket_transport(
         })
         .map_err(SidecarError::from)?;
     Ok(commands)
-}
-
-#[allow(clippy::too_many_arguments)] // one admitted listener's owned reactor state
-fn spawn_unix_listener_acceptor(
-    runtime: agentos_runtime::RuntimeContext,
-    listener: UnixListener,
-    guest_path: String,
-    local_abstract_path_hex: Option<String>,
-    unix_bound_addresses: GuestUnixAddressRegistry,
-    target_binding_id: String,
-    event_pusher: Arc<SocketReadinessSubscribers>,
-    close_notify: Arc<tokio::sync::Notify>,
-    close_complete: tokio::sync::oneshot::Sender<()>,
-    accept_capacity: usize,
-    capabilities: CapabilityRegistry,
-    limits: ReactorIoLimits,
-) -> Result<AsyncCompletionReceiver<JavascriptUnixListenerEvent>, SidecarError> {
-    let (sender, receiver) = async_completion_channel(runtime.clone(), accept_capacity);
-    let completion = UnixListenerTaskCompletion(Some(close_complete));
-    runtime
-        .spawn(agentos_runtime::TaskClass::Listener, async move {
-            let _completion = completion;
-            let listener = match tokio::io::unix::AsyncFd::new(listener) {
-                Ok(listener) => listener,
-                Err(error) => {
-                    if sender
-                        .send(JavascriptUnixListenerEvent::Error {
-                            code: io_error_code(&error),
-                            message: error.to_string(),
-                        })
-                        .await
-                        .is_ok()
-                    {
-                        push_listener_event(&event_pusher);
-                    }
-                    return;
-                }
-            };
-            let mut accepts_this_turn = 0;
-            loop {
-                let mut ready = tokio::select! {
-                    ready = listener.readable() => {
-                        match ready {
-                            Ok(ready) => ready,
-                            Err(error) => {
-                                if sender
-                                    .send(JavascriptUnixListenerEvent::Error {
-                                        code: io_error_code(&error),
-                                        message: error.to_string(),
-                                    })
-                                    .await
-                                    .is_ok()
-                                {
-                                    push_listener_event(&event_pusher);
-                                }
-                                return;
-                            }
-                        }
-                    }
-                    _ = close_notify.notified() => return,
-                };
-                let capability = tokio::select! {
-                    capability = capabilities.reserve_when_available(CapabilityKind::UnixSocket) => {
-                        match capability {
-                            Ok(capability) => capability,
-                            Err(error) => {
-                                if sender.send(JavascriptUnixListenerEvent::Error {
-                                    code: Some(String::from("ERR_AGENTOS_RESOURCE_LIMIT")),
-                                    message: error.to_string(),
-                                }).await.is_ok() {
-                                    push_listener_event(&event_pusher);
-                                }
-                                return;
-                            }
-                        }
-                    }
-                    _ = close_notify.notified() => return,
-                };
-                let event = match ready.try_io(|inner| inner.get_ref().accept()) {
-                    Ok(Ok((stream, remote_addr))) => {
-                        let metadata = (|| {
-                            let connection_state = accept_guest_unix_connection(
-                                &unix_bound_addresses,
-                                &target_binding_id,
-                            )?;
-                            let remote = match unix_host_address_key(&remote_addr) {
-                                Some(key) => consume_guest_unix_peer(
-                                    &unix_bound_addresses,
-                                    &key,
-                                    &target_binding_id,
-                                )?,
-                                None => None,
-                            };
-                            Ok::<_, SidecarError>((connection_state, remote))
-                        })();
-                        match metadata {
-                            Ok((connection_state, remote)) => JavascriptUnixListenerEvent::Connection {
-                                socket: PendingUnixSocket {
-                                    stream,
-                                    local_path: Some(guest_path.clone()),
-                                    remote_path: remote.as_ref().map(|address| address.path.clone()),
-                                    local_abstract_path_hex: local_abstract_path_hex.clone(),
-                                    remote_abstract_path_hex: remote.and_then(|address| address.abstract_path_hex),
-                                    connection_guard: PendingUnixConnectionGuard {
-                                        state: Some(connection_state),
-                                    },
-                                },
-                                capability,
-                            },
-                            Err(error) => {
-                                let _ = stream.shutdown(Shutdown::Both);
-                                JavascriptUnixListenerEvent::Error {
-                                    code: Some(javascript_sync_rpc_error_code(&error)),
-                                    message: error.to_string(),
-                                }
-                            }
-                        }
-                    }
-                    Ok(Err(error)) => JavascriptUnixListenerEvent::Error {
-                        code: io_error_code(&error),
-                        message: error.to_string(),
-                    },
-                    Err(_would_block) => continue,
-                };
-                if sender.send(event).await.is_err() {
-                    return;
-                }
-                push_listener_event(&event_pusher);
-                accepts_this_turn += 1;
-                if accepts_this_turn
-                    >= limits
-                        .accept_quantum
-                        .min(limits.operation_quantum)
-                        .max(1)
-                {
-                    tokio::task::yield_now().await;
-                    accepts_this_turn = 0;
-                }
-            }
-        })
-        .map_err(|error| SidecarError::Execution(error.to_string()))?;
-    Ok(receiver)
-}
-
-struct UnixListenerTaskCompletion(Option<tokio::sync::oneshot::Sender<()>>);
-
-impl Drop for UnixListenerTaskCompletion {
-    fn drop(&mut self) {
-        if let Some(completion) = self.0.take() {
-            let _ = completion.send(());
-        }
-    }
 }
 
 fn push_listener_event(event_pusher: &Arc<SocketReadinessSubscribers>) {

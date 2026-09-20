@@ -32,7 +32,6 @@ use agentos_vm_config::PermissionsPolicy;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use socket2::Socket;
 use std::borrow::Borrow as StdBorrow;
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -41,7 +40,7 @@ use std::fmt;
 use std::fs::File;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -1444,10 +1443,28 @@ pub(crate) struct JavascriptSocketPathContext {
     pub(crate) tcp_loopback_guest_to_host_ports: BTreeMap<(JavascriptSocketFamily, u16), u16>,
     pub(crate) http_loopback_targets:
         BTreeMap<(JavascriptSocketFamily, u16), JavascriptHttpLoopbackTarget>,
+    pub(crate) http2_loopback_targets:
+        BTreeMap<(JavascriptSocketFamily, u16), JavascriptHttp2LoopbackTarget>,
     pub(crate) udp_loopback_guest_to_host_ports: BTreeMap<(JavascriptSocketFamily, u16), u16>,
     pub(crate) udp_loopback_host_to_guest_ports: BTreeMap<(JavascriptSocketFamily, u16), u16>,
     pub(crate) used_tcp_guest_ports: BTreeMap<JavascriptSocketFamily, BTreeSet<u16>>,
     pub(crate) used_udp_guest_ports: BTreeMap<JavascriptSocketFamily, BTreeSet<u16>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct JavascriptHttp2LoopbackTarget {
+    pub(crate) shared: Arc<Mutex<Http2SharedState>>,
+    pub(crate) server_id: u64,
+    pub(crate) runtime_context: agentos_runtime::RuntimeContext,
+}
+
+impl fmt::Debug for JavascriptHttp2LoopbackTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JavascriptHttp2LoopbackTarget")
+            .field("server_id", &self.server_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1467,11 +1484,26 @@ pub(crate) struct GuestUnixAddressRegistryEntry {
     pub(crate) host_address_key: String,
     pub(crate) address: GuestUnixAddress,
     pub(crate) guest_device_inode: Option<(u64, u64)>,
-    pub(crate) host_path: Option<PathBuf>,
     pub(crate) generation: u64,
     pub(crate) active_bindings: usize,
     pub(crate) queued_by_target: BTreeMap<String, usize>,
     pub(crate) pending_connections: VecDeque<Arc<GuestUnixConnectionState>>,
+    pub(crate) listener_route: Option<GuestUnixListenerRoute>,
+}
+
+#[derive(Clone)]
+pub(crate) struct GuestUnixListenerRoute {
+    pub(crate) sender: AsyncCompletionSender<JavascriptUnixListenerEvent>,
+    pub(crate) event_pusher: Arc<SocketReadinessSubscribers>,
+    pub(crate) capabilities: agentos_runtime::capability::CapabilityRegistry,
+}
+
+impl fmt::Debug for GuestUnixListenerRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestUnixListenerRoute")
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) type GuestUnixAddressRegistry =
@@ -1867,7 +1899,6 @@ impl Default for Http2SharedState {
 
 #[derive(Debug)]
 pub(crate) struct ActiveHttp2Server {
-    pub(crate) actual_local_addr: SocketAddr,
     pub(crate) guest_local_addr: SocketAddr,
     pub(crate) secure: bool,
     pub(crate) tls: Option<JavascriptTlsBridgeOptions>,
@@ -2580,7 +2611,6 @@ pub(crate) struct TlsWritePayload {
 pub(crate) struct ReactorIoLimits {
     pub(crate) operation_quantum: usize,
     pub(crate) byte_quantum: usize,
-    pub(crate) accept_quantum: usize,
     pub(crate) datagram_quantum: usize,
     pub(crate) max_handle_commands: usize,
     pub(crate) max_async_completions: usize,
@@ -2723,10 +2753,6 @@ pub(crate) enum JavascriptUnixListenerEvent {
         socket: PendingUnixSocket,
         capability: agentos_runtime::capability::PendingCapability,
     },
-    Error {
-        code: Option<String>,
-        message: String,
-    },
 }
 
 #[derive(Debug)]
@@ -2789,8 +2815,6 @@ pub(crate) struct ActiveUnixSocket {
 
 #[derive(Debug)]
 pub(crate) struct ActiveUnixListener {
-    pub(crate) listener: Option<UnixListener>,
-    pub(crate) bound_socket: Option<Socket>,
     pub(crate) events: Arc<Mutex<AsyncCompletionReceiver<JavascriptUnixListenerEvent>>>,
     pub(crate) event_pusher: Arc<SocketReadinessSubscribers>,
     pub(crate) readiness_registration: SocketReadinessRegistration,
@@ -2800,12 +2824,12 @@ pub(crate) struct ActiveUnixListener {
     pub(crate) path: String,
     pub(crate) abstract_path_hex: Option<String>,
     pub(crate) registry_binding_id: String,
-    pub(crate) private_host_path: Option<PathBuf>,
     pub(crate) guest_node_path: Option<String>,
     pub(crate) backlog: usize,
     pub(crate) active_connection_ids: Arc<Mutex<BTreeSet<String>>>,
     pub(crate) description_handles: Arc<()>,
     pub(crate) description_lease: Arc<SocketDescriptionLease>,
+    pub(crate) virtual_sender: Option<AsyncCompletionSender<JavascriptUnixListenerEvent>>,
 }
 
 // ---------------------------------------------------------------------------

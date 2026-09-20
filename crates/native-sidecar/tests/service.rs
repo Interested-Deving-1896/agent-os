@@ -4045,6 +4045,19 @@ console.log(JSON.stringify({ status: "ok", summary }));
             cwd: &Path,
             process_id: &str,
         ) {
+            let execution_limits = {
+                let vm = sidecar.vms.get(vm_id).expect("javascript vm limits");
+                agentos_execution::JavascriptExecutionLimits {
+                    reactor_work_quantum: Some(vm.limits.reactor.work_quantum),
+                    bridge_call_timeout_ms: Some(
+                        vm.limits
+                            .reactor
+                            .operation_deadline_ms
+                            .saturating_add(1_000),
+                    ),
+                    ..Default::default()
+                }
+            };
             let engines = sidecar
                 .vms
                 .get(vm_id)
@@ -4061,7 +4074,7 @@ console.log(JSON.stringify({ status: "ok", summary }));
             });
             let execution = javascript_engine
                 .start_execution(StartJavascriptExecutionRequest {
-                    limits: Default::default(),
+                    limits: execution_limits,
                     guest_runtime: Default::default(),
                     vm_id: vm_id.to_owned(),
                     context_id: context.context_id,
@@ -15255,13 +15268,19 @@ if (child.status !== 0) {
             let mut sidecar = create_test_sidecar();
             let (connection_id, session_id) =
                 authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
-            let vm_id = create_vm(
-                &mut sidecar,
-                &connection_id,
-                &session_id,
-                PermissionsPolicy::allow_all(),
-            )
-            .expect("create vm");
+            let response = sidecar
+                .dispatch_blocking(request(
+                    3,
+                    OwnershipScope::session(&connection_id, &session_id),
+                    RequestPayload::CreateVm(CreateVmRequest::legacy_test_config(
+                        GuestRuntimeKind::Python,
+                        std::collections::HashMap::new(),
+                        Default::default(),
+                        None,
+                    )),
+                ))
+                .expect("create Python VM with default permissions");
+            let vm_id = created_vm_id(response).expect("Python VM created");
             let cwd = temp_dir("agentos-native-sidecar-python-vfs-rpc-cwd");
             let pyodide_dir = temp_dir("agentos-native-sidecar-python-vfs-rpc-pyodide");
             write_fixture(
@@ -15288,12 +15307,26 @@ export async function loadPyodide() {
             write_fixture(&pyodide_dir.join("pyodide.asm.wasm"), "");
 
             let context = create_python_context_for_vm_test(&sidecar, &vm_id, pyodide_dir);
+            let execution_limits = {
+                let vm = sidecar.vms.get(&vm_id).expect("python vm limits");
+                agentos_execution::PythonExecutionLimits {
+                    reactor_work_quantum: Some(vm.limits.reactor.work_quantum),
+                    bridge_call_timeout_ms: Some(
+                        vm.limits
+                            .reactor
+                            .operation_deadline_ms
+                            .saturating_add(1_000),
+                    ),
+                    max_open_fds: vm.kernel.resource_limits().max_open_fds,
+                    ..Default::default()
+                }
+            };
             let execution = start_python_execution_for_vm_test(
                 &sidecar,
                 &vm_id,
                 StartPythonExecutionRequest {
                     guest_runtime: Default::default(),
-                    limits: Default::default(),
+                    limits: execution_limits,
                     vm_id: vm_id.clone(),
                     context_id: context.context_id,
                     code: String::from("print('hold-open')"),
@@ -15446,6 +15479,74 @@ export async function loadPyodide() {
                 .expect("utf8 file contents")
             };
             assert_eq!(content, "hello from sidecar rpc");
+
+            allow_synthetic_python_vfs_reply_drop(
+                block_on_sidecar!(
+                    sidecar,
+                    sidecar.handle_python_vfs_rpc_request(
+                        &vm_id,
+                        "proc-python-vfs",
+                        PythonVfsRpcRequest {
+                            id: 3,
+                            method: PythonVfsRpcMethod::UdpCreate,
+                            path: String::new(),
+                            destination: None,
+                            target: None,
+                            mode: None,
+                            uid: None,
+                            gid: None,
+                            atime_ms: None,
+                            mtime_ms: None,
+                            content_base64: None,
+                            recursive: false,
+                            url: None,
+                            http_method: None,
+                            headers: BTreeMap::new(),
+                            body_base64: None,
+                            hostname: None,
+                            family: None,
+                            port: None,
+                            socket_id: None,
+                            command: None,
+                            args: Vec::new(),
+                            argv0: None,
+                            cwd: None,
+                            env: BTreeMap::new(),
+                            shell: false,
+                            max_buffer: None,
+                            timeout_ms: None,
+                        },
+                    )
+                ),
+                "handle python UDP create rpc",
+            );
+
+            {
+                let vm = sidecar.vms.get(&vm_id).expect("python vm");
+                let process = vm
+                    .active_processes
+                    .get("proc-python-vfs")
+                    .expect("python process should be tracked");
+                let (_, socket) = process
+                    .python_sockets
+                    .iter()
+                    .next()
+                    .expect("python UDP socket handle");
+                let crate::state::PythonHostSocket::Udp { socket_id } = socket else {
+                    panic!("expected Python UDP socket handle");
+                };
+                let udp = process
+                    .udp_sockets
+                    .get(socket_id)
+                    .expect("Python UDP capability");
+                assert!(
+                    udp.kernel_socket_id.is_some(),
+                    "Python UDP creation must allocate only a VM kernel socket"
+                );
+                assert!(udp.guest_local_addr.is_none());
+                assert!(udp.native_local_addr.is_none());
+                assert!(udp.native_commands.is_none());
+            }
 
             let process = {
                 let mut vm = sidecar.vms.get_mut(&vm_id).expect("python vm");
@@ -20679,7 +20780,7 @@ process.exit(0);
                 "stdout: {stdout}"
             );
         }
-        fn javascript_http_listen_and_close_registers_server() {
+        fn legacy_javascript_http_listen_does_not_bind_a_host_socket() {
             let mut sidecar = create_test_sidecar();
             let (connection_id, session_id) =
                 authenticate_and_open_session(&mut sidecar).expect("authenticate and open session");
@@ -20694,7 +20795,7 @@ process.exit(0);
             write_fixture(&cwd.join("entry.mjs"), "");
             start_fake_javascript_process(&mut sidecar, &vm_id, &cwd, "proc-js-http-listen");
 
-            let listen = call_javascript_sync_rpc(
+            let error = call_javascript_sync_rpc(
                 &mut sidecar,
                 &vm_id,
                 "proc-js-http-listen",
@@ -20707,50 +20808,15 @@ process.exit(0);
                     ))],
                 },
             )
-            .expect("listen via http bridge");
-
-            let payload: Value =
-                serde_json::from_str(listen.as_str().expect("listen payload string"))
-                    .expect("parse listen payload");
-            assert_eq!(
-                payload["address"]["family"],
-                Value::String(String::from("IPv4"))
-            );
-            assert!(
-                payload["address"]["port"]
-                    .as_u64()
-                    .is_some_and(|port| port > 0),
-                "payload: {payload}"
-            );
-            assert!(
-                sidecar.vms.get(&vm_id).is_some_and(|vm| {
-                    vm.active_processes
-                        .get("proc-js-http-listen")
-                        .is_some_and(|process| process.http_servers.contains_key(&7))
-                }),
-                "HTTP server was not registered",
-            );
-
-            let close = call_javascript_sync_rpc(
-                &mut sidecar,
-                &vm_id,
-                "proc-js-http-listen",
-                JavascriptSyncRpcRequest {
-                    raw_bytes_args: std::collections::HashMap::new(),
-                    id: 2,
-                    method: String::from("net.http_close"),
-                    args: vec![json!(7)],
-                },
-            )
-            .expect("close http bridge server");
-            assert_eq!(close, Value::Null);
+            .expect_err("legacy HTTP bridge must not create a host listener");
+            assert!(error.to_string().contains("ENOTSUP"), "error: {error}");
             assert!(
                 sidecar.vms.get(&vm_id).is_some_and(|vm| {
                     vm.active_processes
                         .get("proc-js-http-listen")
                         .is_some_and(|process| process.http_servers.is_empty())
                 }),
-                "HTTP server should be removed after close",
+                "legacy HTTP bridge registered a server",
             );
         }
         fn javascript_http_respond_records_pending_response() {
@@ -21026,6 +21092,22 @@ console.log(JSON.stringify(result || { data: "", error: "missing-result", reques
             let port = listen_payload["address"]["port"]
                 .as_u64()
                 .expect("http2 listen port") as u16;
+            let socket_paths = build_javascript_socket_path_context(
+                &sidecar.vms.get(&vm_id).expect("javascript vm"),
+            )
+            .expect("build HTTP/2 socket context");
+            assert!(
+                socket_paths
+                    .http2_loopback_targets
+                    .contains_key(&(JavascriptSocketFamily::Ipv4, port)),
+                "HTTP/2 listener was not registered as a VM-local target"
+            );
+            assert!(
+                !socket_paths
+                    .tcp_loopback_guest_to_host_ports
+                    .contains_key(&(JavascriptSocketFamily::Ipv4, port)),
+                "HTTP/2 listener exposed a host TCP port"
+            );
 
             let connect = call_javascript_sync_rpc(
                 &mut sidecar,
@@ -24429,8 +24511,21 @@ console.log(`BODY:${{body}}`);
             write_fixture(&cwd.join("entry.mjs"), "setInterval(() => {}, 1000);");
 
             let context = create_javascript_context_for_vm_test(&sidecar, &vm_id);
+            let execution_limits = {
+                let vm = sidecar.vms.get(&vm_id).expect("javascript vm limits");
+                agentos_execution::JavascriptExecutionLimits {
+                    reactor_work_quantum: Some(vm.limits.reactor.work_quantum),
+                    bridge_call_timeout_ms: Some(
+                        vm.limits
+                            .reactor
+                            .operation_deadline_ms
+                            .saturating_add(1_000),
+                    ),
+                    ..Default::default()
+                }
+            };
             let execution = start_javascript_execution_for_vm_test(&sidecar, &vm_id, StartJavascriptExecutionRequest {
-                limits: Default::default(),
+                limits: execution_limits,
                 guest_runtime: Default::default(),
                 vm_id: vm_id.clone(),
                 context_id: context.context_id,
@@ -24536,22 +24631,13 @@ console.log(`BODY:${{body}}`);
                     "kernel did not expose unix socket path"
                 );
             }
-            let host_socket_path = socket_paths
-                .unix_bound_addresses
-                .lock()
-                .expect("Unix address registry")
-                .values()
-                .next()
-                .and_then(|entry| entry.host_path.clone())
-                .expect("pathname Unix host path");
-            assert!(host_socket_path.exists(), "host unix socket path missing");
             assert!(
-                host_socket_path.starts_with(&socket_paths.unix_socket_host_dir),
-                "host Unix socket escaped the per-VM private directory"
-            );
-            assert!(
-                !host_socket_path.starts_with(&cwd),
-                "host Unix socket leaked into the JavaScript working directory"
+                !socket_paths.unix_socket_host_dir.exists()
+                    || fs::read_dir(&socket_paths.unix_socket_host_dir)
+                        .expect("read Unix socket host directory")
+                        .next()
+                        .is_none(),
+                "Unix listener materialized a host socket file"
             );
 
             let listener_lookup = sidecar
@@ -24878,6 +24964,38 @@ console.log(`BODY:${{body}}`);
                 )
                 .expect("close unix listener");
             }
+
+            let abstract_listen = call_javascript_sync_rpc(
+                &mut sidecar,
+                &vm_id,
+                "proc-js-unix",
+                JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
+                    id: 160,
+                    method: String::from("net.listen"),
+                    args: vec![json!({
+                        "abstractPathHex": "766d2d6c6f63616c",
+                        "backlog": 1,
+                    })],
+                },
+            )
+            .expect("listen on abstract Unix socket");
+            let abstract_server_id = abstract_listen["serverId"]
+                .as_str()
+                .expect("abstract server id")
+                .to_owned();
+            call_javascript_sync_rpc(
+                &mut sidecar,
+                &vm_id,
+                "proc-js-unix",
+                JavascriptSyncRpcRequest {
+                    raw_bytes_args: std::collections::HashMap::new(),
+                    id: 161,
+                    method: String::from("net.server_close"),
+                    args: vec![json!(abstract_server_id)],
+                },
+            )
+            .expect("close abstract Unix listener");
 
             // The VM's allow-all policy is static and intentionally bypasses
             // host permission callbacks. Remove it before exercising the
@@ -25860,7 +25978,7 @@ try {
             javascript_network_permission_callbacks_fire_for_dns_lookup_connect_and_listen();
             javascript_network_permission_denials_surface_eacces_to_guest_code();
             javascript_tls_rpc_connects_and_serves_over_guest_net();
-            javascript_http_listen_and_close_registers_server();
+            legacy_javascript_http_listen_does_not_bind_a_host_socket();
             javascript_http_respond_records_pending_response();
             javascript_http_respond_rejects_oversized_pending_response();
             vm_fetch_response_frame_limit_counts_protocol_overhead();
@@ -26087,6 +26205,31 @@ try {
         }
 
         #[test]
+        fn legacy_http_bridge_never_binds_host_tcp_regression() {
+            run_isolated_service_test("legacy-http-no-host-listener");
+        }
+
+        #[test]
+        fn http2_listener_uses_vm_local_transport_regression() {
+            run_isolated_service_test("http2-vm-local-listener");
+        }
+
+        #[test]
+        fn secure_http2_listener_uses_vm_local_transport_regression() {
+            run_isolated_service_test("http2-secure-vm-local-listener");
+        }
+
+        #[test]
+        fn unix_listener_uses_vm_local_transport_regression() {
+            run_isolated_service_test("unix-vm-local-listener");
+        }
+
+        #[test]
+        fn python_udp_creation_and_loopback_stay_vm_local_regression() {
+            run_isolated_service_test("python-udp-vm-local");
+        }
+
+        #[test]
         fn aaa_crypto_handle_tables_are_bounded() {
             run_isolated_service_test("crypto-handle-tables");
         }
@@ -26282,6 +26425,21 @@ try {
                 }
                 "http2-guest-h2c" => {
                     javascript_http2_guest_h2c_round_trip_does_not_deadlock();
+                }
+                "http2-vm-local-listener" => {
+                    javascript_http2_listen_connect_request_and_respond_round_trip();
+                }
+                "http2-secure-vm-local-listener" => {
+                    javascript_http2_secure_listen_connect_request_and_respond_round_trip();
+                }
+                "legacy-http-no-host-listener" => {
+                    legacy_javascript_http_listen_does_not_bind_a_host_socket();
+                }
+                "unix-vm-local-listener" => {
+                    javascript_net_rpc_listens_and_connects_over_unix_domain_sockets();
+                }
+                "python-udp-vm-local" => {
+                    python_vfs_rpc_requests_proxy_into_the_vm_kernel_filesystem();
                 }
                 "http2-request-handler-twice" => {
                     javascript_http2_request_handler_round_trip_runs_twice_in_one_vm();

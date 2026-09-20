@@ -734,13 +734,20 @@ where
                     .ok_or_else(|| missing_vm_error(vm_id))?;
                 let pending = reserve_capability(&vm.capabilities, CapabilityKind::UdpSocket)?;
                 let resources = vm.capabilities.resources();
-                let process = self.target.process_mut(&mut vm).ok_or_else(|| {
-                    SidecarError::InvalidState(format!(
-                        "python socket op for reaped process {}",
-                        self.target.label()
-                    ))
-                })?;
-                let mut socket = ActiveUdpSocket::new_native(
+                let vm = &mut *vm;
+                let (kernel, active_processes) = (&mut vm.kernel, &mut vm.active_processes);
+                let process = self
+                    .target
+                    .process_in_roots_mut(active_processes)
+                    .ok_or_else(|| {
+                        SidecarError::InvalidState(format!(
+                            "python socket op for reaped process {}",
+                            self.target.label()
+                        ))
+                    })?;
+                let mut socket = ActiveUdpSocket::new(
+                    kernel,
+                    process.kernel_pid,
                     JavascriptUdpFamily::Ipv4,
                     resources,
                     process.runtime_context.clone(),
@@ -748,13 +755,16 @@ where
                 )?;
                 let native_socket_id = process.allocate_udp_socket_id();
                 let capability_key = NativeCapabilityKey::UdpSocket(native_socket_id.clone());
-                commit_process_capability(
+                if let Err(error) = commit_process_capability(
                     process,
                     pending,
                     capability_key.clone(),
                     native_socket_id.clone(),
-                    None,
-                )?;
+                    socket.kernel_socket_id,
+                ) {
+                    socket.close(kernel, process.kernel_pid);
+                    return Err(error);
+                }
                 socket.set_fairness_identity(process.capability_fairness_identity(&capability_key));
                 socket.retain_description_lease(
                     process

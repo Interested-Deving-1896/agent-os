@@ -2462,6 +2462,10 @@ pub(super) fn collect_javascript_socket_port_state(
         (JavascriptSocketFamily, u16),
         JavascriptHttpLoopbackTarget,
     >,
+    http2_loopback_targets: &mut BTreeMap<
+        (JavascriptSocketFamily, u16),
+        JavascriptHttp2LoopbackTarget,
+    >,
     udp_guest_to_host: &mut BTreeMap<(JavascriptSocketFamily, u16), u16>,
     udp_host_to_guest: &mut BTreeMap<(JavascriptSocketFamily, u16), u16>,
     used_tcp_ports: &mut BTreeMap<JavascriptSocketFamily, BTreeSet<u16>>,
@@ -2509,8 +2513,20 @@ pub(super) fn collect_javascript_socket_port_state(
     }
 
     if let Ok(http2) = process.http2.shared.lock() {
-        for server in http2.servers.values() {
-            record_tcp_listener(server.guest_local_addr, server.actual_local_addr.port());
+        for (server_id, server) in &http2.servers {
+            let family = JavascriptSocketFamily::from_ip(server.guest_local_addr.ip());
+            used_tcp_ports
+                .entry(family)
+                .or_default()
+                .insert(server.guest_local_addr.port());
+            http2_loopback_targets.insert(
+                (family, server.guest_local_addr.port()),
+                JavascriptHttp2LoopbackTarget {
+                    shared: Arc::clone(&process.http2.shared),
+                    server_id: *server_id,
+                    runtime_context: process.runtime_context.clone(),
+                },
+            );
         }
     }
 
@@ -2566,6 +2582,7 @@ pub(super) fn collect_javascript_socket_port_state(
             child,
             tcp_guest_to_host,
             http_loopback_targets,
+            http2_loopback_targets,
             udp_guest_to_host,
             udp_host_to_guest,
             used_tcp_ports,

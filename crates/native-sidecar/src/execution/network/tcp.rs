@@ -1691,31 +1691,6 @@ pub(in crate::execution) fn defer_native_tcp_connect(
 }
 
 impl ActiveTcpListener {
-    pub(in crate::execution) fn bind(
-        bind_host: &str,
-        guest_host: &str,
-        guest_port: u16,
-        backlog: Option<u32>,
-    ) -> Result<Self, SidecarError> {
-        let bind_addr = resolve_tcp_bind_addr(bind_host, 0)?;
-        let guest_addr = resolve_tcp_bind_addr(guest_host, guest_port)?;
-        let listener = TcpListener::bind(bind_addr).map_err(sidecar_net_error)?;
-        listener.set_nonblocking(true).map_err(sidecar_net_error)?;
-        let local_addr = listener.local_addr().map_err(sidecar_net_error)?;
-        Ok(Self {
-            listener: Some(listener),
-            kernel_socket_id: None,
-            local_addr: Some(local_addr),
-            guest_local_addr: guest_addr,
-            backlog: usize::try_from(backlog.unwrap_or(DEFAULT_JAVASCRIPT_NET_BACKLOG))
-                .expect("default backlog fits within usize"),
-            active_connection_ids: Arc::new(Mutex::new(BTreeSet::new())),
-            description_handles: Arc::new(()),
-            description_lease: Arc::new(SocketDescriptionLease::default()),
-            kernel_transfer_guard: None,
-        })
-    }
-
     pub(in crate::execution) fn bind_kernel(
         kernel: &mut SidecarKernel,
         kernel_pid: u32,
@@ -1783,10 +1758,6 @@ impl ActiveTcpListener {
 
     pub(in crate::execution) fn is_final_description_handle(&self) -> bool {
         Arc::strong_count(&self.description_handles) == 1
-    }
-
-    pub(crate) fn local_addr(&self) -> SocketAddr {
-        self.local_addr.unwrap_or(self.guest_local_addr)
     }
 
     pub(in crate::execution) fn guest_local_addr(&self) -> SocketAddr {
@@ -1985,6 +1956,7 @@ pub(crate) fn build_javascript_socket_path_context(
     loopback_exempt_ports.extend(vm.configuration.loopback_exempt_ports.iter().copied());
     let mut tcp_loopback_guest_to_host_ports = BTreeMap::new();
     let mut http_loopback_targets = BTreeMap::new();
+    let mut http2_loopback_targets = BTreeMap::new();
     let mut udp_loopback_guest_to_host_ports = BTreeMap::new();
     let mut udp_loopback_host_to_guest_ports = BTreeMap::new();
     let mut used_tcp_guest_ports = BTreeMap::new();
@@ -1996,6 +1968,7 @@ pub(crate) fn build_javascript_socket_path_context(
             process,
             &mut tcp_loopback_guest_to_host_ports,
             &mut http_loopback_targets,
+            &mut http2_loopback_targets,
             &mut udp_loopback_guest_to_host_ports,
             &mut udp_loopback_host_to_guest_ports,
             &mut used_tcp_guest_ports,
@@ -2013,6 +1986,7 @@ pub(crate) fn build_javascript_socket_path_context(
         loopback_exempt_ports,
         tcp_loopback_guest_to_host_ports,
         http_loopback_targets,
+        http2_loopback_targets,
         udp_loopback_guest_to_host_ports,
         udp_loopback_host_to_guest_ports,
         used_tcp_guest_ports,
@@ -2095,11 +2069,8 @@ pub(crate) fn finalize_javascript_net_connect(
             remote_path,
             remote_abstract_path_hex,
         } => {
-            if let Some((listener_id, mut listener)) = bound_unix_listener {
+            if let Some((listener_id, _listener)) = bound_unix_listener {
                 process.release_capability(&NativeCapabilityKey::UnixListener(listener_id))?;
-                // Ownership of the private host pathname moves to the connected
-                // socket. Do not unlink it when the consumed listener drops.
-                listener.private_host_path.take();
             }
             let capability_key = NativeCapabilityKey::UnixSocket(socket_id.clone());
             let local_path = socket.local_path.clone();
@@ -3811,6 +3782,7 @@ mod ssrf_egress_classifier_tests {
             loopback_exempt_ports: BTreeSet::new(),
             tcp_loopback_guest_to_host_ports: BTreeMap::new(),
             http_loopback_targets: BTreeMap::new(),
+            http2_loopback_targets: BTreeMap::new(),
             udp_loopback_guest_to_host_ports: BTreeMap::new(),
             udp_loopback_host_to_guest_ports: BTreeMap::new(),
             used_tcp_guest_ports: BTreeMap::new(),

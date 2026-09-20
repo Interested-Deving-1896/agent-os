@@ -2682,7 +2682,7 @@ where
                     false,
                 ),
             )?;
-            let (target, target_binding_id, remote_address) = if let Some(hex) =
+            let (target_binding_id, remote_address) = if let Some(hex) =
                 payload.abstract_path_hex.as_deref()
             {
                 let guest_name = decode_abstract_unix_name(hex)?;
@@ -2694,11 +2694,7 @@ where
                 .ok_or_else(|| {
                     sidecar_net_error(std::io::Error::from_raw_os_error(libc::ECONNREFUSED))
                 })?;
-                (
-                    NativeUnixConnectTarget::Abstract(host_name.to_vec()),
-                    target.0,
-                    target.1,
-                )
+                (target.0, target.1)
             } else {
                 let path = payload.path.as_deref().expect("validated Unix path");
                 let (candidate_path, _) = resolve_guest_unix_path(request.process, path)?;
@@ -2713,16 +2709,12 @@ where
                     )
                     .map_err(kernel_error)?;
                 reject_host_mounted_unix_socket_path(request.socket_paths, &node.canonical_path)?;
-                let (host_path, binding_id, address) =
+                let (binding_id, address) =
                     guest_unix_path_target(request.socket_paths, (node.stat.dev, node.stat.ino))?
                         .ok_or_else(|| {
                         sidecar_net_error(std::io::Error::from_raw_os_error(libc::ECONNREFUSED))
                     })?;
-                (
-                    NativeUnixConnectTarget::Path(host_path),
-                    binding_id,
-                    address,
-                )
+                (binding_id, address)
             };
             let pending = reserve_capability(&request.capabilities, CapabilityKind::UnixSocket)?;
             let bound_listener = if let Some(listener_id) = payload.bound_server_id.as_deref() {
@@ -2735,7 +2727,7 @@ where
                             "unknown bound Unix socket {listener_id}"
                         ))
                     })?;
-                if listener.acceptor_started || listener.bound_socket.is_none() {
+                if listener.acceptor_started {
                     request
                         .process
                         .unix_listeners
@@ -2748,11 +2740,10 @@ where
             } else {
                 None
             };
-            return defer_native_unix_connect(
+            return defer_vm_local_unix_connect(
                 request.process,
                 request.sync_request.id,
                 pending,
-                target,
                 remote_address,
                 Arc::clone(&request.socket_paths.unix_bound_addresses),
                 target_binding_id,
@@ -3014,62 +3005,9 @@ where
     let trace_enabled = net_tcp_trace_enabled(&process.env);
     match request.method.as_str() {
         "net.http_listen" => {
-            let pending = reserve_capability(&capabilities, CapabilityKind::TcpListener)?;
-            let payload_json =
-                javascript_sync_rpc_arg_str(&request.args, 0, "net.http_listen payload")?;
-            let payload: JavascriptHttpListenRequest =
-                serde_json::from_str(payload_json).map_err(|error| {
-                    SidecarError::InvalidState(format!(
-                        "net.http_listen payload must be valid JSON: {error}"
-                    ))
-                })?;
-            let (family, bind_host, guest_host) =
-                normalize_tcp_listen_host(payload.hostname.as_deref())?;
-            let requested_port = payload.port.unwrap_or(0);
-            bridge.require_network_access(
-                vm_id,
-                NetworkOperation::Listen,
-                format_tcp_resource(bind_host, requested_port),
-            )?;
-            let port = allocate_guest_listen_port(
-                requested_port,
-                family,
-                &socket_paths.used_tcp_guest_ports,
-                socket_paths.listen_policy,
-            )?;
-            let mut listener = ActiveTcpListener::bind(
-                bind_host,
-                guest_host,
-                port,
-                Some(DEFAULT_JAVASCRIPT_NET_BACKLOG),
-            )?;
-            let guest_local_addr = listener.guest_local_addr();
-            commit_process_capability(
-                process,
-                pending,
-                NativeCapabilityKey::HttpServer(payload.server_id),
-                format!("http-server-{}", payload.server_id),
-                None,
-            )?;
-            process.http_servers.insert(
-                payload.server_id,
-                ActiveHttpServer {
-                    listener: listener.listener.take().ok_or_else(|| {
-                        SidecarError::InvalidState(String::from(
-                            "HTTP listener missing host TCP socket",
-                        ))
-                    })?,
-                    guest_local_addr,
-                    next_request_id: 0,
-                    closed: Arc::new(AtomicBool::new(false)),
-                    close_notify: Arc::new(tokio::sync::Notify::new()),
-                },
-            );
-            serde_json::to_string(&json!({
-                "address": socket_address_value(&guest_local_addr)
-            }))
-            .map(Value::String)
-            .map_err(|error| SidecarError::Execution(format!("ERR_AGENTOS_NODE_SYNC_RPC: {error}")))
+            Err(SidecarError::Execution(String::from(
+                "ENOTSUP: legacy host-backed HTTP listeners are disabled; node:http uses the VM-local net.listen transport",
+            )))
         }
         "net.http_close" => {
             let server_id =
@@ -3156,7 +3094,7 @@ where
                     let guest_name =
                         guest_autobind_unix_name(process.kernel_pid, &listener_id, nonce);
                     let host_name = host_abstract_unix_name(socket_paths, &guest_name);
-                    register_guest_unix_binding(
+                    if let Err(error) = register_guest_unix_binding(
                         &socket_paths.unix_bound_addresses,
                         &registry_binding_id,
                         &abstract_unix_host_address_key(&host_name),
@@ -3165,8 +3103,12 @@ where
                             abstract_path_hex: Some(abstract_unix_name_hex(&guest_name)),
                         },
                         None,
-                        None,
-                    )?;
+                    ) {
+                        if guest_errno_code(&error.to_string()) == Some("EADDRINUSE") {
+                            continue;
+                        }
+                        return Err(error);
+                    }
                     match ActiveUnixListener::bind_abstract_unlistened(
                         &host_name,
                         &guest_name,
@@ -3204,7 +3146,6 @@ where
                         path: abstract_unix_node_path(&guest_name),
                         abstract_path_hex: Some(abstract_unix_name_hex(&guest_name)),
                     },
-                    None,
                     None,
                 )?;
                 match ActiveUnixListener::bind_abstract_unlistened(
@@ -3259,7 +3200,6 @@ where
                         abstract_path_hex: None,
                     },
                     Some((node.stat.dev, node.stat.ino)),
-                    Some(host_path.clone()),
                 ) {
                     if let Err(rollback_error) = kernel.remove_file(&guest_path) {
                         return Err(SidecarError::Execution(format!(
@@ -3400,7 +3340,6 @@ where
                             abstract_path_hex: Some(abstract_unix_name_hex(&guest_name)),
                         },
                         None,
-                        None,
                     )?;
                     if peer_can_observe_late_bind {
                         let target_binding_id = remote_registry_binding_id
@@ -3485,7 +3424,6 @@ where
                         abstract_path_hex: None,
                     },
                     Some((node.stat.dev, node.stat.ino)),
-                    Some(host_path.clone()),
                 ) {
                     if let Err(rollback_error) = kernel.remove_file(&guest_path) {
                         return Err(SidecarError::Execution(format!(
@@ -3885,7 +3823,7 @@ where
                         let host_name = host_abstract_unix_name(socket_paths, &guest_name);
                         let local_path = abstract_unix_node_path(&guest_name);
                         let local_hex = abstract_unix_name_hex(&guest_name);
-                        register_guest_unix_binding(
+                        if let Err(error) = register_guest_unix_binding(
                             &socket_paths.unix_bound_addresses,
                             &registry_binding_id,
                             &abstract_unix_host_address_key(&host_name),
@@ -3894,8 +3832,12 @@ where
                                 abstract_path_hex: Some(local_hex.clone()),
                             },
                             None,
-                            None,
-                        )?;
+                        ) {
+                            if guest_errno_code(&error.to_string()) == Some("EADDRINUSE") {
+                                continue;
+                            }
+                            return Err(error);
+                        }
                         match ActiveUnixListener::bind_abstract(
                             &host_name,
                             &guest_name,
@@ -3944,7 +3886,6 @@ where
                             path: local_path.clone(),
                             abstract_path_hex: Some(local_hex.clone()),
                         },
-                        None,
                         None,
                     )?;
                     let listener = match ActiveUnixListener::bind_abstract(
@@ -4009,7 +3950,6 @@ where
                             abstract_path_hex: None,
                         },
                         Some((node.stat.dev, node.stat.ino)),
-                        Some(host_path.clone()),
                     )?;
                     let listener = match ActiveUnixListener::bind(
                         &host_path,
@@ -4538,11 +4478,6 @@ where
                         "remoteAbstractPathHex": pending.remote_abstract_path_hex,
                     }))
                 }
-                Some(JavascriptUnixListenerEvent::Error { code, message }) => Ok(json!({
-                    "type": "error",
-                    "code": code,
-                    "message": message,
-                })),
                 None => Ok(Value::Null),
             }
         }
@@ -4736,10 +4671,6 @@ where
                         }),
                         "net.server_accept",
                     )
-                }
-                Some(JavascriptUnixListenerEvent::Error { code, message }) => {
-                    let detail = code.unwrap_or_else(|| String::from("server accept"));
-                    Err(SidecarError::Execution(format!("{detail}: {message}")))
                 }
                 None => Ok(javascript_net_timeout_value()),
             }

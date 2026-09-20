@@ -1014,7 +1014,7 @@ impl TransferredHostNetMetadata {
             local_reservation: None,
             remote_info: None,
             remote_unix_address: None,
-            listening: listener.listener.is_some(),
+            listening: listener.acceptor_started,
         }
     }
 

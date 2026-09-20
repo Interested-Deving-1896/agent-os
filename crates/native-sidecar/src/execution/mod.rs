@@ -128,14 +128,14 @@ use crate::service::{
 use crate::state::{
     async_completion_channel, ActiveCipherSession, ActiveDhSession, ActiveDiffieHellmanSession,
     ActiveEcdhSession, ActiveExecution, ActiveExecutionEvent, ActiveHashSession, ActiveHttp2Server,
-    ActiveHttp2Session, ActiveHttp2Stream, ActiveHttpServer, ActiveMappedHostFd, ActiveProcess,
+    ActiveHttp2Session, ActiveHttp2Stream, ActiveMappedHostFd, ActiveProcess,
     ActiveRealIntervalTimer, ActiveSqliteDatabase, ActiveSqliteStatement, ActiveTcpListener,
     ActiveTcpSocket, ActiveTlsState, ActiveUdpSocket, ActiveUnixListener, ActiveUnixSocket,
-    AsyncCompletionReceiver, AsyncCompletionSender, BindingExecution, BridgeError,
-    ExitedProcessSnapshot, GuestUnixAddress, GuestUnixAddressRegistry,
-    GuestUnixAddressRegistryEntry, GuestUnixConnectionState, HostNetTransferDescription,
-    HostNetTransferDescriptionRegistry, Http2BridgeEvent, Http2ResponseSender,
-    Http2RuntimeSnapshot, Http2SessionCommand, Http2SessionSnapshot, Http2SocketSnapshot,
+    AsyncCompletionSender, BindingExecution, BridgeError, ExitedProcessSnapshot, GuestUnixAddress,
+    GuestUnixAddressRegistry, GuestUnixAddressRegistryEntry, GuestUnixConnectionState,
+    GuestUnixListenerRoute, HostNetTransferDescription, HostNetTransferDescriptionRegistry,
+    Http2BridgeEvent, Http2ResponseSender, Http2RuntimeSnapshot, Http2SessionCommand,
+    Http2SessionSnapshot, Http2SocketSnapshot, JavascriptHttp2LoopbackTarget,
     JavascriptHttpLoopbackTarget, JavascriptSocketFamily, JavascriptSocketPathContext,
     JavascriptTcpListenerEvent, JavascriptTcpSocketEvent, JavascriptTlsBridgeOptions,
     JavascriptTlsClientHello, JavascriptTlsDataValue, JavascriptTlsMaterial, JavascriptUdpFamily,
@@ -171,9 +171,6 @@ use md5::Md5;
 use nix::libc;
 use nix::poll::{poll, PollFd as NixPollFd, PollFlags, PollTimeout};
 use nix::sys::signal::{kill as send_signal, Signal};
-#[cfg(target_os = "linux")]
-use nix::sys::socket::connect as connect_socket;
-use nix::sys::socket::{bind as bind_socket, UnixAddr};
 use nix::sys::wait::WaitStatus;
 #[cfg(not(target_os = "macos"))]
 use nix::sys::wait::{waitid as wait_on_child, Id as WaitId, WaitPidFlag};
@@ -262,7 +259,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha1::Sha1;
 use sha2::{digest::Digest, Sha224, Sha256, Sha384, Sha512};
-use socket2::{Domain, SockAddr, SockRef, Socket, TcpKeepalive, Type};
+use socket2::{SockAddr, SockRef, TcpKeepalive};
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -273,9 +270,9 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
     UdpSocket,
 };
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixListener, UnixStream};
+use std::os::unix::net::{SocketAddr as UnixSocketAddr, UnixStream};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -300,7 +297,6 @@ fn reactor_io_limits(limits: &crate::limits::VmLimits) -> ReactorIoLimits {
     ReactorIoLimits {
         operation_quantum: limits.reactor.per_handle_operation_quantum,
         byte_quantum: limits.reactor.byte_quantum,
-        accept_quantum: limits.reactor.accept_quantum,
         datagram_quantum: limits.reactor.datagram_quantum,
         max_handle_commands: limits.reactor.max_handle_commands,
         max_async_completions: limits.reactor.max_async_completions,

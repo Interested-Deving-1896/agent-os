@@ -4,6 +4,15 @@ trait Http2AsyncIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> Http2AsyncIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
+enum Http2ClientTransport {
+    External(SocketAddr),
+    VmLocal {
+        io: tokio::io::DuplexStream,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    },
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct JavascriptHttp2ServerListenRequest {
@@ -1859,7 +1868,7 @@ fn spawn_http2_client_session(
     runtime: agentos_runtime::RuntimeContext,
     shared: Arc<Mutex<crate::state::Http2SharedState>>,
     session_id: u64,
-    remote_addr: SocketAddr,
+    transport: Http2ClientTransport,
     tls: Option<JavascriptTlsBridgeOptions>,
     default_ca_bundle: Vec<u8>,
     snapshot: Arc<Mutex<Http2SessionSnapshot>>,
@@ -1877,40 +1886,53 @@ fn spawn_http2_client_session(
     let vm_generation = shared.lock().map(|state| state.vm_generation).unwrap_or(0);
     let fair_runtime = runtime.clone();
     if let Err(error) = runtime.spawn(agentos_runtime::TaskClass::Http2, async move {
-            let stream = match tokio::net::TcpStream::connect(remote_addr).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    push_http2_session_event(
-                        &shared,
-                        session_id,
-                        Http2BridgeEvent {
-                            kind: String::from("sessionError"),
-                            id: session_id,
-                            data: Some(http2_error_payload(error.to_string())),
-                            ..Http2BridgeEvent::default()
-                        },
-                    );
-                    remove_http2_session_resources(&shared, session_id);
-                    return;
+            let (base_io, local_addr, remote_addr): (
+                Pin<Box<dyn Http2AsyncIo>>,
+                SocketAddr,
+                SocketAddr,
+            ) = match transport {
+                Http2ClientTransport::External(remote_addr) => {
+                    let stream = match tokio::net::TcpStream::connect(remote_addr).await {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            push_http2_session_event(
+                                &shared,
+                                session_id,
+                                Http2BridgeEvent {
+                                    kind: String::from("sessionError"),
+                                    id: session_id,
+                                    data: Some(http2_error_payload(error.to_string())),
+                                    ..Http2BridgeEvent::default()
+                                },
+                            );
+                            remove_http2_session_resources(&shared, session_id);
+                            return;
+                        }
+                    };
+                    let local_addr = match stream.local_addr() {
+                        Ok(addr) => addr,
+                        Err(error) => {
+                            push_http2_session_event(
+                                &shared,
+                                session_id,
+                                Http2BridgeEvent {
+                                    kind: String::from("sessionError"),
+                                    id: session_id,
+                                    data: Some(http2_error_payload(error.to_string())),
+                                    ..Http2BridgeEvent::default()
+                                },
+                            );
+                            remove_http2_session_resources(&shared, session_id);
+                            return;
+                        }
+                    };
+                    (Box::pin(stream), local_addr, remote_addr)
                 }
-            };
-
-            let local_addr = match stream.local_addr() {
-                Ok(addr) => addr,
-                Err(error) => {
-                    push_http2_session_event(
-                        &shared,
-                        session_id,
-                        Http2BridgeEvent {
-                            kind: String::from("sessionError"),
-                            id: session_id,
-                            data: Some(http2_error_payload(error.to_string())),
-                            ..Http2BridgeEvent::default()
-                        },
-                    );
-                    remove_http2_session_resources(&shared, session_id);
-                    return;
-                }
+                Http2ClientTransport::VmLocal {
+                    io,
+                    local_addr,
+                    remote_addr,
+                } => (Box::pin(io), local_addr, remote_addr),
             };
 
             {
@@ -1980,7 +2002,7 @@ fn spawn_http2_client_session(
                         return;
                     }
                 };
-                match connector.connect(server_name, stream).await {
+                match connector.connect(server_name, base_io).await {
                     Ok(tls_stream) => Box::pin(tls_stream),
                     Err(error) => {
                         push_http2_session_event(
@@ -1998,7 +2020,7 @@ fn spawn_http2_client_session(
                     }
                 }
             } else {
-                Box::pin(stream)
+                base_io
             };
 
             let (max_header_bytes, max_streams_per_connection, max_buffered_bytes) = shared
@@ -2290,7 +2312,9 @@ fn spawn_http2_server_session(
     shared: Arc<Mutex<crate::state::Http2SharedState>>,
     server_id: u64,
     session_id: u64,
-    stream: tokio::net::TcpStream,
+    base_io: Pin<Box<dyn Http2AsyncIo>>,
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
     tls: Option<JavascriptTlsBridgeOptions>,
     snapshot: Arc<Mutex<Http2SessionSnapshot>>,
     mut command_rx: TokioReceiver<QueuedHttp2Command>,
@@ -2308,40 +2332,6 @@ fn spawn_http2_server_session(
     let vm_generation = shared.lock().map(|state| state.vm_generation).unwrap_or(0);
     let fair_runtime = runtime.clone();
     if let Err(error) = runtime.spawn(agentos_runtime::TaskClass::Http2, async move {
-            let local_addr = match stream.local_addr() {
-                Ok(addr) => addr,
-                Err(error) => {
-                    push_http2_server_event(
-                        &shared,
-                        server_id,
-                        Http2BridgeEvent {
-                            kind: String::from("serverStreamError"),
-                            id: session_id,
-                            data: Some(http2_error_payload(error.to_string())),
-                            ..Http2BridgeEvent::default()
-                        },
-                    );
-                    remove_http2_session_resources(&shared, session_id);
-                    return;
-                }
-            };
-            let remote_addr = match stream.peer_addr() {
-                Ok(addr) => addr,
-                Err(error) => {
-                    push_http2_server_event(
-                        &shared,
-                        server_id,
-                        Http2BridgeEvent {
-                            kind: String::from("serverStreamError"),
-                            id: session_id,
-                            data: Some(http2_error_payload(error.to_string())),
-                            ..Http2BridgeEvent::default()
-                        },
-                    );
-                    remove_http2_session_resources(&shared, session_id);
-                    return;
-                }
-            };
             {
                 let mut snapshot_guard = snapshot.lock().expect("http2 snapshot lock");
                 snapshot_guard.socket = http2_socket_snapshot(local_addr, remote_addr);
@@ -2401,7 +2391,7 @@ fn spawn_http2_server_session(
                         return;
                     }
                 };
-                match acceptor.accept(stream).await {
+                match acceptor.accept(base_io).await {
                     Ok(tls_stream) => Box::pin(tls_stream),
                     Err(error) => {
                         push_http2_server_event(
@@ -2419,7 +2409,7 @@ fn spawn_http2_server_session(
                     }
                 }
             } else {
-                Box::pin(stream)
+                base_io
             };
 
             let (max_header_bytes, max_streams_per_connection, max_buffered_bytes) = shared
@@ -2928,218 +2918,80 @@ fn spawn_http2_server_session(
     }
 }
 
-fn spawn_http2_server_accept_loop(
-    runtime: agentos_runtime::RuntimeContext,
-    shared: Arc<Mutex<crate::state::Http2SharedState>>,
-    server_id: u64,
-    listener: TcpListener,
-    close_notify: Arc<tokio::sync::Notify>,
-    capabilities: CapabilityRegistry,
-) {
-    if let Err(error) = listener.set_nonblocking(true) {
-        push_http2_server_event(
-            &shared,
-            server_id,
-            Http2BridgeEvent {
-                kind: String::from("serverStreamError"),
-                id: server_id,
-                data: Some(http2_error_payload(error.to_string())),
-                ..Http2BridgeEvent::default()
-            },
-        );
-        return;
-    }
-    let resources = match shared
-        .lock()
-        .ok()
-        .and_then(|state| state.resources.as_ref().cloned())
-    {
-        Some(resources) => resources,
-        None => {
-            eprintln!(
-                "ERR_AGENTOS_RUNTIME_UNAVAILABLE: HTTP/2 accept task has no VM ResourceLedger"
-            );
-            return;
-        }
+fn spawn_vm_local_http2_server_connection(
+    target: &JavascriptHttp2LoopbackTarget,
+    io: tokio::io::DuplexStream,
+    remote_addr: SocketAddr,
+    capabilities: &CapabilityRegistry,
+) -> Result<(), SidecarError> {
+    let (guest_local_addr, secure, tls, command_limit, closed) = {
+        let state = target
+            .shared
+            .lock()
+            .map_err(|_| SidecarError::InvalidState(String::from("HTTP/2 state lock poisoned")))?;
+        let server = state.servers.get(&target.server_id).ok_or_else(|| {
+            SidecarError::Execution(String::from("ECONNREFUSED: HTTP/2 server is closed"))
+        })?;
+        (
+            server.guest_local_addr,
+            server.secure,
+            server.tls.clone(),
+            state.limits.http2.max_pending_commands,
+            server.closed.load(Ordering::Acquire),
+        )
     };
-    let task_error_shared = Arc::clone(&shared);
-    let child_runtime = runtime.clone();
-    if let Err(error) = runtime.spawn(agentos_runtime::TaskClass::Listener, async move {
-        let listener = match tokio::net::TcpListener::from_std(listener) {
-            Ok(listener) => listener,
-            Err(error) => {
-                push_http2_server_event(
-                    &shared,
-                    server_id,
-                    Http2BridgeEvent {
-                        kind: String::from("serverStreamError"),
-                        id: server_id,
-                        data: Some(http2_error_payload(error.to_string())),
-                        ..Http2BridgeEvent::default()
-                    },
-                );
-                return;
-            }
-        };
-        loop {
-            let connection_reservation = tokio::select! {
-                biased;
-                _ = close_notify.notified() => break,
-                admission = resources.reserve_when_available(ResourceClass::Http2Connections, 1) => {
-                    match admission {
-                        Ok(reservation) => reservation,
-                        Err(error) => {
-                            push_http2_server_event(
-                                &shared,
-                                server_id,
-                                Http2BridgeEvent {
-                                    kind: String::from("serverStreamError"),
-                                    id: server_id,
-                                    data: Some(http2_error_payload(error.to_string())),
-                                    ..Http2BridgeEvent::default()
-                                },
-                            );
-                            break;
-                        }
-                    }
-                }
-            };
-            let pending_capability = tokio::select! {
-                biased;
-                _ = close_notify.notified() => break,
-                admission = capabilities.reserve_when_available(CapabilityKind::Http2Connection) => {
-                    match admission {
-                        Ok(pending) => pending,
-                        Err(error) => {
-                            push_http2_server_event(
-                                &shared,
-                                server_id,
-                                Http2BridgeEvent {
-                                    kind: String::from("serverStreamError"),
-                                    id: server_id,
-                                    data: Some(http2_error_payload(error.to_string())),
-                                    ..Http2BridgeEvent::default()
-                                },
-                            );
-                            break;
-                        }
-                    }
-                }
-            };
-            let accepted = tokio::select! {
-                biased;
-                _ = close_notify.notified() => break,
-                accepted = listener.accept() => accepted,
-            };
-            match accepted {
-                Ok((stream, _)) => {
-                    let (guest_local_addr, secure, tls, command_limit) = {
-                        let state = shared.lock().expect("http2 shared state");
-                        let server = state.servers.get(&server_id).expect("http2 server state");
-                        (
-                            server.guest_local_addr,
-                            server.secure,
-                            server.tls.clone(),
-                            state.limits.http2.max_pending_commands,
-                        )
-                    };
-                    let (command_tx, command_rx) = tokio_channel(command_limit);
-                    let (local_addr, remote_addr) = match (stream.local_addr(), stream.peer_addr())
-                    {
-                        (Ok(local_addr), Ok(remote_addr)) => (local_addr, remote_addr),
-                        _ => continue,
-                    };
-                    let session_snapshot = Arc::new(Mutex::new(Http2SessionSnapshot {
-                        encrypted: secure,
-                        alpn_protocol: Some(if secure {
-                            String::from("h2")
-                        } else {
-                            String::from("h2c")
-                        }),
-                        local_settings: BTreeMap::new(),
-                        remote_settings: BTreeMap::new(),
-                        state: http2_runtime_snapshot(),
-                        socket: Http2SocketSnapshot {
-                            local_address: Some(guest_local_addr.ip().to_string()),
-                            local_port: Some(guest_local_addr.port()),
-                            local_family: Some(socket_addr_family(&guest_local_addr).to_string()),
-                            remote_address: Some(remote_addr.ip().to_string()),
-                            remote_port: Some(remote_addr.port()),
-                            remote_family: Some(socket_addr_family(&remote_addr).to_string()),
-                            ..http2_socket_snapshot(local_addr, remote_addr)
-                        },
-                        ..Http2SessionSnapshot::default()
-                    }));
-                    let (session_id, capability_id, capability_generation) = match admit_http2_session(
-                        &shared,
-                        pending_capability,
-                        command_tx,
-                        child_runtime.fairness().clone(),
-                        vec![connection_reservation],
-                    ) {
-                        Ok(identity) => identity,
-                        Err(error) => {
-                            push_http2_server_event(
-                                &shared,
-                                server_id,
-                                Http2BridgeEvent {
-                                    kind: String::from("serverStreamError"),
-                                    id: server_id,
-                                    data: Some(http2_error_payload(error.to_string())),
-                                    ..Http2BridgeEvent::default()
-                                },
-                            );
-                            continue;
-                        }
-                    };
-                    {
-                        let mut state = session_snapshot.lock().expect("http2 snapshot lock");
-                        state.capability_id = Some(capability_id);
-                        state.capability_generation = Some(capability_generation);
-                    }
-                    spawn_http2_server_session(
-                        child_runtime.clone(),
-                        Arc::clone(&shared),
-                        server_id,
-                        session_id,
-                        stream,
-                        tls,
-                        session_snapshot,
-                        command_rx,
-                        capabilities.clone(),
-                    );
-                }
-                Err(error) => {
-                    push_http2_server_event(
-                        &shared,
-                        server_id,
-                        Http2BridgeEvent {
-                            kind: String::from("serverStreamError"),
-                            id: server_id,
-                            data: Some(http2_error_payload(error.to_string())),
-                            ..Http2BridgeEvent::default()
-                        },
-                    );
-                    // Tokio readiness is level-triggered; retrying a permanent
-                    // accept error would spin. Fail the listener task and let
-                    // the guest explicitly create a replacement server.
-                    break;
-                }
-            }
-        }
-    }) {
-        eprintln!("ERR_AGENTOS_HTTP2_TASK_ADMISSION: server accept {server_id}: {error}");
-        push_http2_server_event(
-            &task_error_shared,
-            server_id,
-            Http2BridgeEvent {
-                kind: String::from("serverStreamError"),
-                id: server_id,
-                data: Some(http2_error_payload(error.to_string())),
-                ..Http2BridgeEvent::default()
-            },
-        );
+    if closed {
+        return Err(SidecarError::Execution(String::from(
+            "ECONNREFUSED: HTTP/2 server is closed",
+        )));
     }
+
+    let pending_capability = reserve_capability(capabilities, CapabilityKind::Http2Connection)?;
+    let connection_reservations = reserve_http2_connection(&target.shared)?;
+    let (command_tx, command_rx) = tokio_channel(command_limit);
+    let snapshot = Arc::new(Mutex::new(Http2SessionSnapshot {
+        encrypted: secure,
+        alpn_protocol: Some(String::from(if secure { "h2" } else { "h2c" })),
+        local_settings: BTreeMap::new(),
+        remote_settings: BTreeMap::new(),
+        state: http2_runtime_snapshot(),
+        socket: Http2SocketSnapshot {
+            local_address: Some(guest_local_addr.ip().to_string()),
+            local_port: Some(guest_local_addr.port()),
+            local_family: Some(socket_addr_family(&guest_local_addr).to_string()),
+            remote_address: Some(remote_addr.ip().to_string()),
+            remote_port: Some(remote_addr.port()),
+            remote_family: Some(socket_addr_family(&remote_addr).to_string()),
+            ..Http2SocketSnapshot::default()
+        },
+        ..Http2SessionSnapshot::default()
+    }));
+    let (session_id, capability_id, capability_generation) = admit_http2_session(
+        &target.shared,
+        pending_capability,
+        command_tx,
+        target.runtime_context.fairness().clone(),
+        connection_reservations,
+    )?;
+    {
+        let mut state = snapshot.lock().expect("http2 snapshot lock");
+        state.capability_id = Some(capability_id);
+        state.capability_generation = Some(capability_generation);
+    }
+    spawn_http2_server_session(
+        target.runtime_context.clone(),
+        Arc::clone(&target.shared),
+        target.server_id,
+        session_id,
+        Box::pin(io),
+        guest_local_addr,
+        remote_addr,
+        tls,
+        snapshot,
+        command_rx,
+        capabilities.clone(),
+    );
+    Ok(())
 }
 
 fn send_http2_command(
@@ -3288,9 +3140,7 @@ where
                 &socket_paths.used_tcp_guest_ports,
                 socket_paths.listen_policy,
             )?;
-            let mut listener =
-                ActiveTcpListener::bind(bind_host, guest_host, port, payload.backlog)?;
-            let guest_local_addr = listener.guest_local_addr();
+            let guest_local_addr = resolve_tcp_bind_addr(guest_host, port)?;
             let closed = Arc::new(AtomicBool::new(false));
             let close_notify = Arc::new(tokio::sync::Notify::new());
             let identity = commit_http2_capability(
@@ -3306,7 +3156,6 @@ where
                 state.servers.insert(
                     payload.server_id,
                     ActiveHttp2Server {
-                        actual_local_addr: listener.local_addr(),
                         guest_local_addr,
                         secure: payload.secure,
                         tls: payload.tls.clone().map(|mut tls| {
@@ -3325,18 +3174,6 @@ where
                 }
                 state.server_events.entry(payload.server_id).or_default();
             }
-            spawn_http2_server_accept_loop(
-                process.runtime_context.clone(),
-                Arc::clone(&process.http2.shared),
-                payload.server_id,
-                listener.listener.take().ok_or_else(|| {
-                    SidecarError::InvalidState(String::from(
-                        "HTTP/2 listener missing host TCP socket",
-                    ))
-                })?,
-                close_notify,
-                capabilities.clone(),
-            );
             javascript_net_json_string(
                 json!({
                     "address": socket_address_value(&guest_local_addr),
@@ -3447,24 +3284,37 @@ where
             )?;
             let pending = reserve_capability(&capabilities, CapabilityKind::Http2Connection)?;
             let connection_reservations = reserve_http2_connection(&process.http2.shared)?;
-            let resolved = {
-                let shared = process.http2.shared.lock().map_err(|_| {
-                    SidecarError::InvalidState(String::from("HTTP/2 state lock poisoned"))
-                })?;
-                shared
-                    .servers
-                    .values()
-                    .find(|server| {
-                        is_loopback_request_host(host) && server.guest_local_addr.port() == port
+            let local_target = is_loopback_request_host(host)
+                .then(|| {
+                    let families: &[JavascriptSocketFamily] = match host {
+                        "::1" => &[JavascriptSocketFamily::Ipv6],
+                        "127.0.0.1" => &[JavascriptSocketFamily::Ipv4],
+                        _ => &[JavascriptSocketFamily::Ipv4, JavascriptSocketFamily::Ipv6],
+                    };
+                    families.iter().find_map(|family| {
+                        socket_paths
+                            .http2_loopback_targets
+                            .get(&(*family, port))
+                            .cloned()
                     })
-                    .map(|server| ResolvedTcpConnectAddr {
-                        actual_addr: server.actual_local_addr,
+                })
+                .flatten();
+            let resolved = match local_target.as_ref() {
+                Some(target) => {
+                    let state = target.shared.lock().map_err(|_| {
+                        SidecarError::InvalidState(String::from("HTTP/2 state lock poisoned"))
+                    })?;
+                    let server = state.servers.get(&target.server_id).ok_or_else(|| {
+                        SidecarError::Execution(String::from(
+                            "ECONNREFUSED: HTTP/2 server is closed",
+                        ))
+                    })?;
+                    ResolvedTcpConnectAddr {
+                        actual_addr: server.guest_local_addr,
                         guest_remote_addr: server.guest_local_addr,
-                        use_kernel_loopback: false,
-                    })
-            };
-            let resolved = match resolved {
-                Some(resolved) => resolved,
+                        use_kernel_loopback: true,
+                    }
+                }
                 None => resolve_tcp_connect_addr(
                     bridge,
                     kernel,
@@ -3534,11 +3384,36 @@ where
                 Some(options) => vm_default_ca_bundle_for_tls_options(kernel, options)?,
                 None => Vec::new(),
             };
+            let transport = if let Some(target) = local_target {
+                let local_ip = match resolved.guest_remote_addr {
+                    SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                };
+                let local_addr = SocketAddr::new(local_ip, 0);
+                let duplex_capacity = process.limits.http2.max_buffered_bytes.clamp(1, 64 * 1024);
+                let (client_io, server_io) = tokio::io::duplex(duplex_capacity);
+                if let Err(error) = spawn_vm_local_http2_server_connection(
+                    &target,
+                    server_io,
+                    local_addr,
+                    &capabilities,
+                ) {
+                    remove_http2_session_resources(&process.http2.shared, session_id);
+                    return Err(error);
+                }
+                Http2ClientTransport::VmLocal {
+                    io: client_io,
+                    local_addr,
+                    remote_addr: resolved.guest_remote_addr,
+                }
+            } else {
+                Http2ClientTransport::External(resolved.actual_addr)
+            };
             spawn_http2_client_session(
                 process.runtime_context.clone(),
                 Arc::clone(&process.http2.shared),
                 session_id,
-                resolved.actual_addr,
+                transport,
                 tls,
                 default_ca_bundle,
                 Arc::clone(&snapshot),
