@@ -3088,7 +3088,10 @@ mod inline_host_functions_prefix_tests {
     fn converts_kebab_case_names_to_identifiers() {
         assert_eq!(host_function_identifier("orders"), "orders");
         assert_eq!(host_function_identifier("order-store"), "orderStore");
-        assert_eq!(host_function_identifier("list-open-orders"), "listOpenOrders");
+        assert_eq!(
+            host_function_identifier("list-open-orders"),
+            "listOpenOrders"
+        );
     }
 
     #[test]

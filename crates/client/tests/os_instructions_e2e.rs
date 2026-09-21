@@ -13,8 +13,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use agentos_client::config::{
-    node_modules_mount, AgentOsConfig, AgentOsSidecarConfig, FsPermissions, HostFunction, HostFunctionCollection,
-    HostFunctionCollections, PackageRef, PatternPermissions, PermissionMode, Permissions,
+    node_modules_mount, AgentOsConfig, AgentOsSidecarConfig, FsPermissions, HostFunction,
+    HostFunctionCollection, HostFunctionCollections, PackageRef, PatternPermissions,
+    PermissionMode, Permissions,
 };
 use agentos_client::{AgentOs, OpenSessionInput};
 use agentos_vm_config::VmSqliteDescriptor;

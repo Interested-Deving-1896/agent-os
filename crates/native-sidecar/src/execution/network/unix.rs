@@ -1114,6 +1114,7 @@ pub(in crate::execution) fn defer_vm_local_unix_connect(
 // ActiveUnixListener moved to crate::state
 
 impl ActiveUnixListener {
+    #[allow(clippy::too_many_arguments)]
     fn from_virtual(
         guest_path: String,
         abstract_path_hex: Option<String>,

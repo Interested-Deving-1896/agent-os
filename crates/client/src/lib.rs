@@ -67,13 +67,13 @@ pub use stream::{ByteStream, Subscription};
 pub use config::{
     node_modules_mount, AcpLimits, AgentOsConfig, AgentOsConfigBuilder, AgentOsLimits,
     AgentOsSidecarConfig, FsPermissionRule, FsPermissions, HostFunction, HostFunctionCallback,
-    HostFunctionCollection, HostFunctionCollections, HostFunctionLimits, HttpLimits, JsRuntimeLimits, MountConfig, MountPlugin,
-    OverlayMountConfig, PackageRef, PatternPermissionRule, PatternPermissions, PermissionMode,
-    Permissions, PluginLimits, PythonLimits, ResourceLimits, RootFilesystemConfig,
-    RootFilesystemKind, RootFilesystemMode, RootLowerInput, RulePermissions, ScheduleCallback,
-    ScheduleDriver, ScheduleEntry, ScheduleHandle, SidecarJsBridgeCall, SidecarJsBridgeCallback,
-    SoftwareInput, SoftwareKind, TimerScheduleDriver, VmGroupConfig, VmUserAccountConfig,
-    VmUserConfig, WasmLimits,
+    HostFunctionCollection, HostFunctionCollections, HostFunctionLimits, HttpLimits,
+    JsRuntimeLimits, MountConfig, MountPlugin, OverlayMountConfig, PackageRef,
+    PatternPermissionRule, PatternPermissions, PermissionMode, Permissions, PluginLimits,
+    PythonLimits, ResourceLimits, RootFilesystemConfig, RootFilesystemKind, RootFilesystemMode,
+    RootLowerInput, RulePermissions, ScheduleCallback, ScheduleDriver, ScheduleEntry,
+    ScheduleHandle, SidecarJsBridgeCall, SidecarJsBridgeCallback, SoftwareInput, SoftwareKind,
+    TimerScheduleDriver, VmGroupConfig, VmUserAccountConfig, VmUserConfig, WasmLimits,
 };
 
 pub use process::{

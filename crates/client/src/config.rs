@@ -307,9 +307,9 @@ fn is_command_name(name: &str) -> bool {
         && !name.starts_with('-')
         && !name.ends_with('-')
         && !name.contains("--")
-        && name
-            .chars()
-            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-')
+        && name.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
 }
 
 fn to_command_name(kind: &str, key: &str) -> Result<String, String> {

@@ -26,9 +26,9 @@ use agentos_vm_config as vm_config;
 
 use crate::config::{
     resolve_host_functions, AgentOsConfig, AgentOsLimits, MountConfig, ResolvedHostFunction,
-    ResolvedHostFunctions, RootFilesystemConfig,
-    RootFilesystemKind, RootFilesystemMode as ConfigRootFilesystemMode, RootLowerInput,
-    SidecarJsBridgeCall, SidecarJsBridgeCallback, TimerScheduleDriver,
+    ResolvedHostFunctions, RootFilesystemConfig, RootFilesystemKind,
+    RootFilesystemMode as ConfigRootFilesystemMode, RootLowerInput, SidecarJsBridgeCall,
+    SidecarJsBridgeCallback, TimerScheduleDriver,
 };
 use crate::cron::CronManager;
 use crate::error::ClientError;

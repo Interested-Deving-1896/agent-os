@@ -114,10 +114,7 @@ pub fn resolve_permissions_policy(
         child_process: requested.child_process.clone().or(defaults.child_process),
         process: requested.process.clone().or(defaults.process),
         env: requested.env.clone().or(defaults.env),
-        host_function: requested
-            .host_function
-            .clone()
-            .or(defaults.host_function),
+        host_function: requested.host_function.clone().or(defaults.host_function),
     }
 }
 
